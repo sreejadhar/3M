@@ -41,17 +41,16 @@ Rules:
 4. Column names MUST match EXACTLY the column names listed in the schema context.
    NEVER invent or guess a column name that is not explicitly listed.
    If a column you need does not appear in the schema, omit that filter entirely.
-5. LIMIT rules — apply carefully based on query type:
-   a. Aggregation queries (any query that uses GROUP BY, or has COUNT/SUM/AVG/MIN/MAX
-      without GROUP BY): do NOT add a LIMIT clause.  The database computes the
-      aggregate over ALL rows and returns only the summarised result, which is
-      already small.  Adding LIMIT here silently drops groups and produces wrong
-      totals.
-   b. Raw-row queries (SELECT without aggregation, used to show examples or a
-      ranked list): add LIMIT {row_limit}.
-   c. Ranked / top-N questions ("top 10 products", "bottom 5 regions"): use
-      ORDER BY <metric> DESC LIMIT <N> where N is the number explicitly requested
-      or a sensible default (10–20).  Do NOT use LIMIT {row_limit} here.
+5. LIMIT rules — critical, follow exactly:
+   a. NEVER add a LIMIT clause to any query unless rule (b) applies.
+      The system automatically adds row limits where needed.
+   b. Explicit top-N questions ONLY ("top 10 products", "bottom 5 regions",
+      "show me 3 examples"): add ORDER BY <metric> DESC LIMIT <N> where N is
+      the number the user explicitly requested or a small sensible default (10–20).
+      Only use this when the question contains a specific count or "top/bottom N"
+      phrasing.
+   c. Do NOT add LIMIT {row_limit} anywhere — not for aggregations, not for
+      raw-row queries, not for any other reason.
 6. Prefer simple queries; only join when necessary.
 7. If the question cannot be answered from the available schema, return [].
 8. Maximum {max_queries} queries total.
@@ -485,50 +484,56 @@ def _fix_count_vs_sum(sql: str, natural_query: str) -> str:
 
 
 _AGG_PATTERN = re.compile(
-    r'\b(GROUP\s+BY|COUNT\s*\(|SUM\s*\(|AVG\s*\(|MIN\s*\(|MAX\s*\()\b',
+    r'\b(GROUP\s+BY|COUNT\s*\(|SUM\s*\(|AVG\s*\(|MIN\s*\(|MAX\s*\()',
     re.IGNORECASE,
 )
 
-def _remove_limit_from_aggregation(sql: str) -> str:
+_LIMIT_PATTERN = re.compile(r'\bLIMIT\s+\d+(\s+OFFSET\s+\d+)?', re.IGNORECASE)
+
+
+def _enforce_sql_limits(sql: str, row_limit: int) -> str:
     """
-    Strip LIMIT / OFFSET clauses from aggregation queries so that GROUP BY
-    results are never silently truncated.
+    Enforce LIMIT rules after the LLM has generated SQL:
 
-    Logic:
-    - If the query has no aggregation (GROUP BY / COUNT / SUM / AVG / MIN / MAX),
-      leave it untouched — the row_limit LIMIT is correct for raw-row queries.
-    - If the query has aggregation and a LIMIT of ≤50, it is an intentional
-      top-N ("top 10 products") — leave it untouched.
-    - If the query has aggregation and a LIMIT of >50 (i.e. the default
-      row_limit like 500), remove the LIMIT so all groups are returned.
+    - Aggregation queries (GROUP BY / COUNT / SUM / AVG / MIN / MAX):
+        Strip ANY LIMIT clause regardless of value.  Aggregates compute over
+        all rows — a LIMIT silently drops groups and produces wrong totals.
+        Exception: keep LIMIT when it is ≤50 AND there is an ORDER BY, which
+        signals an intentional top-N ("top 10 categories by revenue").
+
+    - Raw-row queries (no aggregation):
+        If no LIMIT is present, add LIMIT <row_limit>.
+        If a LIMIT is already present (LLM added a top-N), leave it as-is.
     """
-    if not _AGG_PATTERN.search(sql):
-        return sql  # not an aggregation query
+    is_agg = bool(_AGG_PATTERN.search(sql))
+    has_limit = bool(_LIMIT_PATTERN.search(sql))
 
-    # Find any LIMIT clause
-    m = re.search(r'\bLIMIT\s+(\d+)', sql, re.IGNORECASE)
-    if not m:
-        return sql  # no LIMIT present — nothing to do
+    if is_agg:
+        if not has_limit:
+            return sql  # already clean
 
-    limit_val = int(m.group(1))
-    if limit_val <= 50:
-        return sql  # intentional small top-N — keep it
+        m = re.search(r'\bLIMIT\s+(\d+)', sql, re.IGNORECASE)
+        limit_val = int(m.group(1)) if m else 0
+        has_order_by = bool(re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE))
 
-    # Large LIMIT (e.g. 500) on an aggregation query — strip it
-    cleaned = re.sub(
-        r'\s+LIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*$',
-        '',
-        sql,
-        flags=re.IGNORECASE,
-    ).strip()
+        # Keep only intentional small top-N that has a matching ORDER BY
+        if limit_val <= 50 and has_order_by:
+            return sql
 
-    if cleaned != sql:
+        # Strip the LIMIT (and any trailing OFFSET) from the end of the query
+        cleaned = _LIMIT_PATTERN.sub('', sql).strip().rstrip(';').strip()
         logger.info(
-            "plan_node: removed LIMIT %d from aggregation query (would silently drop groups)",
+            "plan_node: stripped LIMIT %d from aggregation query",
             limit_val,
         )
+        return cleaned
 
-    return cleaned
+    else:
+        # Raw-row query: add row_limit if no LIMIT present
+        if not has_limit:
+            sql = sql.rstrip().rstrip(';').strip() + f" LIMIT {row_limit}"
+            logger.info("plan_node: added LIMIT %d to raw-row query", row_limit)
+        return sql
 
 
 def plan_node(state: DialogState) -> DialogState:
@@ -661,10 +666,9 @@ def plan_node(state: DialogState) -> DialogState:
         sql = _fix_count_vs_sum(sql, natural_query)
         # Percentage fix: inject window-function percentage column when % is asked for
         sql = _fix_percentage(sql, natural_query)
-        # Aggregation fix: remove LIMIT from queries that aggregate over all rows.
-        # The LLM sometimes ignores the prompt rule and adds LIMIT anyway, which
-        # silently drops groups and produces incorrect totals.
-        sql = _remove_limit_from_aggregation(sql)
+        # LIMIT enforcement: strip LIMIT from aggregation queries (all groups must
+        # be returned); add row_limit to raw-row queries that have no LIMIT.
+        sql = _enforce_sql_limits(sql, config.row_limit)
 
         # Multi-table check: reject any query that references more than one table
         # when no valid join key was listed in the schema context.  This catches

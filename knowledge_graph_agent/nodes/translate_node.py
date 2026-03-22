@@ -171,7 +171,7 @@ def _generate_cypher(classes: Dict, obj_props: List, config: Any) -> List[str]:
 
         # Datatype props as node properties (name:xsd_type pairs)
         dt_props = {_escape_cypher(p["name"]): _escape_cypher(p["range"])
-                    for p in cls["datatype_props"][:20]}
+                    for p in cls["datatype_props"]}
         dt_str = ", ".join(f"n.`{k}` = '{v}'" for k, v in dt_props.items())
 
         q = (
@@ -226,7 +226,7 @@ def _generate_gremlin(classes: Dict, obj_props: List, config: Any) -> List[str]:
         ]
         if comment:
             props.append(f".property('description', '{comment}')")
-        for p in cls["datatype_props"][:10]:
+        for p in cls["datatype_props"]:
             pn = _escape_gremlin(p["name"])
             pr = _escape_gremlin(p["range"])
             props.append(f".property('{pn}_xsd_type', '{pr}')")
@@ -270,8 +270,11 @@ def _build_graph_data(classes: Dict, obj_props: List) -> Dict:
     edges = []
 
     for uri, cls in classes.items():
+        # Include ALL properties — no cap. The dialog agent reads every column
+        # from this title to build the schema context; truncating here causes
+        # columns to disappear from the LLM's view of the schema.
         dt_lines = "\n".join(
-            f"  {p['name']}: {p['range']}" for p in cls["datatype_props"][:15]
+            f"  {p['name']}: {p['range']}" for p in cls["datatype_props"]
         )
         title = f"Class: {cls['name']}"
         for c in cls["comments"][:2]:

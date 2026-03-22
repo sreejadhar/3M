@@ -121,6 +121,8 @@ body {
 /* ── Persona badge (in sidebar) ─────────────────────────────────────────────── */
 .sidebar-persona {
   display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
   align-items: center;
   padding: 10px 12px;
   border-bottom: 1px solid var(--clr-border);
@@ -133,6 +135,7 @@ body {
   align-items: center;
   gap: 6px;
   flex: 1;
+  min-width: 0;
   background: var(--clr-bg);
   border-radius: var(--radius-sm);
   padding: 5px 8px;
@@ -141,7 +144,7 @@ body {
 }
 
 .persona-icon  { font-size: 15px; }
-.persona-label { color: var(--clr-text-sec); }
+.persona-label { color: var(--clr-text-sec); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .persona-switch-btn {
   background: none;
@@ -152,6 +155,7 @@ body {
   border-radius: var(--radius-sm);
   transition: background var(--transition);
   line-height: 1;
+  flex-shrink: 0;
 }
 .persona-switch-btn:hover { background: var(--clr-bg); color: var(--clr-primary); }
 

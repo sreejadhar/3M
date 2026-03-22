@@ -50,6 +50,7 @@ class ExcelConnector(BaseConnector):
         _log = _logging.getLogger(__name__)
 
         used_sheets: dict = {}
+        sheet_errors: list = []
         for sheet in xl.sheet_names:
             base = _safe_name(sheet)
             # Deduplicate sheet→table names
@@ -85,6 +86,13 @@ class ExcelConnector(BaseConnector):
                     "ExcelConnector: skipping sheet %r (→ %r) — %s: %s",
                     sheet, safe, type(exc).__name__, exc
                 )
+                sheet_errors.append(f"Sheet '{sheet}': {type(exc).__name__}: {exc}")
+
+        if not self._sheets:
+            detail = "; ".join(sheet_errors) if sheet_errors else "no sheets found"
+            raise RuntimeError(
+                f"Excel file '{path.name}' could not be loaded — {detail}"
+            )
 
     def close(self) -> None:
         if self._conn:

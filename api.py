@@ -121,14 +121,20 @@ def _run_extraction(job_id: str, agent_cfg: AgentConfig, db_type: str, db_info: 
         agent = MetadataExtractionAgent(agent_cfg)
 
         pipeline_error: Optional[str] = None
-        for node_name, _ in agent.stream_run():
+        for node_name, state_update in agent.stream_run():
             clean = node_name.strip("_").replace("error_end", "error")
 
             with _lock:
                 if "error" in node_name:
-                    pipeline_error = f"Pipeline error at node: {node_name}"
+                    # Pull the actual error messages from state; fall back to node name
+                    node_errors = state_update.get("errors") if isinstance(state_update, dict) else []
+                    if node_errors:
+                        pipeline_error = "; ".join(str(e) for e in node_errors)
+                    else:
+                        pipeline_error = f"Pipeline failed at node: {node_name}"
                     _jobs[job_id]["status"] = "error"
                     _jobs[job_id]["error"]  = pipeline_error
+                    logger.error("Extraction job %s failed: %s", job_id[:8], pipeline_error)
                 else:
                     real = clean if clean in PIPELINE_NODES else None
                     if real and real not in completed:

@@ -685,11 +685,30 @@ body {
 }
 .msg-bubble pre code { background:none; border:none; color:#e6edf3; font-size:13px; padding:0; }
 .msg-bubble strong { font-weight:600; }
+/* Raw blockquotes (fallback — processed ones become .insight-callout) */
 .msg-bubble blockquote {
   border-left: 3px solid var(--clr-primary);
-  padding-left: 12px;
+  background: var(--clr-user-bubble);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  padding: 10px 14px;
   color: var(--clr-text-sec);
-  margin: 8px 0;
+  margin: 10px 0;
+}
+
+/* ── Insight & Recommendation callout cards ──────────────────────────────── */
+.insight-callout {
+  display: flex;
+  gap: 12px;
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  margin: 12px 0;
+  border-left: 4px solid var(--clr-primary);
+  background: rgba(66,133,244,0.08);
+}
+.insight-callout p { margin: 0; line-height: 1.6; }
+.insight-callout.callout-recommendation {
+  border-left-color: #34a853;
+  background: rgba(52,168,83,0.08);
 }
 
 /* Typing indicator */
@@ -792,6 +811,16 @@ body {
 .result-table tr:last-child td { border-bottom:none; }
 .result-table tr:hover td      { background:var(--clr-bg); }
 .result-table .num-cell        { text-align:right; font-variant-numeric:tabular-nums; }
+
+/* ── Chart visualizations ─────────────────────────────────────────────────── */
+.chart-wrap {
+  position: relative;
+  height: 240px;
+  padding: 12px 16px 8px;
+  border-bottom: 1px solid var(--clr-border);
+  background: var(--clr-surface);
+}
+.chart-wrap canvas { width: 100% !important; height: 100% !important; }
 
 /* SQL disclosure */
 .sql-disclosure { margin-top:10px; }

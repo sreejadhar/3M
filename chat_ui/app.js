@@ -73,6 +73,9 @@ const adminAddBtn      = document.getElementById('adminAddBtn');
 const adminRefreshBtn  = document.getElementById('adminRefreshBtn');
 const adminTableBody   = document.getElementById('adminTableBody');
 
+// ── Chart state ───────────────────────────────────────────────────────────────
+const _charts = {};   // canvasId → Chart.js instance
+
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 function escHtml(str) {
@@ -104,6 +107,95 @@ function isNumeric(v) {
   return typeof v === 'number' || (typeof v === 'string' && v !== '' && !isNaN(Number(v)));
 }
 
+// ── Chart helpers ─────────────────────────────────────────────────────────────
+
+const CHART_PALETTE = [
+  'rgba(66,133,244,0.85)',  'rgba(155,114,203,0.85)', 'rgba(234,67,53,0.85)',
+  'rgba(52,168,83,0.85)',   'rgba(251,188,4,0.85)',   'rgba(255,109,0,0.85)',
+  'rgba(0,172,193,0.85)',   'rgba(63,81,181,0.85)',
+];
+
+function detectChartConfig(cols, rows) {
+  if (!rows.length || cols.length < 2) return null;
+  // Identify numeric vs label columns (sample first 3 rows)
+  const numCols  = cols.filter(c => rows.slice(0, 3).every(r => r[c] !== null && r[c] !== undefined && isNumeric(r[c])));
+  const lblCols  = cols.filter(c => !numCols.includes(c));
+  if (!lblCols.length || !numCols.length) return null;
+  if (rows.length > 30) return null;  // too dense to chart cleanly
+  const labelCol = lblCols[0];
+  const isTime   = /date|month|year|week|day|quarter|period|time|fiscal/i.test(labelCol);
+  if (isTime)           return { type: 'line',     labelCol, numCols: numCols.slice(0, 3) };
+  if (rows.length <= 7 && numCols.length === 1)
+                        return { type: 'doughnut', labelCol, numCols };
+  return                       { type: 'bar',      labelCol, numCols: numCols.slice(0, 3) };
+}
+
+function renderChart(canvasId, cols, rows) {
+  if (typeof Chart === 'undefined') return;
+  const cfg = detectChartConfig(cols, rows);
+  if (!cfg) return;
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  if (_charts[canvasId]) { _charts[canvasId].destroy(); delete _charts[canvasId]; }
+
+  const labels   = rows.map(r => String(r[cfg.labelCol] ?? ''));
+  const isDark   = document.documentElement.classList.contains('dark') ||
+                   window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const gridClr  = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
+  const tickClr  = isDark ? '#9aa0ac' : '#6b7280';
+
+  const datasets = cfg.numCols.map((col, i) => {
+    const color = CHART_PALETTE[i % CHART_PALETTE.length];
+    if (cfg.type === 'doughnut') {
+      return { label: col, data: rows.map(r => Number(r[col]) || 0),
+               backgroundColor: CHART_PALETTE.slice(0, rows.length), borderWidth: 2 };
+    }
+    return {
+      label: col,
+      data: rows.map(r => Number(r[col]) || 0),
+      backgroundColor: cfg.type === 'line' ? color.replace('0.85', '0.15') : color,
+      borderColor: color,
+      borderWidth: cfg.type === 'line' ? 2 : 1,
+      fill: cfg.type === 'line',
+      tension: 0.35,
+      pointRadius: cfg.type === 'line' ? 3 : 0,
+    };
+  });
+
+  const scaleOpts = {
+    x: { grid: { display: false }, ticks: { color: tickClr, maxRotation: 35 } },
+    y: { beginAtZero: true, grid: { color: gridClr }, ticks: { color: tickClr } },
+  };
+
+  _charts[canvasId] = new Chart(canvas, {
+    type: cfg.type,
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          display: cfg.numCols.length > 1 || cfg.type === 'doughnut',
+          position: 'bottom',
+          labels: { color: tickClr, boxWidth: 12, padding: 12 },
+        },
+        tooltip: { mode: cfg.type === 'doughnut' ? 'nearest' : 'index', intersect: false },
+      },
+      scales: cfg.type === 'doughnut' ? {} : scaleOpts,
+    },
+  });
+}
+
+// ── Insight callout post-processing ──────────────────────────────────────────
+
+function processInsightCallouts(html) {
+  return html.replace(/<blockquote>\s*<p>([\s\S]*?)<\/p>\s*<\/blockquote>/g, (_, inner) => {
+    const isRec  = /recommendation|action item|next step|should|must|consider/i.test(inner);
+    const cls    = isRec ? 'callout-recommendation' : 'callout-insight';
+    return `<div class="insight-callout ${cls}"><p>${inner}</p></div>`;
+  });
+}
+
 function fileIcon(filename) {
   const ext = (filename || '').split('.').pop().toLowerCase();
   if (['xlsx','xls','xlsm','xlsb'].includes(ext)) return '📊';
@@ -113,11 +205,14 @@ function fileIcon(filename) {
 
 function renderMarkdown(text) {
   if (!text) return '';
+  let html;
   if (typeof marked !== 'undefined') {
     marked.setOptions({ breaks: true, gfm: true });
-    return marked.parse(text);
+    html = marked.parse(text);
+  } else {
+    html = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
   }
-  return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>');
+  return processInsightCallouts(html);
 }
 
 function dbTypeLabel(t) {
@@ -601,11 +696,11 @@ function renderAIMessage(ev) {
   row.className    = 'msg-row assistant';
   row.id           = 'ai-msg-' + ev.msg_id;
 
-  const mdHtml     = renderMarkdown(ev.content || '');
-  const resultsHtml = buildResultBlocks(ev.results || []);
-  const sqlHtml    = buildSQLDisclosure(ev.sql || [], ev.msg_id, p.showSQL);
-  const errHtml    = buildErrorNotes(ev.errors || []);
-  const cacheNote  = ev.cache_hit
+  const mdHtml      = renderMarkdown(ev.content || '');
+  const resultsHtml = buildResultBlocks(ev.results || [], ev.msg_id);
+  const sqlHtml     = buildSQLDisclosure(ev.sql || [], ev.msg_id, p.showSQL);
+  const errHtml     = buildErrorNotes(ev.errors || []);
+  const cacheNote   = ev.cache_hit
     ? '<div style="font-size:11px;color:var(--clr-text-mute);margin-top:8px">⚡ From cache</div>' : '';
 
   row.innerHTML = `
@@ -615,6 +710,14 @@ function renderAIMessage(ev) {
       ${resultsHtml}${errHtml}${sqlHtml}${cacheNote}
     </div>`;
   messages.appendChild(row);
+
+  // Render Chart.js charts after the canvases are in the DOM
+  (ev.results || []).forEach((r, i) => {
+    const rows = r.rows || [];
+    if (!rows.length) return;
+    renderChart(`chart-${ev.msg_id}-${i}`, Object.keys(rows[0]), rows);
+  });
+
   scrollToBottom();
 }
 
@@ -627,24 +730,30 @@ function renderAIError(msgId, message) {
   scrollToBottom();
 }
 
-function buildResultBlocks(results) {
+function buildResultBlocks(results, msgId) {
   if (!results || !results.length) return '';
   return results.map((r, i) => {
     const rows = r.rows || [];
     if (!rows.length) return '';
-    const cols   = Object.keys(rows[0]);
-    const header = cols.map(c => `<th>${escHtml(c)}</th>`).join('');
-    const body   = rows.map(row =>
+    const cols     = Object.keys(rows[0]);
+    const canvasId = `chart-${msgId}-${i}`;
+    const hasChart = detectChartConfig(cols, rows) !== null;
+    const header   = cols.map(c => `<th>${escHtml(c)}</th>`).join('');
+    const body     = rows.map(row =>
       `<tr>${cols.map(c => {
         const v = row[c], num = isNumeric(v);
         return `<td class="${num ? 'num-cell' : ''}" title="${escHtml(String(v ?? ''))}">${escHtml(formatNumber(v))}</td>`;
       }).join('')}</tr>`
     ).join('');
+    const chartHtml = hasChart
+      ? `<div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>`
+      : '';
     return `
       <div class="result-block">
         <div class="result-block-header">📋 ${escHtml(r.query_label || `Query ${i+1}`)}
           <span style="margin-left:auto;font-weight:normal;color:var(--clr-text-mute)">${rows.length} row${rows.length !== 1 ? 's' : ''}</span>
         </div>
+        ${chartHtml}
         <div class="result-table-wrap">
           <table class="result-table"><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>
         </div>

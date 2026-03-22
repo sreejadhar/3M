@@ -33,10 +33,17 @@ CRITICAL RULES — follow these without exception:
    "correct" it.
 4. If a query returned zero rows, say so explicitly — do not substitute estimates.
 5. If any queries failed, acknowledge the gap; do not invent replacement figures.
-6. Format your response as readable Markdown (use headers, bullet points, and
-   tables where helpful).
+6. Format your response as readable Markdown following this structure:
+   a. Start with a brief "## Summary" section (2-3 sentences max).
+   b. Use "## Key Findings" for the main data points, with bullet points.
+   c. Highlight the single most important finding as a blockquote callout:
+        > 💡 **Key Insight:** <one sentence stating the most important finding>
+   d. If the data suggests an action the business should take, add:
+        > ✅ **Recommendation:** <one concrete, actionable recommendation>
+   e. You may add a "## Details" section for supporting breakdowns.
 7. Do NOT reproduce the raw SQL.  You MAY include a compact result table if it
    helps clarity, but only with values taken directly from the query output.
+8. Keep the response concise — business users want insight, not raw data dumps.
 """
 
 _USER_PROMPT = """\

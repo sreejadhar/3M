@@ -73,6 +73,91 @@ _sessions: Dict[str, Dict] = {}
 _event_queues: Dict[str, asyncio.Queue] = {}
 _lock = asyncio.Lock()
 
+# ── Source Registry ────────────────────────────────────────────────────────────
+_sources: Dict[str, Dict] = {}
+
+DOMAIN_ICONS: Dict[str, str] = {
+    "Sales":      "💼",
+    "Finance":    "💰",
+    "Operations": "⚙️",
+    "HR":         "👥",
+    "Marketing":  "📢",
+    "IT":         "🖥️",
+    "Other":      "📊",
+}
+
+
+# ── Source models ──────────────────────────────────────────────────────────────
+
+class SourceConnection(BaseModel):
+    file_path:         str            = ""
+    host:              str            = ""
+    port:              int            = 0
+    database:          str            = ""
+    schema_:           str            = "public"   # 'schema' is reserved in Pydantic
+    username:          str            = ""
+    password:          str            = ""
+    connection_string: str            = ""
+    extra:             Dict[str, Any] = {}
+
+class CreateSourceRequest(BaseModel):
+    name:           str
+    description:    str       = ""
+    domain:         str       = "Other"
+    db_type:        str
+    connection:     SourceConnection
+    persona_access: List[str] = ["business_user", "analyst", "admin"]
+    auto_index:     bool      = True
+
+class TestConnectionRequest(BaseModel):
+    db_type:    str
+    connection: SourceConnection
+
+
+def _new_source(name, description, domain, db_type, connection, persona_access) -> Dict:
+    return {
+        "id":               str(uuid.uuid4()),
+        "name":             name,
+        "description":      description,
+        "domain":           domain,
+        "icon":             DOMAIN_ICONS.get(domain, "📊"),
+        "db_type":          db_type,
+        "connection":       connection,
+        "status":           "idle",
+        "error_message":    None,
+        "persona_access":   persona_access,
+        "created_at":       time.time(),
+        "indexed_at":       None,
+        "table_count":      0,
+        "table_names":      [],
+        "extract_job_id":   None,
+        "ontology_job_id":  None,
+        "kg_job_id":        None,
+        "report":           None,
+        "ontology_content": None,
+        "kg_nodes":         [],
+        "kg_edges":         [],
+    }
+
+
+def _source_public(s: Dict) -> Dict:
+    """Return source dict with credentials stripped — safe to send to browser."""
+    return {
+        "id":             s["id"],
+        "name":           s["name"],
+        "description":    s["description"],
+        "domain":         s["domain"],
+        "icon":           s["icon"],
+        "db_type":        s["db_type"],
+        "status":         s["status"],
+        "error_message":  s.get("error_message"),
+        "persona_access": s["persona_access"],
+        "created_at":     s["created_at"],
+        "indexed_at":     s.get("indexed_at"),
+        "table_count":    s["table_count"],
+        "table_names":    s["table_names"],
+    }
+
 
 def _new_session(title: str = "New conversation") -> Dict:
     return {
@@ -410,6 +495,139 @@ async def _run_pipeline(session_id: str) -> None:
         })
 
 
+# ── Source indexer ─────────────────────────────────────────────────────────────
+
+_FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
+
+
+def _build_db_config(db_type: str, conn: Dict) -> Dict:
+    if db_type.lower() in _FILE_BASED_TYPES:
+        return {"db_type": db_type, "file_path": conn.get("file_path", "")}
+    cfg: Dict[str, Any] = {
+        "db_type":  db_type,
+        "host":     conn.get("host", ""),
+        "port":     conn.get("port", 5432),
+        "database": conn.get("database", ""),
+        "username": conn.get("username", ""),
+        "password": conn.get("password", ""),
+        "schema":   conn.get("schema_", "public"),
+    }
+    if conn.get("connection_string"):
+        cfg["connection_string"] = conn["connection_string"]
+    if conn.get("extra"):
+        cfg["extra"] = conn["extra"]
+    return cfg
+
+
+async def _index_source(source_id: str) -> None:
+    """Full pipeline for a registered data source: extract → ontology → KG."""
+    src = _sources.get(source_id)
+    if not src:
+        return
+    src["status"]        = "indexing"
+    src["error_message"] = None
+    db_config = _build_db_config(src["db_type"], src["connection"])
+
+    try:
+        # ── 1. Extraction ──────────────────────────────────────────────────────
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(f"{METADATA_API}/extract", json={
+                "db_config":    db_config,
+                "sample_size":  10000,
+                "fd_threshold": 1.0,
+                "id_threshold": 0.95,
+            })
+            r.raise_for_status()
+            extract_job_id = r.json()["job_id"]
+
+        src["extract_job_id"] = extract_job_id
+        report = None
+        deadline = time.time() + 600
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while time.time() < deadline:
+                pr  = await client.get(f"{METADATA_API}/jobs/{extract_job_id}")
+                job = pr.json()
+                if job.get("status") == "done":
+                    rr = await client.get(f"{METADATA_API}/jobs/{extract_job_id}/report")
+                    report = rr.json()
+                    break
+                if job.get("status") == "error":
+                    raise RuntimeError(job.get("error", "Extraction failed"))
+                await asyncio.sleep(2.0)
+
+        if not report:
+            raise RuntimeError("Extraction timed out")
+
+        src["report"]      = report
+        src["table_names"] = list((report.get("tables") or {}).keys())
+        src["table_count"] = len(src["table_names"])
+
+        # ── 2. Ontology ────────────────────────────────────────────────────────
+        ontology_content = None
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                ro = await client.post(f"{ONTOLOGY_API}/generate",
+                                       json={"report": report, "include_statistics": True})
+                ro.raise_for_status()
+                onto_job_id = ro.json()["job_id"]
+
+            src["ontology_job_id"] = onto_job_id
+            deadline2 = time.time() + 300
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                while time.time() < deadline2:
+                    pr  = await client.get(f"{ONTOLOGY_API}/jobs/{onto_job_id}")
+                    job = pr.json()
+                    if job.get("status") == "done":
+                        rc = await client.get(f"{ONTOLOGY_API}/jobs/{onto_job_id}/content")
+                        if rc.status_code == 200:
+                            ontology_content = rc.json().get("content", "")
+                        break
+                    if job.get("status") == "error":
+                        break
+                    await asyncio.sleep(2.0)
+            if ontology_content:
+                src["ontology_content"] = ontology_content
+        except Exception as exc:
+            logger.warning("Source %s: ontology failed: %s", source_id[:8], exc)
+
+        # ── 3. Knowledge Graph ─────────────────────────────────────────────────
+        if ontology_content:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    rk = await client.post(f"{KG_API}/generate",
+                                           json={"ontology_text": ontology_content})
+                    rk.raise_for_status()
+                    kg_job_id = rk.json()["job_id"]
+
+                src["kg_job_id"] = kg_job_id
+                deadline3 = time.time() + 300
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    while time.time() < deadline3:
+                        pr  = await client.get(f"{KG_API}/jobs/{kg_job_id}")
+                        job = pr.json()
+                        if job.get("status") == "done":
+                            rg = await client.get(f"{KG_API}/jobs/{kg_job_id}/graph")
+                            if rg.status_code == 200:
+                                graph = rg.json()
+                                src["kg_nodes"] = graph.get("nodes") or []
+                                src["kg_edges"] = graph.get("edges") or []
+                            break
+                        if job.get("status") == "error":
+                            break
+                        await asyncio.sleep(2.0)
+            except Exception as exc:
+                logger.warning("Source %s: KG failed: %s", source_id[:8], exc)
+
+        src["status"]     = "ready"
+        src["indexed_at"] = time.time()
+        logger.info("Source %s indexed: %d tables", source_id[:8], src["table_count"])
+
+    except Exception as exc:
+        logger.exception("Source %s indexing failed", source_id[:8])
+        src["status"]        = "error"
+        src["error_message"] = str(exc)
+
+
 # ── SSE generator ──────────────────────────────────────────────────────────────
 
 async def _sse_generator(session_id: str) -> AsyncGenerator[str, None]:
@@ -476,16 +694,48 @@ async def serve_ui():
 # ── Session endpoints ──────────────────────────────────────────────────────────
 
 class NewSessionRequest(BaseModel):
-    title: Optional[str] = "New conversation"
+    title:     Optional[str] = "New conversation"
+    source_id: Optional[str] = None
 
 
 @app.post("/sessions", status_code=201)
 async def create_session(req: NewSessionRequest):
     s = _new_session(req.title or "New conversation")
+
+    if req.source_id:
+        src = _sources.get(req.source_id)
+        if not src:
+            raise HTTPException(status_code=404, detail="Source not found")
+        s["source_id"] = req.source_id
+        s["title"]     = req.title or src["name"]
+
+        if src["status"] == "ready":
+            s["stage"]         = "ready"
+            s["pct"]           = 100
+            s["stage_message"] = "Ready"
+            s["report"]        = src["report"]
+            s["db_type"]       = src["db_type"]
+            s["kg_nodes"]      = src.get("kg_nodes", [])
+            s["kg_edges"]      = src.get("kg_edges", [])
+            s["db_connection"] = src["connection"]
+            conn = src["connection"]
+            if src["db_type"].lower() in _FILE_BASED_TYPES:
+                s["db_file_path"] = conn.get("file_path", "")
+            else:
+                s["db_file_path"] = None
+        elif src["status"] == "indexing":
+            s["stage"]         = "extracting"
+            s["stage_message"] = "Source is being indexed, please wait…"
+
     _sessions[s["id"]] = s
     _event_queues[s["id"]] = asyncio.Queue()
-    logger.info("Session created: %s", s["id"][:8])
-    return {"session_id": s["id"], "title": s["title"]}
+    logger.info("Session created: %s (source: %s)", s["id"][:8], req.source_id or "none")
+    return {
+        "session_id": s["id"],
+        "title":      s["title"],
+        "stage":      s["stage"],
+        "source_id":  req.source_id,
+    }
 
 
 @app.get("/sessions")
@@ -683,17 +933,29 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
 
     dialog_session_id = session.get("dialog_session_id")
 
-    dialog_payload = {
-        "natural_query":  message,
-        "kg_nodes":       session.get("kg_nodes") or [],
-        "kg_edges":       session.get("kg_edges") or [],
-        "db_type":        session["db_type"],
-        "db_file_path":   session["db_file_path"],
-        "skip_cache":     skip_cache,
-        "session_id":     dialog_session_id,
-        "row_limit":      500,
+    db_type = session.get("db_type") or "sqlite"
+    conn    = session.get("db_connection") or {}
+    dialog_payload: Dict[str, Any] = {
+        "natural_query":   message,
+        "kg_nodes":        session.get("kg_nodes") or [],
+        "kg_edges":        session.get("kg_edges") or [],
+        "db_type":         db_type,
+        "skip_cache":      skip_cache,
+        "session_id":      dialog_session_id,
+        "row_limit":       500,
         "max_sql_queries": 10,
     }
+    if db_type.lower() in _FILE_BASED_TYPES:
+        dialog_payload["db_file_path"] = session.get("db_file_path") or ""
+    else:
+        dialog_payload["db_host"]              = conn.get("host", "")
+        dialog_payload["db_port"]              = conn.get("port", 5432)
+        dialog_payload["db_name"]              = conn.get("database", "")
+        dialog_payload["db_schema"]            = conn.get("schema_", "public")
+        dialog_payload["db_user"]              = conn.get("username", "")
+        dialog_payload["db_password"]          = conn.get("password", "")
+        dialog_payload["db_connection_string"] = conn.get("connection_string", "")
+        dialog_payload["db_extra"]             = conn.get("extra", {})
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -794,3 +1056,88 @@ async def purge_session_file_cache(session_id: str):
             return r.json()
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# ── Source Registry endpoints ──────────────────────────────────────────────────
+
+@app.get("/sources")
+async def list_sources(persona: str = "business_user"):
+    """List all data sources visible to a given persona (credentials never returned)."""
+    return [
+        _source_public(s) for s in _sources.values()
+        if persona in s.get("persona_access", ["business_user", "analyst", "admin"])
+    ]
+
+
+@app.post("/sources", status_code=201)
+async def create_source(req: CreateSourceRequest):
+    """Register a new data source and optionally start background indexing."""
+    s = _new_source(
+        name=req.name,
+        description=req.description,
+        domain=req.domain,
+        db_type=req.db_type,
+        connection=req.connection.dict(),
+        persona_access=req.persona_access,
+    )
+    _sources[s["id"]] = s
+    if req.auto_index:
+        asyncio.create_task(_index_source(s["id"]))
+    logger.info("Source registered: %s (%s)", s["id"][:8], req.name)
+    return _source_public(s)
+
+
+@app.get("/sources/{source_id}")
+async def get_source(source_id: str):
+    """Get a single source by ID (without credentials)."""
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return _source_public(s)
+
+
+@app.delete("/sources/{source_id}", status_code=200)
+async def delete_source(source_id: str):
+    """Remove a registered source."""
+    s = _sources.pop(source_id, None)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    logger.info("Source deleted: %s (%s)", source_id[:8], s["name"])
+    return {"deleted": source_id}
+
+
+@app.post("/sources/{source_id}/reindex", status_code=202)
+async def reindex_source(source_id: str):
+    """Trigger a fresh indexing run for a registered source."""
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if s["status"] == "indexing":
+        raise HTTPException(status_code=409, detail="Source is already being indexed")
+    s["status"]        = "idle"
+    s["error_message"] = None
+    asyncio.create_task(_index_source(source_id))
+    return {"source_id": source_id, "status": "indexing"}
+
+
+@app.post("/sources/test-connection")
+async def test_source_connection(req: TestConnectionRequest):
+    """Test a database connection without registering or saving it."""
+    conn      = req.connection.dict()
+    db_config = _build_db_config(req.db_type, conn)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(f"{METADATA_API}/extract", json={
+                "db_config":    db_config,
+                "sample_size":  1,
+                "fd_threshold": 1.0,
+                "id_threshold": 0.95,
+            })
+            if r.status_code == 422:
+                return {"ok": False, "error": str(r.json().get("detail", "Invalid parameters"))}
+            r.raise_for_status()
+        return {"ok": True}
+    except httpx.HTTPStatusError as exc:
+        return {"ok": False, "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}

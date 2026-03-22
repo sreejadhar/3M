@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DataChat</title>
   <link rel="stylesheet" href="/ui/style.css" />
-  <!-- marked.js for Markdown rendering -->
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
 </head>
 <body>
@@ -28,10 +27,36 @@
       </button>
     </div>
 
-    <div class="sidebar-section-label">Recent</div>
-    <nav class="session-list" id="sessionList">
-      <!-- Populated by JS -->
+    <!-- Persona badge -->
+    <div class="sidebar-persona" id="sidebarPersona">
+      <div class="persona-badge" id="personaBadge">
+        <span class="persona-icon" id="personaIcon">👤</span>
+        <span class="persona-label" id="personaLabel">Business User</span>
+      </div>
+      <button class="persona-switch-btn" id="personaSwitchBtn" title="Switch persona">⌄</button>
+    </div>
+
+    <!-- Data Sources -->
+    <div class="sidebar-section-label">Data Sources</div>
+    <nav class="source-list" id="sourceList">
+      <div class="source-list-empty">Loading sources…</div>
     </nav>
+
+    <!-- Recent Conversations -->
+    <div class="sidebar-section-label" style="margin-top:8px">Recent</div>
+    <nav class="session-list" id="sessionList">
+      <div style="font-size:13px;color:var(--clr-text-mute);padding:8px 14px">No conversations yet</div>
+    </nav>
+
+    <!-- Admin button (shown only for admin persona) -->
+    <div class="sidebar-bottom" id="sidebarBottom" style="display:none">
+      <button class="admin-btn" id="adminBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+          <circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 10-16 0"/>
+        </svg>
+        Admin Panel
+      </button>
+    </div>
   </aside>
 
   <!-- ── Main area ───────────────────────────────────────────────────────── -->
@@ -60,17 +85,16 @@
         </svg>
         <span class="logo-text">DataChat</span>
       </div>
+      <div class="topbar-center" id="topbarSourceName"></div>
       <div class="topbar-right">
         <div class="pipeline-status" id="pipelineStatus"></div>
       </div>
     </header>
 
-    <!-- Chat area -->
-    <div class="chat-area" id="chatArea">
-
-      <!-- Welcome screen -->
-      <div class="welcome" id="welcome">
-        <div class="welcome-logo">
+    <!-- ── Landing / Source Catalog ─────────────────────────────────────── -->
+    <div class="landing" id="landing">
+      <div class="landing-header">
+        <div class="landing-logo">
           <svg viewBox="0 0 80 80">
             <defs>
               <linearGradient id="wGrad" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -83,73 +107,273 @@
             <polygon points="40,18 62,29 62,51 40,62 18,51 18,29" fill="none" stroke="white" stroke-width="2" opacity="0.6"/>
           </svg>
         </div>
-        <h1 class="welcome-title">How can I help with your data?</h1>
-        <p class="welcome-sub">Upload Excel or CSV files, then ask questions in plain English.</p>
+        <h1 class="landing-title">What would you like to explore?</h1>
+        <p class="landing-sub">Select a data source to start a conversation, or add your own data.</p>
+      </div>
+      <div class="source-catalog" id="sourceCatalog">
+        <!-- Source cards rendered by JS -->
+      </div>
+    </div>
 
-        <div class="suggestions">
-          <button class="suggestion-chip" data-q="What tables are available and how many rows does each have?">
-            📊 List available tables
-          </button>
-          <button class="suggestion-chip" data-q="Show me the top 10 rows from the first table">
-            🔍 Preview data
-          </button>
-          <button class="suggestion-chip" data-q="What is the total headcount by department?">
-            👥 Headcount by department
-          </button>
-          <button class="suggestion-chip" data-q="Show me the revenue breakdown by service line with percentages">
-            💰 Revenue breakdown
+    <!-- ── Chat area ──────────────────────────────────────────────────────── -->
+    <div class="chat-view" id="chatView" style="display:none">
+
+      <div class="chat-area" id="chatArea">
+        <div class="welcome" id="welcome" style="display:none">
+          <h1 class="welcome-title">Ready to answer your questions</h1>
+          <p class="welcome-sub">Ask anything about the data in natural English.</p>
+          <div class="suggestions" id="suggestions">
+            <button class="suggestion-chip" data-q="What tables are available and how many rows does each have?">📊 List available tables</button>
+            <button class="suggestion-chip" data-q="Show me the top 10 rows from the first table">🔍 Preview data</button>
+            <button class="suggestion-chip" data-q="What is the total headcount by department?">👥 Headcount by department</button>
+            <button class="suggestion-chip" data-q="Show me the revenue breakdown by service line with percentages">💰 Revenue breakdown</button>
+          </div>
+        </div>
+        <div class="messages" id="messages"></div>
+      </div>
+
+      <!-- Input area -->
+      <div class="input-area" id="inputArea">
+        <div class="file-chips" id="fileChips"></div>
+        <div class="pipeline-bar" id="pipelineBar" style="display:none">
+          <div class="pipeline-bar-inner" id="pipelineBarInner"></div>
+        </div>
+        <div class="input-row">
+          <label class="upload-btn" for="fileInput" title="Upload CSV or Excel files">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+            </svg>
+            <input type="file" id="fileInput" multiple accept=".csv,.xlsx,.xls,.xlsm" />
+          </label>
+          <textarea class="msg-input" id="msgInput" placeholder="Ask anything about your data…" rows="1" disabled></textarea>
+          <button class="send-btn" id="sendBtn" disabled title="Send">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
           </button>
         </div>
+        <div class="input-footer">DataChat can make mistakes. Verify important figures independently.</div>
       </div>
-
-      <!-- Messages -->
-      <div class="messages" id="messages"></div>
-
-    </div><!-- /chat-area -->
-
-    <!-- Input area -->
-    <div class="input-area" id="inputArea">
-      <!-- Uploaded file chips -->
-      <div class="file-chips" id="fileChips"></div>
-
-      <!-- Progress bar (shown during pipeline) -->
-      <div class="pipeline-bar" id="pipelineBar" style="display:none">
-        <div class="pipeline-bar-inner" id="pipelineBarInner"></div>
-      </div>
-
-      <!-- Input row -->
-      <div class="input-row">
-        <label class="upload-btn" for="fileInput" title="Upload CSV or Excel files">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
-          </svg>
-          <input type="file" id="fileInput" multiple accept=".csv,.xlsx,.xls,.xlsm" />
-        </label>
-
-        <textarea
-          class="msg-input"
-          id="msgInput"
-          placeholder="Ask anything about your data…"
-          rows="1"
-          disabled
-        ></textarea>
-
-        <button class="send-btn" id="sendBtn" disabled title="Send">
-          <svg viewBox="0 0 24 24" fill="currentColor">
-            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
-          </svg>
-        </button>
-      </div>
-
-      <div class="input-footer">
-        DataChat can make mistakes. Verify important figures independently.
-      </div>
-    </div><!-- /input-area -->
+    </div>
 
   </div><!-- /main -->
 
   <!-- ── Toast notifications ──────────────────────────────────────────────── -->
   <div class="toast-container" id="toastContainer"></div>
+
+  <!-- ── Persona Selector dropdown ────────────────────────────────────────── -->
+  <div class="persona-dropdown" id="personaDropdown" style="display:none">
+    <div class="persona-option" data-persona="business_user">
+      <span class="persona-opt-icon">👤</span>
+      <div>
+        <div class="persona-opt-name">Business User</div>
+        <div class="persona-opt-desc">Explore data sources and ask questions</div>
+      </div>
+    </div>
+    <div class="persona-option" data-persona="analyst">
+      <span class="persona-opt-icon">🔬</span>
+      <div>
+        <div class="persona-opt-name">Business Analyst</div>
+        <div class="persona-opt-desc">Schema browser, SQL visibility, connect databases</div>
+      </div>
+    </div>
+    <div class="persona-option" data-persona="admin">
+      <span class="persona-opt-icon">⚙️</span>
+      <div>
+        <div class="persona-opt-name">Data Admin</div>
+        <div class="persona-opt-desc">Manage all sources, reindex, control access</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Connection Wizard Modal ───────────────────────────────────────────── -->
+  <div class="modal-overlay" id="wizardOverlay" style="display:none">
+    <div class="modal wizard-modal">
+      <div class="modal-header">
+        <h2 class="modal-title" id="wizardTitle">Connect a Data Source</h2>
+        <button class="modal-close" id="wizardClose">✕</button>
+      </div>
+
+      <!-- Step indicators -->
+      <div class="wizard-steps" id="wizardSteps">
+        <div class="wizard-step active" data-step="1"><span>1</span> Type</div>
+        <div class="wizard-step-sep">›</div>
+        <div class="wizard-step" data-step="2"><span>2</span> Connect</div>
+        <div class="wizard-step-sep">›</div>
+        <div class="wizard-step" data-step="3"><span>3</span> Name</div>
+        <div class="wizard-step-sep">›</div>
+        <div class="wizard-step" data-step="4"><span>4</span> Confirm</div>
+      </div>
+
+      <!-- Step 1: DB type -->
+      <div class="wizard-pane" id="wizardStep1">
+        <p class="wizard-pane-label">What type of data source are you connecting?</p>
+        <div class="db-type-grid">
+          <button class="db-type-card" data-dbtype="postgres">
+            <span class="db-type-icon">🐘</span>
+            <span class="db-type-name">PostgreSQL</span>
+          </button>
+          <button class="db-type-card" data-dbtype="sqlserver">
+            <span class="db-type-icon">🖥️</span>
+            <span class="db-type-name">SQL Server</span>
+          </button>
+          <button class="db-type-card" data-dbtype="oracle">
+            <span class="db-type-icon">🔴</span>
+            <span class="db-type-name">Oracle</span>
+          </button>
+          <button class="db-type-card" data-dbtype="mysql">
+            <span class="db-type-icon">🐬</span>
+            <span class="db-type-name">MySQL</span>
+          </button>
+          <button class="db-type-card" data-dbtype="sqlite">
+            <span class="db-type-icon">📦</span>
+            <span class="db-type-name">SQLite</span>
+          </button>
+          <button class="db-type-card" data-dbtype="csv">
+            <span class="db-type-icon">📄</span>
+            <span class="db-type-name">CSV / Excel</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Step 2: Connection details -->
+      <div class="wizard-pane" id="wizardStep2" style="display:none">
+        <!-- DB connection fields (shown for network DBs) -->
+        <div id="wizardDbFields">
+          <div class="form-row">
+            <div class="form-group" style="flex:2">
+              <label class="form-label">Host</label>
+              <input class="form-input" id="wHost" placeholder="db.example.com" />
+            </div>
+            <div class="form-group" style="flex:1">
+              <label class="form-label">Port</label>
+              <input class="form-input" id="wPort" type="number" placeholder="5432" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group" style="flex:1">
+              <label class="form-label">Database</label>
+              <input class="form-input" id="wDatabase" placeholder="mydb" />
+            </div>
+            <div class="form-group" style="flex:1">
+              <label class="form-label">Schema</label>
+              <input class="form-input" id="wSchema" placeholder="public" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group" style="flex:1">
+              <label class="form-label">Username</label>
+              <input class="form-input" id="wUsername" placeholder="readonly_user" />
+            </div>
+            <div class="form-group" style="flex:1">
+              <label class="form-label">Password</label>
+              <input class="form-input" id="wPassword" type="password" placeholder="••••••••" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Connection string <span class="form-label-opt">(optional — overrides fields above)</span></label>
+            <input class="form-input" id="wConnStr" placeholder="postgresql://user:pass@host:5432/db" />
+          </div>
+        </div>
+
+        <!-- File path (shown for SQLite / CSV / Excel) -->
+        <div id="wizardFileFields" style="display:none">
+          <div class="form-group">
+            <label class="form-label">File path on server</label>
+            <input class="form-input" id="wFilePath" placeholder="/data/reports/myfile.db" />
+            <div class="form-hint">Path must be accessible from inside the agent container.</div>
+          </div>
+        </div>
+
+        <div class="test-connection-row">
+          <button class="btn-secondary" id="testConnBtn">Test connection</button>
+          <span class="test-conn-result" id="testConnResult"></span>
+        </div>
+      </div>
+
+      <!-- Step 3: Name & access -->
+      <div class="wizard-pane" id="wizardStep3" style="display:none">
+        <div class="form-group">
+          <label class="form-label">Display name</label>
+          <input class="form-input" id="wName" placeholder='e.g. "Sales Database"' />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Description <span class="form-label-opt">(optional)</span></label>
+          <textarea class="form-textarea" id="wDesc" placeholder="What data does this source contain?" rows="2"></textarea>
+        </div>
+        <div class="form-row">
+          <div class="form-group" style="flex:1">
+            <label class="form-label">Business domain</label>
+            <select class="form-select" id="wDomain">
+              <option value="Sales">Sales</option>
+              <option value="Finance">Finance</option>
+              <option value="Operations">Operations</option>
+              <option value="HR">HR</option>
+              <option value="Marketing">Marketing</option>
+              <option value="IT">IT</option>
+              <option value="Other" selected>Other</option>
+            </select>
+          </div>
+          <div class="form-group" style="flex:1">
+            <label class="form-label">Access</label>
+            <select class="form-select" id="wAccess">
+              <option value="all">All users</option>
+              <option value="analyst">Analysts &amp; Admins only</option>
+              <option value="admin">Admins only</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 4: Confirm -->
+      <div class="wizard-pane" id="wizardStep4" style="display:none">
+        <div class="confirm-summary" id="confirmSummary"></div>
+        <div class="form-group" style="margin-top:16px">
+          <label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer">
+            <input type="checkbox" id="wAutoIndex" checked style="width:16px;height:16px" />
+            Index automatically after saving (recommended)
+          </label>
+          <div class="form-hint">Indexing builds the metadata, ontology and knowledge graph so users can immediately ask questions.</div>
+        </div>
+      </div>
+
+      <!-- Wizard footer -->
+      <div class="modal-footer">
+        <button class="btn-secondary" id="wizardBack" style="display:none">Back</button>
+        <div style="flex:1"></div>
+        <button class="btn-primary" id="wizardNext">Next</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Admin Panel Modal ─────────────────────────────────────────────────── -->
+  <div class="modal-overlay" id="adminOverlay" style="display:none">
+    <div class="modal admin-modal">
+      <div class="modal-header">
+        <h2 class="modal-title">Admin Panel — Data Sources</h2>
+        <button class="modal-close" id="adminClose">✕</button>
+      </div>
+      <div class="admin-toolbar">
+        <button class="btn-primary" id="adminAddBtn">+ Add data source</button>
+        <button class="btn-secondary" id="adminRefreshBtn">Refresh</button>
+      </div>
+      <div class="admin-table-wrap">
+        <table class="admin-table" id="adminTable">
+          <thead>
+            <tr>
+              <th>Source</th>
+              <th>Type</th>
+              <th>Domain</th>
+              <th>Status</th>
+              <th>Tables</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="adminTableBody">
+            <tr><td colspan="6" style="text-align:center;color:var(--clr-text-mute);padding:24px">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 
   <script src="/ui/app.js"></script>
 </body>

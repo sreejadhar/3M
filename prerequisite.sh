@@ -119,11 +119,11 @@ success "System packages updated."
 header "Installing Base Tools"
 
 install_pkg() {
-    local pkg="$1"
+    # Accepts one or more package names as separate arguments
     case "$OS_FLAVOUR" in
-        al2|rhel7)       yum install -y -q "$pkg" ;;
-        al2023|rhel8)    dnf install -y -q "$pkg" ;;
-        ubuntu|debian)   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$pkg" ;;
+        al2|rhel7)       yum install -y -q "$@" ;;
+        al2023|rhel8)    dnf install -y -q "$@" ;;
+        ubuntu|debian)   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
     esac
 }
 
@@ -166,7 +166,7 @@ else
                 docker-buildx-plugin docker-compose-plugin
             ;;
         ubuntu)
-            install_pkg "ca-certificates gnupg lsb-release"
+            install_pkg ca-certificates gnupg lsb-release
             install -m 0755 -d /etc/apt/keyrings
             curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
                 | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -183,7 +183,7 @@ else
                 docker-buildx-plugin docker-compose-plugin
             ;;
         debian)
-            install_pkg "ca-certificates gnupg lsb-release"
+            install_pkg ca-certificates gnupg lsb-release
             install -m 0755 -d /etc/apt/keyrings
             curl -fsSL https://download.docker.com/linux/debian/gpg \
                 | gpg --dearmor -o /etc/apt/keyrings/docker.gpg

@@ -217,21 +217,28 @@ def _run_dialog(
             session_id[:8], turn_number, len(_sessions[session_id]),
         )
 
-        # Store in NLQ cache
-        with _cache_lock:
-            _nlq_cache[cache_key] = {
-                "cache_key":      cache_key,
-                "natural_query":  natural_query,
-                "db_fingerprint": db_fingerprint,
-                "kg_fingerprint": kg_fingerprint,
-                "cached_at":      datetime.now(timezone.utc).isoformat(),
-                "job_id":         job_id,
-                "insights":       result.get("insights", ""),
-                "sql_queries":    result.get("sql_queries") or [],
-                "query_results":  result.get("query_results") or [],
-                "errors":         result.get("errors") or [],
-            }
-            logger.info("NLQ cached: key=%s", cache_key[:12])
+        # Only cache successful results — never cache empty query_results
+        # (a failed run would poison the cache and repeat the error forever).
+        if result.get("query_results"):
+            with _cache_lock:
+                _nlq_cache[cache_key] = {
+                    "cache_key":      cache_key,
+                    "natural_query":  natural_query,
+                    "db_fingerprint": db_fingerprint,
+                    "kg_fingerprint": kg_fingerprint,
+                    "cached_at":      datetime.now(timezone.utc).isoformat(),
+                    "job_id":         job_id,
+                    "insights":       result.get("insights", ""),
+                    "sql_queries":    result.get("sql_queries") or [],
+                    "query_results":  result.get("query_results") or [],
+                    "errors":         result.get("errors") or [],
+                }
+                logger.info("NLQ cached: key=%s", cache_key[:12])
+        else:
+            logger.info(
+                "NLQ result NOT cached (empty query_results): key=%s errors=%s",
+                cache_key[:12], result.get("errors") or [],
+            )
 
     except Exception as exc:
         logger.exception("Dialog job %s failed", job_id)

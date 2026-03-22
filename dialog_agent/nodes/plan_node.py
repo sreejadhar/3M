@@ -660,9 +660,14 @@ def plan_node(state: DialogState) -> DialogState:
         # when no valid join key was listed in the schema context.  This catches
         # "cross-reference approach" patterns (subqueries, IN (...), EXISTS, etc.)
         # that the LLM uses to sneak cross-table lookups past the JOIN ON check.
+        #
+        # Strip string literals first to avoid false positives where a table name
+        # appears as a WHERE clause value (e.g. WHERE dept = 'Sales' when 'Sales'
+        # is also a table label).
+        sql_no_strings = re.sub(r"'[^']*'", "''", sql)
         tables_in_sql = [
             t for t in table_labels
-            if re.search(r'\b' + re.escape(t) + r'\b', sql, re.IGNORECASE)
+            if re.search(r'\b' + re.escape(t) + r'\b', sql_no_strings, re.IGNORECASE)
         ]
         if len(tables_in_sql) > 1:
             # Check whether the schema advertises a valid join key for this pair

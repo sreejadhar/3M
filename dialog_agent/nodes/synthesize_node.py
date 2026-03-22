@@ -114,10 +114,18 @@ def synthesize_node(state: DialogState) -> DialogState:
     query_results: List[QueryResult] = state.get("query_results") or []
 
     if not query_results:
+        errors = state.get("errors") or []
+        if errors:
+            error_lines = "\n".join(f"- {e}" for e in errors)
+            detail = f"\n\n**Why this happened:**\n{error_lines}"
+        else:
+            detail = ""
         state["insights"] = (
             "No query results were produced. "
-            "This may be because the schema did not contain relevant tables "
-            "or all queries failed. Please check the error log."
+            "This may be because the schema did not contain relevant tables, "
+            "the question could not be answered from the available data, "
+            "or all generated queries were rejected during validation."
+            + detail
         )
         state["phase"] = "synthesize"
         return state

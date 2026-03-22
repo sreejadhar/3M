@@ -134,23 +134,25 @@
 
       <!-- Input area -->
       <div class="input-area" id="inputArea">
-        <div class="file-chips" id="fileChips"></div>
-        <div class="pipeline-bar" id="pipelineBar" style="display:none">
-          <div class="pipeline-bar-inner" id="pipelineBarInner"></div>
+        <div class="input-area-inner">
+          <div class="file-chips" id="fileChips"></div>
+          <div class="pipeline-bar" id="pipelineBar" style="display:none">
+            <div class="pipeline-bar-inner" id="pipelineBarInner"></div>
+          </div>
+          <div class="input-row">
+            <label class="upload-btn" for="fileInput" title="Upload CSV or Excel files">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+              </svg>
+              <input type="file" id="fileInput" multiple accept=".csv,.xlsx,.xls,.xlsm" />
+            </label>
+            <textarea class="msg-input" id="msgInput" placeholder="Ask anything about your data…" rows="1" disabled></textarea>
+            <button class="send-btn" id="sendBtn" disabled title="Send">
+              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+            </button>
+          </div>
+          <div class="input-footer">DataChat can make mistakes. Verify important figures independently.</div>
         </div>
-        <div class="input-row">
-          <label class="upload-btn" for="fileInput" title="Upload CSV or Excel files">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
-            </svg>
-            <input type="file" id="fileInput" multiple accept=".csv,.xlsx,.xls,.xlsm" />
-          </label>
-          <textarea class="msg-input" id="msgInput" placeholder="Ask anything about your data…" rows="1" disabled></textarea>
-          <button class="send-btn" id="sendBtn" disabled title="Send">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-          </button>
-        </div>
-        <div class="input-footer">DataChat can make mistakes. Verify important figures independently.</div>
       </div>
     </div>
 

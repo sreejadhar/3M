@@ -389,16 +389,11 @@ async function openSourceSession(sourceId) {
 
 // ── Ad-hoc file upload session ────────────────────────────────────────────────
 
-async function startAdHocUploadSession() {
-  activeSourceId = null;
-  const { session_id, title } = await apiCreateSession('New conversation', null);
-  sessions[session_id] = { session_id, title, stage: 'idle', created_at: Date.now() / 1000 };
-  activeSessionId = session_id;
-  subscribeSSE(session_id);
-  clearChatUI();
-  renderSessionList();
-  showChatView('');
-  // Trigger file picker
+// Trigger file picker synchronously inside the click handler — no await before this
+// or browsers block the programmatic open. Session is created lazily in handleFileUpload.
+function startAdHocUploadSession() {
+  activeSourceId  = null;
+  activeSessionId = null;
   fileInput.click();
 }
 
@@ -622,6 +617,7 @@ function renderAIMessage(ev) {
 function renderAIError(msgId, message) {
   const row = document.createElement('div');
   row.className = 'msg-row assistant';
+  row.id = 'ai-err-' + msgId;
   row.innerHTML = `<div class="msg-avatar">⬡</div><div class="msg-bubble"><div class="msg-error-note">⚠️ ${escHtml(message)}</div></div>`;
   messages.appendChild(row);
   scrollToBottom();

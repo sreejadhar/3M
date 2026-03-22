@@ -202,9 +202,12 @@ async def _poll_job(
             node_msg = node_labels.get(current_node, current_node or stage_label)
             if current_node != last_node:
                 last_node = current_node
-                _sessions[session_id]["stage"] = stage
-                _sessions[session_id]["pct"] = pct
-                _sessions[session_id]["stage_message"] = node_msg
+                # Don't overwrite "ready" — ontology/KG run in background
+                # and must not block the chat endpoint which requires stage=="ready"
+                if _sessions[session_id]["stage"] != "ready":
+                    _sessions[session_id]["stage"] = stage
+                    _sessions[session_id]["pct"] = pct
+                    _sessions[session_id]["stage_message"] = node_msg
                 await _push(session_id, {
                     "type":    "progress",
                     "stage":   stage,

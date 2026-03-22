@@ -111,78 +111,170 @@ function isNumeric(v) {
 // ── Chart helpers ─────────────────────────────────────────────────────────────
 
 const CHART_PALETTE = [
-  'rgba(66,133,244,0.85)',  'rgba(155,114,203,0.85)', 'rgba(234,67,53,0.85)',
-  'rgba(52,168,83,0.85)',   'rgba(251,188,4,0.85)',   'rgba(255,109,0,0.85)',
-  'rgba(0,172,193,0.85)',   'rgba(63,81,181,0.85)',
+  '#4285F4','#9B72CB','#EA4335','#34A853','#FBBC04','#FF6D00','#00ACC1','#3F51B5',
 ];
+
+/** Convert a QueryResult (columns + row arrays) into an array of row objects. */
+function normalizeRows(result) {
+  const rawRows = result.rows || [];
+  const cols    = result.columns || Object.keys(rawRows[0] || {});
+  return {
+    cols,
+    rows: rawRows.map(row =>
+      Array.isArray(row)
+        ? Object.fromEntries(cols.map((c, j) => [c, row[j]]))
+        : row
+    ),
+  };
+}
+
+function formatAxisValue(n) {
+  const v = Number(n);
+  if (isNaN(v)) return n;
+  const abs = Math.abs(v);
+  if (abs >= 1e9) return (v / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+  if (abs >= 1e6) return (v / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+  if (abs >= 1e3) return (v / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+  return Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2);
+}
 
 function detectChartConfig(cols, rows) {
   if (!rows.length || cols.length < 2) return null;
-  // Identify numeric vs label columns (sample first 3 rows)
-  const numCols  = cols.filter(c => rows.slice(0, 3).every(r => r[c] !== null && r[c] !== undefined && isNumeric(r[c])));
-  const lblCols  = cols.filter(c => !numCols.includes(c));
+  const numCols = cols.filter(c => rows.slice(0, 3).every(r => r[c] !== null && r[c] !== undefined && isNumeric(r[c])));
+  const lblCols = cols.filter(c => !numCols.includes(c));
   if (!lblCols.length || !numCols.length) return null;
-  if (rows.length > 30) return null;  // too dense to chart cleanly
+  if (rows.length > 30) return null;
   const labelCol = lblCols[0];
   const isTime   = /date|month|year|week|day|quarter|period|time|fiscal/i.test(labelCol);
-  if (isTime)           return { type: 'line',     labelCol, numCols: numCols.slice(0, 3) };
-  if (rows.length <= 7 && numCols.length === 1)
-                        return { type: 'doughnut', labelCol, numCols };
-  return                       { type: 'bar',      labelCol, numCols: numCols.slice(0, 3) };
+  if (isTime)                                    return { type: 'line',     labelCol, numCols: numCols.slice(0, 3) };
+  if (rows.length <= 6 && numCols.length === 1)  return { type: 'doughnut', labelCol, numCols };
+  // Horizontal bar is the most readable default for named categories
+  return                                                { type: 'hbar',     labelCol, numCols: numCols.slice(0, 3) };
 }
 
-function renderChart(canvasId, cols, rows) {
+function renderChart(canvasId, cols, rows, title) {
   if (typeof Chart === 'undefined') return;
   const cfg = detectChartConfig(cols, rows);
   if (!cfg) return;
+
+  const wrap = document.getElementById(canvasId)?.parentElement;
+  if (!wrap) return;
+
+  // Size the container dynamically: horizontal bars need height per row
+  if (cfg.type === 'hbar') {
+    const rowH = cfg.numCols.length > 1 ? 22 : 28;
+    wrap.style.height = Math.max(200, rows.length * rowH + 80) + 'px';
+  }
+
   const canvas = document.getElementById(canvasId);
   if (!canvas) return;
   if (_charts[canvasId]) { _charts[canvasId].destroy(); delete _charts[canvasId]; }
 
-  const labels   = rows.map(r => String(r[cfg.labelCol] ?? ''));
-  const isDark   = document.documentElement.classList.contains('dark') ||
-                   window.matchMedia('(prefers-color-scheme: dark)').matches;
-  const gridClr  = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
-  const tickClr  = isDark ? '#9aa0ac' : '#6b7280';
+  const isDark  = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const gridClr = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
+  const tickClr = isDark ? '#9aa0ac' : '#6b7280';
+  const lblClr  = isDark ? '#c9d1d9' : '#374151';
+  const labels  = rows.map(r => String(r[cfg.labelCol] ?? ''));
 
   const datasets = cfg.numCols.map((col, i) => {
     const color = CHART_PALETTE[i % CHART_PALETTE.length];
     if (cfg.type === 'doughnut') {
-      return { label: col, data: rows.map(r => Number(r[col]) || 0),
-               backgroundColor: CHART_PALETTE.slice(0, rows.length), borderWidth: 2 };
+      return {
+        label: col,
+        data: rows.map(r => Number(r[col]) || 0),
+        backgroundColor: CHART_PALETTE.slice(0, rows.length),
+        borderWidth: 2,
+        borderColor: isDark ? '#1e2432' : '#ffffff',
+      };
     }
     return {
       label: col,
       data: rows.map(r => Number(r[col]) || 0),
-      backgroundColor: cfg.type === 'line' ? color.replace('0.85', '0.15') : color,
+      backgroundColor: cfg.type === 'line'
+        ? color + '26'   // 15% opacity for fill
+        : color + 'cc',  // 80% opacity for bars
       borderColor: color,
-      borderWidth: cfg.type === 'line' ? 2 : 1,
+      borderWidth: cfg.type === 'line' ? 2 : 0,
+      borderRadius: cfg.type !== 'line' ? 4 : 0,
       fill: cfg.type === 'line',
       tension: 0.35,
       pointRadius: cfg.type === 'line' ? 3 : 0,
+      pointBackgroundColor: color,
     };
   });
 
-  const scaleOpts = {
-    x: { grid: { display: false }, ticks: { color: tickClr, maxRotation: 35 } },
-    y: { beginAtZero: true, grid: { color: gridClr }, ticks: { color: tickClr } },
+  // Datalabels config: show values on bars and doughnut slices
+  const datalabelsPlugin = (typeof ChartDataLabels !== 'undefined');
+  const datalabelsCfg = datalabelsPlugin ? {
+    anchor:    cfg.type === 'doughnut' ? 'center' : 'end',
+    align:     cfg.type === 'doughnut' ? 'center' : 'end',
+    offset:    cfg.type === 'doughnut' ? 0 : 4,
+    color:     cfg.type === 'doughnut' ? '#fff' : lblClr,
+    font:      { size: 11, weight: '600' },
+    formatter: (v) => formatAxisValue(v),
+    display:   (ctx) => {
+      // Hide label if bar is too short to fit
+      if (cfg.type === 'doughnut') return true;
+      const max = Math.max(...(ctx.dataset.data));
+      return max > 0 ? ctx.dataset.data[ctx.dataIndex] / max > 0.05 : false;
+    },
+  } : false;
+
+  const isHbar = cfg.type === 'hbar';
+  const chartType = isHbar ? 'bar' : cfg.type;
+
+  const scaleOpts = cfg.type === 'doughnut' ? {} : {
+    [isHbar ? 'x' : 'y']: {
+      beginAtZero: true,
+      grid: { color: gridClr },
+      ticks: { color: tickClr, callback: formatAxisValue },
+    },
+    [isHbar ? 'y' : 'x']: {
+      grid: { display: false },
+      ticks: {
+        color: tickClr,
+        maxRotation: isHbar ? 0 : 35,
+        // Truncate long labels to keep chart readable
+        callback: (v, i) => {
+          const lbl = labels[i] || '';
+          return lbl.length > 22 ? lbl.slice(0, 20) + '…' : lbl;
+        },
+      },
+    },
   };
 
+  const plugins = {
+    title: {
+      display: !!title,
+      text: title,
+      color: lblClr,
+      font: { size: 13, weight: '600' },
+      padding: { bottom: 12 },
+    },
+    legend: {
+      display: cfg.numCols.length > 1 || cfg.type === 'doughnut',
+      position: 'bottom',
+      labels: { color: tickClr, boxWidth: 12, padding: 12, font: { size: 12 } },
+    },
+    tooltip: {
+      mode: cfg.type === 'doughnut' ? 'nearest' : 'index',
+      intersect: false,
+      callbacks: { label: (ctx) => ` ${ctx.dataset.label}: ${formatAxisValue(ctx.parsed[isHbar ? 'x' : 'y'] ?? ctx.parsed)}` },
+    },
+    ...(datalabelsPlugin ? { datalabels: datalabelsCfg } : {}),
+  };
+
+  if (datalabelsPlugin) Chart.register(ChartDataLabels);
+
   _charts[canvasId] = new Chart(canvas, {
-    type: cfg.type,
+    type: chartType,
     data: { labels, datasets },
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      plugins: {
-        legend: {
-          display: cfg.numCols.length > 1 || cfg.type === 'doughnut',
-          position: 'bottom',
-          labels: { color: tickClr, boxWidth: 12, padding: 12 },
-        },
-        tooltip: { mode: cfg.type === 'doughnut' ? 'nearest' : 'index', intersect: false },
-      },
-      scales: cfg.type === 'doughnut' ? {} : scaleOpts,
+      indexAxis: isHbar ? 'y' : 'x',
+      plugins,
+      scales: scaleOpts,
     },
   });
 }
@@ -732,9 +824,9 @@ function renderAIMessage(ev) {
 
   // Render Chart.js charts after the canvases are in the DOM
   (ev.results || []).forEach((r, i) => {
-    const rows = r.rows || [];
+    const { cols, rows } = normalizeRows(r);
     if (!rows.length) return;
-    renderChart(`chart-${ev.msg_id}-${i}`, Object.keys(rows[0]), rows);
+    renderChart(`chart-${ev.msg_id}-${i}`, cols, rows, r.description || '');
   });
 
   scrollToBottom();
@@ -752,14 +844,12 @@ function renderAIError(msgId, message) {
 function buildResultBlocks(results, msgId) {
   if (!results || !results.length) return '';
   return results.map((r, i) => {
-    const rows = r.rows || [];
+    const { cols, rows } = normalizeRows(r);
     if (!rows.length) return '';
-    const cols     = Object.keys(rows[0]);
     const canvasId = `chart-${msgId}-${i}`;
-    if (!detectChartConfig(cols, rows)) return '';   // no chartable data — insight text is enough
+    if (!detectChartConfig(cols, rows)) return '';
     return `
       <div class="result-block chart-only">
-        <div class="result-block-header">📊 ${escHtml(r.query_label || `Query ${i+1}`)}</div>
         <div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>
       </div>`;
   }).join('');

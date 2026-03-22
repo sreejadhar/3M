@@ -156,7 +156,7 @@ function switchPersona(persona) {
 // ── View management ───────────────────────────────────────────────────────────
 
 function showLanding() {
-  landing.style.display = '';
+  landing.style.display = 'flex';
   chatView.style.display = 'none';
   topbarSourceName.textContent = '';
   pipelineStatus.classList.remove('visible');
@@ -164,7 +164,7 @@ function showLanding() {
 
 function showChatView(sourceNameOrTitle) {
   landing.style.display = 'none';
-  chatView.style.display = 'flex';
+  chatView.style.display = '';   // use CSS flex
   topbarSourceName.textContent = sourceNameOrTitle || '';
 }
 
@@ -797,17 +797,23 @@ function clearChatUI() {
   pendingFiles         = [];
   pipelineBar.style.display = 'none';
   pipelineStatus.classList.remove('visible');
-  welcome.style.display = '';
+  welcome.style.display = 'block';
   updateSendState();
 }
 
 async function createNewSession() {
-  activeSourceId = null;
-  pendingFiles   = [];
+  activeSourceId  = null;
+  activeSessionId = null;
+  pendingFiles    = [];
   fileChips.innerHTML = '';
   fileInput.value = '';
-  showLanding();
   await loadSources();
+  if (Object.keys(sources).length > 0) {
+    showLanding();
+  } else {
+    clearChatUI();
+    showChatView('');
+  }
 }
 
 // ── File handling ─────────────────────────────────────────────────────────────
@@ -1147,8 +1153,15 @@ function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
 sidebarToggle.addEventListener('click', toggleSidebar);
 menuBtn.addEventListener('click', toggleSidebar);
 
-// New chat → go to landing
+// New chat
 newChatBtn.addEventListener('click', createNewSession);
+
+// Browse sources button
+const browseSourcesBtn = document.getElementById('browseSourcesBtn');
+browseSourcesBtn.addEventListener('click', async () => {
+  await loadSources();
+  showLanding();
+});
 
 // Persona switcher
 personaSwitchBtn.addEventListener('click', (e) => {
@@ -1233,12 +1246,18 @@ window.addEventListener('beforeunload', () => {
   applyPersona();
   await Promise.all([loadSources(), loadSessions()]);
 
-  // If there are recent sessions, show the most recent in the chat view
-  const sorted = Object.values(sessions).sort((a, b) => b.created_at - a.created_at);
+  const sorted   = Object.values(sessions).sort((a, b) => b.created_at - a.created_at);
+  const hasSources = Object.keys(sources).length > 0;
+
   if (sorted.length > 0 && sorted[0].stage === 'ready') {
+    // Resume the most recent ready session
     await resumeSession(sorted[0].session_id);
-  } else {
+  } else if (hasSources) {
+    // Sources registered — show the catalog so users can pick one
     showLanding();
+  } else {
+    // No sessions, no sources — go straight to chat (like the original UI)
+    showChatView('');
   }
 
   // Poll indexing sources on load

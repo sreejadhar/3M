@@ -368,8 +368,7 @@ async def _run_pipeline(session_id: str) -> None:
             })
             try:
                 kg_payload = {
-                    "ontology_content": ontology_content,
-                    "store_type":       "memory",
+                    "ontology_text": ontology_content,
                 }
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     rk = await client.post(f"{KG_API}/generate", json=kg_payload)

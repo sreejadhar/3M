@@ -21,10 +21,11 @@ let progressMsgId     = null;
 let sessions          = {};
 let sources           = {};       // source_id → source dict
 let activeSourceId    = null;     // selected source on landing
-let wizardStep            = 1;
-let wizardDbType          = null;
-let wizardUploadedPath    = null;   // server path returned by /sources/upload-file
-let wizardUploadedFilename = null;  // original filename
+let wizardStep             = 1;
+let wizardDbType           = null;
+let wizardUploadedPath     = null;   // server path returned by /sources/upload-file
+let wizardUploadedFilename = null;   // original filename
+let wizardUploadedDbType   = null;   // actual db_type from upload response (may differ from wizardDbType)
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const sidebar          = document.getElementById('sidebar');
@@ -889,6 +890,7 @@ function openWizard() {
   wizardDbType           = null;
   wizardUploadedPath     = null;
   wizardUploadedFilename = null;
+  wizardUploadedDbType   = null;
   renderWizardStep();
   wizardOverlay.style.display = 'flex';
 }
@@ -921,6 +923,7 @@ function setWizardFileChosen(filename) {
 function clearWizardFile() {
   wizardUploadedPath     = null;
   wizardUploadedFilename = null;
+  wizardUploadedDbType   = null;
   document.getElementById('wFileInput').value = '';
   document.getElementById('sourceFilePrompt').style.display = '';
   document.getElementById('sourceFileChosen').style.display = 'none';
@@ -947,7 +950,8 @@ function initSourceFileDrop() {
     wizardNext.textContent = 'Uploading…';
     try {
       const info = await apiUploadSourceFile(file);
-      wizardUploadedPath = info.path;
+      wizardUploadedPath   = info.path;
+      wizardUploadedDbType = info.db_type;
       showToast(`"${file.name}" uploaded`, 'success', 3000);
     } catch (err) {
       clearWizardFile();
@@ -1084,7 +1088,7 @@ function buildWizardPayload() {
     name:           document.getElementById('wName').value.trim(),
     description:    document.getElementById('wDesc').value.trim(),
     domain:         document.getElementById('wDomain').value,
-    db_type:        wizardDbType,
+    db_type:        isFile ? (wizardUploadedDbType || wizardDbType) : wizardDbType,
     connection:     conn,
     persona_access: personaMap[access] || personaMap.all,
     auto_index:     document.getElementById('wAutoIndex').checked,

@@ -21,6 +21,7 @@ let progressMsgId     = null;
 let sessions          = {};
 let sources           = {};       // source_id → source dict
 let activeSourceId    = null;     // selected source on landing
+let _newChatRequested = false;    // set by "New chat" btn; forces a fresh session on next source open
 let wizardStep             = 1;
 let wizardDbType           = null;
 let wizardUploadedPath     = null;   // server path returned by /sources/upload-file
@@ -242,9 +243,10 @@ function applyPersona() {
   // SQL disclosure: show by default for analysts/admins
   document.documentElement.dataset.showSql = p.showSQL ? 'true' : 'false';
 
-  // Reload source catalog with persona filter
+  // Reload source catalog and session list with persona filter
   renderSourceCatalog();
   renderSourceSidebar();
+  loadSessions();
 }
 
 function switchPersona(persona) {
@@ -317,7 +319,7 @@ async function apiGetSource(id) {
 // ── Session API calls ─────────────────────────────────────────────────────────
 
 async function apiCreateSession(title, sourceId) {
-  const body = { title };
+  const body = { title, persona: currentPersona };
   if (sourceId) body.source_id = sourceId;
   const r = await fetch(`${API}/sessions`, {
     method: 'POST',
@@ -329,7 +331,7 @@ async function apiCreateSession(title, sourceId) {
 }
 
 async function apiListSessions() {
-  const r = await fetch(`${API}/sessions`);
+  const r = await fetch(`${API}/sessions?persona=${encodeURIComponent(currentPersona)}`);
   if (!r.ok) return [];
   return r.json();
 }
@@ -467,6 +469,21 @@ function renderSourceSidebar() {
 async function openSourceSession(sourceId) {
   activeSourceId = sourceId;
   const src = sources[sourceId];
+
+  // Resume the most recent ready session for this source (within the current persona)
+  // unless the user explicitly asked for a new chat.
+  if (!_newChatRequested) {
+    const existing = Object.values(sessions)
+      .filter(s => s.source_id === sourceId && s.stage === 'ready')
+      .sort((a, b) => b.created_at - a.created_at)[0];
+    if (existing) {
+      await resumeSession(existing.session_id);
+      renderSourceSidebar();
+      return;
+    }
+  }
+  _newChatRequested = false;
+
   try {
     const { session_id, title, stage } = await apiCreateSession(src.name, sourceId);
     sessions[session_id] = { session_id, title, stage, created_at: Date.now() / 1000, source_id: sourceId };
@@ -904,6 +921,7 @@ function clearChatUI() {
 }
 
 async function createNewSession() {
+  _newChatRequested = true;
   activeSourceId  = null;
   activeSessionId = null;
   pendingFiles    = [];

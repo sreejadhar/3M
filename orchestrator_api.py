@@ -160,10 +160,11 @@ def _source_public(s: Dict) -> Dict:
     }
 
 
-def _new_session(title: str = "New conversation") -> Dict:
+def _new_session(title: str = "New conversation", persona: str = "business_user") -> Dict:
     return {
         "id":               str(uuid.uuid4()),
         "title":            title,
+        "persona":          persona,
         "created_at":       time.time(),
         # pipeline state
         "stage":            "idle",        # idle|uploading|extracting|ontology|kg|ready|error
@@ -695,11 +696,12 @@ async def serve_ui():
 class NewSessionRequest(BaseModel):
     title:     Optional[str] = "New conversation"
     source_id: Optional[str] = None
+    persona:   str           = "business_user"
 
 
 @app.post("/sessions", status_code=201)
 async def create_session(req: NewSessionRequest):
-    s = _new_session(req.title or "New conversation")
+    s = _new_session(req.title or "New conversation", req.persona)
 
     if req.source_id:
         src = _sources.get(req.source_id)
@@ -738,17 +740,21 @@ async def create_session(req: NewSessionRequest):
 
 
 @app.get("/sessions")
-async def list_sessions():
+async def list_sessions(persona: Optional[str] = None):
+    all_sessions = sorted(_sessions.values(), key=lambda x: x["created_at"], reverse=True)
     return [
         {
             "session_id": s["id"],
             "title":      s["title"],
             "stage":      s["stage"],
+            "persona":    s.get("persona", "business_user"),
+            "source_id":  s.get("source_id"),
             "files":      [f["name"] for f in s.get("files", [])],
             "created_at": s["created_at"],
             "msg_count":  len(s.get("messages", [])),
         }
-        for s in sorted(_sessions.values(), key=lambda x: x["created_at"], reverse=True)
+        for s in all_sessions
+        if persona is None or s.get("persona", "business_user") == persona
     ]
 
 

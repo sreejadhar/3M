@@ -316,6 +316,62 @@ def _summarise_graph(
 
 # ── node ──────────────────────────────────────────────────────────────────────
 
+def _build_nodes_from_file_db(config: DialogConfig) -> List[Dict[str, Any]]:
+    """
+    Fallback: when kg_nodes is empty (KG pipeline didn't run or failed), build
+    synthetic KG nodes by reading the schema directly from the cached SQLite DB.
+    This lets the LLM generate SQL even without a KG graph.
+    """
+    import sqlite3
+
+    db    = config.db_type.lower()
+    fpath = config.db_file_path
+    if not fpath:
+        return []
+
+    try:
+        if db == "sqlite":
+            conn = sqlite3.connect(fpath, check_same_thread=False)
+        else:
+            from .execute_node import _get_cached_file_db
+            tmp_path = _get_cached_file_db(config)
+            conn = sqlite3.connect(tmp_path, check_same_thread=False)
+
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [r[0] for r in cur.fetchall()]
+
+        nodes: List[Dict[str, Any]] = []
+        for tbl in tables:
+            cur.execute(f'PRAGMA table_info("{tbl}")')
+            pragma_rows = cur.fetchall()   # (cid, name, type, notnull, dflt, pk)
+            col_lines: List[str] = []
+            for row in pragma_rows:
+                col_name = row[1]
+                raw_type = (row[2] or "text").lower()
+                if "int" in raw_type:
+                    simple_type = "integer"
+                elif any(t in raw_type for t in ("real", "float", "double", "numeric", "decimal")):
+                    simple_type = "float"
+                else:
+                    simple_type = "text"
+                col_lines.append(f"  {col_name}: {simple_type}")
+
+            title = "Class: {}\nProperties:\n{}".format(tbl, "\n".join(col_lines))
+            nodes.append({"id": tbl, "label": tbl, "title": title})
+
+        conn.close()
+        logger.info(
+            "understand_node: built %d synthetic KG nodes from SQLite schema (KG fallback)",
+            len(nodes),
+        )
+        return nodes
+
+    except Exception as exc:
+        logger.warning("understand_node: fallback DB schema read failed — %s", exc)
+        return []
+
+
 def understand_node(state: DialogState) -> DialogState:
     """Build schema_context from KG graph data, qualified with the target schema."""
     logger.info("=== understand_node ===")
@@ -324,6 +380,22 @@ def understand_node(state: DialogState) -> DialogState:
     edges     = state.get("kg_edges") or []
     config: DialogConfig = state["config"]
     db_schema = config.db_schema or ""
+
+    # If the KG pipeline didn't run or failed, fall back to reading the schema
+    # directly from the SQLite DB so queries still work.
+    if not nodes and config.db_type.lower() in _FILE_BASED_TYPES and config.db_file_path:
+        nodes = _build_nodes_from_file_db(config)
+        if nodes:
+            logger.info(
+                "understand_node: kg_nodes was empty — using direct DB schema fallback (%d tables)",
+                len(nodes),
+            )
+        else:
+            state["errors"] = state.get("errors") or []
+            state["errors"].append(
+                "understand_node: kg_nodes is empty and fallback DB schema read also failed. "
+                "The KG pipeline may not have completed for this source."
+            )
 
     # For file-based sources, inject sample values so the LLM sees actual data
     # values (e.g. exact company names) and generates accurate WHERE clauses.

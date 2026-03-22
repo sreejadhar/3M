@@ -629,7 +629,7 @@ def plan_node(state: DialogState) -> DialogState:
 
     try:
         raw = _call_llm(system, user, config.plan_llm_model, config.llm_temperature)
-        logger.debug("LLM plan response (first 500 chars): %s", raw[:500])
+        logger.info("LLM plan response (first 500 chars): %s", raw[:500])
         plan: List[Dict] = _extract_json(raw)
     except Exception as exc:
         logger.exception("plan_node LLM call failed")
@@ -740,7 +740,16 @@ def plan_node(state: DialogState) -> DialogState:
             )
         )
 
-    logger.info("plan_node: %d SQL queries planned", len(sql_queries))
+    if not sql_queries:
+        state["errors"] = state.get("errors") or []
+        state["errors"].append(
+            f"plan_node: LLM returned {len(plan)} item(s) but all were dropped or empty. "
+            "Check logs for hallucination/multi-table drops, or the LLM may have returned [] "
+            "because the schema context had no tables."
+        )
+        logger.warning("plan_node: 0 SQL queries produced from LLM plan of %d item(s)", len(plan))
+    else:
+        logger.info("plan_node: %d SQL queries planned", len(sql_queries))
     state["sql_queries"] = sql_queries
     state["phase"] = "plan"
     return state

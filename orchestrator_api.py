@@ -504,16 +504,14 @@ def _build_db_config(db_type: str, conn: Dict) -> Dict:
     if db_type.lower() in _FILE_BASED_TYPES:
         return {"db_type": db_type, "file_path": conn.get("file_path", "")}
     cfg: Dict[str, Any] = {
-        "db_type":  db_type,
-        "host":     conn.get("host", ""),
-        "port":     conn.get("port", 5432),
-        "database": conn.get("database", ""),
-        "username": conn.get("username", ""),
-        "password": conn.get("password", ""),
-        "schema":   conn.get("schema_", "public"),
+        "db_type":     db_type,
+        "host":        conn.get("host", ""),
+        "port":        conn.get("port", 5432),
+        "database":    conn.get("database", ""),
+        "username":    conn.get("username", ""),
+        "password":    conn.get("password", ""),
+        "schema_name": conn.get("schema_", "public"),
     }
-    if conn.get("connection_string"):
-        cfg["connection_string"] = conn["connection_string"]
     if conn.get("extra"):
         cfg["extra"] = conn["extra"]
     return cfg
@@ -1127,14 +1125,11 @@ async def test_source_connection(req: TestConnectionRequest):
     db_config = _build_db_config(req.db_type, conn)
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(f"{METADATA_API}/extract", json={
-                "db_config":    db_config,
-                "sample_size":  1,
-                "fd_threshold": 1.0,
-                "id_threshold": 0.95,
-            })
+            r = await client.post(f"{METADATA_API}/discover", json=db_config)
             if r.status_code == 422:
                 return {"ok": False, "error": str(r.json().get("detail", "Invalid parameters"))}
+            if r.status_code == 503:
+                return {"ok": False, "error": r.json().get("detail", "Could not connect to database")}
             r.raise_for_status()
         return {"ok": True}
     except httpx.HTTPStatusError as exc:

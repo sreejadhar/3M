@@ -864,13 +864,13 @@ body {
 .upload-btn {
   display:flex; align-items:center; justify-content:center;
   width:36px; height:36px; border-radius:50%; cursor:pointer;
+  background: none; border: none;
   color:var(--clr-text-sec);
   transition:background var(--transition), color var(--transition);
   flex-shrink:0;
 }
 .upload-btn:hover { background:var(--clr-bg); color:var(--clr-primary); }
 .upload-btn svg   { width:20px; height:20px; }
-.upload-btn input { display:none; }
 
 .msg-input {
   flex:1; border:none; outline:none; background:transparent;

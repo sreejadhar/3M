@@ -47,6 +47,7 @@ const messages         = document.getElementById('messages');
 const chatArea         = document.getElementById('chatArea');
 const topbarSourceName = document.getElementById('topbarSourceName');
 
+const uploadBtn        = document.getElementById('uploadBtn');
 const fileInput        = document.getElementById('fileInput');
 const fileChips        = document.getElementById('fileChips');
 const msgInput         = document.getElementById('msgInput');
@@ -841,6 +842,7 @@ async function handleFileUpload(files) {
   renderFileChips(pendingFiles);
 
   if (!activeSessionId) {
+    clearChatUI();
     const { session_id, title } = await apiCreateSession(files[0].name, null);
     sessions[session_id] = { session_id, title, stage: 'idle', created_at: Date.now() / 1000 };
     activeSessionId = session_id;
@@ -1210,6 +1212,8 @@ document.querySelectorAll('.db-type-card').forEach(card => {
 });
 
 // File input
+uploadBtn.addEventListener('click', startAdHocUploadSession);
+
 fileInput.addEventListener('change', (e) => {
   handleFileUpload(e.target.files);
   fileInput.value = '';
@@ -1221,6 +1225,8 @@ chatArea.addEventListener('dragleave', ()  => { chatArea.style.outline = ''; });
 chatArea.addEventListener('drop', (e) => {
   e.preventDefault();
   chatArea.style.outline = '';
+  activeSourceId  = null;
+  activeSessionId = null;
   handleFileUpload(e.dataTransfer.files);
 });
 

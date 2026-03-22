@@ -123,6 +123,43 @@ services:
     networks:
       - metadata-net
 
+  # ── DataChat Web UI (Orchestrator) ───────────────────────────────────────────
+  chat-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.chat
+    image: metadata-chat-ui:latest
+    container_name: metadata-chat-ui
+    restart: unless-stopped
+    ports:
+      - "${CHAT_PORT:-8005}:8005"
+    environment:
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      # Internal Docker DNS — matches service names above
+      METADATA_API_URL: "http://agent-api:8000"
+      ONTOLOGY_API_URL: "http://ontology-api:8001"
+      KG_API_URL:       "http://kg-api:8002"
+      DIALOG_API_URL:   "http://dialog-api:8003"
+      LOG_LEVEL:        "${LOG_LEVEL:-info}"
+    depends_on:
+      agent-api:
+        condition: service_healthy
+      dialog-api:
+        condition: service_healthy
+      ontology-api:
+        condition: service_started
+      kg-api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - metadata-net
+
   # ── Streamlit UI ──────────────────────────────────────────────────────────────
   ui:
     build:

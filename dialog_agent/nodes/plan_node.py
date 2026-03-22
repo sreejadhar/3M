@@ -638,6 +638,16 @@ def plan_node(state: DialogState) -> DialogState:
         state["phase"] = "plan"
         return state
 
+    # If the LLM returned [] it usually includes a prose explanation of why the
+    # question cannot be answered from the schema.  Capture that text so
+    # synthesize_node can surface it to the user instead of a generic error.
+    if not plan:
+        prose = re.sub(r'```(?:json)?\s*\[\s*\]\s*```', '', raw).strip()
+        prose = re.sub(r'^\s*\[\s*\]\s*', '', prose).strip()
+        if prose:
+            state["plan_explanation"] = prose
+            logger.info("plan_node: LLM returned [] with explanation (%d chars)", len(prose))
+
     # Validate, qualify, and cap
     sql_queries: List[SQLQuery] = []
     for item in plan[: config.max_sql_queries]:

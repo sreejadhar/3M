@@ -114,6 +114,15 @@ def synthesize_node(state: DialogState) -> DialogState:
     query_results: List[QueryResult] = state.get("query_results") or []
 
     if not query_results:
+        # If plan_node captured an explanation from the LLM (returned [] with prose),
+        # surface that directly — it's a meaningful "can't answer" reason from the model.
+        plan_explanation = state.get("plan_explanation", "").strip()
+        if plan_explanation:
+            state["insights"] = plan_explanation
+            state["phase"] = "synthesize"
+            return state
+
+        # Otherwise fall back to a generic message with any logged errors
         errors = state.get("errors") or []
         if errors:
             error_lines = "\n".join(f"- {e}" for e in errors)

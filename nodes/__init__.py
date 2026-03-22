@@ -1,13 +1,13 @@
-from .connection_node import ConnectionNode
-from .discovery_node import DiscoveryNode
-from .extraction_node import ExtractionNode
-from .analysis_node import AnalysisNode
-from .report_node import ReportNode
+from .connection_node import connection_node
+from .discovery_node import discovery_node
+from .extraction_node import extraction_node
+from .analysis_node import analysis_node
+from .report_node import report_node
 
 __all__ = [
-    "ConnectionNode",
-    "DiscoveryNode",
-    "ExtractionNode",
-    "AnalysisNode",
-    "ReportNode",
+    "connection_node",
+    "discovery_node",
+    "extraction_node",
+    "analysis_node",
+    "report_node",
 ]

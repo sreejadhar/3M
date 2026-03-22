@@ -41,7 +41,17 @@ Rules:
 4. Column names MUST match EXACTLY the column names listed in the schema context.
    NEVER invent or guess a column name that is not explicitly listed.
    If a column you need does not appear in the schema, omit that filter entirely.
-5. Apply LIMIT {row_limit} to every query.
+5. LIMIT rules — apply carefully based on query type:
+   a. Aggregation queries (any query that uses GROUP BY, or has COUNT/SUM/AVG/MIN/MAX
+      without GROUP BY): do NOT add a LIMIT clause.  The database computes the
+      aggregate over ALL rows and returns only the summarised result, which is
+      already small.  Adding LIMIT here silently drops groups and produces wrong
+      totals.
+   b. Raw-row queries (SELECT without aggregation, used to show examples or a
+      ranked list): add LIMIT {row_limit}.
+   c. Ranked / top-N questions ("top 10 products", "bottom 5 regions"): use
+      ORDER BY <metric> DESC LIMIT <N> where N is the number explicitly requested
+      or a sensible default (10–20).  Do NOT use LIMIT {row_limit} here.
 6. Prefer simple queries; only join when necessary.
 7. If the question cannot be answered from the available schema, return [].
 8. Maximum {max_queries} queries total.
@@ -474,6 +484,44 @@ def _fix_count_vs_sum(sql: str, natural_query: str) -> str:
     return fixed
 
 
+_AGG_PATTERN = re.compile(
+    r'\b(GROUP\s+BY|COUNT\s*\(|SUM\s*\(|AVG\s*\(|MIN\s*\(|MAX\s*\()\b',
+    re.IGNORECASE,
+)
+
+def _remove_limit_from_aggregation(sql: str) -> str:
+    """
+    Strip trailing LIMIT / OFFSET clauses from aggregation queries so that
+    GROUP BY results are never silently truncated.
+
+    Only removes LIMIT when the SQL contains GROUP BY or a top-level aggregate
+    function — ranked / top-N queries that use ORDER BY … LIMIT N intentionally
+    are left untouched because those LIMIT values were chosen by the LLM
+    specifically for the question (e.g. "top 10 products").
+    """
+    if not _AGG_PATTERN.search(sql):
+        return sql  # not an aggregation query
+
+    sql_upper = sql.upper()
+
+    # Keep ORDER BY … LIMIT N (intentional top-N ranking)
+    if re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE):
+        return sql
+
+    # Remove a trailing bare LIMIT [OFFSET] clause with no ORDER BY
+    cleaned = re.sub(
+        r'\s+LIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*$',
+        '',
+        sql,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if cleaned != sql:
+        logger.info("plan_node: removed LIMIT from aggregation query (no ORDER BY)")
+
+    return cleaned
+
+
 def plan_node(state: DialogState) -> DialogState:
     """Decompose the NQL into SQL queries via LLM."""
     logger.info("=== plan_node ===")
@@ -594,6 +642,10 @@ def plan_node(state: DialogState) -> DialogState:
         sql = _fix_count_vs_sum(sql, natural_query)
         # Percentage fix: inject window-function percentage column when % is asked for
         sql = _fix_percentage(sql, natural_query)
+        # Aggregation fix: remove LIMIT from queries that aggregate over all rows.
+        # The LLM sometimes ignores the prompt rule and adds LIMIT anyway, which
+        # silently drops groups and produces incorrect totals.
+        sql = _remove_limit_from_aggregation(sql)
 
         # Multi-table check: reject any query that references more than one table
         # when no valid join key was listed in the schema context.  This catches

@@ -21,8 +21,10 @@ let progressMsgId     = null;
 let sessions          = {};
 let sources           = {};       // source_id → source dict
 let activeSourceId    = null;     // selected source on landing
-let wizardStep        = 1;
-let wizardDbType      = null;
+let wizardStep            = 1;
+let wizardDbType          = null;
+let wizardUploadedPath    = null;   // server path returned by /sources/upload-file
+let wizardUploadedFilename = null;  // original filename
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const sidebar          = document.getElementById('sidebar');
@@ -883,14 +885,93 @@ document.querySelectorAll('.suggestion-chip').forEach(chip => {
 // ── Connection Wizard ─────────────────────────────────────────────────────────
 
 function openWizard() {
-  wizardStep   = 1;
-  wizardDbType = null;
+  wizardStep             = 1;
+  wizardDbType           = null;
+  wizardUploadedPath     = null;
+  wizardUploadedFilename = null;
   renderWizardStep();
   wizardOverlay.style.display = 'flex';
 }
 
 function closeWizard() {
   wizardOverlay.style.display = 'none';
+}
+
+async function apiUploadSourceFile(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  const r = await fetch(`${API}/sources/upload-file`, { method: 'POST', body: fd });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({ detail: r.statusText }));
+    throw new Error(err.detail || r.statusText);
+  }
+  return r.json();
+}
+
+function setWizardFileChosen(filename) {
+  wizardUploadedFilename = filename;
+  const ext = (filename || '').split('.').pop().toLowerCase();
+  const icon = ['xlsx','xls','xlsm'].includes(ext) ? '📊' : ext === 'csv' ? '📄' : '🗄️';
+  document.getElementById('sourceFileChosenIcon').textContent = icon;
+  document.getElementById('sourceFileChosenName').textContent = filename;
+  document.getElementById('sourceFilePrompt').style.display = 'none';
+  document.getElementById('sourceFileChosen').style.display = '';
+}
+
+function clearWizardFile() {
+  wizardUploadedPath     = null;
+  wizardUploadedFilename = null;
+  document.getElementById('wFileInput').value = '';
+  document.getElementById('sourceFilePrompt').style.display = '';
+  document.getElementById('sourceFileChosen').style.display = 'none';
+}
+
+function initSourceFileDrop() {
+  const drop    = document.getElementById('sourceFileDrop');
+  const input   = document.getElementById('wFileInput');
+  const browse  = document.getElementById('sourceFileBrowse');
+  const clear   = document.getElementById('sourceFileClear');
+
+  // Restore state if a file was already chosen
+  if (wizardUploadedFilename) {
+    setWizardFileChosen(wizardUploadedFilename);
+  } else {
+    document.getElementById('sourceFilePrompt').style.display = '';
+    document.getElementById('sourceFileChosen').style.display = 'none';
+  }
+
+  async function handleSourceFile(file) {
+    if (!file) return;
+    setWizardFileChosen(file.name);
+    wizardNext.disabled = true;
+    wizardNext.textContent = 'Uploading…';
+    try {
+      const info = await apiUploadSourceFile(file);
+      wizardUploadedPath = info.path;
+      showToast(`"${file.name}" uploaded`, 'success', 3000);
+    } catch (err) {
+      clearWizardFile();
+      showToast(err.message || 'Upload failed', 'error');
+    } finally {
+      wizardNext.disabled = false;
+      wizardNext.textContent = 'Next';
+    }
+  }
+
+  drop.addEventListener('click', (e) => {
+    if (e.target === clear || e.target.closest('.source-file-clear')) return;
+    input.click();
+  });
+  browse.addEventListener('click', (e) => { e.stopPropagation(); input.click(); });
+  clear.addEventListener('click',  (e) => { e.stopPropagation(); clearWizardFile(); });
+  input.addEventListener('change', (e) => { handleSourceFile(e.target.files[0]); input.value = ''; });
+  drop.addEventListener('dragover',  (e) => { e.preventDefault(); drop.classList.add('drag-over'); });
+  drop.addEventListener('dragleave', ()  => { drop.classList.remove('drag-over'); });
+  drop.addEventListener('drop', (e) => {
+    e.preventDefault();
+    drop.classList.remove('drag-over');
+    handleSourceFile(e.dataTransfer.files[0]);
+  });
 }
 
 function renderWizardStep() {
@@ -920,6 +1001,8 @@ function renderWizardStep() {
     if (!isFile) document.getElementById('wPort').placeholder = portMap[wizardDbType] || '5432';
     testConnResult.textContent = '';
     testConnResult.className   = 'test-conn-result';
+    document.querySelector('.test-connection-row').style.display = isFile ? 'none' : '';
+    if (isFile) initSourceFileDrop();
   }
 
   // Step 4: confirm summary
@@ -937,7 +1020,7 @@ function renderConfirmSummary() {
 
   let connRow = '';
   if (isFile) {
-    connRow = `<div class="confirm-row"><span class="confirm-key">File path</span><span class="confirm-val">${escHtml(document.getElementById('wFilePath').value || '—')}</span></div>`;
+    connRow = `<div class="confirm-row"><span class="confirm-key">File</span><span class="confirm-val">${escHtml(wizardUploadedFilename || '—')}</span></div>`;
   } else {
     const host = document.getElementById('wHost').value;
     const port = document.getElementById('wPort').value;
@@ -962,7 +1045,7 @@ async function advanceWizard() {
     // Validate required fields
     const isFile = ['sqlite','csv','excel'].includes(wizardDbType);
     if (isFile) {
-      if (!document.getElementById('wFilePath').value.trim()) { showToast('File path is required', 'error'); return; }
+      if (!wizardUploadedPath) { showToast('Please upload a file first', 'error'); return; }
     } else {
       if (!document.getElementById('wHost').value.trim())     { showToast('Host is required', 'error'); return; }
       if (!document.getElementById('wDatabase').value.trim()) { showToast('Database name is required', 'error'); return; }
@@ -987,7 +1070,7 @@ function buildWizardPayload() {
     admin:   ['admin'],
   };
   const conn = isFile
-    ? { file_path: document.getElementById('wFilePath').value.trim() }
+    ? { file_path: wizardUploadedPath, uploaded: true }
     : {
         host:              document.getElementById('wHost').value.trim(),
         port:              parseInt(document.getElementById('wPort').value, 10) || 5432,

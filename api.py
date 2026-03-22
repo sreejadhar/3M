@@ -386,9 +386,9 @@ def _ts(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
 
 
-def _register_upload(path: str, db_type: str, label: str) -> float:
-    """Record an upload; return its expiry epoch."""
-    expires = time.time() + UPLOAD_TTL_SECONDS
+def _register_upload(path: str, db_type: str, label: str, permanent: bool = False) -> Optional[float]:
+    """Record an upload; return its expiry epoch (None if permanent)."""
+    expires = None if permanent else time.time() + UPLOAD_TTL_SECONDS
     with _registry_lock:
         _upload_registry[path] = {
             "uploaded_at": time.time(),
@@ -396,6 +396,7 @@ def _register_upload(path: str, db_type: str, label: str) -> float:
             "extended":    False,
             "db_type":     db_type,
             "label":       label,
+            "permanent":   permanent,
         }
     return expires
 
@@ -404,7 +405,8 @@ def _purge_old_uploads() -> None:
     """Remove entries (and files/dirs) whose expiry has passed."""
     now = time.time()
     with _registry_lock:
-        expired = [p for p, m in _upload_registry.items() if m["expires_at"] < now]
+        expired = [p for p, m in _upload_registry.items()
+                   if m["expires_at"] is not None and m["expires_at"] < now]
     for path in expired:
         try:
             p = Path(path)
@@ -494,6 +496,41 @@ def extend_upload(req: ExtendRequest):
         new_expires = meta["expires_at"]
     logger.info("Extended upload TTL by 15 min: %s (new expiry %s)", req.path, _ts(new_expires))
     return {"expires_at": _ts(new_expires), "extended": True}
+
+
+@app.post("/upload-permanent")
+async def upload_permanent(file: UploadFile = File(...)):
+    """Upload a file for a registered source (no TTL — persists until explicitly purged)."""
+    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest = _UPLOAD_DIR / file.filename
+    contents = await file.read()
+    dest.write_bytes(contents)
+    db_type = _db_type_from_path(str(dest))
+    _register_upload(str(dest), db_type, file.filename, permanent=True)
+    return {"path": str(dest), "db_type": db_type, "filename": file.filename}
+
+
+class PurgeRequest(BaseModel):
+    path: str
+
+
+@app.delete("/uploads/purge", status_code=200)
+def purge_upload(req: PurgeRequest):
+    """Explicitly delete a registered upload from disk and the registry."""
+    path = req.path
+    with _registry_lock:
+        removed = _upload_registry.pop(path, None)
+    try:
+        p = Path(path)
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        elif p.exists():
+            p.unlink()
+    except Exception as exc:
+        logger.warning("Could not delete file %s: %s", path, exc)
+    if removed is None:
+        raise HTTPException(status_code=404, detail="Upload not found in registry")
+    return {"deleted": path}
 
 
 @app.post("/extract", status_code=202)

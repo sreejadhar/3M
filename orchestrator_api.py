@@ -91,6 +91,7 @@ DOMAIN_ICONS: Dict[str, str] = {
 
 class SourceConnection(BaseModel):
     file_path:         str            = ""
+    uploaded:          bool           = False   # True when file was uploaded via /sources/upload-file
     host:              str            = ""
     port:              int            = 0
     database:          str            = ""
@@ -1096,12 +1097,42 @@ async def get_source(source_id: str):
 
 @app.delete("/sources/{source_id}", status_code=200)
 async def delete_source(source_id: str):
-    """Remove a registered source."""
+    """Remove a registered source and purge any associated uploaded file."""
     s = _sources.pop(source_id, None)
     if not s:
         raise HTTPException(status_code=404, detail="Source not found")
+    # Purge persistent source file from the metadata API if it was uploaded
+    file_path = s.get("connection", {}).get("file_path", "")
+    if file_path and s.get("connection", {}).get("uploaded"):
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                await client.request("DELETE", f"{METADATA_API}/uploads/purge",
+                                     json={"path": file_path})
+        except Exception as exc:
+            logger.warning("Could not purge source file %s: %s", file_path, exc)
     logger.info("Source deleted: %s (%s)", source_id[:8], s["name"])
     return {"deleted": source_id}
+
+
+@app.post("/sources/upload-file", status_code=200)
+async def upload_source_file(file: UploadFile = File(...)):
+    """Upload a file for a registered source. Stored permanently until the source is deleted."""
+    file_bytes = await file.read()
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{METADATA_API}/upload-permanent",
+                files={"file": (file.filename, file_bytes,
+                                file.content_type or "application/octet-stream")},
+            )
+            r.raise_for_status()
+            info = r.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502,
+                            detail=f"File upload failed: {exc.response.text[:200]}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"path": info["path"], "db_type": info["db_type"], "filename": info["filename"]}
 
 
 @app.post("/sources/{source_id}/reindex", status_code=202)

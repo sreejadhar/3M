@@ -1049,6 +1049,35 @@ body {
 .form-textarea { resize: vertical; min-height: 60px; }
 .form-hint { font-size: 12px; color: var(--clr-text-mute); }
 
+/* Source file drop zone (wizard step 2) */
+.source-file-drop {
+  border: 2px dashed var(--clr-border);
+  border-radius: var(--radius-md);
+  padding: 24px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition);
+}
+.source-file-drop:hover,
+.source-file-drop.drag-over { border-color: var(--clr-primary); background: var(--clr-user-bubble); }
+.source-file-prompt { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.source-file-icon   { font-size: 28px; }
+.source-file-hint   { font-size: 12px; color: var(--clr-text-mute); }
+.source-file-browse {
+  background: none; border: none; color: var(--clr-primary);
+  font-size: inherit; cursor: pointer; text-decoration: underline; padding: 0;
+}
+.source-file-chosen {
+  display: flex; align-items: center; gap: 10px; justify-content: center;
+}
+.source-file-chosen-icon { font-size: 22px; }
+.source-file-chosen-name { font-size: 14px; font-weight: 500; }
+.source-file-clear {
+  background: none; border: none; color: var(--clr-text-mute);
+  font-size: 14px; cursor: pointer; padding: 2px 6px; border-radius: 4px;
+}
+.source-file-clear:hover { background: var(--clr-bg); color: var(--clr-error); }
+
 .test-connection-row {
   display: flex;
   align-items: center;

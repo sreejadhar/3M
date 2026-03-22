@@ -400,13 +400,23 @@ def execute_node(state: DialogState) -> DialogState:
             columns   = outcome.get("columns") or []
             error_msg: Optional[str] = outcome.get("error")
 
+            # For aggregation queries, return all rows — truncating would silently
+            # drop groups and produce wrong totals.  For raw-row queries the SQL
+            # already has a LIMIT clause added by plan_node, so Python truncation
+            # is redundant; we keep it only as a safety cap for very large raw dumps.
+            _is_agg = bool(re.search(
+                r'\b(GROUP\s+BY|COUNT\s*\(|SUM\s*\(|AVG\s*\(|MIN\s*\(|MAX\s*\()\b',
+                q.get("sql", ""), re.IGNORECASE,
+            ))
+            returned_rows = rows if _is_agg else rows[: config.row_limit]
+
             results.append(
                 QueryResult(
                     query_id    = q["query_id"],
                     description = q["description"],
                     sql         = q["sql"],
                     columns     = columns,
-                    rows        = rows[: config.row_limit],
+                    rows        = returned_rows,
                     row_count   = len(rows),
                     error       = error_msg,
                 )

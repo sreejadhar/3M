@@ -491,24 +491,30 @@ _AGG_PATTERN = re.compile(
 
 def _remove_limit_from_aggregation(sql: str) -> str:
     """
-    Strip trailing LIMIT / OFFSET clauses from aggregation queries so that
-    GROUP BY results are never silently truncated.
+    Strip LIMIT / OFFSET clauses from aggregation queries so that GROUP BY
+    results are never silently truncated.
 
-    Only removes LIMIT when the SQL contains GROUP BY or a top-level aggregate
-    function — ranked / top-N queries that use ORDER BY … LIMIT N intentionally
-    are left untouched because those LIMIT values were chosen by the LLM
-    specifically for the question (e.g. "top 10 products").
+    Logic:
+    - If the query has no aggregation (GROUP BY / COUNT / SUM / AVG / MIN / MAX),
+      leave it untouched — the row_limit LIMIT is correct for raw-row queries.
+    - If the query has aggregation and a LIMIT of ≤50, it is an intentional
+      top-N ("top 10 products") — leave it untouched.
+    - If the query has aggregation and a LIMIT of >50 (i.e. the default
+      row_limit like 500), remove the LIMIT so all groups are returned.
     """
     if not _AGG_PATTERN.search(sql):
         return sql  # not an aggregation query
 
-    sql_upper = sql.upper()
+    # Find any LIMIT clause
+    m = re.search(r'\bLIMIT\s+(\d+)', sql, re.IGNORECASE)
+    if not m:
+        return sql  # no LIMIT present — nothing to do
 
-    # Keep ORDER BY … LIMIT N (intentional top-N ranking)
-    if re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE):
-        return sql
+    limit_val = int(m.group(1))
+    if limit_val <= 50:
+        return sql  # intentional small top-N — keep it
 
-    # Remove a trailing bare LIMIT [OFFSET] clause with no ORDER BY
+    # Large LIMIT (e.g. 500) on an aggregation query — strip it
     cleaned = re.sub(
         r'\s+LIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*$',
         '',
@@ -517,7 +523,10 @@ def _remove_limit_from_aggregation(sql: str) -> str:
     ).strip()
 
     if cleaned != sql:
-        logger.info("plan_node: removed LIMIT from aggregation query (no ORDER BY)")
+        logger.info(
+            "plan_node: removed LIMIT %d from aggregation query (would silently drop groups)",
+            limit_val,
+        )
 
     return cleaned
 

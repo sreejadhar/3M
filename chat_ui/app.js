@@ -737,26 +737,11 @@ function buildResultBlocks(results, msgId) {
     if (!rows.length) return '';
     const cols     = Object.keys(rows[0]);
     const canvasId = `chart-${msgId}-${i}`;
-    const hasChart = detectChartConfig(cols, rows) !== null;
-    const header   = cols.map(c => `<th>${escHtml(c)}</th>`).join('');
-    const body     = rows.map(row =>
-      `<tr>${cols.map(c => {
-        const v = row[c], num = isNumeric(v);
-        return `<td class="${num ? 'num-cell' : ''}" title="${escHtml(String(v ?? ''))}">${escHtml(formatNumber(v))}</td>`;
-      }).join('')}</tr>`
-    ).join('');
-    const chartHtml = hasChart
-      ? `<div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>`
-      : '';
+    if (!detectChartConfig(cols, rows)) return '';   // no chartable data — insight text is enough
     return `
-      <div class="result-block">
-        <div class="result-block-header">📋 ${escHtml(r.query_label || `Query ${i+1}`)}
-          <span style="margin-left:auto;font-weight:normal;color:var(--clr-text-mute)">${rows.length} row${rows.length !== 1 ? 's' : ''}</span>
-        </div>
-        ${chartHtml}
-        <div class="result-table-wrap">
-          <table class="result-table"><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>
-        </div>
+      <div class="result-block chart-only">
+        <div class="result-block-header">📊 ${escHtml(r.query_label || `Query ${i+1}`)}</div>
+        <div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>
       </div>`;
   }).join('');
 }

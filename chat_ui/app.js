@@ -236,6 +236,9 @@ function applyPersona() {
   // Admin button visibility
   sidebarBottom.style.display = p.isAdmin ? '' : 'none';
 
+  // Upload button: admins only
+  uploadBtn.style.display = p.isAdmin ? '' : 'none';
+
   // SQL disclosure: show by default for analysts/admins
   document.documentElement.dataset.showSql = p.showSQL ? 'true' : 'false';
 
@@ -413,18 +416,17 @@ function renderSourceCatalog() {
     sourceCatalog.appendChild(card);
   });
 
-  // "Upload your own data" card
-  const uploadCard = document.createElement('div');
-  uploadCard.className = 'source-card add-card';
-  uploadCard.innerHTML = `
-    <div class="add-card-icon">📁</div>
-    <div class="add-card-label">Upload your own data</div>
-    <div class="add-card-sub">CSV or Excel files</div>`;
-  uploadCard.addEventListener('click', startAdHocUploadSession);
-  sourceCatalog.appendChild(uploadCard);
+  // Data configuration cards — admins only
+  if (p.isAdmin) {
+    const uploadCard = document.createElement('div');
+    uploadCard.className = 'source-card add-card';
+    uploadCard.innerHTML = `
+      <div class="add-card-icon">📁</div>
+      <div class="add-card-label">Upload your own data</div>
+      <div class="add-card-sub">CSV or Excel files</div>`;
+    uploadCard.addEventListener('click', startAdHocUploadSession);
+    sourceCatalog.appendChild(uploadCard);
 
-  // "Connect a database" card (analysts + admins)
-  if (p.canConnect) {
     const connectCard = document.createElement('div');
     connectCard.className = 'source-card add-card';
     connectCard.innerHTML = `
@@ -890,7 +892,9 @@ function clearChatUI() {
   isWaitingForReply    = false;
   msgInput.disabled    = true;
   msgInput.value       = '';
-  msgInput.placeholder = 'Upload files to get started…';
+  msgInput.placeholder = (PERSONAS[currentPersona] || PERSONAS.business_user).isAdmin
+    ? 'Upload files to get started…'
+    : 'Select a data source to get started…';
   fileChips.innerHTML  = '';
   pendingFiles         = [];
   pipelineBar.style.display = 'none';

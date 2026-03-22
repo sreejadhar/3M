@@ -22,6 +22,12 @@ class DialogConfig:
     db_file_path: str = ""             # for SQLite / CSV / Excel sources
 
     # ── LLM settings ──────────────────────────────────────────────────────────
+    # plan_llm_model: used by plan_node to generate SQL.
+    #   Haiku is ~10-15× cheaper than Sonnet and fully capable of structured
+    #   JSON output for SQL generation — the biggest per-question cost driver.
+    plan_llm_model: str = "claude-haiku-4-5-20251001"
+    # llm_model: used by synthesize_node to write the final user-facing insight.
+    #   Kept at Sonnet — this is what the business user reads.
     llm_model: str = "claude-sonnet-4-6"
     llm_temperature: float = 0.0
 

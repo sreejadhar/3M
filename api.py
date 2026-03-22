@@ -205,7 +205,7 @@ def _ask_llm(report: Dict, question: str) -> str:
     if not report:
         return "No report available — run an extraction first."
 
-    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0.0)
+    llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.0)
     system = SystemMessage(content=(
         "You are a data engineering expert. You have been provided the full "
         "metadata report from a database schema scan. Answer questions about "

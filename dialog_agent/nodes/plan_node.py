@@ -571,7 +571,7 @@ def plan_node(state: DialogState) -> DialogState:
     )
 
     try:
-        raw = _call_llm(system, user, config.llm_model, config.llm_temperature)
+        raw = _call_llm(system, user, config.plan_llm_model, config.llm_temperature)
         logger.debug("LLM plan response (first 500 chars): %s", raw[:500])
         plan: List[Dict] = _extract_json(raw)
     except Exception as exc:

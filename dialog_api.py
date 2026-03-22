@@ -140,7 +140,8 @@ class QueryRequest(BaseModel):
     # Behaviour
     max_sql_queries: int = 10
     row_limit:       int = 500
-    llm_model:       str = "claude-sonnet-4-6"
+    llm_model:       str = "claude-sonnet-4-6"        # synthesize node (insight quality)
+    plan_llm_model:  str = "claude-haiku-4-5-20251001" # plan node (SQL generation — cheaper)
 
     # Cache control
     skip_cache: bool = False   # Set True to force a fresh run even if cached
@@ -265,6 +266,7 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
         db_extra             = req.db_extra,
         db_file_path         = req.db_file_path or "",
         llm_model            = req.llm_model,
+        plan_llm_model       = req.plan_llm_model,
         max_sql_queries      = req.max_sql_queries,
         row_limit            = req.row_limit,
     )

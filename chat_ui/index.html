@@ -8,6 +8,7 @@
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/vis-network@9/standalone/umd/vis-network.min.js"></script>
 </head>
 <body>
 
@@ -403,6 +404,54 @@
             <tr><td colspan="6" style="text-align:center;color:var(--clr-text-mute);padding:24px">Loading…</td></tr>
           </tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Index Log Modal ──────────────────────────────────────────────────── -->
+  <div class="modal-overlay" id="indexLogOverlay" style="display:none">
+    <div class="modal index-log-modal">
+      <div class="modal-header">
+        <h2 class="modal-title" id="indexLogTitle">Indexing Progress</h2>
+        <button class="modal-close" id="indexLogClose">✕</button>
+      </div>
+      <div class="index-log-steps" id="indexLogSteps">
+        <!-- Step rows rendered by JS -->
+      </div>
+      <div class="index-log-detail" id="indexLogDetail"></div>
+    </div>
+  </div>
+
+  <!-- ── KG & Ontology Explorer Modal ─────────────────────────────────────── -->
+  <div class="modal-overlay" id="kgExplorerOverlay" style="display:none">
+    <div class="modal kg-explorer-modal">
+      <div class="modal-header">
+        <h2 class="modal-title" id="kgExplorerTitle">Knowledge Graph &amp; Ontology</h2>
+        <div class="kg-explorer-header-actions" id="kgExplorerHeaderActions">
+          <!-- Save button shown only for admin -->
+        </div>
+        <button class="modal-close" id="kgExplorerClose">✕</button>
+      </div>
+      <div class="kg-explorer-body">
+        <!-- Left pane: KG graph -->
+        <div class="kg-graph-pane">
+          <div class="kg-pane-label">Knowledge Graph</div>
+          <div class="kg-graph-container" id="kgGraphContainer">
+            <div class="kg-graph-placeholder" id="kgGraphPlaceholder">Loading graph…</div>
+          </div>
+        </div>
+        <!-- Right pane: Ontology editor -->
+        <div class="kg-ontology-pane">
+          <div class="kg-pane-label">
+            Ontology (OWL/Turtle)
+            <span class="kg-modified-badge" id="kgModifiedBadge" style="display:none">modified</span>
+          </div>
+          <textarea class="kg-ontology-editor" id="kgOntologyEditor"
+                    placeholder="Ontology text will appear here…" spellcheck="false"></textarea>
+          <div class="kg-ontology-hint" id="kgOntologyHint">
+            Editing the ontology will update the graph preview. Admin can save changes.
+          </div>
+        </div>
       </div>
     </div>
   </div>

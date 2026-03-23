@@ -75,6 +75,10 @@ _lock = asyncio.Lock()
 
 # ── Source Registry ────────────────────────────────────────────────────────────
 _sources: Dict[str, Dict] = {}
+# Per-source SSE queues for indexing step events (source_id → Queue)
+_source_event_queues: Dict[str, asyncio.Queue] = {}
+# Per-source recent event buffer for replay on new SSE connections (last 100 events)
+_source_event_log: Dict[str, List[Dict]] = {}
 
 DOMAIN_ICONS: Dict[str, str] = {
     "Sales":      "💼",
@@ -519,6 +523,30 @@ def _build_db_config(db_type: str, conn: Dict) -> Dict:
     return cfg
 
 
+def _push_index_event(source_id: str, step: str, status: str, message: str, detail: str = "") -> None:
+    """Append an indexing step event to the per-source log and live queue."""
+    event = {
+        "type":    "index_step",
+        "step":    step,
+        "status":  status,   # running | done | error | warn
+        "message": message,
+        "detail":  detail,
+        "ts":      time.time(),
+    }
+    # Append to replay buffer (keep last 100)
+    buf = _source_event_log.setdefault(source_id, [])
+    buf.append(event)
+    if len(buf) > 100:
+        buf.pop(0)
+    # Push to live SSE queue if a client is connected
+    q = _source_event_queues.get(source_id)
+    if q:
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
+
 async def _index_source(source_id: str) -> None:
     """Full pipeline for a registered data source: extract → ontology → KG."""
     src = _sources.get(source_id)
@@ -526,10 +554,12 @@ async def _index_source(source_id: str) -> None:
         return
     src["status"]        = "indexing"
     src["error_message"] = None
+    _source_event_log[source_id] = []   # clear log for fresh run
     db_config = _build_db_config(src["db_type"], src["connection"])
 
     try:
         # ── 1. Extraction ──────────────────────────────────────────────────────
+        _push_index_event(source_id, "extract", "running", "Extracting metadata from database…")
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(f"{METADATA_API}/extract", json={
                 "db_config":    db_config,
@@ -561,9 +591,13 @@ async def _index_source(source_id: str) -> None:
         src["report"]      = report
         src["table_names"] = list((report.get("tables") or {}).keys())
         src["table_count"] = len(src["table_names"])
+        _push_index_event(source_id, "extract", "done",
+                          f"Metadata extracted — {src['table_count']} tables found",
+                          f"Tables: {', '.join(src['table_names'][:10])}" + ("…" if src['table_count'] > 10 else ""))
 
         # ── 2. Ontology ────────────────────────────────────────────────────────
         ontology_content = None
+        _push_index_event(source_id, "ontology", "running", "Building OWL ontology…")
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 ro = await client.post(f"{ONTOLOGY_API}/generate",
@@ -587,11 +621,20 @@ async def _index_source(source_id: str) -> None:
                     await asyncio.sleep(2.0)
             if ontology_content:
                 src["ontology_content"] = ontology_content
+                lines = ontology_content.count("\n")
+                _push_index_event(source_id, "ontology", "done",
+                                  f"Ontology built — {lines} lines of OWL/Turtle")
+            else:
+                _push_index_event(source_id, "ontology", "warn",
+                                  "Ontology generation incomplete — skipping KG build")
         except Exception as exc:
             logger.warning("Source %s: ontology failed: %s", source_id[:8], exc)
+            _push_index_event(source_id, "ontology", "warn",
+                              f"Ontology step failed: {exc}")
 
         # ── 3. Knowledge Graph ─────────────────────────────────────────────────
         if ontology_content:
+            _push_index_event(source_id, "kg", "running", "Translating ontology to knowledge graph…")
             try:
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     rk = await client.post(f"{KG_API}/generate",
@@ -615,17 +658,23 @@ async def _index_source(source_id: str) -> None:
                         if job.get("status") == "error":
                             break
                         await asyncio.sleep(2.0)
+                _push_index_event(source_id, "kg", "done",
+                                  f"Knowledge graph built — {len(src['kg_nodes'])} nodes, {len(src['kg_edges'])} edges")
             except Exception as exc:
                 logger.warning("Source %s: KG failed: %s", source_id[:8], exc)
+                _push_index_event(source_id, "kg", "warn", f"KG build failed: {exc}")
 
         src["status"]     = "ready"
         src["indexed_at"] = time.time()
+        _push_index_event(source_id, "complete", "done",
+                          f"Indexing complete — {src['table_count']} tables ready for querying")
         logger.info("Source %s indexed: %d tables", source_id[:8], src["table_count"])
 
     except Exception as exc:
         logger.exception("Source %s indexing failed", source_id[:8])
         src["status"]        = "error"
         src["error_message"] = str(exc)
+        _push_index_event(source_id, "complete", "error", f"Indexing failed: {exc}")
 
 
 # ── SSE generator ──────────────────────────────────────────────────────────────
@@ -1175,3 +1224,166 @@ async def test_source_connection(req: TestConnectionRequest):
         return {"ok": False, "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+# ── Source detail endpoints (KG / Ontology / SSE) ─────────────────────────────
+
+@app.get("/sources/{source_id}/graph")
+async def get_source_graph(source_id: str):
+    """Return the KG graph data (nodes + edges) for an indexed source."""
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return {
+        "nodes": s.get("kg_nodes") or [],
+        "edges": s.get("kg_edges") or [],
+    }
+
+
+@app.get("/sources/{source_id}/ontology")
+async def get_source_ontology(source_id: str):
+    """Return the OWL/Turtle ontology text for an indexed source."""
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    content = s.get("ontology_content") or ""
+    return {"content": content}
+
+
+class SaveOntologyRequest(BaseModel):
+    content: str
+    rebuild_kg: bool = True
+
+
+@app.post("/sources/{source_id}/ontology")
+async def save_source_ontology(source_id: str, req: SaveOntologyRequest):
+    """
+    Save an edited ontology for a source and optionally rebuild the KG.
+    Triggers a KG rebuild in the background when rebuild_kg=True.
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    s["ontology_content"] = req.content
+    if req.rebuild_kg:
+        asyncio.create_task(_rebuild_kg(source_id, req.content))
+    return {"saved": True, "rebuild_kg": req.rebuild_kg}
+
+
+class KGPreviewRequest(BaseModel):
+    ontology_text: str
+
+
+@app.post("/sources/{source_id}/kg-preview")
+async def preview_source_kg(source_id: str, req: KGPreviewRequest):
+    """
+    Generate a KG preview from the provided ontology text without saving.
+    Calls the KG API synchronously and returns {nodes, edges}.
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            rk = await client.post(f"{KG_API}/generate",
+                                   json={"ontology_text": req.ontology_text})
+            rk.raise_for_status()
+            kg_job_id = rk.json()["job_id"]
+
+        deadline = time.time() + 120
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while time.time() < deadline:
+                pr  = await client.get(f"{KG_API}/jobs/{kg_job_id}")
+                job = pr.json()
+                if job.get("status") == "done":
+                    rg = await client.get(f"{KG_API}/jobs/{kg_job_id}/graph")
+                    if rg.status_code == 200:
+                        return rg.json()
+                    return {"nodes": [], "edges": []}
+                if job.get("status") == "error":
+                    raise RuntimeError(job.get("error", "KG generation failed"))
+                await asyncio.sleep(1.5)
+        raise RuntimeError("KG preview timed out")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.get("/sources/{source_id}/index-events")
+async def source_index_events(source_id: str):
+    """
+    SSE stream of indexing step events for a source.
+    Replays the stored event log first, then streams live events.
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    async def _gen() -> AsyncGenerator[str, None]:
+        # Replay buffered events so reconnecting clients catch up
+        for ev in list(_source_event_log.get(source_id, [])):
+            yield _sse_line(ev)
+
+        # Attach a live queue
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        _source_event_queues[source_id] = q
+
+        heartbeat_interval = 20
+        last_hb = time.time()
+        try:
+            while True:
+                try:
+                    ev = q.get_nowait()
+                    yield _sse_line(ev)
+                    # Stop streaming once indexing is complete or errored
+                    if ev.get("step") == "complete":
+                        break
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.3)
+                    if time.time() - last_hb >= heartbeat_interval:
+                        yield _sse_line({"type": "heartbeat"})
+                        last_hb = time.time()
+        finally:
+            # Remove queue so _push_index_event stops trying to write to it
+            if _source_event_queues.get(source_id) is q:
+                del _source_event_queues[source_id]
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+async def _rebuild_kg(source_id: str, ontology_text: str) -> None:
+    """Rebuild the KG for a source from a (possibly edited) ontology."""
+    src = _sources.get(source_id)
+    if not src:
+        return
+    _push_index_event(source_id, "kg", "running",
+                      "Rebuilding knowledge graph from updated ontology…")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            rk = await client.post(f"{KG_API}/generate",
+                                   json={"ontology_text": ontology_text})
+            rk.raise_for_status()
+            kg_job_id = rk.json()["job_id"]
+
+        deadline = time.time() + 300
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while time.time() < deadline:
+                pr  = await client.get(f"{KG_API}/jobs/{kg_job_id}")
+                job = pr.json()
+                if job.get("status") == "done":
+                    rg = await client.get(f"{KG_API}/jobs/{kg_job_id}/graph")
+                    if rg.status_code == 200:
+                        graph = rg.json()
+                        src["kg_nodes"] = graph.get("nodes") or []
+                        src["kg_edges"] = graph.get("edges") or []
+                    break
+                if job.get("status") == "error":
+                    raise RuntimeError(job.get("error", "KG build failed"))
+                await asyncio.sleep(2.0)
+
+        _push_index_event(source_id, "kg", "done",
+                          f"KG rebuilt — {len(src['kg_nodes'])} nodes, {len(src['kg_edges'])} edges")
+        _push_index_event(source_id, "complete", "done", "KG rebuild complete")
+    except Exception as exc:
+        logger.warning("Source %s: KG rebuild failed: %s", source_id[:8], exc)
+        _push_index_event(source_id, "kg", "error", f"KG rebuild failed: {exc}")
+        _push_index_event(source_id, "complete", "error", f"KG rebuild failed: {exc}")

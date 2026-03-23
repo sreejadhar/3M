@@ -569,6 +569,38 @@ async function apiGetSource(id) {
   return r.json();
 }
 
+async function apiGetSourceGraph(id) {
+  const r = await fetch(`${API}/sources/${id}/graph`);
+  if (!r.ok) return { nodes: [], edges: [] };
+  return r.json();
+}
+
+async function apiGetSourceOntology(id) {
+  const r = await fetch(`${API}/sources/${id}/ontology`);
+  if (!r.ok) return { content: '' };
+  return r.json();
+}
+
+async function apiSaveOntology(id, content, rebuildKg = true) {
+  const r = await fetch(`${API}/sources/${id}/ontology`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content, rebuild_kg: rebuildKg }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function apiPreviewKG(id, ontologyText) {
+  const r = await fetch(`${API}/sources/${id}/kg-preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ontology_text: ontologyText }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 // ── Session API calls ─────────────────────────────────────────────────────────
 
 async function apiCreateSession(title, sourceId) {
@@ -659,10 +691,18 @@ function renderSourceCatalog() {
       <div class="source-card-footer">
         <span class="domain-badge">${escHtml(s.domain)}</span>
         <span class="source-card-status ${s.status}">${escHtml(statusLabel)}</span>
+        ${s.status === 'ready' ? `<button class="source-card-kg-btn" data-id="${s.id}" title="View Knowledge Graph">KG</button>` : ''}
       </div>`;
 
     if (s.status === 'ready') {
-      card.addEventListener('click', () => openSourceSession(s.id));
+      card.addEventListener('click', (e) => {
+        if (e.target.closest('.source-card-kg-btn')) return;
+        openSourceSession(s.id);
+      });
+      card.querySelector('.source-card-kg-btn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openKGExplorer(s.id);
+      });
     } else if (s.status === 'indexing') {
       card.title = 'Source is being indexed. Please wait.';
     } else if (s.status === 'error') {
@@ -1710,6 +1750,8 @@ function renderAdminTable() {
       <td>${s.table_count}</td>
       <td>
         <div class="admin-actions">
+          <button class="admin-action-btn" data-action="index-log" data-id="${s.id}">Index Log</button>
+          <button class="admin-action-btn" data-action="view-kg" data-id="${s.id}">View KG</button>
           <button class="admin-action-btn" data-action="reindex" data-id="${s.id}">Reindex</button>
           <button class="admin-action-btn danger" data-action="delete" data-id="${s.id}">Delete</button>
         </div>
@@ -1721,7 +1763,11 @@ function renderAdminTable() {
       const id     = btn.dataset.id;
       const action = btn.dataset.action;
       const src    = sources[id];
-      if (action === 'reindex') {
+      if (action === 'index-log') {
+        openIndexLog(id);
+      } else if (action === 'view-kg') {
+        openKGExplorer(id);
+      } else if (action === 'reindex') {
         try {
           await apiReindexSource(id);
           sources[id].status = 'indexing';
@@ -1744,6 +1790,235 @@ function renderAdminTable() {
       }
     });
   });
+}
+
+// ── Index Log ─────────────────────────────────────────────────────────────────
+
+let _indexLogSourceId = null;
+let _indexLogSSE      = null;
+
+const INDEX_STEP_LABELS = {
+  extract:  'Metadata Extraction',
+  ontology: 'Ontology Generation',
+  kg:       'Knowledge Graph Build',
+  complete: 'Complete',
+};
+
+function openIndexLog(sourceId) {
+  _indexLogSourceId = sourceId;
+  const src = sources[sourceId];
+  document.getElementById('indexLogTitle').textContent =
+    `Indexing Progress — ${src ? src.name : sourceId}`;
+  document.getElementById('indexLogDetail').textContent = '';
+  renderIndexLogSteps([]);
+  document.getElementById('indexLogOverlay').style.display = 'flex';
+  connectIndexSSE(sourceId);
+}
+
+function closeIndexLog() {
+  document.getElementById('indexLogOverlay').style.display = 'none';
+  if (_indexLogSSE) { _indexLogSSE.close(); _indexLogSSE = null; }
+  _indexLogSourceId = null;
+}
+
+function connectIndexSSE(sourceId) {
+  if (_indexLogSSE) { _indexLogSSE.close(); }
+  const es = new EventSource(`${API}/sources/${sourceId}/index-events`);
+  _indexLogSSE = es;
+
+  const stepsMap = {};   // step → latest event
+
+  es.onmessage = (e) => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.type === 'heartbeat') return;
+    if (ev.type === 'index_step') {
+      stepsMap[ev.step] = ev;
+      renderIndexLogSteps(Object.values(stepsMap));
+    }
+    if (ev.step === 'complete') {
+      es.close();
+      _indexLogSSE = null;
+    }
+  };
+  es.onerror = () => {
+    es.close();
+    _indexLogSSE = null;
+  };
+}
+
+function renderIndexLogSteps(events) {
+  const container = document.getElementById('indexLogSteps');
+  if (!events.length) {
+    container.innerHTML = '<div style="padding:24px;text-align:center;color:var(--clr-text-mute);font-size:14px">No events yet — trigger reindex to start.</div>';
+    return;
+  }
+  container.innerHTML = events.map(ev => {
+    const label = INDEX_STEP_LABELS[ev.step] || ev.step;
+    let iconHtml;
+    if (ev.status === 'running') {
+      iconHtml = `<div class="step-icon-running"></div>`;
+    } else if (ev.status === 'done') {
+      iconHtml = `<span style="color:var(--clr-success,#34A853);font-size:16px">✓</span>`;
+    } else if (ev.status === 'error') {
+      iconHtml = `<span style="color:var(--clr-error,#EA4335);font-size:16px">✗</span>`;
+    } else {
+      iconHtml = `<span style="color:var(--clr-warn,#FBBC04);font-size:14px">⚠</span>`;
+    }
+    return `
+      <div class="index-log-step status-${escHtml(ev.status)}" data-detail="${escHtml(ev.detail || '')}">
+        <div class="index-log-step-icon">${iconHtml}</div>
+        <div class="index-log-step-body">
+          <div class="index-log-step-name">${escHtml(label)}</div>
+          <div class="index-log-step-msg">${escHtml(ev.message)}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  container.querySelectorAll('.index-log-step').forEach(row => {
+    row.addEventListener('click', () => {
+      document.getElementById('indexLogDetail').textContent = row.dataset.detail || '';
+    });
+  });
+}
+
+// ── KG Explorer ───────────────────────────────────────────────────────────────
+
+let _kgExplorerSourceId  = null;
+let _kgNetwork           = null;
+let _kgOntologyOriginal  = '';
+let _kgPreviewDebounce   = null;
+
+async function openKGExplorer(sourceId) {
+  _kgExplorerSourceId = sourceId;
+  const src = sources[sourceId];
+  document.getElementById('kgExplorerTitle').textContent =
+    `Knowledge Graph & Ontology — ${src ? src.name : sourceId}`;
+
+  // Show save button for admins only
+  const actionsEl = document.getElementById('kgExplorerHeaderActions');
+  const isAdmin = PERSONAS[currentPersona]?.isAdmin;
+  actionsEl.innerHTML = isAdmin
+    ? `<button class="btn-primary" id="kgSaveBtn">Save Ontology &amp; Rebuild KG</button>`
+    : '';
+  if (isAdmin) {
+    document.getElementById('kgSaveBtn').addEventListener('click', () => saveOntologyAndKG(sourceId));
+  }
+
+  document.getElementById('kgModifiedBadge').style.display = 'none';
+  document.getElementById('kgOntologyHint').textContent = isAdmin
+    ? 'Edit the ontology and click "Save Ontology & Rebuild KG" to persist changes.'
+    : 'Editing the ontology updates the graph preview. Only admins can save changes.';
+
+  document.getElementById('kgExplorerOverlay').style.display = 'flex';
+  document.getElementById('kgGraphPlaceholder').style.display = 'flex';
+  document.getElementById('kgGraphPlaceholder').textContent = 'Loading…';
+
+  // Destroy any existing vis network
+  if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; }
+
+  // Load graph + ontology in parallel
+  const [graphData, ontologyData] = await Promise.all([
+    apiGetSourceGraph(sourceId),
+    apiGetSourceOntology(sourceId),
+  ]);
+
+  // Render graph
+  renderKGGraph(graphData.nodes || [], graphData.edges || []);
+
+  // Load ontology into editor
+  _kgOntologyOriginal = ontologyData.content || '';
+  const editor = document.getElementById('kgOntologyEditor');
+  editor.value  = _kgOntologyOriginal;
+  editor.disabled = false;
+}
+
+function closeKGExplorer() {
+  document.getElementById('kgExplorerOverlay').style.display = 'none';
+  if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; }
+  if (_kgPreviewDebounce) { clearTimeout(_kgPreviewDebounce); _kgPreviewDebounce = null; }
+  _kgExplorerSourceId = null;
+}
+
+function renderKGGraph(nodes, edges) {
+  const container = document.getElementById('kgGraphContainer');
+  const placeholder = document.getElementById('kgGraphPlaceholder');
+
+  if (!nodes.length) {
+    placeholder.style.display = 'flex';
+    placeholder.textContent = 'No graph data available. Index this source first.';
+    return;
+  }
+  placeholder.style.display = 'none';
+
+  if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; }
+
+  const visNodes = new vis.DataSet(nodes.map(n => ({
+    id:    n.id,
+    label: n.label,
+    title: n.title,
+    color: n.color || '#63b3ed',
+    size:  n.size  || 20,
+    font:  { color: '#e2e8f0', size: 13 },
+  })));
+
+  const visEdges = new vis.DataSet(edges.map((e, i) => ({
+    id:    i,
+    from:  e.from,
+    to:    e.to,
+    label: e.label,
+    title: e.title,
+    arrows: { to: { enabled: true, scaleFactor: 0.6 } },
+    color:  { color: '#718096', highlight: '#63b3ed' },
+    font:   { color: '#a0aec0', size: 11 },
+    smooth: { type: 'dynamic' },
+  })));
+
+  const options = {
+    physics: { stabilization: { iterations: 150 }, barnesHut: { gravitationalConstant: -3000 } },
+    interaction: { tooltipDelay: 100 },
+    nodes: { shape: 'ellipse', borderWidth: 1.5 },
+  };
+
+  _kgNetwork = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
+}
+
+async function saveOntologyAndKG(sourceId) {
+  const editor = document.getElementById('kgOntologyEditor');
+  const content = editor.value;
+  const btn = document.getElementById('kgSaveBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    await apiSaveOntology(sourceId, content, true);
+    _kgOntologyOriginal = content;
+    document.getElementById('kgModifiedBadge').style.display = 'none';
+    showToast('Ontology saved. KG rebuild started in background.', 'info');
+  } catch (err) {
+    showToast(`Save failed: ${err.message}`, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save Ontology & Rebuild KG'; }
+  }
+}
+
+function _scheduleKGPreview() {
+  if (!_kgExplorerSourceId) return;
+  if (_kgPreviewDebounce) clearTimeout(_kgPreviewDebounce);
+  document.getElementById('kgModifiedBadge').style.display =
+    document.getElementById('kgOntologyEditor').value !== _kgOntologyOriginal ? 'inline' : 'none';
+  _kgPreviewDebounce = setTimeout(async () => {
+    const sourceId = _kgExplorerSourceId;
+    const text = document.getElementById('kgOntologyEditor').value;
+    if (!text.trim() || !sourceId) return;
+    document.getElementById('kgGraphPlaceholder').style.display = 'flex';
+    document.getElementById('kgGraphPlaceholder').textContent = 'Generating preview…';
+    try {
+      const graph = await apiPreviewKG(sourceId, text);
+      renderKGGraph(graph.nodes || [], graph.edges || []);
+    } catch (err) {
+      document.getElementById('kgGraphPlaceholder').style.display = 'flex';
+      document.getElementById('kgGraphPlaceholder').textContent = `Preview failed: ${err.message}`;
+    }
+  }, 1800);
 }
 
 // ── Event listeners ───────────────────────────────────────────────────────────
@@ -1801,6 +2076,19 @@ document.getElementById('personaRoleOk')?.addEventListener('click', () => {
 document.getElementById('personaRoleInput')?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') document.getElementById('personaRoleOk')?.click();
 });
+
+// Index Log modal
+document.getElementById('indexLogClose').addEventListener('click', closeIndexLog);
+document.getElementById('indexLogOverlay').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('indexLogOverlay')) closeIndexLog();
+});
+
+// KG Explorer modal
+document.getElementById('kgExplorerClose').addEventListener('click', closeKGExplorer);
+document.getElementById('kgExplorerOverlay').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('kgExplorerOverlay')) closeKGExplorer();
+});
+document.getElementById('kgOntologyEditor').addEventListener('input', _scheduleKGPreview);
 
 // Admin panel
 adminBtn.addEventListener('click', openAdminPanel);

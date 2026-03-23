@@ -57,11 +57,6 @@ import hashlib
 import re as _re
 from collections import deque as _deque
 
-try:
-    import numpy as _np
-    _NUMPY_OK = True
-except ImportError:
-    _NUMPY_OK = False
 
 # Per-source embedding cache: f"{schema_hash}:{backend}" → _GRCache
 _GR_EMBED_CACHE: Dict[str, Any] = {}
@@ -1520,8 +1515,6 @@ async def graphrag_query(source_id: str, req: GraphRAGQueryRequest):
         raise HTTPException(status_code=422, detail="Source has no KG nodes — index it first")
     if not req.query.strip():
         raise HTTPException(status_code=422, detail="Query must not be empty")
-    if not _NUMPY_OK:
-        raise HTTPException(status_code=501, detail="numpy is required for GraphRAG — pip install numpy")
 
     def _run() -> Dict:
         import numpy as np

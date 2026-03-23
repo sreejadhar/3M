@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional
 from langgraph.graph import END, START, StateGraph
 
 from .config import KGConfig
-from .nodes import execute_node, fetch_node, parse_node, translate_node
+from .nodes import embed_node, execute_node, fetch_node, parse_node, translate_node
 from .state import KGState
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,16 @@ def _route_after_translate(state: KGState) -> str:
     return "error_end" if state.get("phase") == "error" else "execute"
 
 
+def _route_after_execute(state: KGState) -> str:
+    """Route to embed_node when embedding is enabled, otherwise end."""
+    if state.get("phase") == "error":
+        return "error_end"
+    config = state.get("config")
+    if config and getattr(config, "embed_enabled", False) and getattr(config, "neo4j_uri", ""):
+        return "embed"
+    return END
+
+
 def _route_after_fetch(state: KGState) -> str:
     return "error_end" if state.get("phase") == "error" else END
 
@@ -57,6 +67,7 @@ def _build_graph() -> Any:
     graph.add_node("parse",     parse_node)
     graph.add_node("translate", translate_node)
     graph.add_node("execute",   execute_node)
+    graph.add_node("embed",     embed_node)
     graph.add_node("fetch",     fetch_node)
     graph.add_node("error_end", _error_end_node)
 
@@ -76,11 +87,16 @@ def _build_graph() -> Any:
         {"execute": "execute", "error_end": "error_end"},
     )
     graph.add_conditional_edges(
+        "execute",
+        _route_after_execute,
+        {"embed": "embed", END: END, "error_end": "error_end"},
+    )
+    graph.add_conditional_edges(
         "fetch",
         _route_after_fetch,
         {END: END, "error_end": "error_end"},
     )
-    graph.add_edge("execute",   END)
+    graph.add_edge("embed",     END)
     graph.add_edge("error_end", END)
 
     return graph.compile()

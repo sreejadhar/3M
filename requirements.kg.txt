@@ -15,3 +15,8 @@ langchain-core>=0.3.0
 # Graph database drivers
 neo4j>=5.0.0
 gremlinpython>=3.7.0
+
+# GraphRAG embedding (embed_node)
+numpy>=1.26.0                          # vector math (required)
+# sentence-transformers>=3.0.0         # best-quality local backend (optional, 384 dims)
+# openai>=1.0.0                        # OpenAI backend (optional, 1536 dims, needs OPENAI_API_KEY)

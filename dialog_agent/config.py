@@ -40,9 +40,15 @@ class DialogConfig:
     analyst_role: str = ""             # e.g. "Financial Analyst" — personalises insights
 
     # ── GraphRAG retrieval ────────────────────────────────────────────────────
-    # In-memory hybrid graph retrieval: embed KG node titles, find the top-K
-    # tables most relevant to the NLQ via cosine similarity, then BFS-expand
-    # via FK edges so JOIN partners are always included.
+    # Hybrid graph retrieval: embed KG node titles, find top-K tables most
+    # relevant to the NLQ via cosine similarity, BFS-expand via FK edges.
+    #
+    # Two paths selected automatically:
+    #   Production (Neo4j): set graphrag_neo4j_uri — uses the HNSW vector
+    #     index written by embed_node at KG build time.  Safe for multi-worker
+    #     deployments; embeddings are shared across all processes.
+    #   In-memory (dev/small schemas): graphrag_neo4j_uri empty — embeds node
+    #     titles once per session, caches in process memory with numpy.
     graphrag_enabled: bool = True
     # Number of seed tables returned by vector search before graph expansion.
     graphrag_top_k: int = 8
@@ -53,4 +59,16 @@ class DialogConfig:
     graphrag_min_tables: int = 10
     # Embedding backend: "auto" | "sentence-transformers" | "openai" | "tfidf" | "keyword"
     # "auto" tries sentence-transformers → tfidf → keyword in order.
+    # Note: "tfidf" and "keyword" are in-memory only; Neo4j path requires
+    # "sentence-transformers" or "openai" (fixed-dimension vectors).
     graphrag_embedding_backend: str = "auto"
+
+    # ── Neo4j connection for production GraphRAG ──────────────────────────────
+    # Leave graphrag_neo4j_uri empty to use the in-memory fallback.
+    # These should point to the same Neo4j instance used by the KG pipeline.
+    graphrag_neo4j_uri:      str = ""        # e.g. "bolt://localhost:7687"
+    graphrag_neo4j_username: str = "neo4j"
+    graphrag_neo4j_password: str = ""
+    graphrag_neo4j_database: str = "neo4j"
+    # Name of the HNSW vector index created by embed_node (must match KGConfig.embed_index_name)
+    graphrag_neo4j_index:    str = "kg-node-embeddings"

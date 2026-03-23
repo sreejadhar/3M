@@ -22,4 +22,5 @@ class KGState(TypedDict, total=False):
     edge_count:         int        # OWL object properties mapped to graph edges
     executed_count:     int        # Queries successfully executed
     errors:             List[str]  # Accumulated non-fatal errors
-    phase:              str        # "init"|"parsed"|"translated"|"executed"|"fetched"|"error"
+    phase:              str        # "init"|"parsed"|"translated"|"executed"|"embedded"|"fetched"|"error"
+    embeddings_stored:  bool       # True after embed_node successfully writes to Neo4j

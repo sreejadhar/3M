@@ -38,3 +38,19 @@ class DialogConfig:
 
     # ── User context ──────────────────────────────────────────────────────────
     analyst_role: str = ""             # e.g. "Financial Analyst" — personalises insights
+
+    # ── GraphRAG retrieval ────────────────────────────────────────────────────
+    # In-memory hybrid graph retrieval: embed KG node titles, find the top-K
+    # tables most relevant to the NLQ via cosine similarity, then BFS-expand
+    # via FK edges so JOIN partners are always included.
+    graphrag_enabled: bool = True
+    # Number of seed tables returned by vector search before graph expansion.
+    graphrag_top_k: int = 8
+    # BFS hops from seed nodes when expanding via FK edges.
+    graphrag_hop_depth: int = 2
+    # Only activate retrieval when the schema has more than this many tables.
+    # For small schemas the full schema fits easily in the prompt.
+    graphrag_min_tables: int = 10
+    # Embedding backend: "auto" | "sentence-transformers" | "openai" | "tfidf" | "keyword"
+    # "auto" tries sentence-transformers → tfidf → keyword in order.
+    graphrag_embedding_backend: str = "auto"

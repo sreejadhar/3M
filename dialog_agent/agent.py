@@ -3,7 +3,8 @@ LangGraph agent for the Dialog with Data pipeline.
 
 Pipeline:
     START
-      → understand   (build schema context from KG data)
+      → retrieve     (GraphRAG: embed KG nodes, retrieve relevant subgraph)
+      → understand   (build schema context from retrieved subgraph)
       → plan         (LLM decomposes NQL → SQL queries)
       → execute      (run SQL against target DB)
       → synthesize   (LLM stitches results → insights)
@@ -18,6 +19,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .config import DialogConfig
 from .nodes import (
+    retrieve_node,
     execute_node,
     plan_node,
     synthesize_node,
@@ -27,18 +29,20 @@ from .state import ConversationTurn, DialogState
 
 logger = logging.getLogger(__name__)
 
-_NODES = ["understand", "plan", "execute", "synthesize"]
+_NODES = ["retrieve", "understand", "plan", "execute", "synthesize"]
 
 
 def _build_graph() -> Any:
     g = StateGraph(DialogState)
 
-    g.add_node("understand",  understand_node)
-    g.add_node("plan",        plan_node)
-    g.add_node("execute",     execute_node)
-    g.add_node("synthesize",  synthesize_node)
+    g.add_node("retrieve",   retrieve_node)
+    g.add_node("understand", understand_node)
+    g.add_node("plan",       plan_node)
+    g.add_node("execute",    execute_node)
+    g.add_node("synthesize", synthesize_node)
 
-    g.add_edge(START,       "understand")
+    g.add_edge(START,        "retrieve")
+    g.add_edge("retrieve",   "understand")
     g.add_edge("understand", "plan")
     g.add_edge("plan",       "execute")
     g.add_edge("execute",    "synthesize")

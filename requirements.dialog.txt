@@ -10,6 +10,12 @@ langchain-core>=0.2.0
 pandas>=2.0.0
 openpyxl>=3.1.0
 
+# GraphRAG in-memory retrieval
+numpy>=1.26.0                          # vector math for cosine similarity (required)
+scikit-learn>=1.4.0                    # TF-IDF embedding backend (recommended)
+# sentence-transformers>=3.0.0         # best-quality local embedding backend (optional)
+# openai>=1.0.0                        # OpenAI embedding backend (optional, needs OPENAI_API_KEY)
+
 # Database drivers (optional — only the target DB driver is needed at runtime)
 psycopg2-binary>=2.9.9        # PostgreSQL / Redshift
 # cx_Oracle>=8.3.0            # Oracle (install manually if needed)

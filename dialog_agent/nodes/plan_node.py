@@ -22,13 +22,134 @@ from ..state import DialogState, SQLQuery
 
 logger = logging.getLogger(__name__)
 
+def _build_dialect_rules(db_type: str) -> str:
+    """Return database-specific SQL syntax rules injected into the system prompt."""
+    db = db_type.lower()
+
+    if db in ("sqlite", "csv", "excel"):
+        return """\
+ROW LIMITING      : LIMIT N at the end of the query  (e.g. SELECT col FROM t LIMIT 100)
+TOP-N QUERIES     : ORDER BY col DESC LIMIT N
+CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')   — ILIKE does NOT exist in SQLite
+DATE EXTRACTION   : strftime('%Y', date_col) for year; strftime('%m', date_col) for month
+                    strftime('%Y-%m', date_col) for year-month
+DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
+STRING CONCAT     : col1 || col2   — do NOT use + or CONCAT()
+IDENTIFIER QUOTING: double-quotes "col name" only when a name has spaces or is reserved;
+                    never use backticks (`)
+PERCENTILES       : NOT SUPPORTED — use MIN/MAX/AVG as approximations, or note unavailability
+PERCENTAGE CALC   : window function over aggregate is INVALID in SQLite.
+                    Use a CTE instead:
+                      WITH grp AS (SELECT cat, COUNT(*) AS cnt FROM t GROUP BY cat)
+                      SELECT cat, cnt,
+                             ROUND(cnt * 100.0 / (SELECT SUM(cnt) FROM grp), 2) AS Pct
+                      FROM grp
+NULL HANDLING     : COALESCE(col, 0) or IFNULL(col, 0)
+BOOLEAN           : use 1 / 0 integers — TRUE/FALSE literals are not reliable in SQLite
+TYPE CASTING      : CAST(col AS INTEGER), CAST(col AS REAL), CAST(col AS TEXT)
+UNSUPPORTED       : FULL OUTER JOIN, PIVOT, PERCENTILE_CONT, PERCENTILE_DISC,
+                    GENERATE_SERIES, ANY/ALL subquery operators"""
+
+    if db in ("postgres", "postgresql", "redshift"):
+        return """\
+ROW LIMITING      : LIMIT N at the end  (e.g. SELECT col FROM t LIMIT 100)
+TOP-N QUERIES     : ORDER BY col DESC LIMIT N
+CASE-INSENSITIVE  : col ILIKE '%term%'   — preferred; or LOWER(col) LIKE LOWER('%term%')
+DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
+                    DATE_TRUNC('month', date_col)
+DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
+                    date_col >= '2024-01-01'::date
+STRING CONCAT     : col1 || col2   or   CONCAT(col1, col2)
+IDENTIFIER QUOTING: double-quotes "col name" only when needed; never backticks
+PERCENTILES       : PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) AS median
+                    PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY col) AS q1
+PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
+                    ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Pct
+NULL HANDLING     : COALESCE(col, 0)
+TYPE CASTING      : value::integer, value::numeric, value::text
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported"""
+
+    if db == "sqlserver":
+        return """\
+ROW LIMITING      : SELECT TOP N col FROM t   — LIMIT does NOT exist in SQL Server
+                    For top-N with ordering: SELECT TOP 10 col FROM t ORDER BY col DESC
+                    For paging: ORDER BY col OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
+CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')  (collation-dependent; ILIKE not supported)
+DATE EXTRACTION   : YEAR(date_col), MONTH(date_col), DAY(date_col)
+                    DATEPART(year, date_col), DATEPART(month, date_col)
+                    FORMAT(date_col, 'yyyy-MM')
+DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
+STRING CONCAT     : col1 + col2   or   CONCAT(col1, col2)
+IDENTIFIER QUOTING: square brackets [col name] when needed, or double-quotes
+PERCENTILES       : PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) OVER () AS median
+                    PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY col) OVER () AS q1
+PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
+NULL HANDLING     : ISNULL(col, 0) or COALESCE(col, 0)
+STRING LENGTH     : LEN(col)   — LENGTH() does NOT exist in SQL Server
+TYPE CASTING      : CAST(col AS INT), CAST(col AS DECIMAL(10,2)), CAST(col AS NVARCHAR(100))
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported"""
+
+    if db == "oracle":
+        return """\
+ROW LIMITING      : FETCH FIRST N ROWS ONLY  (Oracle 12c+)
+                    Example: SELECT col FROM t ORDER BY col DESC FETCH FIRST 10 ROWS ONLY
+                    Legacy (pre-12c): SELECT * FROM (SELECT col FROM t ORDER BY col DESC)
+                                      WHERE ROWNUM <= 10
+                    NEVER use LIMIT — it does NOT exist in Oracle
+CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')   — ILIKE does NOT exist
+DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
+                    TO_CHAR(date_col, 'YYYY-MM')
+DATE COMPARISON   : date_col BETWEEN DATE '2024-01-01' AND DATE '2024-12-31'
+STRING CONCAT     : col1 || col2   — do NOT use +
+IDENTIFIER QUOTING: double-quotes "col name" only when needed; never backticks
+PERCENTILES       : PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) OVER () AS median
+PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
+NULL HANDLING     : NVL(col, 0) or COALESCE(col, 0)
+CURRENT DATE/TIME : SYSDATE  or  CURRENT_DATE  — do NOT use NOW()
+TYPE CASTING      : CAST(col AS NUMBER), CAST(col AS VARCHAR2(100))
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported"""
+
+    if db == "bigquery":
+        return """\
+ROW LIMITING      : LIMIT N at the end
+TOP-N QUERIES     : ORDER BY col DESC LIMIT N
+CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')  — ILIKE does NOT exist
+DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
+                    DATE_TRUNC(date_col, MONTH), FORMAT_DATE('%Y-%m', date_col)
+DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
+STRING CONCAT     : CONCAT(col1, col2)   or   col1 || col2
+IDENTIFIER QUOTING: backticks `col name` or `project.dataset.table` when needed
+PERCENTILES       : PERCENTILE_CONT(col, 0.5) OVER ()   — note: argument order differs from ANSI!
+                    APPROX_QUANTILES(col, 100)[OFFSET(50)] AS median
+PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
+NULL HANDLING     : COALESCE(col, 0) or IFNULL(col, 0)
+TABLE REFERENCES  : use fully qualified `project.dataset.table` in FROM/JOIN
+TYPE CASTING      : CAST(col AS INT64), CAST(col AS FLOAT64), CAST(col AS STRING)
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported"""
+
+    # Fallback for unknown db types
+    return """\
+ROW LIMITING      : LIMIT N at the end of the query
+CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')
+STRING CONCAT     : col1 || col2
+NULL HANDLING     : COALESCE(col, 0)"""
+
+
 _SYSTEM_PROMPT = """\
 You are an expert SQL analyst.  You receive a natural-language question about a
 database and a schema context (qualified table names, columns, relationships).
 Your job is to decompose the question into one or more SQL SELECT queries that,
 when executed and combined, will answer the question completely.
 
-Rules:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATABASE-SPECIFIC SYNTAX — {db_label}
+EVERY QUERY YOU WRITE MUST USE THIS EXACT SYNTAX.
+DO NOT use syntax from any other database.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{dialect_rules}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+General Rules:
 1. Return ONLY a JSON array — no prose, no markdown fences.
 2. Each element must have exactly these fields:
    - "query_id"   : a short unique identifier (e.g. "q1", "q2")
@@ -41,16 +162,13 @@ Rules:
 4. Column names MUST match EXACTLY the column names listed in the schema context.
    NEVER invent or guess a column name that is not explicitly listed.
    If a column you need does not appear in the schema, omit that filter entirely.
-5. LIMIT rules — critical, follow exactly:
-   a. NEVER add a LIMIT clause to any query unless rule (b) applies.
-      The system automatically adds row limits where needed.
-   b. Explicit top-N questions ONLY ("top 10 products", "bottom 5 regions",
-      "show me 3 examples"): add ORDER BY <metric> DESC LIMIT <N> where N is
-      the number the user explicitly requested or a small sensible default (10–20).
-      Only use this when the question contains a specific count or "top/bottom N"
-      phrasing.
-   c. Do NOT add LIMIT {row_limit} anywhere — not for aggregations, not for
-      raw-row queries, not for any other reason.
+5. ROW LIMITING — follow the database-specific syntax shown above:
+   a. NEVER add a row limit to any aggregation query (GROUP BY / COUNT / SUM / AVG / MIN / MAX)
+      unless the user explicitly asks for "top N" or "bottom N".
+      Limiting aggregation queries silently drops groups and produces wrong totals.
+   b. Explicit top-N questions ONLY ("top 10 products", "bottom 5 regions"):
+      use ORDER BY <metric> DESC then the appropriate limit syntax for this database.
+   c. Do NOT add LIMIT {row_limit} to any query — the system applies row limits automatically.
 6. Prefer simple queries; only join when necessary.
 7. If the question cannot be answered from the available schema, return [].
 8. Maximum {max_queries} queries total.
@@ -59,8 +177,7 @@ Rules:
      CORRECT: FROM public.orders AS o  WHERE o.id = 1  SELECT o.col1
      WRONG:   FROM orders WHERE orders.id = 1         -- unqualified table
      WRONG:   WHERE public.orders.id = 1              -- 3-part names fail in PostgreSQL
-   Do NOT use backtick quoting (`col`) — it is MySQL syntax and causes errors in PostgreSQL/SQLite.
-   Use double-quotes ("col") only when a column name contains spaces or is a reserved word.
+   Identifier quoting: follow the rule shown in the DATABASE-SPECIFIC SYNTAX section above.
 9b. CROSS-TABLE RULES — read carefully:
     a. To JOIN two tables you MUST have a column listed under "POSSIBLE JOIN KEYS"
        in the schema context, or one shown on a "FK:" line.
@@ -78,14 +195,12 @@ Rules:
     c. If a column you need (e.g. SBU1) is only in Table A, write a query for
        Table A that retrieves it.  Write a second query for Table B with its
        own columns.  Do NOT try to bridge them without a valid join key.
-10. String/text filters: ALWAYS use case-insensitive matching.
+10. String/text filters — use the case-insensitive syntax shown above for this database.
     - If [sample values] are shown for a column, use the exact spelling from the samples.
-    - If sample values are NOT shown, use: LOWER(column_name) LIKE LOWER('%search_term%')
-    - Never rely on an exact case-sensitive equality match for text unless you copied
-      the value directly from a [sample values] list.
-11. Date/period filters: if filtering by year/month, check column names in the schema
-    carefully — use the correct column (e.g. Year, Month, Period) and match the sample
-    value format (e.g. integer 2026 vs string '2026').
+    - Never rely on a case-sensitive equality match unless copying verbatim from samples.
+11. Date/period filters — use the date extraction functions shown above for this database.
+    Check column names carefully and match the sample value format (e.g. integer 2026
+    vs string '2026').
 12. COUNT vs SUM — choose the correct aggregate:
     a. Use COUNT(*) or COUNT(column) when the question asks for:
          headcount, number of people, how many employees/records/rows,
@@ -105,28 +220,17 @@ Rules:
 13. Percentage calculations — when the question asks for %, share, proportion,
     or percentage of a total:
     a. Always compute the percentage IN SQL — do not leave it to the reader.
-    b. Choose the form that matches TARGET DATABASE TYPE:
-       PostgreSQL / Redshift / BigQuery / SQL Server — window function:
-         ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Percentage
-         ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Percentage
-       SQLite / CSV / Excel — window function over aggregate is INVALID.
-       Use a CTE to pre-aggregate and then divide:
-         WITH grp AS (SELECT category, COUNT(*) AS cnt FROM t WHERE ... GROUP BY category)
-         SELECT category, cnt,
-                ROUND(cnt * 100.0 / (SELECT SUM(cnt) FROM grp), 2) AS Pct
-         FROM grp
+    b. Use the PERCENTAGE CALC syntax shown in the DATABASE-SPECIFIC SYNTAX section above.
     c. Always include both the raw value (count or sum) AND the percentage column
        in the SELECT list so the user sees both.
     d. Label the percentage column clearly, e.g. AS Headcount_Pct or AS Revenue_Pct.
     e. Round percentages to 2 decimal places with ROUND(..., 2).
-    f. If asked "what percentage is X of Y" without a GROUP BY, use a single-row
-       scalar expression (valid in all databases):
+    f. If asked "what percentage is X of Y" without a GROUP BY, use:
          SELECT
            SUM(CASE WHEN condition THEN 1 ELSE 0 END) AS numerator,
            COUNT(*) AS denominator,
            ROUND(SUM(CASE WHEN condition THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS Pct
          FROM table_name
-       — include both the raw counts and the percentage column.
 """
 
 _USER_PROMPT = """\
@@ -150,8 +254,8 @@ CRITICAL REMINDERS:
 - COUNT vs SUM: use COUNT(*) for headcount/how-many questions; use SUM(col) only for
   monetary/quantity totals. NEVER use SUM() to count people or rows.
 - PERCENTAGES: if the question asks for %, share, or proportion — compute it in SQL
-  using ROUND(value * 100.0 / SUM(value) OVER (), 2). Always include both the raw
-  value and the percentage column. Do not leave percentage calculation to the reader.
+  using the PERCENTAGE CALC syntax from the DATABASE-SPECIFIC SYNTAX section in your
+  instructions. Always include both the raw value and the percentage column.
 
 Return the JSON array of SQL queries now.
 """
@@ -518,52 +622,100 @@ _AGG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_LIMIT_PATTERN = re.compile(r'\bLIMIT\s+\d+(\s+OFFSET\s+\d+)?', re.IGNORECASE)
+_LIMIT_PATTERN      = re.compile(r'\bLIMIT\s+\d+(\s+OFFSET\s+\d+)?', re.IGNORECASE)
+_TOP_PATTERN        = re.compile(r'\bSELECT\s+TOP\s+\d+\b', re.IGNORECASE)
+_FETCH_FIRST_PATTERN = re.compile(r'\bFETCH\s+FIRST\s+\d+\s+ROWS?\s+ONLY\b', re.IGNORECASE)
+_ROWNUM_PATTERN     = re.compile(r'\bROWNUM\s*<=?\s*\d+\b', re.IGNORECASE)
 
 
-def _enforce_sql_limits(sql: str, row_limit: int) -> str:
+def _enforce_sql_limits(sql: str, row_limit: int, db_type: str = "") -> str:
     """
-    Enforce LIMIT rules after the LLM has generated SQL:
+    Enforce row-limit rules after the LLM has generated SQL, using the correct
+    syntax for the target database.
 
     - Aggregation queries (GROUP BY / COUNT / SUM / AVG / MIN / MAX):
-        Strip ANY LIMIT clause regardless of value.  Aggregates compute over
-        all rows — a LIMIT silently drops groups and produces wrong totals.
-        Exception: keep LIMIT when it is ≤50 AND there is an ORDER BY, which
-        signals an intentional top-N ("top 10 categories by revenue").
+        Remove any limit clause unless it is a small intentional top-N
+        (≤50 rows AND there is an ORDER BY).  Limiting aggregations silently
+        drops groups and produces wrong totals.
 
     - Raw-row queries (no aggregation):
-        If no LIMIT is present, add LIMIT <row_limit>.
-        If a LIMIT is already present (LLM added a top-N), leave it as-is.
+        If no limit is present, add one using db-appropriate syntax:
+          PostgreSQL / SQLite / Redshift / BigQuery / CSV / Excel : LIMIT N
+          SQL Server                                               : SELECT TOP N …
+          Oracle                                                   : … FETCH FIRST N ROWS ONLY
     """
-    is_agg = bool(_AGG_PATTERN.search(sql))
+    db        = db_type.lower()
+    is_agg    = bool(_AGG_PATTERN.search(sql))
     has_limit = bool(_LIMIT_PATTERN.search(sql))
+    has_top   = bool(_TOP_PATTERN.search(sql))
+    has_fetch = bool(_FETCH_FIRST_PATTERN.search(sql))
+    has_rownum = bool(_ROWNUM_PATTERN.search(sql))
+    has_any_limit = has_limit or has_top or has_fetch or has_rownum
+
+    has_order_by = bool(re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE))
 
     if is_agg:
-        if not has_limit:
+        if not has_any_limit:
             return sql  # already clean
 
-        m = re.search(r'\bLIMIT\s+(\d+)', sql, re.IGNORECASE)
-        limit_val = int(m.group(1)) if m else 0
-        has_order_by = bool(re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE))
+        # Determine the limit value for the intentional-top-N check
+        limit_val = 0
+        if has_limit:
+            m = re.search(r'\bLIMIT\s+(\d+)', sql, re.IGNORECASE)
+            limit_val = int(m.group(1)) if m else 0
+        elif has_top:
+            m = re.search(r'\bSELECT\s+TOP\s+(\d+)\b', sql, re.IGNORECASE)
+            limit_val = int(m.group(1)) if m else 0
+        elif has_fetch:
+            m = re.search(r'\bFETCH\s+FIRST\s+(\d+)\s+ROWS?\s+ONLY\b', sql, re.IGNORECASE)
+            limit_val = int(m.group(1)) if m else 0
 
-        # Keep only intentional small top-N that has a matching ORDER BY
+        # Keep intentional small top-N with ORDER BY
         if limit_val <= 50 and has_order_by:
             return sql
 
-        # Strip the LIMIT (and any trailing OFFSET) from the end of the query
-        cleaned = _LIMIT_PATTERN.sub('', sql).strip().rstrip(';').strip()
-        logger.info(
-            "plan_node: stripped LIMIT %d from aggregation query",
-            limit_val,
-        )
+        # Strip the limit clause
+        cleaned = sql
+        if has_limit:
+            cleaned = _LIMIT_PATTERN.sub('', cleaned)
+        if has_top:
+            # Remove TOP N from SELECT clause: "SELECT TOP 100 " → "SELECT "
+            cleaned = re.sub(
+                r'(\bSELECT\b\s+)TOP\s+\d+\s+', r'\1', cleaned, flags=re.IGNORECASE
+            )
+        if has_fetch:
+            cleaned = _FETCH_FIRST_PATTERN.sub('', cleaned)
+        cleaned = cleaned.strip().rstrip(';').strip()
+        logger.info("plan_node: stripped limit clause from aggregation query")
         return cleaned
 
     else:
-        # Raw-row query: add row_limit if no LIMIT present
-        if not has_limit:
-            sql = sql.rstrip().rstrip(';').strip() + f" LIMIT {row_limit}"
+        # Raw-row query — add db-appropriate limit if none present
+        if has_any_limit:
+            return sql  # LLM already added a top-N; leave it
+
+        sql_clean = sql.rstrip().rstrip(';').strip()
+
+        if db == "sqlserver":
+            # Insert TOP N immediately after SELECT (before DISTINCT / column list)
+            patched = re.sub(
+                r'(\bSELECT\b)(\s+)',
+                lambda m: m.group(1) + m.group(2) + f"TOP {row_limit} ",
+                sql_clean, count=1, flags=re.IGNORECASE,
+            )
+            logger.info("plan_node: added TOP %d to raw-row SQL Server query", row_limit)
+            return patched
+
+        elif db == "oracle":
+            patched = sql_clean + f" FETCH FIRST {row_limit} ROWS ONLY"
+            logger.info("plan_node: added FETCH FIRST %d to raw-row Oracle query", row_limit)
+            return patched
+
+        else:
+            # PostgreSQL, Redshift, BigQuery, SQLite, CSV, Excel
+            patched = sql_clean + f" LIMIT {row_limit}"
             logger.info("plan_node: added LIMIT %d to raw-row query", row_limit)
-        return sql
+            return patched
 
 
 def plan_node(state: DialogState) -> DialogState:
@@ -625,9 +777,20 @@ def plan_node(state: DialogState) -> DialogState:
     known_columns.update(t.lower() for t in table_labels)
     logger.debug("plan_node: %d known columns extracted from schema context", len(known_columns))
 
+    _DB_LABELS = {
+        "sqlite": "SQLite", "csv": "SQLite (CSV file)", "excel": "SQLite (Excel file)",
+        "postgres": "PostgreSQL", "postgresql": "PostgreSQL",
+        "redshift": "Amazon Redshift (PostgreSQL-compatible)",
+        "sqlserver": "SQL Server (T-SQL)",
+        "oracle": "Oracle SQL",
+        "bigquery": "Google BigQuery",
+    }
+    db_label = _DB_LABELS.get(config.db_type.lower(), config.db_type.upper())
     system = _SYSTEM_PROMPT.format(
         row_limit=config.row_limit,
         max_queries=config.max_sql_queries,
+        db_label=db_label,
+        dialect_rules=_build_dialect_rules(config.db_type),
     )
     schema_line = (
         f"TARGET SCHEMA: {db_schema}"
@@ -698,9 +861,8 @@ def plan_node(state: DialogState) -> DialogState:
         # Percentage fix: inject window-function percentage column when % is asked for
         # (skipped for SQLite/CSV/Excel to avoid nested-aggregate syntax errors)
         sql = _fix_percentage(sql, natural_query, config.db_type)
-        # LIMIT enforcement: strip LIMIT from aggregation queries (all groups must
-        # be returned); add row_limit to raw-row queries that have no LIMIT.
-        sql = _enforce_sql_limits(sql, config.row_limit)
+        # Limit enforcement: use db-appropriate syntax (LIMIT / TOP N / FETCH FIRST)
+        sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
 
         # Multi-table check: reject any query that references more than one table
         # when no valid join key was listed in the schema context.  This catches

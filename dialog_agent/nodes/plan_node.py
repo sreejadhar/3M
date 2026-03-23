@@ -54,8 +54,13 @@ Rules:
 6. Prefer simple queries; only join when necessary.
 7. If the question cannot be answered from the available schema, return [].
 8. Maximum {max_queries} queries total.
-9. Do NOT use table aliases that shadow schema-qualified names — always write the
-   full qualified reference in FROM/JOIN clauses.
+9. Schema-qualified FROM/JOIN clauses: always write FROM schema.table.
+   Use short aliases for column references so you avoid unsupported 3-part names:
+     CORRECT: FROM public.orders AS o  WHERE o.id = 1  SELECT o.col1
+     WRONG:   FROM orders WHERE orders.id = 1         -- unqualified table
+     WRONG:   WHERE public.orders.id = 1              -- 3-part names fail in PostgreSQL
+   Do NOT use backtick quoting (`col`) — it is MySQL syntax and causes errors in PostgreSQL/SQLite.
+   Use double-quotes ("col") only when a column name contains spaces or is a reserved word.
 9b. CROSS-TABLE RULES — read carefully:
     a. To JOIN two tables you MUST have a column listed under "POSSIBLE JOIN KEYS"
        in the schema context, or one shown on a "FK:" line.
@@ -100,18 +105,28 @@ Rules:
 13. Percentage calculations — when the question asks for %, share, proportion,
     or percentage of a total:
     a. Always compute the percentage IN SQL — do not leave it to the reader.
-    b. Use a window function to avoid a subquery where possible:
+    b. Choose the form that matches TARGET DATABASE TYPE:
+       PostgreSQL / Redshift / BigQuery / SQL Server — window function:
          ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Percentage
-       or for SUM-based measures:
          ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Percentage
+       SQLite / CSV / Excel — window function over aggregate is INVALID.
+       Use a CTE to pre-aggregate and then divide:
+         WITH grp AS (SELECT category, COUNT(*) AS cnt FROM t WHERE ... GROUP BY category)
+         SELECT category, cnt,
+                ROUND(cnt * 100.0 / (SELECT SUM(cnt) FROM grp), 2) AS Pct
+         FROM grp
     c. Always include both the raw value (count or sum) AND the percentage column
        in the SELECT list so the user sees both.
     d. Label the percentage column clearly, e.g. AS Headcount_Pct or AS Revenue_Pct.
     e. Round percentages to 2 decimal places with ROUND(..., 2).
     f. If asked "what percentage is X of Y" without a GROUP BY, use a single-row
-       scalar expression:
-         SELECT ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM table), 2) AS Pct
-       — still include the raw numerator and denominator counts alongside it.
+       scalar expression (valid in all databases):
+         SELECT
+           SUM(CASE WHEN condition THEN 1 ELSE 0 END) AS numerator,
+           COUNT(*) AS denominator,
+           ROUND(SUM(CASE WHEN condition THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS Pct
+         FROM table_name
+       — include both the raw counts and the percentage column.
 """
 
 _USER_PROMPT = """\
@@ -359,8 +374,9 @@ def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
     Safety net: if the LLM wrote `FROM orders` but the schema is `public`,
     rewrite bare table references to schema-qualified form `public.orders`.
 
-    Only touches identifiers that exactly match known table labels and are not
-    already preceded by a dot (i.e., not already schema-qualified).
+    Restricted to FROM / JOIN contexts ONLY.  Replacing table names in SELECT
+    column lists or WHERE predicates creates invalid 3-part names like
+    `public.column_name` which cause syntax errors in PostgreSQL/SQLite.
     """
     if not db_schema or not known_tables:
         return sql
@@ -371,11 +387,14 @@ def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
         # Skip if already present in the SQL (case-insensitive)
         if re.search(re.escape(qualified), sql, re.IGNORECASE):
             continue
-        # Replace bare table name not preceded by a dot
-        # Negative lookbehind for `.` or alphanumeric ensures we don't touch substrings
-        pattern = r'(?<![.\w])\b' + re.escape(table) + r'\b(?!\s*\.)'
-        if re.search(pattern, sql, re.IGNORECASE):
-            sql = re.sub(pattern, qualified, sql, flags=re.IGNORECASE)
+        # Only replace immediately after FROM or JOIN keywords so we never
+        # accidentally qualify a column reference or a string literal value.
+        sql = re.sub(
+            r'(\b(?:FROM|JOIN)\b)(\s+)' + re.escape(table) + r'(?![\.\w])',
+            lambda m, q=qualified: m.group(1) + m.group(2) + q,
+            sql,
+            flags=re.IGNORECASE,
+        )
 
     return sql
 
@@ -387,15 +406,26 @@ _PERCENTAGE_KEYWORDS = re.compile(
 )
 
 
-def _fix_percentage(sql: str, natural_query: str) -> str:
+def _fix_percentage(sql: str, natural_query: str, db_type: str = "") -> str:
     """
     If the question asks for a percentage and the SQL has a GROUP BY aggregate
     but no percentage column, inject a window-function percentage expression.
 
     Works for both COUNT(*) and SUM(col) aggregates.
     Leaves the SQL unchanged if it already contains a percentage expression.
+
+    NOTE: SUM(COUNT(*)) OVER () is a nested aggregate inside a window function.
+    This is valid in PostgreSQL, Redshift, BigQuery, and SQL Server 2012+, but
+    NOT in SQLite (used for CSV/Excel sources).  Skip injection for SQLite so
+    we do not introduce syntax errors — the system prompt instructs the LLM to
+    handle percentages directly.
     """
     if not _PERCENTAGE_KEYWORDS.search(natural_query):
+        return sql
+
+    # Skip for SQLite/file-based sources to avoid nested-aggregate syntax errors
+    _SQLITE_BASED = {"sqlite", "csv", "excel"}
+    if db_type.lower() in _SQLITE_BASED:
         return sql
 
     sql_upper = sql.upper()
@@ -659,13 +689,15 @@ def plan_node(state: DialogState) -> DialogState:
         if not item.get("sql"):
             continue
 
-        sql = item["sql"].strip()
+        # Strip trailing semicolons so downstream regexes match end-of-string ($)
+        sql = item["sql"].strip().rstrip(";").strip()
         # Safety net: ensure table names are schema-qualified even if LLM forgot
         sql = _qualify_sql(sql, db_schema, table_labels)
         # Headcount fix: replace SUM() with COUNT(*) when question is about people
         sql = _fix_count_vs_sum(sql, natural_query)
         # Percentage fix: inject window-function percentage column when % is asked for
-        sql = _fix_percentage(sql, natural_query)
+        # (skipped for SQLite/CSV/Excel to avoid nested-aggregate syntax errors)
+        sql = _fix_percentage(sql, natural_query, config.db_type)
         # LIMIT enforcement: strip LIMIT from aggregation queries (all groups must
         # be returned); add row_limit to raw-row queries that have no LIMIT.
         sql = _enforce_sql_limits(sql, config.row_limit)

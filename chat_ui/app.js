@@ -159,7 +159,18 @@ function detectChartConfig(cols, rows) {
   const lblCols = cols.filter(c => !numCols.includes(c));
   if (!lblCols.length || !numCols.length) return null;
   const labelCol = lblCols[0];
-  const isTime   = /date|month|year|week|day|quarter|period|time|fiscal/i.test(labelCol);
+
+  // Suppress charts when the label column is an identifier/key — not a meaningful category.
+  // Identifiers: column name contains id/key/sku/code/uuid/hash/no/num/ref/pk suffixes.
+  const isIdCol = /(\b|_)(id|key|sku|code|uuid|guid|hash|no|num|nr|ref|pk)(\b|_|$)/i.test(labelCol);
+  if (isIdCol) return null;
+
+  // Suppress charts when label values are not unique (duplicate rows = unaggregated detail data).
+  const labelVals = rows.map(r => r[labelCol]);
+  const hasDuplicates = labelVals.length !== new Set(labelVals).size;
+  if (hasDuplicates) return null;
+
+  const isTime = /date|month|year|week|day|quarter|period|time|fiscal/i.test(labelCol);
   if (isTime)                                             return { type: 'line',    labelCol, numCols: numCols.slice(0, 5) };
   // KPI tiles: few rows with multiple metrics — each row becomes a card
   if (rows.length <= 5 && numCols.length === 1)           return { type: 'doughnut', labelCol, numCols };

@@ -220,10 +220,8 @@ def _summarise_graph(
             lines.append(f"  - {_qualified(db_schema, sql_name)}")
     lines.append("")
 
-    # ── Section 1b: Shared columns (valid join keys) ───────────────────────────
-    # Build a map of sanitized-column-name → [table_names] so we can surface
-    # the ONLY columns that legitimately appear in multiple tables.  The LLM
-    # must use one of these as a JOIN key; it must NOT invent its own.
+    # ── Section 1b: Join keys ──────────────────────────────────────────────────
+    # 1. Same-name columns appearing in 2+ tables (implicit join candidates).
     col_to_tables: Dict[str, List[str]] = {}
     for node in nodes:
         lbl   = node.get("label", "")
@@ -242,13 +240,32 @@ def _summarise_graph(
         if len(tbls) >= 2
     }
 
-    if shared_cols:
+    # 2. Explicit FK join pairs parsed from ObjectProperty rdfs:comments.
+    #    These capture cross-name FKs (e.g. orders.customer_id → customers.id).
+    explicit_fk_lines: List[str] = []
+    for e in edges:
+        src_lbl = node_label_by_id.get(e.get("from", ""), "")
+        tgt_lbl = node_label_by_id.get(e.get("to", ""), "")
+        if not src_lbl or not tgt_lbl:
+            continue
+        src_tbl = _to_sql_table(src_lbl) if samples is not None else src_lbl
+        tgt_tbl = _to_sql_table(tgt_lbl) if samples is not None else tgt_lbl
+        src_q   = _qualified(db_schema, src_tbl)
+        tgt_q   = _qualified(db_schema, tgt_tbl)
+        for pair in e.get("join_columns", []):
+            if len(pair) == 2:
+                sc = _to_sql_col(pair[0]) if samples is not None else pair[0]
+                tc = _to_sql_col(pair[1]) if samples is not None else pair[1]
+                explicit_fk_lines.append(f"  - JOIN ON {src_q}.{sc} = {tgt_q}.{tc}")
+
+    if shared_cols or explicit_fk_lines:
         lines.append(
-            "POSSIBLE JOIN KEYS — columns that exist in multiple tables "
-            "(ONLY these may be used in JOIN ON conditions):"
+            "POSSIBLE JOIN KEYS — use ONLY these in JOIN ON conditions:"
         )
         for col, tbls in sorted(shared_cols.items()):
             lines.append(f"  - {col}: shared by {', '.join(tbls)}")
+        for fk_line in explicit_fk_lines:
+            lines.append(fk_line)
         lines.append(
             "WARNING: Do NOT use any column in a JOIN ON clause unless it "
             "appears in this list or is shown on a FK line below."
@@ -301,14 +318,23 @@ def _summarise_graph(
 
         # Foreign-key relationships (edges)
         for edge in edges_by_src.get(node_id, []):
-            tgt_label = node_label_by_id.get(edge.get("to", ""), edge.get("to", "?"))
-            tgt_display = _to_sql_table(tgt_label) if samples is not None else tgt_label
+            tgt_label   = node_label_by_id.get(edge.get("to", ""), edge.get("to", "?"))
+            tgt_display  = _to_sql_table(tgt_label) if samples is not None else tgt_label
             tgt_qualified = _qualified(db_schema, tgt_display)
-            edge_title = edge.get("title", "")
-            rel_lbl    = edge.get("label", "")
-            lines.append(
-                f"  FK: {rel_lbl} -> {tgt_qualified}  ({edge_title})"
-            )
+            rel_lbl      = edge.get("label", "")
+            join_cols    = edge.get("join_columns", [])
+            if join_cols:
+                for pair in join_cols:
+                    if len(pair) == 2:
+                        sc = _to_sql_col(pair[0]) if samples is not None else pair[0]
+                        tc = _to_sql_col(pair[1]) if samples is not None else pair[1]
+                        lines.append(
+                            f"  FK ({rel_lbl}): "
+                            f"JOIN ON {qualified_name}.{sc} = {tgt_qualified}.{tc}"
+                        )
+            else:
+                edge_title = edge.get("title", "")
+                lines.append(f"  FK: {rel_lbl} -> {tgt_qualified}  ({edge_title})")
 
     lines.append("\n" + "=" * 60)
     return "\n".join(lines)

@@ -107,9 +107,11 @@ def _extract_ontology(g: Graph) -> Tuple[Dict, List]:
         range_uri = next(g.objects(prop_uri, RDFS.range), None)
         prop_label = _get_label(g, prop_uri) or _local_name(prop_uri)
         xsd_type   = _local_name(range_uri) if range_uri else "string"
+        prop_comments = [str(c) for c in g.objects(prop_uri, RDFS.comment)]
         classes[str(domain)]["datatype_props"].append({
-            "name":  prop_label,
-            "range": xsd_type,
+            "name":     prop_label,
+            "range":    xsd_type,
+            "comments": prop_comments,
         })
 
     # --- OWL ObjectProperties → directed edges ---
@@ -269,15 +271,30 @@ def _build_graph_data(classes: Dict, obj_props: List) -> Dict:
     nodes = []
     edges = []
 
+    # Regex to extract join column pairs from ObjectProperty rdfs:comments.
+    # Matches: "Join columns: col1 → col2" or "Explicit FK: tbl1.col1 → tbl2.col2"
+    _join_re     = re.compile(r'Join\s+columns?\s*:\s*(\w+)\s*[→>-]+\s*(\w+)', re.IGNORECASE)
+    _expl_fk_re  = re.compile(r'Explicit\s+FK\s*:\s*\S+?\.(\w+)\s*[→>-]+\s*\S+?\.(\w+)', re.IGNORECASE)
+
     for uri, cls in classes.items():
         # Include ALL properties — no cap. The dialog agent reads every column
         # from this title to build the schema context; truncating here causes
         # columns to disappear from the LLM's view of the schema.
-        dt_lines = "\n".join(
-            f"  {p['name']}: {p['range']}" for p in cls["datatype_props"]
-        )
+        dt_line_parts = []
+        for p in cls["datatype_props"]:
+            col_line = f"  {p['name']}: {p['range']}"
+            # Surface the first column-level comment (contains top values /
+            # statistics for PostgreSQL-sourced ontologies).
+            col_comments = p.get("comments", [])
+            if col_comments:
+                col_line += f"  -- {col_comments[0]}"
+            dt_line_parts.append(col_line)
+        dt_lines = "\n".join(dt_line_parts)
+
         title = f"Class: {cls['name']}"
-        for c in cls["comments"][:2]:
+        # Include ALL class comments (not just first two) — FD hints, row
+        # counts, and other metadata all live here and are useful for the LLM.
+        for c in cls["comments"]:
             title += f"\n{c}"
         if dt_lines:
             title += f"\n\nProperties:\n{dt_lines}"
@@ -296,12 +313,28 @@ def _build_graph_data(classes: Dict, obj_props: List) -> Dict:
             else "1:N" if op["is_functional"]
             else "M:N"
         )
-        comments = "; ".join(op["comments"][:2])
+        # Parse explicit FK join-column pairs from ObjectProperty rdfs:comments.
+        # These look like "Join columns: customer_id → id" or
+        # "Explicit FK: orders.customer_id → customers.id".
+        # Stored as a list of [src_col, tgt_col] so understand_node can emit
+        # precise "JOIN ON t1.col = t2.col" lines for the SQL planner.
+        join_columns: List[List[str]] = []
+        for c in op["comments"]:
+            m = _join_re.search(c)
+            if m:
+                join_columns.append([m.group(1), m.group(2)])
+                continue
+            m2 = _expl_fk_re.search(c)
+            if m2:
+                join_columns.append([m2.group(1), m2.group(2)])
+
+        comments = "; ".join(op["comments"])
         edges.append({
-            "from":  op["domain"],
-            "to":    op["range"],
-            "label": op["name"],
-            "title": f"{op['name']} ({cardinality})" + (f"\n{comments}" if comments else ""),
+            "from":         op["domain"],
+            "to":           op["range"],
+            "label":        op["name"],
+            "title":        f"{op['name']} ({cardinality})" + (f"\n{comments}" if comments else ""),
+            "join_columns": join_columns,   # [[src_col, tgt_col], ...]
         })
 
     return {"nodes": nodes, "edges": edges}

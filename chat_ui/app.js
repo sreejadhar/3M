@@ -1953,34 +1953,55 @@ function renderKGGraph(nodes, edges) {
 
   if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; }
 
+  const isDark   = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const fontClr  = isDark ? '#e2e8f0' : '#1a202c';
+  const edgeClr  = isDark ? '#718096' : '#a0aec0';
+  const edgeFont = isDark ? '#a0aec0' : '#4a5568';
+
   const visNodes = new vis.DataSet(nodes.map(n => ({
     id:    n.id,
     label: n.label,
     title: n.title,
-    color: n.color || '#63b3ed',
-    size:  n.size  || 20,
-    font:  { color: '#e2e8f0', size: 13 },
+    color: { background: n.color || '#63b3ed', border: '#3182ce',
+             highlight: { background: '#90cdf4', border: '#2b6cb0' } },
+    size:  n.size || 20,
+    font:  { color: fontClr, size: 13 },
   })));
 
   const visEdges = new vis.DataSet(edges.map((e, i) => ({
-    id:    i,
-    from:  e.from,
-    to:    e.to,
-    label: e.label,
-    title: e.title,
+    id:     i,
+    from:   e.from,
+    to:     e.to,
+    label:  e.label,
+    title:  e.title,
     arrows: { to: { enabled: true, scaleFactor: 0.6 } },
-    color:  { color: '#718096', highlight: '#63b3ed' },
-    font:   { color: '#a0aec0', size: 11 },
+    color:  { color: edgeClr, highlight: '#63b3ed' },
+    font:   { color: edgeFont, size: 11, align: 'middle' },
     smooth: { type: 'dynamic' },
   })));
 
   const options = {
-    physics: { stabilization: { iterations: 150 }, barnesHut: { gravitationalConstant: -3000 } },
-    interaction: { tooltipDelay: 100 },
-    nodes: { shape: 'ellipse', borderWidth: 1.5 },
+    physics: {
+      stabilization: { iterations: 200, fit: true },
+      barnesHut: { gravitationalConstant: -4000, springLength: 120 },
+    },
+    interaction: { tooltipDelay: 100, hover: true },
+    nodes: { shape: 'ellipse', borderWidth: 1.5, widthConstraint: { maximum: 140 } },
+    layout: { improvedLayout: true },
   };
 
-  _kgNetwork = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
+  // Defer init by one animation frame so the flex container has rendered dimensions
+  requestAnimationFrame(() => {
+    if (!document.getElementById('kgExplorerOverlay') ||
+        document.getElementById('kgExplorerOverlay').style.display === 'none') return;
+
+    _kgNetwork = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
+
+    // Fit view once physics stabilizes
+    _kgNetwork.once('stabilizationIterationsDone', () => {
+      _kgNetwork.fit({ animation: { duration: 300, easingFunction: 'easeInOutQuad' } });
+    });
+  });
 }
 
 async function saveOntologyAndKG(sourceId) {

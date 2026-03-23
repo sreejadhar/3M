@@ -49,13 +49,151 @@ from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Lazy import of GraphRAG helpers (only needed when graphrag-query endpoint is called)
-def _import_graphrag():
-    from dialog_agent.nodes.retrieve_node import (
-        _detect_backend, _schema_hash, _build_cache, _bfs_expand,
-        _build_adjacency, _EMBED_CACHE,
-    )
-    return _detect_backend, _schema_hash, _build_cache, _bfs_expand, _build_adjacency, _EMBED_CACHE
+# ── GraphRAG helpers (inlined — no dialog_agent import needed) ─────────────────
+# These functions mirror dialog_agent/nodes/retrieve_node.py but have no
+# LangGraph / LangChain dependencies, so they work in the orchestrator process.
+
+import hashlib
+import re as _re
+from collections import deque as _deque
+
+try:
+    import numpy as _np
+    _NUMPY_OK = True
+except ImportError:
+    _NUMPY_OK = False
+
+# Per-source embedding cache: f"{schema_hash}:{backend}" → _GRCache
+_GR_EMBED_CACHE: Dict[str, Any] = {}
+
+
+class _GRCache:
+    __slots__ = ("key", "backend", "node_ids", "texts", "matrix", "_vect")
+
+    def __init__(self, key, backend, node_ids, texts, matrix, vect=None):
+        self.key      = key
+        self.backend  = backend
+        self.node_ids = node_ids
+        self.texts    = texts
+        self.matrix   = matrix
+        self._vect    = vect
+
+    def embed_query(self, query: str):
+        import numpy as np
+        if self.backend == "sentence-transformers":
+            from sentence_transformers import SentenceTransformer
+            m = SentenceTransformer("all-MiniLM-L6-v2")
+            v = m.encode([query], normalize_embeddings=True)[0]
+            return v.astype(np.float32)
+        if self.backend == "openai":
+            from openai import OpenAI
+            resp = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "")).embeddings.create(
+                model="text-embedding-3-small", input=[query]
+            )
+            v = np.array(resp.data[0].embedding, dtype=np.float32)
+            n = np.linalg.norm(v)
+            return v / max(n, 1e-9)
+        if self.backend == "tfidf" and self._vect is not None:
+            v = self._vect.transform([query]).toarray()[0].astype(np.float32)
+            n = np.linalg.norm(v)
+            return v / max(n, 1e-9)
+        return _gr_keyword_embed([query], self.texts)[0]
+
+
+def _gr_node_text(node: Dict) -> str:
+    label = node.get("label", "")
+    title = node.get("title", "")
+    body  = _re.sub(r'^Class:\s*\S+\s*', '', title, flags=_re.IGNORECASE).strip()
+    return f"{label} {body}".strip()
+
+
+def _gr_keyword_embed(texts, vocab_texts=None):
+    import numpy as np
+    tok   = lambda t: _re.findall(r'\w+', t.lower())
+    src   = vocab_texts if vocab_texts is not None else texts
+    vocab = sorted({w for t in src for w in tok(t)})
+    idx   = {w: i for i, w in enumerate(vocab)}
+    mat   = np.zeros((len(texts), max(len(vocab), 1)), dtype=np.float32)
+    for i, t in enumerate(texts):
+        for w in tok(t):
+            if w in idx:
+                mat[i, idx[w]] = 1.0
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    return mat / np.maximum(norms, 1e-9)
+
+
+def _gr_detect_backend(preferred: str = "auto") -> str:
+    if preferred != "auto":
+        return preferred
+    for candidate, pkg in [("sentence-transformers", "sentence_transformers"),
+                            ("tfidf", "sklearn")]:
+        try:
+            __import__(pkg)
+            return candidate
+        except ImportError:
+            continue
+    return "keyword"
+
+
+def _gr_schema_hash(nodes) -> str:
+    fp = json.dumps(sorted((n.get("id", ""), n.get("title", "")) for n in nodes))
+    return hashlib.md5(fp.encode()).hexdigest()
+
+
+def _gr_build_cache(nodes, backend: str, s_hash: str) -> _GRCache:
+    import numpy as np
+    node_ids = [n.get("id", "") for n in nodes]
+    texts    = [_gr_node_text(n) for n in nodes]
+
+    if backend == "sentence-transformers":
+        from sentence_transformers import SentenceTransformer
+        model  = SentenceTransformer("all-MiniLM-L6-v2")
+        matrix = model.encode(texts, normalize_embeddings=True).astype(np.float32)
+        return _GRCache(s_hash, backend, node_ids, texts, matrix)
+
+    if backend == "openai":
+        from openai import OpenAI
+        resp   = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "")).embeddings.create(
+            model="text-embedding-3-small", input=texts)
+        vecs   = np.array([d.embedding for d in resp.data], dtype=np.float32)
+        norms  = np.linalg.norm(vecs, axis=1, keepdims=True)
+        matrix = vecs / np.maximum(norms, 1e-9)
+        return _GRCache(s_hash, backend, node_ids, texts, matrix)
+
+    if backend == "tfidf":
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        vect   = TfidfVectorizer(max_features=3000, sublinear_tf=True)
+        raw    = vect.fit_transform(texts).toarray().astype(np.float32)
+        norms  = np.linalg.norm(raw, axis=1, keepdims=True)
+        matrix = raw / np.maximum(norms, 1e-9)
+        return _GRCache(s_hash, backend, node_ids, texts, matrix, vect=vect)
+
+    matrix = _gr_keyword_embed(texts)
+    return _GRCache(s_hash, backend, node_ids, texts, matrix)
+
+
+def _gr_build_adjacency(edges) -> Dict[str, List]:
+    adj: Dict[str, List] = {}
+    for e in edges:
+        src, tgt = e.get("from", ""), e.get("to", "")
+        if src and tgt:
+            adj.setdefault(src, []).append(tgt)
+            adj.setdefault(tgt, []).append(src)
+    return adj
+
+
+def _gr_bfs_expand(seeds, adjacency, hop_depth: int) -> List[str]:
+    visited  = set(seeds)
+    frontier = _deque((nid, 0) for nid in seeds)
+    while frontier:
+        nid, depth = frontier.popleft()
+        if depth >= hop_depth:
+            continue
+        for nb in adjacency.get(nid, []):
+            if nb not in visited:
+                visited.add(nb)
+                frontier.append((nb, depth + 1))
+    return list(visited)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1382,28 +1520,20 @@ async def graphrag_query(source_id: str, req: GraphRAGQueryRequest):
         raise HTTPException(status_code=422, detail="Source has no KG nodes — index it first")
     if not req.query.strip():
         raise HTTPException(status_code=422, detail="Query must not be empty")
-
-    try:
-        (
-            _detect_backend, _schema_hash, _build_cache, _bfs_expand,
-            _build_adjacency, _EMBED_CACHE,
-        ) = _import_graphrag()
-    except ImportError as exc:
-        raise HTTPException(status_code=501,
-                            detail=f"GraphRAG dependencies not installed: {exc}")
+    if not _NUMPY_OK:
+        raise HTTPException(status_code=501, detail="numpy is required for GraphRAG — pip install numpy")
 
     def _run() -> Dict:
         import numpy as np
 
-        backend  = _detect_backend("auto")
-        s_hash   = _schema_hash(nodes)
-        key      = f"{s_hash}:{backend}"
+        backend = _gr_detect_backend("auto")
+        s_hash  = _gr_schema_hash(nodes)
+        key     = f"{s_hash}:{backend}"
 
-        if key not in _EMBED_CACHE:
-            _EMBED_CACHE[key] = _build_cache(nodes, backend, s_hash)
+        if key not in _GR_EMBED_CACHE:
+            _GR_EMBED_CACHE[key] = _gr_build_cache(nodes, backend, s_hash)
 
-        cache = _EMBED_CACHE[key]
-
+        cache  = _GR_EMBED_CACHE[key]
         q_vec  = cache.embed_query(req.query)
         scores = cache.matrix @ q_vec          # cosine similarity [N]
 
@@ -1411,8 +1541,8 @@ async def graphrag_query(source_id: str, req: GraphRAGQueryRequest):
         top_indices = scores.argsort()[::-1][:k]
         seed_ids    = [cache.node_ids[i] for i in top_indices]
 
-        adjacency    = _build_adjacency(edges)
-        expanded_ids = set(_bfs_expand(seed_ids, adjacency, req.hop_depth))
+        adjacency    = _gr_build_adjacency(edges)
+        expanded_ids = set(_gr_bfs_expand(seed_ids, adjacency, req.hop_depth))
 
         seed_nodes = [
             {
@@ -1424,10 +1554,10 @@ async def graphrag_query(source_id: str, req: GraphRAGQueryRequest):
         ]
 
         return {
-            "backend":        backend,
-            "seed_nodes":     seed_nodes,
-            "expanded_ids":   list(expanded_ids - set(seed_ids)),
-            "total_nodes":    len(nodes),
+            "backend":         backend,
+            "seed_nodes":      seed_nodes,
+            "expanded_ids":    list(expanded_ids - set(seed_ids)),
+            "total_nodes":     len(nodes),
             "retrieved_nodes": len(expanded_ids),
         }
 

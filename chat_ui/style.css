@@ -1515,6 +1515,93 @@ body {
 .result-table-wrap::-webkit-scrollbar-thumb { background:var(--clr-border); border-radius:2px; }
 .landing::-webkit-scrollbar           { width:6px; }
 
+/* ── KG GraphRAG query bar ───────────────────────────────────────────────────── */
+.kg-graphrag-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--clr-border);
+  flex-shrink: 0;
+  background: var(--clr-bg);
+}
+.kg-graphrag-input {
+  flex: 1;
+  padding: 5px 10px;
+  border: 1px solid var(--clr-border);
+  border-radius: 6px;
+  background: var(--clr-bg-input);
+  color: var(--clr-text);
+  font-size: 13px;
+  outline: none;
+}
+.kg-graphrag-input:focus { border-color: var(--clr-primary); }
+.kg-graphrag-btn {
+  padding: 5px 12px;
+  background: var(--clr-primary);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.kg-graphrag-btn:hover   { opacity: .85; }
+.kg-graphrag-btn:disabled { opacity: .5; cursor: default; }
+.kg-graphrag-reset {
+  width: 26px; height: 26px;
+  border: 1px solid var(--clr-border);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--clr-text-mute);
+  font-size: 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.kg-graphrag-reset:hover { background: var(--clr-bg-hover); }
+.kg-graphrag-legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px;
+  font-size: 11px;
+  border-bottom: 1px solid var(--clr-border);
+  flex-shrink: 0;
+  background: var(--clr-bg);
+  flex-wrap: wrap;
+}
+.kg-legend-seed, .kg-legend-expanded, .kg-legend-other {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.kg-legend-seed::before {
+  content: '';
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: #f6ad55;
+  display: inline-block;
+}
+.kg-legend-expanded::before {
+  content: '';
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: #68d391;
+  display: inline-block;
+}
+.kg-legend-other::before {
+  content: '';
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: #a0aec0;
+  display: inline-block;
+}
+.kg-graphrag-backend {
+  margin-left: auto;
+  color: var(--clr-text-mute);
+  font-style: italic;
+}
+
 /* ── Source card KG button ───────────────────────────────────────────────────── */
 .source-card-kg-btn {
   margin-left: auto;

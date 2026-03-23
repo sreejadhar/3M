@@ -1886,6 +1886,9 @@ function renderIndexLogSteps(events) {
 
 let _kgExplorerSourceId  = null;
 let _kgNetwork           = null;
+let _kgVisNodes          = null;   // vis.DataSet — kept for highlight updates
+let _kgVisEdges          = null;
+let _kgOriginalColors    = {};     // node id → original color object
 let _kgOntologyOriginal  = '';
 let _kgPreviewDebounce   = null;
 
@@ -1937,7 +1940,13 @@ function closeKGExplorer() {
   document.getElementById('kgExplorerOverlay').style.display = 'none';
   if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; }
   if (_kgPreviewDebounce) { clearTimeout(_kgPreviewDebounce); _kgPreviewDebounce = null; }
+  _kgVisNodes = null;
+  _kgVisEdges = null;
+  _kgOriginalColors = {};
   _kgExplorerSourceId = null;
+  document.getElementById('kgGraphragLegend').style.display = 'none';
+  document.getElementById('kgGraphragReset').style.display  = 'none';
+  document.getElementById('kgGraphragInput').value          = '';
 }
 
 function renderKGGraph(nodes, edges) {
@@ -1990,6 +1999,14 @@ function renderKGGraph(nodes, edges) {
     layout: { improvedLayout: true },
   };
 
+  // Store DataSets for highlight updates without rebuilding the network
+  _kgVisNodes = visNodes;
+  _kgVisEdges = visEdges;
+
+  // Capture original colors for reset
+  _kgOriginalColors = {};
+  nodes.forEach(n => { _kgOriginalColors[n.id] = null; });  // null = keep default
+
   // Defer init by one animation frame so the flex container has rendered dimensions
   requestAnimationFrame(() => {
     if (!document.getElementById('kgExplorerOverlay') ||
@@ -2002,6 +2019,125 @@ function renderKGGraph(nodes, edges) {
       _kgNetwork.fit({ animation: { duration: 300, easingFunction: 'easeInOutQuad' } });
     });
   });
+}
+
+async function apiGraphRAGQuery(sourceId, query, topK = 8, hopDepth = 2) {
+  const r = await fetch(`${API}/sources/${sourceId}/graphrag-query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query, top_k: topK, hop_depth: hopDepth }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function testGraphRAG(sourceId) {
+  const input = document.getElementById('kgGraphragInput');
+  const btn   = document.getElementById('kgGraphragBtn');
+  const query = input.value.trim();
+  if (!query) { input.focus(); return; }
+
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const result = await apiGraphRAGQuery(sourceId, query);
+    applyGraphRAGHighlight(result);
+  } catch (err) {
+    showToast(`GraphRAG query failed: ${err.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Search';
+  }
+}
+
+function applyGraphRAGHighlight(result) {
+  if (!_kgVisNodes) return;
+
+  const seedIds     = new Set(result.seed_nodes.map(n => n.id));
+  const expandedIds = new Set(result.expanded_ids || []);
+  const scoreMap    = Object.fromEntries(result.seed_nodes.map(n => [n.id, n.score]));
+
+  const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const dimmed = isDark
+    ? { background: '#2d3748', border: '#4a5568' }
+    : { background: '#e2e8f0', border: '#cbd5e0' };
+
+  const updates = _kgVisNodes.getIds().map(id => {
+    if (seedIds.has(id)) {
+      const score  = scoreMap[id] || 0;
+      const pct    = Math.round(score * 100);
+      const alpha  = 0.5 + score * 0.5;   // 0.5–1.0 opacity for background
+      return {
+        id,
+        color: {
+          background: `rgba(246,173,85,${alpha.toFixed(2)})`,  // gold
+          border:     '#d97706',
+          highlight:  { background: '#fbd38d', border: '#b45309' },
+        },
+        label:  _kgVisNodes.get(id).label + `\n(${pct}%)`,
+        font:   { color: isDark ? '#1a202c' : '#1a202c', size: 13, bold: true },
+      };
+    }
+    if (expandedIds.has(id)) {
+      return {
+        id,
+        color: {
+          background: '#68d391',    // green
+          border:     '#276749',
+          highlight:  { background: '#9ae6b4', border: '#276749' },
+        },
+        font: { color: '#1a202c', size: 13 },
+        label: _kgVisNodes.get(id).label,
+      };
+    }
+    // Dim everything else
+    return {
+      id,
+      color: { background: dimmed.background, border: dimmed.border },
+      font:  { color: isDark ? '#718096' : '#a0aec0', size: 12 },
+      label: _kgVisNodes.get(id).label,
+    };
+  });
+
+  _kgVisNodes.update(updates);
+
+  // Show legend + backend info
+  document.getElementById('kgGraphragLegend').style.display = 'flex';
+  document.getElementById('kgGraphragReset').style.display  = 'inline-flex';
+  document.getElementById('kgGraphragBackend').textContent  =
+    `backend: ${result.backend} · ${result.retrieved_nodes}/${result.total_nodes} nodes retrieved`;
+
+  // Focus the graph on seed nodes
+  if (_kgNetwork && result.seed_nodes.length) {
+    _kgNetwork.fit({
+      nodes:     result.seed_nodes.map(n => n.id),
+      animation: { duration: 400, easingFunction: 'easeInOutQuad' },
+    });
+  }
+}
+
+function resetGraphRAGHighlight() {
+  if (!_kgVisNodes) return;
+
+  const isDark  = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const fontClr = isDark ? '#e2e8f0' : '#1a202c';
+
+  const updates = _kgVisNodes.getIds().map(id => ({
+    id,
+    color: { background: '#63b3ed', border: '#3182ce',
+             highlight: { background: '#90cdf4', border: '#2b6cb0' } },
+    font:  { color: fontClr, size: 13, bold: false },
+    label: _kgVisNodes.get(id).label.replace(/\n\(\d+%\)$/, ''),
+  }));
+  _kgVisNodes.update(updates);
+
+  document.getElementById('kgGraphragLegend').style.display = 'none';
+  document.getElementById('kgGraphragReset').style.display  = 'none';
+  document.getElementById('kgGraphragInput').value          = '';
+
+  if (_kgNetwork) {
+    _kgNetwork.fit({ animation: { duration: 300, easingFunction: 'easeInOutQuad' } });
+  }
 }
 
 async function saveOntologyAndKG(sourceId) {
@@ -2110,6 +2246,13 @@ document.getElementById('kgExplorerOverlay').addEventListener('click', (e) => {
   if (e.target === document.getElementById('kgExplorerOverlay')) closeKGExplorer();
 });
 document.getElementById('kgOntologyEditor').addEventListener('input', _scheduleKGPreview);
+document.getElementById('kgGraphragBtn').addEventListener('click', () => {
+  if (_kgExplorerSourceId) testGraphRAG(_kgExplorerSourceId);
+});
+document.getElementById('kgGraphragInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && _kgExplorerSourceId) testGraphRAG(_kgExplorerSourceId);
+});
+document.getElementById('kgGraphragReset').addEventListener('click', resetGraphRAGHighlight);
 
 // Admin panel
 adminBtn.addEventListener('click', openAdminPanel);

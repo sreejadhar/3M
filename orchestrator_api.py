@@ -49,6 +49,14 @@ from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Lazy import of GraphRAG helpers (only needed when graphrag-query endpoint is called)
+def _import_graphrag():
+    from dialog_agent.nodes.retrieve_node import (
+        _detect_backend, _schema_hash, _build_cache, _bfs_expand,
+        _build_adjacency, _EMBED_CACHE,
+    )
+    return _detect_backend, _schema_hash, _build_cache, _bfs_expand, _build_adjacency, _EMBED_CACHE
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -1348,6 +1356,87 @@ async def source_index_events(source_id: str):
                 del _source_event_queues[source_id]
 
     return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
+class GraphRAGQueryRequest(BaseModel):
+    query:      str
+    top_k:      int = 8
+    hop_depth:  int = 2
+
+
+@app.post("/sources/{source_id}/graphrag-query")
+async def graphrag_query(source_id: str, req: GraphRAGQueryRequest):
+    """
+    Run in-memory GraphRAG retrieval against the source's KG nodes and return
+    seed nodes (with cosine scores) and BFS-expanded node IDs so the UI can
+    highlight them in the KG explorer.
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    nodes: List[Dict] = s.get("kg_nodes") or []
+    edges: List[Dict] = s.get("kg_edges") or []
+
+    if not nodes:
+        raise HTTPException(status_code=422, detail="Source has no KG nodes — index it first")
+    if not req.query.strip():
+        raise HTTPException(status_code=422, detail="Query must not be empty")
+
+    try:
+        (
+            _detect_backend, _schema_hash, _build_cache, _bfs_expand,
+            _build_adjacency, _EMBED_CACHE,
+        ) = _import_graphrag()
+    except ImportError as exc:
+        raise HTTPException(status_code=501,
+                            detail=f"GraphRAG dependencies not installed: {exc}")
+
+    def _run() -> Dict:
+        import numpy as np
+
+        backend  = _detect_backend("auto")
+        s_hash   = _schema_hash(nodes)
+        key      = f"{s_hash}:{backend}"
+
+        if key not in _EMBED_CACHE:
+            _EMBED_CACHE[key] = _build_cache(nodes, backend, s_hash)
+
+        cache = _EMBED_CACHE[key]
+
+        q_vec  = cache.embed_query(req.query)
+        scores = cache.matrix @ q_vec          # cosine similarity [N]
+
+        k           = min(req.top_k, len(nodes))
+        top_indices = scores.argsort()[::-1][:k]
+        seed_ids    = [cache.node_ids[i] for i in top_indices]
+
+        adjacency    = _build_adjacency(edges)
+        expanded_ids = set(_bfs_expand(seed_ids, adjacency, req.hop_depth))
+
+        seed_nodes = [
+            {
+                "id":    cache.node_ids[i],
+                "label": nodes[i].get("label", cache.node_ids[i]),
+                "score": float(scores[i]),
+            }
+            for i in top_indices
+        ]
+
+        return {
+            "backend":        backend,
+            "seed_nodes":     seed_nodes,
+            "expanded_ids":   list(expanded_ids - set(seed_ids)),
+            "total_nodes":    len(nodes),
+            "retrieved_nodes": len(expanded_ids),
+        }
+
+    try:
+        result = await asyncio.to_thread(_run)
+        return result
+    except Exception as exc:
+        logger.exception("graphrag_query failed for source %s", source_id[:8])
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 async def _rebuild_kg(source_id: str, ontology_text: str) -> None:

@@ -436,6 +436,19 @@
         <!-- Left pane: KG graph -->
         <div class="kg-graph-pane">
           <div class="kg-pane-label">Knowledge Graph</div>
+          <!-- GraphRAG query bar -->
+          <div class="kg-graphrag-bar">
+            <input class="kg-graphrag-input" id="kgGraphragInput"
+                   type="text" placeholder="Test GraphRAG: type a natural language question…" />
+            <button class="kg-graphrag-btn" id="kgGraphragBtn">Search</button>
+            <button class="kg-graphrag-reset" id="kgGraphragReset" title="Clear highlights" style="display:none">✕</button>
+          </div>
+          <div class="kg-graphrag-legend" id="kgGraphragLegend" style="display:none">
+            <span class="kg-legend-seed">Seed (top-K)</span>
+            <span class="kg-legend-expanded">Expanded (BFS)</span>
+            <span class="kg-legend-other">Other nodes</span>
+            <span class="kg-graphrag-backend" id="kgGraphragBackend"></span>
+          </div>
           <div class="kg-graph-container" id="kgGraphContainer">
             <div class="kg-graph-placeholder" id="kgGraphPlaceholder">Loading graph…</div>
           </div>

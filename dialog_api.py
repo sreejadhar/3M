@@ -143,6 +143,9 @@ class QueryRequest(BaseModel):
     llm_model:       str = "claude-sonnet-4-6"        # synthesize node (insight quality)
     plan_llm_model:  str = "claude-haiku-4-5-20251001" # plan node (SQL generation — cheaper)
 
+    # User context — used to personalise insight framing
+    analyst_role: str = ""   # e.g. "Financial Analyst", "Supply Chain Analyst"
+
     # Cache control
     skip_cache: bool = False   # Set True to force a fresh run even if cached
 
@@ -276,6 +279,7 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
         plan_llm_model       = req.plan_llm_model,
         max_sql_queries      = req.max_sql_queries,
         row_limit            = req.row_limit,
+        analyst_role         = req.analyst_role or "",
     )
 
     # ── Session resolution ─────────────────────────────────────────────────────

@@ -887,8 +887,9 @@ async def session_events(session_id: str):
 # ── Chat endpoint ──────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message: str
-    skip_cache: bool = False
+    message:      str
+    skip_cache:   bool = False
+    analyst_role: str  = ""   # functional role sent from the UI persona selector
 
 
 @app.post("/sessions/{session_id}/chat", status_code=202)
@@ -926,12 +927,12 @@ async def send_chat(session_id: str, req: ChatRequest):
     })
 
     # Start background task to run the dialog
-    asyncio.create_task(_run_dialog(session_id, msg_id, req.message, req.skip_cache))
+    asyncio.create_task(_run_dialog(session_id, msg_id, req.message, req.skip_cache, req.analyst_role or ""))
 
     return {"msg_id": msg_id, "session_id": session_id}
 
 
-async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bool) -> None:
+async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bool, analyst_role: str = "") -> None:
     session = _sessions.get(session_id)
     if not session:
         return
@@ -949,6 +950,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
         "session_id":      dialog_session_id,
         "row_limit":       500,
         "max_sql_queries": 10,
+        "analyst_role":    analyst_role,
     }
     if db_type.lower() in _FILE_BASED_TYPES:
         dialog_payload["db_file_path"] = session.get("db_file_path") or ""

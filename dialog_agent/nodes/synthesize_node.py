@@ -179,9 +179,21 @@ def synthesize_node(state: DialogState) -> DialogState:
         results_text=results_text,
     )
 
+    # Prepend analyst-role context so the LLM tailors terminology and framing
+    analyst_role = getattr(config, "analyst_role", "").strip()
+    if analyst_role:
+        role_prefix = (
+            f"You are assisting a **{analyst_role}**. "
+            f"Tailor your insights, terminology, and recommendations to be most "
+            f"relevant and actionable for this specific role.\n\n"
+        )
+        system = role_prefix + _SYSTEM_PROMPT
+    else:
+        system = _SYSTEM_PROMPT
+
     try:
         insights = _call_llm(
-            _SYSTEM_PROMPT, user_prompt,
+            system, user_prompt,
             config.llm_model, config.llm_temperature,
         )
         logger.info("synthesize_node: insights generated (%d chars)", len(insights))

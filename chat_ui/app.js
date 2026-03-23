@@ -10,7 +10,22 @@ const PERSONAS = {
   admin:         { label: 'Data Admin',       icon: '⚙️', showSQL: true,  canConnect: true,  isAdmin: true  },
 };
 
-let currentPersona = localStorage.getItem('datachat_persona') || 'business_user';
+// ── Analyst roles (business_user sub-personas) ─────────────────────────────
+const ANALYST_ROLES = [
+  { key: 'supply_chain',  label: 'Supply Chain Analyst',       icon: '🔗' },
+  { key: 'program_mgmt',  label: 'Program Management Analyst', icon: '📋' },
+  { key: 'financial',     label: 'Financial Analyst',          icon: '💰' },
+  { key: 'people',        label: 'People & Workforce Analyst', icon: '👥' },
+  { key: 'logistics',     label: 'Logistics Analyst',          icon: '🚚' },
+  { key: 'sales',         label: 'Sales Analyst',              icon: '📈' },
+  { key: 'marketing',     label: 'Marketing Analyst',          icon: '📣' },
+  { key: 'it',            label: 'IT Analyst',                 icon: '💻' },
+  { key: 'other',         label: 'Other',                      icon: '✏️' },
+];
+
+let currentPersona     = localStorage.getItem('datachat_persona') || 'business_user';
+// currentAnalystRole: '' | role key | 'other' (pending) | 'other:Custom text'
+let currentAnalystRole = localStorage.getItem('datachat_analyst_role') || '';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let activeSessionId   = null;
@@ -374,6 +389,10 @@ function applyPersona() {
     el.classList.toggle('active', el.dataset.persona === currentPersona);
   });
 
+  // Show/hide role picker section in dropdown
+  renderAnalystRoleSection();
+  updateRoleBadge();
+
   // Admin button visibility
   sidebarBottom.style.display = p.isAdmin ? '' : 'none';
 
@@ -392,10 +411,78 @@ function applyPersona() {
 function switchPersona(persona) {
   currentPersona = persona;
   localStorage.setItem('datachat_persona', persona);
-  personaDropdown.style.display = 'none';
+  if (persona !== 'business_user') {
+    personaDropdown.style.display = 'none';
+  }
   applyPersona();
   showToast(`Switched to ${PERSONAS[persona].label}`, 'info', 2500);
 }
+
+// ── Analyst role helpers ───────────────────────────────────────────────────
+
+function getAnalystRoleLabel() {
+  if (!currentAnalystRole || currentPersona !== 'business_user') return '';
+  if (currentAnalystRole.startsWith('other:')) return currentAnalystRole.slice(6).trim();
+  const r = ANALYST_ROLES.find(x => x.key === currentAnalystRole);
+  return r && r.key !== 'other' ? r.label : '';
+}
+
+function updateRoleBadge() {
+  const roleText = document.getElementById('personaRoleText');
+  if (!roleText) return;
+  const label = getAnalystRoleLabel();
+  roleText.textContent = label;
+  roleText.style.display = label ? '' : 'none';
+}
+
+function renderAnalystRoleSection() {
+  const section  = document.getElementById('personaRoleSection');
+  const chipsEl  = document.getElementById('personaRoleChips');
+  const customEl = document.getElementById('personaRoleCustom');
+  if (!section || !chipsEl) return;
+
+  if (currentPersona !== 'business_user') {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = '';
+
+  const isOtherPending  = currentAnalystRole === 'other';
+  const isOtherCustom   = currentAnalystRole.startsWith('other:');
+  const activeKey       = isOtherCustom ? 'other' : currentAnalystRole;
+
+  chipsEl.innerHTML = ANALYST_ROLES.map(r =>
+    `<button class="role-chip${activeKey === r.key ? ' active' : ''}"
+             onclick="selectAnalystRole('${r.key}')">${r.icon} ${r.label}</button>`
+  ).join('');
+
+  if (customEl) {
+    customEl.style.display = (isOtherPending || isOtherCustom) ? '' : 'none';
+    if (isOtherCustom) {
+      const inp = document.getElementById('personaRoleInput');
+      if (inp && !inp.value) inp.value = currentAnalystRole.slice(6).trim();
+    }
+  }
+}
+
+window.selectAnalystRole = function(key) {
+  if (key === 'other') {
+    // Mark as "other pending" — show input but don't confirm yet
+    currentAnalystRole = 'other';
+    localStorage.setItem('datachat_analyst_role', 'other');
+    renderAnalystRoleSection();
+    setTimeout(() => document.getElementById('personaRoleInput')?.focus(), 50);
+    return;
+  }
+  currentAnalystRole = key;
+  localStorage.setItem('datachat_analyst_role', key);
+  renderAnalystRoleSection();
+  updateRoleBadge();
+  // Close dropdown after picking a named role
+  personaDropdown.style.display = 'none';
+  const r = ANALYST_ROLES.find(x => x.key === key);
+  if (r) showToast(`Role set: ${r.label}`, 'info', 2000);
+};
 
 // ── View management ───────────────────────────────────────────────────────────
 
@@ -495,7 +582,7 @@ async function apiSendChat(sessionId, message) {
   const r = await fetch(`${API}/sessions/${sessionId}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({ message, analyst_role: getAnalystRoleLabel() }),
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({ detail: r.statusText }));
@@ -999,6 +1086,21 @@ function updateSendState() {
 async function sendMessage() {
   const text = msgInput.value.trim();
   if (!text || isWaitingForReply || !activeSessionId) return;
+
+  // If business_user selected "Other" but hasn't entered a custom role, prompt them first
+  if (currentPersona === 'business_user' && currentAnalystRole === 'other') {
+    const rect = sidebar.getBoundingClientRect();
+    personaDropdown.style.display = 'flex';
+    personaDropdown.style.left = `${rect.left + 8}px`;
+    personaDropdown.style.top  = `${rect.top + 110}px`;
+    personaDropdown.style.flexDirection = 'column';
+    personaDropdown.style.width = `${rect.width - 16}px`;
+    renderAnalystRoleSection();
+    setTimeout(() => document.getElementById('personaRoleInput')?.focus(), 50);
+    showToast('Please describe your role so I can tailor my answers to you.', 'info', 5000);
+    return;
+  }
+
   isWaitingForReply = true;
   const tmp = msgInput.value;
   msgInput.value = '';
@@ -1581,6 +1683,22 @@ document.addEventListener('click', (e) => {
   if (!personaDropdown.contains(e.target) && !personaSwitchBtn.contains(e.target)) {
     personaDropdown.style.display = 'none';
   }
+});
+
+// Custom role "OK" button
+document.getElementById('personaRoleOk')?.addEventListener('click', () => {
+  const inp = document.getElementById('personaRoleInput');
+  const val = inp?.value.trim();
+  if (!val) { inp?.focus(); return; }
+  currentAnalystRole = 'other:' + val;
+  localStorage.setItem('datachat_analyst_role', currentAnalystRole);
+  renderAnalystRoleSection();
+  updateRoleBadge();
+  personaDropdown.style.display = 'none';
+  showToast(`Role set: ${val}`, 'info', 2000);
+});
+document.getElementById('personaRoleInput')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('personaRoleOk')?.click();
 });
 
 // Admin panel

@@ -140,19 +140,18 @@ function formatAxisValue(n) {
 
 function detectChartConfig(cols, rows) {
   if (!rows.length || cols.length < 2) return null;
-  const numCols = cols.filter(c => rows.slice(0, 3).every(r => r[c] !== null && r[c] !== undefined && isNumeric(r[c])));
+  const numCols = cols.filter(c => rows.slice(0, 5).every(r => r[c] !== null && r[c] !== undefined && isNumeric(r[c])));
   const lblCols = cols.filter(c => !numCols.includes(c));
   if (!lblCols.length || !numCols.length) return null;
-  if (rows.length > 30) return null;
   const labelCol = lblCols[0];
   const isTime   = /date|month|year|week|day|quarter|period|time|fiscal/i.test(labelCol);
-  if (isTime)                                    return { type: 'line',     labelCol, numCols: numCols.slice(0, 3) };
-  if (rows.length <= 6 && numCols.length === 1)  return { type: 'doughnut', labelCol, numCols };
-  // Horizontal bar is the most readable default for named categories
-  return                                                { type: 'hbar',     labelCol, numCols: numCols.slice(0, 3) };
+  if (isTime)                                    return { type: 'line',     labelCol, numCols: numCols.slice(0, 5) };
+  if (rows.length <= 8 && numCols.length === 1)  return { type: 'doughnut', labelCol, numCols };
+  if (rows.length > 60)                          return null;
+  return                                                { type: 'hbar',     labelCol, numCols: numCols.slice(0, 5) };
 }
 
-function renderChart(canvasId, cols, rows, title) {
+function renderChart(canvasId, cols, rows) {
   if (typeof Chart === 'undefined') return;
   const cfg = detectChartConfig(cols, rows);
   if (!cfg) return;
@@ -160,10 +159,10 @@ function renderChart(canvasId, cols, rows, title) {
   const wrap = document.getElementById(canvasId)?.parentElement;
   if (!wrap) return;
 
-  // Size the container dynamically: horizontal bars need height per row
+  // Dynamic height for horizontal bars
   if (cfg.type === 'hbar') {
-    const rowH = cfg.numCols.length > 1 ? 22 : 28;
-    wrap.style.height = Math.max(200, rows.length * rowH + 80) + 'px';
+    const rowH = cfg.numCols.length > 1 ? 28 : 34;
+    wrap.style.height = Math.max(220, rows.length * rowH + 90) + 'px';
   }
 
   const canvas = document.getElementById(canvasId);
@@ -171,95 +170,132 @@ function renderChart(canvasId, cols, rows, title) {
   if (_charts[canvasId]) { _charts[canvasId].destroy(); delete _charts[canvasId]; }
 
   const isDark  = window.matchMedia('(prefers-color-scheme: dark)').matches;
-  const gridClr = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)';
+  const gridClr = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)';
   const tickClr = isDark ? '#9aa0ac' : '#6b7280';
   const lblClr  = isDark ? '#c9d1d9' : '#374151';
   const labels  = rows.map(r => String(r[cfg.labelCol] ?? ''));
+  const ctx     = canvas.getContext('2d');
 
   const datasets = cfg.numCols.map((col, i) => {
     const color = CHART_PALETTE[i % CHART_PALETTE.length];
+
     if (cfg.type === 'doughnut') {
       return {
         label: col,
         data: rows.map(r => Number(r[col]) || 0),
-        backgroundColor: CHART_PALETTE.slice(0, rows.length),
-        borderWidth: 2,
+        backgroundColor: CHART_PALETTE.slice(0, rows.length).map(c => c + 'dd'),
+        borderWidth: 3,
         borderColor: isDark ? '#1e2432' : '#ffffff',
+        hoverBorderWidth: 4,
+        hoverOffset: 8,
       };
     }
+
+    if (cfg.type === 'line') {
+      const h = wrap.clientHeight || 300;
+      const grad = ctx.createLinearGradient(0, 0, 0, h);
+      grad.addColorStop(0, color + '55');
+      grad.addColorStop(1, color + '00');
+      return {
+        label: col,
+        data: rows.map(r => Number(r[col]) || 0),
+        backgroundColor: grad,
+        borderColor: color,
+        borderWidth: 2.5,
+        fill: true,
+        tension: 0.4,
+        pointRadius: rows.length < 25 ? 4 : 2,
+        pointHoverRadius: 6,
+        pointBackgroundColor: color,
+        pointBorderColor: isDark ? '#1e2432' : '#fff',
+        pointBorderWidth: 2,
+      };
+    }
+
+    // Horizontal bar
     return {
       label: col,
       data: rows.map(r => Number(r[col]) || 0),
-      backgroundColor: cfg.type === 'line'
-        ? color + '26'   // 15% opacity for fill
-        : color + 'cc',  // 80% opacity for bars
-      borderColor: color,
-      borderWidth: cfg.type === 'line' ? 2 : 0,
-      borderRadius: cfg.type !== 'line' ? 4 : 0,
-      fill: cfg.type === 'line',
-      tension: 0.35,
-      pointRadius: cfg.type === 'line' ? 3 : 0,
-      pointBackgroundColor: color,
+      backgroundColor: color + 'cc',
+      hoverBackgroundColor: color,
+      borderRadius: 5,
+      borderSkipped: false,
     };
   });
 
-  // Datalabels config: show values on bars and doughnut slices
+  // Datalabels: values on bars + percentages on doughnut slices
   const datalabelsPlugin = (typeof ChartDataLabels !== 'undefined');
   const datalabelsCfg = datalabelsPlugin ? {
     anchor:    cfg.type === 'doughnut' ? 'center' : 'end',
     align:     cfg.type === 'doughnut' ? 'center' : 'end',
-    offset:    cfg.type === 'doughnut' ? 0 : 4,
+    offset:    cfg.type === 'doughnut' ? 0 : 5,
     color:     cfg.type === 'doughnut' ? '#fff' : lblClr,
     font:      { size: 11, weight: '600' },
-    formatter: (v) => formatAxisValue(v),
-    display:   (ctx) => {
-      // Hide label if bar is too short to fit
-      if (cfg.type === 'doughnut') return true;
-      const max = Math.max(...(ctx.dataset.data));
-      return max > 0 ? ctx.dataset.data[ctx.dataIndex] / max > 0.05 : false;
+    formatter: (v, context) => {
+      if (cfg.type === 'doughnut') {
+        const total = context.dataset.data.reduce((a, b) => a + b, 0);
+        return total > 0 ? (v / total * 100).toFixed(1) + '%' : '';
+      }
+      return formatAxisValue(v);
+    },
+    display: (context) => {
+      if (cfg.type === 'doughnut') return context.dataset.data[context.dataIndex] > 0;
+      if (cfg.type === 'line') return false;
+      const max = Math.max(...context.dataset.data);
+      return max > 0 ? context.dataset.data[context.dataIndex] / max > 0.06 : false;
     },
   } : false;
 
-  const isHbar = cfg.type === 'hbar';
+  const isHbar    = cfg.type === 'hbar';
   const chartType = isHbar ? 'bar' : cfg.type;
 
   const scaleOpts = cfg.type === 'doughnut' ? {} : {
     [isHbar ? 'x' : 'y']: {
       beginAtZero: true,
       grid: { color: gridClr },
-      ticks: { color: tickClr, callback: formatAxisValue },
+      ticks: { color: tickClr, callback: formatAxisValue, maxTicksLimit: 6 },
     },
     [isHbar ? 'y' : 'x']: {
       grid: { display: false },
       ticks: {
         color: tickClr,
         maxRotation: isHbar ? 0 : 35,
-        // Truncate long labels to keep chart readable
-        callback: (v, i) => {
+        callback: (_v, i) => {
           const lbl = labels[i] || '';
-          return lbl.length > 22 ? lbl.slice(0, 20) + '…' : lbl;
+          return lbl.length > 26 ? lbl.slice(0, 24) + '…' : lbl;
         },
       },
     },
   };
 
   const plugins = {
-    title: {
-      display: !!title,
-      text: title,
-      color: lblClr,
-      font: { size: 13, weight: '600' },
-      padding: { bottom: 12 },
-    },
+    title: { display: false },
     legend: {
       display: cfg.numCols.length > 1 || cfg.type === 'doughnut',
-      position: 'bottom',
-      labels: { color: tickClr, boxWidth: 12, padding: 12, font: { size: 12 } },
+      position: cfg.type === 'doughnut' ? 'right' : 'bottom',
+      labels: {
+        color: tickClr,
+        boxWidth: 12,
+        padding: 16,
+        font: { size: 12 },
+        usePointStyle: cfg.type === 'line',
+      },
     },
     tooltip: {
       mode: cfg.type === 'doughnut' ? 'nearest' : 'index',
       intersect: false,
-      callbacks: { label: (ctx) => ` ${ctx.dataset.label}: ${formatAxisValue(ctx.parsed[isHbar ? 'x' : 'y'] ?? ctx.parsed)}` },
+      backgroundColor: isDark ? '#2d3347' : '#ffffff',
+      titleColor: lblClr,
+      bodyColor: tickClr,
+      borderColor: isDark ? '#3d4661' : '#e3e8f0',
+      borderWidth: 1,
+      padding: 10,
+      callbacks: {
+        label: (context) => {
+          const v = isHbar ? context.parsed.x : (context.parsed.y ?? context.parsed);
+          return ` ${context.dataset.label}: ${formatAxisValue(v)}`;
+        },
+      },
     },
     ...(datalabelsPlugin ? { datalabels: datalabelsCfg } : {}),
   };
@@ -275,6 +311,7 @@ function renderChart(canvasId, cols, rows, title) {
       indexAxis: isHbar ? 'y' : 'x',
       plugins,
       scales: scaleOpts,
+      animation: { duration: 450, easing: 'easeInOutQuart' },
     },
   });
 }
@@ -282,10 +319,21 @@ function renderChart(canvasId, cols, rows, title) {
 // ── Insight callout post-processing ──────────────────────────────────────────
 
 function processInsightCallouts(html) {
+  const KNOWN_ICONS = ['💡','✅','⚠️','🔍','📌','🎯','⚡','🚨','📊','💰','🔑','🏆','📈','📉','🔎'];
   return html.replace(/<blockquote>\s*<p>([\s\S]*?)<\/p>\s*<\/blockquote>/g, (_, inner) => {
-    const isRec  = /recommendation|action item|next step|should|must|consider/i.test(inner);
-    const cls    = isRec ? 'callout-recommendation' : 'callout-insight';
-    return `<div class="insight-callout ${cls}"><p>${inner}</p></div>`;
+    let icon = '';
+    let bodyText = inner.trim();
+    for (const ic of KNOWN_ICONS) {
+      if (bodyText.startsWith(ic)) {
+        icon = ic;
+        bodyText = bodyText.slice(ic.length).trim();
+        break;
+      }
+    }
+    const isRec    = /recommendation|action item|next step|should|must|consider/i.test(inner);
+    const cls      = isRec ? 'callout-recommendation' : 'callout-insight';
+    const iconHtml = icon ? `<div class="callout-icon">${icon}</div>` : '';
+    return `<div class="insight-callout ${cls}">${iconHtml}<div class="callout-body"><p>${bodyText}</p></div></div>`;
   });
 }
 
@@ -826,7 +874,7 @@ function renderAIMessage(ev) {
   (ev.results || []).forEach((r, i) => {
     const { cols, rows } = normalizeRows(r);
     if (!rows.length) return;
-    renderChart(`chart-${ev.msg_id}-${i}`, cols, rows, r.description || '');
+    renderChart(`chart-${ev.msg_id}-${i}`, cols, rows);
   });
 
   scrollToBottom();
@@ -846,11 +894,58 @@ function buildResultBlocks(results, msgId) {
   return results.map((r, i) => {
     const { cols, rows } = normalizeRows(r);
     if (!rows.length) return '';
-    const canvasId = `chart-${msgId}-${i}`;
-    if (!detectChartConfig(cols, rows)) return '';
+
+    const canvasId  = `chart-${msgId}-${i}`;
+    const tableId   = `tbl-${msgId}-${i}`;
+    const chartable = detectChartConfig(cols, rows);
+    const desc      = r.description || '';
+    const rowCount  = r.row_count ?? rows.length;
+
+    // Data table (up to 50 rows in the block; full data is in query results)
+    const displayRows = rows.slice(0, 50);
+    const thead = '<tr>' + cols.map(c => `<th>${escHtml(c)}</th>`).join('') + '</tr>';
+    const tbody = displayRows.map(row =>
+      '<tr>' + cols.map(c => {
+        const v = row[c];
+        return `<td class="${isNumeric(v) ? 'num-cell' : ''}">${escHtml(formatNumber(v))}</td>`;
+      }).join('') + '</tr>'
+    ).join('');
+    const moreNote = rows.length > 50
+      ? `<div class="table-more-note">Showing 50 of ${rows.length.toLocaleString()} rows</div>` : '';
+
+    if (chartable) {
+      return `
+        <div class="result-block">
+          <div class="result-block-header">
+            <span class="result-block-icon">📊</span>
+            <span class="result-block-title">${escHtml(desc)}</span>
+            <span class="result-row-badge">${rowCount.toLocaleString()} rows</span>
+          </div>
+          <div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>
+          <div class="result-data-footer">
+            <button class="data-toggle-btn" onclick="toggleDataTable('${tableId}', this)">
+              <span class="data-toggle-icon">▶</span> Show data
+            </button>
+          </div>
+          <div class="result-table-wrap table-hidden" id="${tableId}">
+            <table class="result-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table>
+            ${moreNote}
+          </div>
+        </div>`;
+    }
+
+    // Not chartable — show table only
     return `
-      <div class="result-block chart-only">
-        <div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>
+      <div class="result-block">
+        <div class="result-block-header">
+          <span class="result-block-icon">📋</span>
+          <span class="result-block-title">${escHtml(desc)}</span>
+          <span class="result-row-badge">${rowCount.toLocaleString()} rows</span>
+        </div>
+        <div class="result-table-wrap">
+          <table class="result-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table>
+          ${moreNote}
+        </div>
       </div>`;
   }).join('');
 }
@@ -885,6 +980,13 @@ window.toggleSQL = function(id) {
   if (!block) return;
   const open = block.classList.toggle('visible');
   if (icon) { icon.textContent = open ? '▼' : '▶'; icon.classList.toggle('open', open); }
+};
+
+window.toggleDataTable = function(id, btn) {
+  const tbl = document.getElementById(id);
+  if (!tbl) return;
+  const hidden = tbl.classList.toggle('table-hidden');
+  if (btn) btn.innerHTML = `<span class="data-toggle-icon">${hidden ? '▶' : '▼'}</span> ${hidden ? 'Show data' : 'Hide data'}`;
 };
 
 // ── Send logic ────────────────────────────────────────────────────────────────

@@ -160,16 +160,22 @@ function detectChartConfig(cols, rows) {
   if (!lblCols.length || !numCols.length) return null;
   const labelCol = lblCols[0];
   const isTime   = /date|month|year|week|day|quarter|period|time|fiscal/i.test(labelCol);
-  if (isTime)                                    return { type: 'line',     labelCol, numCols: numCols.slice(0, 5) };
-  if (rows.length <= 8 && numCols.length === 1)  return { type: 'doughnut', labelCol, numCols };
-  if (rows.length > 60)                          return null;
-  return                                                { type: 'hbar',     labelCol, numCols: numCols.slice(0, 5) };
+  if (isTime)                                             return { type: 'line',    labelCol, numCols: numCols.slice(0, 5) };
+  // KPI tiles: few rows with multiple metrics — each row becomes a card
+  if (rows.length <= 5 && numCols.length === 1)           return { type: 'doughnut', labelCol, numCols };
+  if (rows.length <= 5 && numCols.length >= 2)            return { type: 'kpi',     labelCol, numCols: numCols.slice(0, 5) };
+  // Stacked bar: multi-series breakdown
+  if (numCols.length >= 2 && rows.length <= 25)           return { type: 'stacked', labelCol, numCols: numCols.slice(0, 6) };
+  // Single-series fallbacks
+  if (rows.length <= 8)                                   return { type: 'doughnut', labelCol, numCols: numCols.slice(0, 1) };
+  if (rows.length <= 60)                                  return { type: 'hbar',    labelCol, numCols: numCols.slice(0, 1) };
+  return null;
 }
 
 function renderChart(canvasId, cols, rows) {
   if (typeof Chart === 'undefined') return;
   const cfg = detectChartConfig(cols, rows);
-  if (!cfg) return;
+  if (!cfg || cfg.type === 'kpi') return;  // kpi is HTML-only
 
   const wrap = document.getElementById(canvasId)?.parentElement;
   if (!wrap) return;
@@ -178,6 +184,10 @@ function renderChart(canvasId, cols, rows) {
   if (cfg.type === 'hbar') {
     const rowH = cfg.numCols.length > 1 ? 28 : 34;
     wrap.style.height = Math.max(220, rows.length * rowH + 90) + 'px';
+  }
+  // Taller canvas for stacked bars with many groups
+  if (cfg.type === 'stacked') {
+    wrap.style.height = Math.max(280, rows.length * 32 + 100) + 'px';
   }
 
   const canvas = document.getElementById(canvasId);
@@ -227,6 +237,18 @@ function renderChart(canvasId, cols, rows) {
       };
     }
 
+    // Stacked vertical bar
+    if (cfg.type === 'stacked') {
+      return {
+        label: col,
+        data: rows.map(r => Number(r[col]) || 0),
+        backgroundColor: color + 'dd',
+        hoverBackgroundColor: color,
+        borderRadius: i === cfg.numCols.length - 1 ? [4, 4, 0, 0] : 0,
+        borderSkipped: false,
+      };
+    }
+
     // Horizontal bar
     return {
       label: col,
@@ -262,15 +284,18 @@ function renderChart(canvasId, cols, rows) {
   } : false;
 
   const isHbar    = cfg.type === 'hbar';
-  const chartType = isHbar ? 'bar' : cfg.type;
+  const isStacked = cfg.type === 'stacked';
+  const chartType = (isHbar || isStacked) ? 'bar' : cfg.type;
 
   const scaleOpts = cfg.type === 'doughnut' ? {} : {
     [isHbar ? 'x' : 'y']: {
+      stacked: isStacked,
       beginAtZero: true,
       grid: { color: gridClr },
       ticks: { color: tickClr, callback: formatAxisValue, maxTicksLimit: 6 },
     },
     [isHbar ? 'y' : 'x']: {
+      stacked: isStacked,
       grid: { display: false },
       ticks: {
         color: tickClr,
@@ -286,7 +311,7 @@ function renderChart(canvasId, cols, rows) {
   const plugins = {
     title: { display: false },
     legend: {
-      display: cfg.numCols.length > 1 || cfg.type === 'doughnut',
+      display: cfg.numCols.length > 1 || cfg.type === 'doughnut' || isStacked,
       position: cfg.type === 'doughnut' ? 'right' : 'bottom',
       labels: {
         color: tickClr,
@@ -324,6 +349,7 @@ function renderChart(canvasId, cols, rows) {
       responsive: true,
       maintainAspectRatio: false,
       indexAxis: isHbar ? 'y' : 'x',
+      // stacked bars always use vertical orientation (indexAxis stays 'x')
       plugins,
       scales: scaleOpts,
       animation: { duration: 450, easing: 'easeInOutQuart' },
@@ -957,10 +983,12 @@ function renderAIMessage(ev) {
     </div>`;
   messages.appendChild(row);
 
-  // Render Chart.js charts after the canvases are in the DOM
+  // Render Chart.js charts after the canvases are in the DOM (skip HTML-only types)
   (ev.results || []).forEach((r, i) => {
     const { cols, rows } = normalizeRows(r);
     if (!rows.length) return;
+    const cfg = detectChartConfig(cols, rows);
+    if (!cfg || cfg.type === 'kpi') return;
     renderChart(`chart-${ev.msg_id}-${i}`, cols, rows);
   });
 
@@ -1001,14 +1029,13 @@ function buildResultBlocks(results, msgId) {
       ? `<div class="table-more-note">Showing 50 of ${rows.length.toLocaleString()} rows</div>` : '';
 
     if (chartable) {
-      return `
-        <div class="result-block">
+      const header = `
           <div class="result-block-header">
             <span class="result-block-icon">📊</span>
             <span class="result-block-title">${escHtml(desc)}</span>
             <span class="result-row-badge">${rowCount.toLocaleString()} rows</span>
-          </div>
-          <div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>
+          </div>`;
+      const dataFooter = `
           <div class="result-data-footer">
             <button class="data-toggle-btn" onclick="toggleDataTable('${tableId}', this)">
               <span class="data-toggle-icon">▶</span> Show data
@@ -1017,7 +1044,19 @@ function buildResultBlocks(results, msgId) {
           <div class="result-table-wrap table-hidden" id="${tableId}">
             <table class="result-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table>
             ${moreNote}
-          </div>
+          </div>`;
+
+      // KPI tiles — HTML, no canvas
+      if (chartable.type === 'kpi') {
+        return `<div class="result-block">${header}${buildKPICards(rows, chartable)}${dataFooter}</div>`;
+      }
+
+      // Canvas-based chart (line / doughnut / hbar / stacked)
+      return `
+        <div class="result-block">
+          ${header}
+          <div class="chart-wrap"><canvas id="${canvasId}"></canvas></div>
+          ${dataFooter}
         </div>`;
     }
 
@@ -1035,6 +1074,68 @@ function buildResultBlocks(results, msgId) {
         </div>
       </div>`;
   }).join('');
+}
+
+// ── KPI card renderer ─────────────────────────────────────────────────────────
+
+function buildKPICards(rows, viz) {
+  const { labelCol, numCols } = viz;
+  // Pick accent colors cycling through palette
+  const cards = rows.map(row => {
+    const label = escHtml(String(row[labelCol] ?? ''));
+    const metrics = numCols.map((col, i) => {
+      const v = Number(row[col]);
+      const fmt = isNaN(v) ? escHtml(String(row[col] ?? '—')) : escHtml(formatAxisValue(v));
+      return `<div class="kpi-metric${i === 0 ? ' kpi-primary' : ''}">
+        <div class="kpi-val">${fmt}</div>
+        <div class="kpi-col-label">${escHtml(col)}</div>
+      </div>`;
+    }).join('');
+    return `<div class="kpi-card">${metrics}<div class="kpi-card-title">${label}</div></div>`;
+  }).join('');
+  return `<div class="kpi-grid">${cards}</div>`;
+}
+
+// ── Heatmap renderer ──────────────────────────────────────────────────────────
+
+function heatColor(t) {
+  // t: 0 (low, cool green) → 1 (high, warm red-orange)
+  const stops = [
+    [52, 168, 83],   // #34a853 green
+    [251, 188, 4],   // #fbbc04 yellow
+    [234, 67, 53],   // #ea4335 red
+  ];
+  const seg  = t * (stops.length - 1);
+  const idx  = Math.min(Math.floor(seg), stops.length - 2);
+  const frac = seg - idx;
+  const [r1, g1, b1] = stops[idx];
+  const [r2, g2, b2] = stops[idx + 1];
+  const r = Math.round(r1 + (r2 - r1) * frac);
+  const g = Math.round(g1 + (g2 - g1) * frac);
+  const b = Math.round(b1 + (b2 - b1) * frac);
+  return `rgb(${r},${g},${b})`;
+}
+
+function buildHeatmapTable(rows, viz) {
+  const { labelCol, numCols } = viz;
+  const allVals = rows.flatMap(r => numCols.map(c => Number(r[c]) || 0));
+  const vMin = Math.min(...allVals);
+  const vMax = Math.max(...allVals);
+  const range = vMax - vMin || 1;
+
+  const thead = '<tr><th class="heatmap-th-label">' + escHtml(labelCol) + '</th>' +
+    numCols.map(c => `<th class="heatmap-th">${escHtml(c)}</th>`).join('') + '</tr>';
+  const tbody = rows.map(row => {
+    const cells = numCols.map(col => {
+      const v   = Number(row[col]) || 0;
+      const t   = (v - vMin) / range;
+      const bg  = heatColor(t);
+      const fg  = t > 0.55 ? '#fff' : '#1f1f1f';
+      return `<td class="heatmap-cell" style="background:${bg};color:${fg}">${escHtml(formatAxisValue(v))}</td>`;
+    }).join('');
+    return `<tr><td class="heatmap-label-cell">${escHtml(String(row[labelCol] ?? ''))}</td>${cells}</tr>`;
+  }).join('');
+  return `<div class="heatmap-wrap"><table class="heatmap-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`;
 }
 
 function buildSQLDisclosure(sqlQueries, msgId, showByDefault) {

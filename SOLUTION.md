@@ -14,6 +14,11 @@
 10. [Deployment](#deployment)
 11. [Data Flow](#data-flow)
 12. [Configuration Reference](#configuration-reference)
+13. [GraphRAG — Hybrid Semantic Retrieval](#graphrag--hybrid-semantic-retrieval)
+14. [KG Isolation — Multi-KG Support via kg_id](#kg-isolation--multi-kg-support-via-kg_id)
+15. [Production Embedding — embed_node](#production-embedding--embed_node)
+16. [DataChat UI — orchestrator_api.py](#datachat-ui--orchestrator_apipy)
+17. [DataChat UI — Frontend (chat_ui/)](#datachat-ui--frontend-chat_ui)
 
 ---
 
@@ -1558,3 +1563,544 @@ for event in self._graph.stream(initial_state):
 ```
 
 Without this capture, `api.py` would read `agent._report = None`, write `{}` to disk, and the UI would render nothing after a successful extraction.
+
+---
+
+## GraphRAG — Hybrid Semantic Retrieval
+
+### What it is
+
+GraphRAG is a **query-time retrieval layer** that sits at the start of the Dialog pipeline. Instead of sending the full schema (all KG nodes and edges) to the LLM for every question, it selects only the most relevant subset using a combination of **vector similarity** and **graph traversal**.
+
+This matters at scale: a schema with 200 tables produces a schema context that exceeds LLM context windows. Even at 20–50 tables, including irrelevant tables wastes tokens and confuses the planner.
+
+### Why not just vector similarity alone?
+
+Vector similarity finds tables whose *names and descriptions* match the question semantically. But SQL queries frequently need JOIN partners — tables that are structurally connected by foreign keys but may not mention the same keywords.
+
+Example: "What is the revenue per customer?" semantically matches `orders` and `customers`. But to compute revenue you also need `order_items` (joined to `orders` via FK). `order_items` may score low in vector similarity — its description says "line items per order", not "revenue" or "customer". Without graph expansion, the planner would miss the JOIN and produce wrong SQL.
+
+### Two Execution Paths
+
+| Path | When | How |
+|---|---|---|
+| **In-memory** | `graphrag_neo4j_uri` is empty (dev / small schema) | Embeds all node titles once per session; numpy cosine similarity; cache keyed by schema hash |
+| **Production (Neo4j)** | `graphrag_neo4j_uri` is set | Uses HNSW vector index in Neo4j (`db.index.vector.queryNodes`); embeddings persisted by `embed_node` at KG build time |
+
+Both paths produce the same output: a filtered `kg_nodes` / `kg_edges` subgraph that replaces the full schema in state.
+
+### Step 1 — Vector Similarity (Seed Nodes)
+
+Each KG node's `title` field (label + column names + comments + top values) is embedded into a fixed-dimension vector. At query time, the NLQ is embedded into the same space and cosine similarity is computed against all node vectors. The top-K nodes (default K=8) are selected as **seed nodes**.
+
+```
+NLQ: "total revenue by customer for last quarter"
+         │
+         ▼  embed (all-MiniLM-L6-v2 / TF-IDF / keyword)
+     query vector [0.12, -0.34, 0.87, ...]
+         │
+         ▼  cosine similarity against corpus matrix [N × D]
+     scores: orders=0.87  customers=0.82  products=0.61  inventory=0.23 ...
+         │
+         ▼  top-K=8 seeds
+     seeds: [orders, customers, products, order_items, ...]
+```
+
+### Step 2 — BFS Graph Expansion (Expanded Nodes)
+
+**Breadth-First Search (BFS)** starts from the seed nodes and explores the FK graph hop by hop, adding every reachable table within `hop_depth` hops (default 2).
+
+```
+Seeds from vector similarity:
+  orders, customers
+
+Hop 1 — follow FK edges from seeds:
+  orders    ──FK──► order_items   (orders.order_id → order_items.order_id)
+  customers ──FK──► addresses     (customers.id → addresses.customer_id)
+
+Hop 2 — follow FK edges from hop-1 nodes:
+  order_items ──FK──► products    (order_items.product_id → products.id)
+
+Final subgraph: orders, customers, order_items, addresses, products
+```
+
+BFS is **bidirectional** — it follows FK edges in both directions (parent→child and child→parent).
+
+The `hop_depth` config controls reach:
+- `hop_depth=1` → direct FK neighbours of seeds only
+- `hop_depth=2` → neighbours of neighbours (default; usually sufficient)
+- Higher values → more tables included, less focused context for the LLM
+
+### Step 3 — Filter to Subgraph
+
+Nodes not in the BFS-expanded set are dropped. Only edges where both endpoints are in the subgraph are kept. The filtered `kg_nodes` and `kg_edges` replace the full schema in `DialogState` so `understand_node` builds a focused schema context.
+
+### Embedding Backends
+
+| Backend | Quality | Requires | Dimensions | Neo4j HNSW compatible |
+|---|---|---|---|---|
+| `sentence-transformers` | Best | `pip install sentence-transformers` | 384 | Yes |
+| `openai` | Good | `OPENAI_API_KEY` | 1536 | Yes |
+| `tfidf` | Good (no GPU) | `pip install scikit-learn` | vocabulary-size | No (variable) |
+| `keyword` | Basic | None (pure Python) | vocabulary-size | No (variable) |
+
+Auto-detection order: `sentence-transformers` → `tfidf` → `keyword`.
+
+**Note:** TF-IDF and keyword backends produce variable-dimension vectors. They work for in-memory GraphRAG but cannot be used with the Neo4j HNSW index (which requires fixed dimensions). `embed_node` enforces this: it will error if `embed_backend` is `tfidf` or `keyword`.
+
+### Configuration (DialogConfig)
+
+```python
+# dialog_agent/config.py
+
+graphrag_enabled:           bool = True
+graphrag_top_k:             int  = 8      # seed tables from vector search
+graphrag_hop_depth:         int  = 2      # BFS hops from seeds via FK edges
+graphrag_min_tables:        int  = 10     # skip retrieval if schema ≤ this many tables
+graphrag_embedding_backend: str  = "auto" # "auto"|"sentence-transformers"|"openai"|"tfidf"|"keyword"
+
+# Production Neo4j path — leave empty to use in-memory fallback
+graphrag_neo4j_uri:         str  = ""     # e.g. "bolt://localhost:7687"
+graphrag_neo4j_username:    str  = "neo4j"
+graphrag_neo4j_password:    str  = ""
+graphrag_neo4j_database:    str  = "neo4j"
+graphrag_kg_id:             str  = ""     # must match KGConfig.kg_id used at build time
+graphrag_neo4j_index:       str  = ""     # auto-derived as "kg-{kg_id}-embeddings" if empty
+```
+
+### Skip Conditions
+
+The `retrieve_node` is a no-op (full schema passed through) when:
+- `graphrag_enabled = False`
+- `kg_nodes` is empty
+- `len(kg_nodes) <= graphrag_min_tables` — small schemas fit in the prompt directly
+- `natural_query` is empty
+
+### Module-level Cache
+
+The in-memory path maintains a module-level `_EMBED_CACHE` dict keyed by `f"{schema_hash}:{backend}"`. The schema hash is a stable MD5 over all `(node_id, node_title)` pairs. When the KG schema changes (e.g. after reindexing), the key changes and the cache is automatically rebuilt.
+
+### Updated Dialog Pipeline
+
+```
+START
+  │
+  ▼
+retrieve_node    GraphRAG: filter kg_nodes/kg_edges to the relevant subgraph.
+  │              In-memory: cosine similarity + BFS. Production: Neo4j HNSW + Cypher BFS.
+  │              No-op for small schemas (≤ graphrag_min_tables).
+  │
+  ▼
+understand_node  Build focused schema context from the (now filtered) KG nodes/edges.
+  │              Surfaces FK join columns as explicit JOIN ON clauses.
+  │
+  ▼
+plan_node        LLM (claude-haiku-4-5) decomposes NLQ into SQL queries using schema context.
+  │
+  ▼
+execute_node     Execute each SQL query against the target database.
+  │
+  ▼
+synthesize_node  LLM (claude-sonnet-4-6) derives narrative insights from all results.
+  │
+  ▼
+END
+```
+
+### Visualising GraphRAG in the KG Explorer
+
+The DataChat UI KG explorer includes a **"Test GraphRAG"** panel. Type any natural language question and click Search:
+
+- **Gold nodes** = seed tables returned by vector similarity. Percentage label = cosine similarity score.
+- **Green nodes** = tables pulled in by BFS expansion via FK edges.
+- **Grey/dimmed** = tables GraphRAG filtered out for this question.
+- The legend shows the backend used and how many tables were retrieved vs. the total schema size.
+
+This makes the retrieval layer visible and debuggable without running a full dialog query.
+
+---
+
+## KG Isolation — Multi-KG Support via kg_id
+
+### Problem
+
+Without isolation, two KGs loaded into the same Neo4j instance collide: `MERGE` on `uri` alone matches nodes from a different schema, causing graph corruption.
+
+### Solution
+
+Every node, edge, and vector index is stamped with a `kg_id`. The `MERGE` key is `{uri, kg_id}` — not `uri` alone. The HNSW vector index is named `kg-{kg_id}-embeddings` so each KG has its own isolated index.
+
+### KGConfig additions
+
+```python
+# knowledge_graph_agent/config.py
+
+kg_id: str = ""   # Unique identifier for this KG. Default "default".
+                  # Use meaningful names: "sales_prod", "hr_staging", etc.
+
+embed_enabled:    bool = False   # Set True to run embed_node after execute_node
+embed_backend:    str  = "auto"  # "sentence-transformers" | "openai" (tfidf/keyword not supported)
+embed_dimensions: int  = 384     # Must match the chosen model's output dimension
+embed_index_name: str  = ""      # Auto-derived as "kg-{kg_id}-embeddings" if empty
+```
+
+### Cypher changes
+
+```cypher
+-- Constraint is now per (uri, kg_id) pair
+CREATE CONSTRAINT IF NOT EXISTS FOR (n:KGNode) REQUIRE (n.uri, n.kg_id) IS UNIQUE
+
+-- MERGE key includes kg_id
+MERGE (n:KGNode {uri: 'http://...#orders', kg_id: 'sales_prod'})
+  ON CREATE SET n.name = 'orders', n.type = 'owl:Class', ...
+
+-- Relationships match both endpoints by kg_id
+MATCH (a:KGNode {uri: '...#orders', kg_id: 'sales_prod'}),
+      (b:KGNode {uri: '...#customers', kg_id: 'sales_prod'})
+MERGE (a)-[r:FK_CUSTOMERS {kg_id: 'sales_prod', ...}]->(b)
+
+-- Clearing a KG only deletes its own nodes
+MATCH (n:KGNode {kg_id: 'sales_prod'}) DETACH DELETE n
+```
+
+### Gremlin changes
+
+Vertex lookup uses `has('uri').has('kg_id')` so cross-KG nodes are never confused:
+
+```groovy
+g.V().has('kg_id', 'sales_prod').has('uri', '...#orders')
+  .fold().coalesce(unfold(),
+    addV('orders').property('uri','...').property('kg_id','sales_prod')
+  ).next()
+```
+
+### How DialogConfig references a KG
+
+Set `graphrag_kg_id` on `DialogConfig` to the same value used for `KGConfig.kg_id` at build time. The `retrieve_node` uses this to scope all Neo4j queries and to derive the HNSW index name:
+
+```python
+kg_id      = getattr(config, "graphrag_kg_id", "").strip() or "default"
+index_name = getattr(config, "graphrag_neo4j_index", "").strip() or f"kg-{kg_id}-embeddings"
+```
+
+---
+
+## Production Embedding — embed_node
+
+### Purpose
+
+`embed_node` runs after `execute_node` in the KG pipeline (when `embed_enabled=True` and `neo4j_uri` is set). It:
+
+1. Builds a rich text representation for each node: `label + title body` (columns, types, statistics, sample values — stripped of the redundant "Class: X" prefix).
+2. Embeds all texts in one batch via the configured backend (sentence-transformers or OpenAI).
+3. Writes `embedding` vector + full `title` back onto the existing `KGNode` nodes in Neo4j, matched by `(uri, kg_id)`.
+4. Serialises `join_columns` onto edges as JSON so `retrieve_node` can reconstruct exact `JOIN ON t1.col = t2.col` conditions.
+5. Creates an HNSW cosine vector index `kg-{kg_id}-embeddings` (IF NOT EXISTS) with automatic fallback to the legacy `db.index.vector.createNodeIndex` API for Neo4j < 5.11.
+
+### Location in the pipeline
+
+```
+START → parse_node → translate_node → execute_node → [embed_node] → END
+                                                            ▲
+                                              only when embed_enabled=True
+                                              and neo4j_uri is non-empty
+```
+
+### Skip conditions
+
+`embed_node` is a no-op when:
+- `embed_enabled = False` (default — safe for dev/preview)
+- `neo4j_uri` is empty
+- `graph_data` has no nodes
+- `embed_backend` resolves to `tfidf` or `keyword` (variable dimensions — incompatible with HNSW)
+
+### Cypher written by embed_node
+
+```cypher
+-- Vector index (HNSW cosine, 384 dims for sentence-transformers)
+CREATE VECTOR INDEX `kg-sales_prod-embeddings` IF NOT EXISTS
+FOR (n:KGNode) ON (n.embedding)
+OPTIONS {indexConfig: {`vector.dimensions`: 384, `vector.similarity_function`: 'cosine'}}
+
+-- Per-node embedding write (matched by uri + kg_id for isolation)
+MATCH (n:KGNode {uri: $uri, kg_id: $kg_id})
+SET n.embedding = $embedding, n.title = $title
+
+-- Per-edge join_columns serialisation
+MATCH (a:KGNode {uri: $src, kg_id: $kg_id})-[r]->(b:KGNode {uri: $tgt, kg_id: $kg_id})
+SET r.join_columns = $jc, r.title = $title
+```
+
+### Supported backends for production mode
+
+| Backend | Model | Dimensions |
+|---|---|---|
+| `sentence-transformers` | all-MiniLM-L6-v2 | 384 |
+| `openai` | text-embedding-3-small | 1536 |
+
+---
+
+## DataChat UI — orchestrator_api.py
+
+### Overview
+
+`orchestrator_api.py` (port 8005) is a FastAPI-based orchestrator that replaces the Streamlit UI for end-user access. It:
+
+- Serves the `chat_ui/` single-page application (HTML + JS + CSS)
+- Manages a **source registry** — pre-registered database connections with full indexing lifecycle
+- Manages **chat sessions** — each session attaches to one source and runs the dialog pipeline
+- Streams **Server-Sent Events (SSE)** for real-time progress to the browser
+
+### Architecture
+
+```
+Browser (chat_ui/index.html)
+    │
+    │  HTTP / SSE (port 8005)
+    ▼
+orchestrator_api.py (port 8005)
+    │
+    ├── POST /sources              → register a data source
+    ├── POST /sources/{id}/reindex → trigger indexing pipeline
+    ├── GET  /sources/{id}/graph   → return KG nodes/edges
+    ├── GET  /sources/{id}/ontology → return OWL/Turtle text
+    ├── POST /sources/{id}/ontology → save edited ontology + rebuild KG
+    ├── POST /sources/{id}/kg-preview → preview KG from ontology without saving
+    ├── GET  /sources/{id}/index-events → SSE stream of indexing steps
+    ├── POST /sources/{id}/graphrag-query → run in-memory GraphRAG retrieval
+    │
+    ├── POST /sessions             → create a chat session (optionally with source)
+    ├── POST /sessions/{id}/chat   → send NLQ → runs dialog pipeline → returns insights
+    └── GET  /sessions/{id}/events → SSE stream: pipeline progress + chat events
+         │
+         ├── METADATA_API (port 8000)  — extract metadata from source DB
+         ├── ONTOLOGY_API (port 8001)  — build OWL ontology from metadata
+         ├── KG_API       (port 8002)  — build KG from ontology
+         └── DIALOG_API   (port 8003)  — NLQ → SQL → insights
+```
+
+### Source Registry
+
+Sources are registered once (by an admin) and then available to all users as a named data source. They persist in memory (`_sources` dict) for the lifetime of the process.
+
+**Source fields:**
+
+| Field | Description |
+|---|---|
+| `id` | UUID |
+| `name` | Display name |
+| `description` | Optional description |
+| `domain` | Business domain (Sales, Finance, HR, etc.) |
+| `icon` | Domain emoji |
+| `db_type` | postgres / oracle / sqlserver / mysql / sqlite / csv / excel |
+| `connection` | DB credentials (never returned to the browser) |
+| `persona_access` | Which personas can see this source |
+| `status` | `idle` / `indexing` / `ready` / `error` |
+| `indexed_at` | Unix timestamp of last successful index |
+| `table_count` | Number of tables discovered |
+| `table_names` | List of table names |
+| `report` | Full metadata report (internal) |
+| `ontology_content` | OWL/Turtle text (internal) |
+| `kg_nodes` | KG graph nodes (internal) |
+| `kg_edges` | KG graph edges (internal) |
+| `error_message` | Last error (if status=error) |
+
+### Indexing Pipeline (`_index_source`)
+
+When `POST /sources/{id}/reindex` is called (or `auto_index=true` on creation), `_index_source` runs as an `asyncio.Task`:
+
+```
+_index_source(source_id)
+  │
+  ├─ push event: extract / running
+  ├─ POST metadata-api/extract → poll until done → get report
+  ├─ push event: extract / done  (table count + names)
+  │
+  ├─ push event: ontology / running
+  ├─ POST ontology-api/generate → poll until done → get content
+  ├─ push event: ontology / done  (line count)  [or warn on failure]
+  │
+  ├─ push event: kg / running
+  ├─ POST kg-api/generate → poll until done → get graph
+  ├─ push event: kg / done  (node + edge count)  [or warn on failure]
+  │
+  └─ push event: complete / done  [or complete / error]
+```
+
+Each step event has the shape:
+```json
+{
+  "type":    "index_step",
+  "step":    "extract",
+  "status":  "done",
+  "message": "Metadata extracted — 12 tables found",
+  "detail":  "Tables: orders, customers, products, …",
+  "ts":      1711123456.789
+}
+```
+
+### SSE Endpoints
+
+**`GET /sources/{id}/index-events`**
+
+Replays the stored event log (last 100 events) immediately, then streams live events as they are pushed by `_index_source`. Clients that connect mid-indexing receive all past steps plus the live tail. The stream terminates automatically when a `step=complete` event is received.
+
+**`GET /sessions/{id}/events`**
+
+Streams pipeline progress (`type=progress`) and chat reply events (`type=chat_reply`) for a session. Used by the browser to update the pipeline progress bar and render streaming chat responses.
+
+### Source Detail Endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /sources/{id}/graph` | Returns `{nodes, edges}` from the last successful index |
+| `GET /sources/{id}/ontology` | Returns `{content: "...turtle..."}` |
+| `POST /sources/{id}/ontology` | Body: `{content, rebuild_kg}`. Saves ontology. If `rebuild_kg=true`, triggers `_rebuild_kg` background task. |
+| `POST /sources/{id}/kg-preview` | Body: `{ontology_text}`. Calls `kg-api/generate`, waits for result, returns `{nodes, edges}` without saving. Used by the ontology editor preview. |
+| `POST /sources/{id}/graphrag-query` | Body: `{query, top_k, hop_depth}`. Runs in-memory GraphRAG against the source's KG nodes and returns seed nodes with cosine scores and BFS-expanded node IDs. |
+
+### Session Flow
+
+1. `POST /sessions` with `source_id` creates a session. If the source is ready, the dialog session is pre-configured with the source's DB credentials.
+2. `POST /sessions/{id}/chat` accepts `{message}`, runs the dialog pipeline (understand → plan → execute → synthesize), and returns insights + SQL + results.
+3. All pipeline events are pushed to the session SSE queue so the browser can render progress in real time.
+
+---
+
+## DataChat UI — Frontend (chat_ui/)
+
+The `chat_ui/` directory contains a single-page application served by `orchestrator_api.py` at `/`.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `index.html` | Main HTML — sidebar, chat view, landing catalog, all modals |
+| `app.js` | All client-side logic (~2000 lines) |
+| `style.css` | All styles — CSS custom properties for theme, dark mode via `prefers-color-scheme` |
+
+### Personas
+
+Three personas control UI capabilities:
+
+| Persona | Can ask questions | Can connect DBs | Admin panel | Index Log | Save ontology |
+|---|---|---|---|---|---|
+| Business User | Yes | No | No | No | No |
+| Business Analyst | Yes | Yes | No | No | No |
+| Data Admin | Yes | Yes | Yes | Yes | Yes |
+
+### Source Catalog (Landing)
+
+Shows registered sources as cards. Each ready source has a **KG** button that opens the KG & Ontology Explorer. Clicking the card opens a chat session for that source.
+
+### Admin Panel
+
+Accessible to the Data Admin persona. Shows all registered sources in a table with columns: Source, Type, Domain, Status, Tables, Actions.
+
+Actions per source:
+- **Index Log** — opens the Index Log modal
+- **View KG** — opens the KG & Ontology Explorer
+- **Reindex** — triggers `POST /sources/{id}/reindex`
+- **Delete** — removes the source
+
+### Connection Wizard
+
+4-step wizard for registering new data sources:
+1. **Type** — pick DB type (PostgreSQL, SQL Server, Oracle, MySQL, SQLite, CSV/Excel)
+2. **Connect** — enter credentials or upload a file; "Test connection" button
+3. **Name** — display name, description, domain, persona access
+4. **Confirm** — summary + "Index automatically" checkbox
+
+### Index Log Modal
+
+Opens when "Index Log" is clicked for a source. Connects to `GET /sources/{id}/index-events` via EventSource. Shows each pipeline step as a row:
+
+- **Spinner** (animated CSS) = `status: running`
+- **✓** (green) = `status: done`
+- **✗** (red) = `status: error`
+- **⚠** (yellow) = `status: warn`
+
+Clicking a row shows the `detail` field (e.g. table names discovered, line counts) in a detail panel below the steps.
+
+### KG & Ontology Explorer Modal
+
+Split-pane modal:
+
+**Left pane — Knowledge Graph (vis.js)**
+
+An interactive force-directed graph rendered with `vis-network`. Nodes are ellipses sized by column count. Edges are directed arrows labelled with the relationship name.
+
+Interaction:
+- Zoom and pan (scroll/drag)
+- Hover tooltip shows full node/edge metadata
+- Physics: ForceAtlas2 with BFS spring layout, auto-fits after stabilization
+
+**GraphRAG test panel** (above the graph):
+
+Input bar where any persona can type a natural language question to test GraphRAG retrieval:
+
+```
+[ What is the revenue per customer for last quarter? ] [ Search ] [✕]
+● Seed (top-K)  ● Expanded (BFS)  ● Other nodes       backend: tfidf · 5/12 nodes retrieved
+```
+
+- **Gold nodes** = seed tables from vector similarity (label shows cosine % score)
+- **Green nodes** = tables added by BFS expansion via FK edges
+- **Grey/dimmed** = tables not relevant to this question
+- **✕ button** resets all highlights and fits the full graph back into view
+
+**Right pane — Ontology editor**
+
+A monospace `<textarea>` pre-filled with the OWL/Turtle ontology text. Editable by all personas.
+
+Behavior:
+- Editing triggers a debounced (1.8s) call to `POST /sources/{id}/kg-preview`, which rebuilds the graph preview from the modified ontology
+- A "modified" badge appears on the pane label when the editor content differs from the saved state
+- **Admins only** see a "Save Ontology & Rebuild KG" button. Clicking it calls `POST /sources/{id}/ontology` with `rebuild_kg=true`, which persists the change and kicks off `_rebuild_kg` in the background.
+
+**vis.js initialization detail:** The Network is created inside a `requestAnimationFrame` callback (not synchronously) to guarantee the flex container has computed pixel dimensions before vis.js measures it. After physics stabilization, `network.fit()` is called automatically.
+
+### Chat View
+
+Standard chat interface:
+- Messages rendered with `marked.js` for markdown
+- SQL results shown in collapsible result blocks with a `<table>` and optional Chart.js visualization (auto-detected: bar, horizontal bar, doughnut, stacked bar, line, KPI tiles)
+- Pipeline progress bar shows current stage (understanding → planning → executing → synthesizing)
+
+### API functions (app.js)
+
+| Function | HTTP call | Used by |
+|---|---|---|
+| `apiListSources()` | `GET /sources?persona=X` | Sidebar, landing |
+| `apiCreateSource(payload)` | `POST /sources` | Wizard |
+| `apiDeleteSource(id)` | `DELETE /sources/{id}` | Admin panel |
+| `apiReindexSource(id)` | `POST /sources/{id}/reindex` | Admin panel |
+| `apiTestConnection(payload)` | `POST /sources/test-connection` | Wizard |
+| `apiGetSourceGraph(id)` | `GET /sources/{id}/graph` | KG explorer |
+| `apiGetSourceOntology(id)` | `GET /sources/{id}/ontology` | KG explorer |
+| `apiSaveOntology(id, content, rebuild)` | `POST /sources/{id}/ontology` | KG explorer (admin) |
+| `apiPreviewKG(id, text)` | `POST /sources/{id}/kg-preview` | KG explorer (debounced) |
+| `apiGraphRAGQuery(id, query, k, hops)` | `POST /sources/{id}/graphrag-query` | KG GraphRAG test panel |
+| `apiCreateSession(title, sourceId)` | `POST /sessions` | Source card click |
+| `apiSendChat(sessionId, message)` | `POST /sessions/{id}/chat` | Send button |
+
+### Running the DataChat UI
+
+```bash
+# Start all microservices (ports 8000–8003) then:
+export ANTHROPIC_API_KEY=sk-ant-...
+uvicorn orchestrator_api:app --port 8005 --reload
+
+# Open browser
+open http://localhost:8005
+```
+
+Environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `METADATA_API_URL` | `http://localhost:8000` | Metadata extraction service |
+| `ONTOLOGY_API_URL` | `http://localhost:8001` | Ontology generation service |
+| `KG_API_URL` | `http://localhost:8002` | Knowledge graph service |
+| `DIALOG_API_URL` | `http://localhost:8003` | Dialog with data service |
+| `DATA_DIR` | `./reports` | Directory for persisted session data |

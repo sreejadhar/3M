@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 def _fetch_neo4j(config: Any) -> Tuple[Dict, int, int]:
     from neo4j import GraphDatabase  # noqa: PLC0415
 
+    kg_id  = getattr(config, "kg_id", "").strip() or "default"
     driver = GraphDatabase.driver(
         config.neo4j_uri,
         auth=(config.neo4j_username, config.neo4j_password),
@@ -27,26 +28,37 @@ def _fetch_neo4j(config: Any) -> Tuple[Dict, int, int]:
     nodes: List[Dict] = []
     edges: List[Dict] = []
 
+    # Properties written by embed_node / internal fields — never shown as columns
+    _INTERNAL = {"uri", "name", "type", "description", "kg_id", "title", "embedding"}
+
     try:
         with driver.session(database=config.neo4j_database) as session:
-            # Fetch all KGNode vertices
-            for rec in session.run("MATCH (n:KGNode) RETURN n"):
+            # Fetch KGNode vertices scoped to this KG only
+            for rec in session.run(
+                "MATCH (n:KGNode {kg_id: $kg_id}) RETURN n", kg_id=kg_id
+            ):
                 props = dict(rec["n"].items())
                 uri   = props.get("uri", str(rec["n"].id))
                 name  = props.get("name", uri)
-                desc  = props.get("description", "")
-                title = f"Class: {name}"
-                if desc:
-                    title += f"\n{desc}"
 
-                # Reconstruct property lines from stored node attributes
-                dt_lines = []
-                skip = {"uri", "name", "type", "description"}
-                for k, v in props.items():
-                    if k not in skip:
-                        dt_lines.append(f"  {k}: {v}")
-                if dt_lines:
-                    title += "\n\nProperties:\n" + "\n".join(dt_lines)
+                # Use the rich title stored by embed_node when available;
+                # otherwise reconstruct from stored column properties.
+                stored_title = props.get("title", "")
+                if stored_title:
+                    title = stored_title
+                    dt_lines: List[str] = []
+                else:
+                    desc  = props.get("description", "")
+                    title = f"Class: {name}"
+                    if desc:
+                        title += f"\n{desc}"
+                    dt_lines = [
+                        f"  {k}: {v}"
+                        for k, v in props.items()
+                        if k not in _INTERNAL
+                    ]
+                    if dt_lines:
+                        title += "\n\nProperties:\n" + "\n".join(dt_lines)
 
                 nodes.append({
                     "id":    uri,
@@ -56,25 +68,34 @@ def _fetch_neo4j(config: Any) -> Tuple[Dict, int, int]:
                     "size":  20 + min(len(dt_lines) * 2, 20),
                 })
 
-            # Fetch all relationships between KGNode vertices
+            # Fetch relationships scoped to this KG only
             for rec in session.run(
-                "MATCH (a:KGNode)-[r]->(b:KGNode) "
+                "MATCH (a:KGNode {kg_id: $kg_id})-[r]->(b:KGNode {kg_id: $kg_id}) "
                 "RETURN a.uri AS from_uri, b.uri AS to_uri, "
-                "type(r) AS rel_type, r.name AS rel_name, r.cardinality AS cardinality"
+                "type(r) AS rel_type, r.name AS rel_name, r.cardinality AS cardinality, "
+                "r.join_columns AS join_columns, r.title AS rel_title",
+                kg_id=kg_id,
             ):
+                import json as _json
                 rel_name = rec["rel_name"] or rec["rel_type"]
                 card     = rec["cardinality"] or "M:N"
+                jc_raw   = rec["join_columns"] or "[]"
+                try:
+                    join_columns = _json.loads(jc_raw)
+                except Exception:
+                    join_columns = []
                 edges.append({
-                    "from":  rec["from_uri"],
-                    "to":    rec["to_uri"],
-                    "label": rel_name,
-                    "title": f"{rel_name} ({card})",
+                    "from":         rec["from_uri"],
+                    "to":           rec["to_uri"],
+                    "label":        rel_name,
+                    "title":        rec["rel_title"] or f"{rel_name} ({card})",
+                    "join_columns": join_columns,
                 })
 
     finally:
         driver.close()
 
-    logger.info("Fetched %d nodes, %d edges from Neo4j", len(nodes), len(edges))
+    logger.info("Fetched %d nodes, %d edges from Neo4j (kg_id=%s)", len(nodes), len(edges), kg_id)
     return {"nodes": nodes, "edges": edges}, len(nodes), len(edges)
 
 
@@ -83,32 +104,45 @@ def _fetch_neo4j(config: Any) -> Tuple[Dict, int, int]:
 def _fetch_gremlin(config: Any) -> Tuple[Dict, int, int]:
     from gremlin_python.driver import client as gremlin_client  # noqa: PLC0415
 
-    gc = gremlin_client.Client(
+    kg_id = getattr(config, "kg_id", "").strip() or "default"
+    gc    = gremlin_client.Client(
         config.gremlin_url,
         config.gremlin_traversal_source,
     )
     nodes: List[Dict] = []
     edges: List[Dict] = []
 
+    _INTERNAL = {"uri", "name", "type", "description", "kg_id", "title", "embedding",
+                 "T.id", "T.label"}
+
     try:
-        # Fetch all vertices with their properties
-        vertices = gc.submit("g.V().valueMap(true)").all().result()
+        # Fetch only vertices belonging to this KG
+        vertices = gc.submit(
+            f"g.V().has('kg_id', '{kg_id}').valueMap(true)"
+        ).all().result()
+
         for v in vertices:
             uri   = v.get("uri", [None])[0] or str(v.get("id", ""))
             name  = v.get("name", [uri])[0]
-            desc  = (v.get("description", [None])[0] or "")
-            title = f"Class: {name}"
-            if desc:
-                title += f"\n{desc}"
 
-            skip = {"uri", "name", "type", "description", "T.id", "T.label"}
-            dt_lines = []
-            for k, vals in v.items():
-                if str(k) not in skip and isinstance(vals, list):
-                    for val in vals:
-                        dt_lines.append(f"  {k}: {val}")
-            if dt_lines:
-                title += "\n\nProperties:\n" + "\n".join(dt_lines)
+            # Use stored title from embed_node when available
+            stored_title_list = v.get("title", [])
+            stored_title = stored_title_list[0] if stored_title_list else ""
+            if stored_title:
+                title    = stored_title
+                dt_lines = []
+            else:
+                desc  = (v.get("description", [None])[0] or "")
+                title = f"Class: {name}"
+                if desc:
+                    title += f"\n{desc}"
+                dt_lines = []
+                for k, vals in v.items():
+                    if str(k) not in _INTERNAL and isinstance(vals, list):
+                        for val in vals:
+                            dt_lines.append(f"  {k}: {val}")
+                if dt_lines:
+                    title += "\n\nProperties:\n" + "\n".join(dt_lines)
 
             nodes.append({
                 "id":    uri,
@@ -118,27 +152,35 @@ def _fetch_gremlin(config: Any) -> Tuple[Dict, int, int]:
                 "size":  20 + min(len(dt_lines) * 2, 20),
             })
 
-        # Fetch all edges
+        # Fetch edges scoped to this KG
         edge_data = gc.submit(
-            "g.E().project('from_uri','to_uri','label','card')"
+            f"g.E().has('kg_id', '{kg_id}')"
+            ".project('from_uri','to_uri','label','card','join_columns')"
             ".by(outV().values('uri'))"
             ".by(inV().values('uri'))"
             ".by(label())"
             ".by(coalesce(values('cardinality'), constant('M:N')))"
+            ".by(coalesce(values('join_columns'), constant('[]')))"
         ).all().result()
 
+        import json as _json
         for e in edge_data:
+            try:
+                join_columns = _json.loads(e.get("join_columns", "[]"))
+            except Exception:
+                join_columns = []
             edges.append({
-                "from":  e["from_uri"],
-                "to":    e["to_uri"],
-                "label": e["label"],
-                "title": f"{e['label']} ({e['card']})",
+                "from":         e["from_uri"],
+                "to":           e["to_uri"],
+                "label":        e["label"],
+                "title":        f"{e['label']} ({e['card']})",
+                "join_columns": join_columns,
             })
 
     finally:
         gc.close()
 
-    logger.info("Fetched %d nodes, %d edges from Gremlin", len(nodes), len(edges))
+    logger.info("Fetched %d nodes, %d edges from Gremlin (kg_id=%s)", len(nodes), len(edges), kg_id)
     return {"nodes": nodes, "edges": edges}, len(nodes), len(edges)
 
 

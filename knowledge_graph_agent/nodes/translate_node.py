@@ -155,19 +155,26 @@ def _extract_ontology(g: Graph) -> Tuple[Dict, List]:
 def _generate_cypher(classes: Dict, obj_props: List, config: Any) -> List[str]:
     queries: List[str] = []
 
-    if config.clear_existing:
-        queries.append("MATCH (n) DETACH DELETE n")
+    # Resolve the KG identifier — default to "default" when not set.
+    # Every node and edge is stamped with this so multiple KGs can coexist
+    # in the same Neo4j database without URI collisions.
+    kg_id = _escape_cypher(getattr(config, "kg_id", "").strip() or "default")
 
-    # Uniqueness constraint
+    if config.clear_existing:
+        # Only delete nodes/edges belonging to this KG, not the entire graph.
+        queries.append(f"MATCH (n:KGNode {{kg_id: '{kg_id}'}}) DETACH DELETE n")
+
+    # Composite uniqueness constraint: (uri, kg_id) so the same URI can exist
+    # in multiple KGs without violating the constraint.
     queries.append(
-        "CREATE CONSTRAINT kg_node_uri IF NOT EXISTS "
-        "FOR (n:KGNode) REQUIRE n.uri IS UNIQUE"
+        "CREATE CONSTRAINT kg_node_uri_kg_id IF NOT EXISTS "
+        "FOR (n:KGNode) REQUIRE (n.uri, n.kg_id) IS UNIQUE"
     )
 
     # Class nodes
     for uri, cls in classes.items():
-        safe_uri  = _escape_cypher(uri)
-        safe_name = _escape_cypher(cls["name"])
+        safe_uri   = _escape_cypher(uri)
+        safe_name  = _escape_cypher(cls["name"])
         node_label = _safe_label(cls["name"])
         comment    = _escape_cypher(cls["comments"][0]) if cls["comments"] else ""
 
@@ -176,17 +183,19 @@ def _generate_cypher(classes: Dict, obj_props: List, config: Any) -> List[str]:
                     for p in cls["datatype_props"]}
         dt_str = ", ".join(f"n.`{k}` = '{v}'" for k, v in dt_props.items())
 
+        # MERGE key includes kg_id so nodes from different KGs never collide.
         q = (
             f"MERGE (n:KGNode:{node_label} "
-            f"{{uri: '{safe_uri}', name: '{safe_name}', type: 'owl:Class'"
-            + (f", description: '{comment}'" if comment else "")
-            + "})"
+            f"{{uri: '{safe_uri}', kg_id: '{kg_id}'}}) "
+            f"ON CREATE SET n.name = '{safe_name}', n.type = 'owl:Class'"
+            + (f", n.description = '{comment}'" if comment else "")
         )
         if dt_str:
             q += f"\nON CREATE SET {dt_str}"
         queries.append(q)
 
-    # Object property edges
+    # Object property edges — MATCH filters by kg_id so edges only connect
+    # nodes within the same KG; kg_id is stored on the relationship too.
     for op in obj_props:
         rel_type    = _safe_rel(op["name"])
         domain_uri  = _escape_cypher(op["domain"])
@@ -198,9 +207,11 @@ def _generate_cypher(classes: Dict, obj_props: List, config: Any) -> List[str]:
             else "M:N"
         )
         q = (
-            f"MATCH (a:KGNode {{uri: '{domain_uri}'}}), (b:KGNode {{uri: '{range_uri}'}})\n"
+            f"MATCH (a:KGNode {{uri: '{domain_uri}', kg_id: '{kg_id}'}}), "
+            f"(b:KGNode {{uri: '{range_uri}', kg_id: '{kg_id}'}})\n"
             f"MERGE (a)-[r:{rel_type} {{name: '{op_name}', "
-            f"type: 'owl:ObjectProperty', cardinality: '{cardinality}'}}]->(b)"
+            f"type: 'owl:ObjectProperty', cardinality: '{cardinality}', "
+            f"kg_id: '{kg_id}'}}]->(b)"
         )
         queries.append(q)
 
@@ -212,17 +223,21 @@ def _generate_cypher(classes: Dict, obj_props: List, config: Any) -> List[str]:
 def _generate_gremlin(classes: Dict, obj_props: List, config: Any) -> List[str]:
     queries: List[str] = []
 
+    kg_id = _escape_gremlin(getattr(config, "kg_id", "").strip() or "default")
+
     if config.clear_existing:
-        queries.append("g.V().drop().iterate()")
+        # Only drop vertices belonging to this KG.
+        queries.append(f"g.V().has('kg_id', '{kg_id}').drop().iterate()")
 
     for uri, cls in classes.items():
         safe_uri  = _escape_gremlin(uri)
         safe_name = _escape_gremlin(cls["name"])
         comment   = _escape_gremlin(cls["comments"][0]) if cls["comments"] else ""
 
-        # Build property chain
+        # Build property chain — kg_id added so vertices are KG-scoped.
         props = [
             f".property('uri', '{safe_uri}')",
+            f".property('kg_id', '{kg_id}')",
             f".property('name', '{safe_name}')",
             ".property('type', 'owl:Class')",
         ]
@@ -234,9 +249,10 @@ def _generate_gremlin(classes: Dict, obj_props: List, config: Any) -> List[str]:
             props.append(f".property('{pn}_xsd_type', '{pr}')")
 
         props_str = "".join(props)
-        # Upsert pattern: merge on uri, create if absent
+        # Upsert on (uri, kg_id) so the same URI in different KGs creates
+        # separate vertices rather than merging into one.
         q = (
-            f"g.V().has('uri', '{safe_uri}').fold()"
+            f"g.V().has('uri', '{safe_uri}').has('kg_id', '{kg_id}').fold()"
             f".coalesce(unfold(), addV('{safe_name}'){props_str}).next()"
         )
         queries.append(q)
@@ -250,14 +266,16 @@ def _generate_gremlin(classes: Dict, obj_props: List, config: Any) -> List[str]:
             else "1:N" if op["is_functional"]
             else "M:N"
         )
+        # Look up vertices by both uri AND kg_id to avoid cross-KG edge creation.
         q = (
-            f"g.V().has('uri', '{domain_uri}').as('a')"
-            f".V().has('uri', '{range_uri}')"
+            f"g.V().has('uri', '{domain_uri}').has('kg_id', '{kg_id}').as('a')"
+            f".V().has('uri', '{range_uri}').has('kg_id', '{kg_id}')"
             f".coalesce("
             f"inE('{edge_label}').where(outV().as('a')), "
             f"addE('{edge_label}').from('a')"
             f".property('type', 'owl:ObjectProperty')"
             f".property('cardinality', '{cardinality}')"
+            f".property('kg_id', '{kg_id}')"
             f").next()"
         )
         queries.append(q)

@@ -70,5 +70,10 @@ class DialogConfig:
     graphrag_neo4j_username: str = "neo4j"
     graphrag_neo4j_password: str = ""
     graphrag_neo4j_database: str = "neo4j"
-    # Name of the HNSW vector index created by embed_node (must match KGConfig.embed_index_name)
-    graphrag_neo4j_index:    str = "kg-node-embeddings"
+    # Which KG to query.  Must match KGConfig.kg_id used when the KG was built.
+    # e.g. "sales_prod", "hr_staging".  Defaults to "default" when empty.
+    graphrag_kg_id:          str = ""
+    # HNSW index name.  When empty, derived automatically as "kg-{graphrag_kg_id}-embeddings"
+    # so it matches the index created by embed_node.  Only set this explicitly
+    # if you used a custom KGConfig.embed_index_name.
+    graphrag_neo4j_index:    str = ""

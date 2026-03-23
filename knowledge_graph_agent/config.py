@@ -21,6 +21,14 @@ class KGConfig:
     gremlin_url:               str = ""    # e.g. "ws://localhost:8182/gremlin" — empty = skip
     gremlin_traversal_source:  str = "g"
 
+    # ── KG identity ───────────────────────────────────────────────────────────
+    # Unique name for this knowledge graph.  Used to isolate nodes/edges in Neo4j
+    # so multiple KGs can coexist in the same database without collision.
+    # e.g. "sales_prod", "hr_staging", "finance_v2".
+    # Defaults to "default" when empty.  Must match DialogConfig.graphrag_kg_id
+    # for the dialog agent to retrieve the correct KG at query time.
+    kg_id: str = ""
+
     # ── Behaviour ─────────────────────────────────────────────────────────────
     mode:           str  = "generate"  # "generate" | "update" | "load"
     clear_existing: bool = False       # Drop all existing vertices/edges before loading

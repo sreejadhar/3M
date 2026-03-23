@@ -273,7 +273,10 @@ def _neo4j_retrieve(
     neo4j_user     = getattr(config, "graphrag_neo4j_username",  "neo4j")
     neo4j_pass     = getattr(config, "graphrag_neo4j_password",  "")
     neo4j_db       = getattr(config, "graphrag_neo4j_database",  "neo4j")
-    index_name     = getattr(config, "graphrag_neo4j_index",     "kg-node-embeddings")
+    # Resolve KG identity — must match KGConfig.kg_id used at build time
+    kg_id          = getattr(config, "graphrag_kg_id", "").strip() or "default"
+    # Index name: explicit override → else derive from kg_id (matches embed_node logic)
+    index_name     = getattr(config, "graphrag_neo4j_index", "").strip() or f"kg-{kg_id}-embeddings"
     top_k          = getattr(config, "graphrag_top_k",           8)
     hop_depth      = getattr(config, "graphrag_hop_depth",       2)
     pref_backend   = getattr(config, "graphrag_embedding_backend", "auto")
@@ -318,7 +321,7 @@ def _neo4j_retrieve(
 
         logger.info("retrieve_node (Neo4j): %d seed nodes from vector search", len(seed_uris))
 
-        # ── Step 2: BFS-expand via FK edges ───────────────────────────────────
+        # ── Step 2: BFS-expand via FK edges (within same KG only) ────────────
         subgraph_uris: set = set(seed_uris)
         frontier: set = set(seed_uris)
         for hop in range(hop_depth):
@@ -326,10 +329,10 @@ def _neo4j_retrieve(
                 break
             with driver.session(database=neo4j_db) as session:
                 result = session.run(
-                    "MATCH (n:KGNode)-[]-(m:KGNode) "
+                    "MATCH (n:KGNode {kg_id: $kg_id})-[]-(m:KGNode {kg_id: $kg_id}) "
                     "WHERE n.uri IN $uris "
                     "RETURN DISTINCT m.uri AS uri",
-                    uris=list(frontier),
+                    uris=list(frontier), kg_id=kg_id,
                 )
                 new_uris = {r["uri"] for r in result if r["uri"]} - subgraph_uris
             subgraph_uris.update(new_uris)

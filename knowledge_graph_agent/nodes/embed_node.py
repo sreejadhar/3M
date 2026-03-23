@@ -129,8 +129,10 @@ def _write_embeddings(
     session: Any,
     nodes: List[Dict],
     embeddings: np.ndarray,
+    kg_id: str,
 ) -> int:
-    """Batch-write embedding vectors + titles onto Neo4j KGNode nodes."""
+    """Batch-write embedding vectors + titles onto Neo4j KGNode nodes.
+    Matches on (uri, kg_id) so nodes from different KGs are never confused."""
     written = 0
     for node, emb in zip(nodes, embeddings):
         uri   = node.get("id", "")
@@ -138,22 +140,26 @@ def _write_embeddings(
         if not uri:
             continue
         result = session.run(
-            "MATCH (n:KGNode {uri: $uri}) "
+            "MATCH (n:KGNode {uri: $uri, kg_id: $kg_id}) "
             "SET n.embedding = $embedding, n.title = $title "
             "RETURN count(n) AS updated",
-            uri=uri, embedding=emb.tolist(), title=title,
+            uri=uri, kg_id=kg_id, embedding=emb.tolist(), title=title,
         )
         record = result.single()
         if record and record["updated"]:
             written += 1
         else:
-            logger.warning("embed_node: no KGNode found for uri=%s — was execute_node run?", uri)
+            logger.warning(
+                "embed_node: no KGNode found for uri=%s kg_id=%s — was execute_node run?",
+                uri, kg_id,
+            )
     return written
 
 
-def _write_edge_metadata(session: Any, edges: List[Dict]) -> int:
+def _write_edge_metadata(session: Any, edges: List[Dict], kg_id: str) -> int:
     """
     Write join_columns + title onto Neo4j relationships.
+    Matches on (uri, kg_id) for both endpoints so cross-KG edges are never touched.
     join_columns is serialised as a JSON string so it survives the graph store.
     """
     written = 0
@@ -161,15 +167,14 @@ def _write_edge_metadata(session: Any, edges: List[Dict]) -> int:
         src   = edge.get("from", "")
         tgt   = edge.get("to", "")
         jc    = edge.get("join_columns", [])
-        label = edge.get("label", "")
         title = edge.get("title", "")
         if not src or not tgt:
             continue
         result = session.run(
-            "MATCH (a:KGNode {uri: $src})-[r]->(b:KGNode {uri: $tgt}) "
+            "MATCH (a:KGNode {uri: $src, kg_id: $kg_id})-[r]->(b:KGNode {uri: $tgt, kg_id: $kg_id}) "
             "SET r.join_columns = $jc, r.title = $title "
             "RETURN count(r) AS updated",
-            src=src, tgt=tgt,
+            src=src, tgt=tgt, kg_id=kg_id,
             jc=json.dumps(jc) if jc else "[]",
             title=title,
         )
@@ -249,7 +254,10 @@ def embed_node(state: KGState) -> KGState:
     neo4j_user = getattr(config, "neo4j_username", "neo4j")
     neo4j_pass = getattr(config, "neo4j_password", "")
     neo4j_db   = getattr(config, "neo4j_database", "neo4j")
-    index_name = getattr(config, "embed_index_name", "kg-node-embeddings")
+    kg_id      = getattr(config, "kg_id", "").strip() or "default"
+    # Index name: explicit config takes precedence; otherwise derived from kg_id
+    # so each KG gets its own isolated HNSW index.
+    index_name = getattr(config, "embed_index_name", "").strip() or f"kg-{kg_id}-embeddings"
 
     try:
         from neo4j import GraphDatabase
@@ -257,8 +265,8 @@ def embed_node(state: KGState) -> KGState:
 
         with driver.session(database=neo4j_db) as session:
             _ensure_vector_index(session, index_name, dimensions)
-            node_written = _write_embeddings(session, nodes, embeddings)
-            edge_written = _write_edge_metadata(session, edges)
+            node_written = _write_embeddings(session, nodes, embeddings, kg_id)
+            edge_written = _write_edge_metadata(session, edges, kg_id)
 
         driver.close()
 

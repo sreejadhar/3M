@@ -1950,6 +1950,9 @@ async function openKGExplorer(sourceId) {
 function closeKGExplorer() {
   document.getElementById('kgExplorerOverlay').style.display = 'none';
   if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; }
+  // Eagerly clean the container so vis.js residual DOM/styles don't affect the next open
+  const _closeCtr = document.getElementById('kgGraphContainer');
+  if (_closeCtr) { _closeCtr.innerHTML = ''; _closeCtr.style.cssText = ''; }
   if (_kgPreviewDebounce) { clearTimeout(_kgPreviewDebounce); _kgPreviewDebounce = null; }
   _kgVisNodes = null;
   _kgVisEdges = null;
@@ -1971,7 +1974,10 @@ function renderKGGraph(nodes, edges) {
   }
   placeholder.style.display = 'none';
 
-  if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; container.innerHTML = ''; }
+  // Destroy previous instance and eagerly clear the container
+  if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; }
+  container.innerHTML = '';
+  container.style.cssText = '';
 
   const isDark   = window.matchMedia('(prefers-color-scheme: dark)').matches;
   const fontClr  = isDark ? '#e2e8f0' : '#1a202c';
@@ -2018,30 +2024,33 @@ function renderKGGraph(nodes, edges) {
   _kgOriginalColors = {};
   nodes.forEach(n => { _kgOriginalColors[n.id] = null; });  // null = keep default
 
-  // Capture current source id so stale rAF callbacks from a previous open are ignored
+  // Capture source id so stale callbacks from a previous open are ignored
   const renderSourceId = _kgExplorerSourceId;
 
-  // Double rAF ensures browser has completed flex layout before vis.js measures the container
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    // Drop if the explorer was closed or a different source was opened in the meantime
-    if (_kgExplorerSourceId !== renderSourceId) return;
+  // Try to initialise vis.js. If the flex container hasn't been sized yet,
+  // retry every 50 ms (up to ~2 s) until it has real pixel dimensions.
+  function _initNetwork(attempt) {
+    if (attempt > 40) return;  // give up after ~2 s
+    if (_kgExplorerSourceId !== renderSourceId) return;  // stale: modal closed or re-opened
     const overlay = document.getElementById('kgExplorerOverlay');
     if (!overlay || overlay.style.display === 'none') return;
 
-    // Clear any residual vis.js inline styles left over from a previous network instance
-    container.innerHTML = '';
-    container.removeAttribute('style');
+    const w = container.offsetWidth;
+    const h = container.offsetHeight;
+    if (w < 10 || h < 10) {
+      // Container not sized yet — wait another frame
+      setTimeout(() => _initNetwork(attempt + 1), 50);
+      return;
+    }
 
     _kgNetwork = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
-
-    // Force a repaint so vis.js picks up the actual container dimensions
-    _kgNetwork.redraw();
-
-    // Fit view once physics stabilizes
     _kgNetwork.once('stabilizationIterationsDone', () => {
       _kgNetwork.fit({ animation: { duration: 300, easingFunction: 'easeInOutQuad' } });
     });
-  }));
+  }
+
+  // Defer by two frames so the overlay's flex layout is computed before the first check
+  requestAnimationFrame(() => requestAnimationFrame(() => _initNetwork(0)));
 }
 
 async function apiGraphRAGQuery(sourceId, query, topK = 8, hopDepth = 2) {

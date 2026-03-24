@@ -1971,7 +1971,7 @@ function renderKGGraph(nodes, edges) {
   }
   placeholder.style.display = 'none';
 
-  if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; }
+  if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; container.innerHTML = ''; }
 
   const isDark   = window.matchMedia('(prefers-color-scheme: dark)').matches;
   const fontClr  = isDark ? '#e2e8f0' : '#1a202c';
@@ -2018,18 +2018,30 @@ function renderKGGraph(nodes, edges) {
   _kgOriginalColors = {};
   nodes.forEach(n => { _kgOriginalColors[n.id] = null; });  // null = keep default
 
-  // Defer init by one animation frame so the flex container has rendered dimensions
-  requestAnimationFrame(() => {
-    if (!document.getElementById('kgExplorerOverlay') ||
-        document.getElementById('kgExplorerOverlay').style.display === 'none') return;
+  // Capture current source id so stale rAF callbacks from a previous open are ignored
+  const renderSourceId = _kgExplorerSourceId;
+
+  // Double rAF ensures browser has completed flex layout before vis.js measures the container
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    // Drop if the explorer was closed or a different source was opened in the meantime
+    if (_kgExplorerSourceId !== renderSourceId) return;
+    const overlay = document.getElementById('kgExplorerOverlay');
+    if (!overlay || overlay.style.display === 'none') return;
+
+    // Clear any residual vis.js inline styles left over from a previous network instance
+    container.innerHTML = '';
+    container.removeAttribute('style');
 
     _kgNetwork = new vis.Network(container, { nodes: visNodes, edges: visEdges }, options);
+
+    // Force a repaint so vis.js picks up the actual container dimensions
+    _kgNetwork.redraw();
 
     // Fit view once physics stabilizes
     _kgNetwork.once('stabilizationIterationsDone', () => {
       _kgNetwork.fit({ animation: { duration: 300, easingFunction: 'easeInOutQuad' } });
     });
-  });
+  }));
 }
 
 async function apiGraphRAGQuery(sourceId, query, topK = 8, hopDepth = 2) {

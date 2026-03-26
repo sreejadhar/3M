@@ -881,21 +881,34 @@ async def _index_source(source_id: str) -> None:
             _reg_upsert(entry)
             logger.info("KG registry: registered %s (%s)", entry.kg_id[:8], entry.display_name)
 
-            # Run bridge inference against all other registered KGs
+            # Run enterprise bridge inference against all other registered KGs
             for other in _reg_list():
                 if other.kg_id == entry.kg_id:
                     continue
                 other_src = _sources.get(other.source_id)
                 if other_src:
                     saved = _infer_bridges(
-                        entry.kg_id, src.get("kg_nodes", []),
-                        other.kg_id, other_src.get("kg_nodes", []),
+                        entry.kg_id,  src.get("kg_nodes", []),
+                        other.kg_id,  other_src.get("kg_nodes", []),
+                        kg_a_report   = src.get("report"),
+                        kg_b_report   = other_src.get("report"),
+                        kg_a_domain   = src.get("domain", ""),
+                        kg_b_domain   = other_src.get("domain", ""),
                     )
                     if saved:
+                        high = sum(1 for b in saved if b.enabled)
+                        med  = len(saved) - high
                         logger.info(
-                            "KG bridges: inferred %d bridges between %s and %s",
-                            len(saved), entry.kg_id[:8], other.kg_id[:8],
+                            "KG bridges %s↔%s: %d auto-enabled, %d queued for LLM validation",
+                            entry.kg_id[:8], other.kg_id[:8], high, med,
                         )
+
+            # Transitivity pass after all pairs are processed
+            from dialog_agent.kg_inference_engine import infer_transitive_bridges
+            trans = infer_transitive_bridges()
+            if trans:
+                logger.info("Transitive bridges: %d new bridges from A→B+B→C chains", len(trans))
+
         except Exception as _reg_exc:
             logger.warning("KG registry registration failed (non-fatal): %s", _reg_exc)
 
@@ -1921,5 +1934,112 @@ async def patch_metadata_attribute(attr_id: str, req: UpdateAttributeRequest):
         return _coerce_attr(dict(row))
     except HTTPException:
         raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── KG Bridge Inference endpoints ─────────────────────────────────────────────
+
+class InferRequest(BaseModel):
+    kg_ids:               Optional[List[str]] = None  # subset; None = all KGs
+    run_tier2_embeddings: bool  = True
+    run_tier3_llm:        bool  = True
+    auto_enable_threshold: float = 0.80
+    min_confidence:        float = 0.55
+    cross_domain_penalty:  float = 0.08
+
+
+@app.post("/kg-bridges/infer", status_code=202)
+async def trigger_bridge_inference(req: InferRequest, background_tasks: BackgroundTasks):
+    """
+    Trigger enterprise bridge inference across all (or a subset of) registered KGs.
+    Runs in the background; returns immediately with a summary of the KGs involved.
+
+    Tiers run:
+      1 — structural (exact + normalised name, type compatibility, cardinality)
+      2 — semantic embedding similarity          (if run_tier2_embeddings=true)
+      3 — async LLM validation of medium-conf    (if run_tier3_llm=true)
+    followed by a transitivity pass (A→B + B→C → A→C).
+    """
+    try:
+        from dialog_agent.kg_registry import list_all as _reg_list
+        from dialog_agent.kg_inference_engine import (
+            KGContext, InferenceOptions, run_all_pairs,
+        )
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail=f"Import error: {exc}")
+
+    all_entries = _reg_list()
+    if req.kg_ids:
+        wanted = set(req.kg_ids)
+        all_entries = [e for e in all_entries if e.kg_id in wanted]
+
+    if len(all_entries) < 2:
+        return {
+            "status": "skipped",
+            "reason": "fewer than 2 KGs registered" + (
+                f" matching ids {req.kg_ids}" if req.kg_ids else ""
+            ),
+            "kg_count": len(all_entries),
+        }
+
+    # Build KGContext for each entry
+    contexts: List[KGContext] = []
+    for entry in all_entries:
+        src = _sources.get(entry.source_id) or {}
+        contexts.append(KGContext(
+            kg_id        = entry.kg_id,
+            display_name = entry.display_name,
+            domain       = (entry.domain_keywords or [""])[0],
+            nodes        = src.get("kg_nodes") or [],
+            report       = src.get("report"),
+        ))
+
+    opts = InferenceOptions(
+        min_confidence        = req.min_confidence,
+        auto_enable_threshold = req.auto_enable_threshold,
+        cross_domain_penalty  = req.cross_domain_penalty,
+        run_tier2_embeddings  = req.run_tier2_embeddings,
+        run_tier3_llm         = req.run_tier3_llm,
+    )
+
+    def _run():
+        result = run_all_pairs(contexts, opts)
+        logger.info(
+            "Manual inference job complete: %d pairs, %d bridges saved",
+            result["pairs_processed"], result["bridges_saved"],
+        )
+
+    background_tasks.add_task(_run)
+
+    return {
+        "status":    "accepted",
+        "kg_count":  len(contexts),
+        "kg_ids":    [c.kg_id for c in contexts],
+        "pairs":     len(contexts) * (len(contexts) - 1) // 2,
+        "options":   {
+            "tier2_embeddings":    req.run_tier2_embeddings,
+            "tier3_llm":           req.run_tier3_llm,
+            "auto_enable_at":      req.auto_enable_threshold,
+            "min_confidence":      req.min_confidence,
+            "cross_domain_penalty": req.cross_domain_penalty,
+        },
+    }
+
+
+@app.post("/kg-bridges/transitivity", status_code=200)
+async def run_bridge_transitivity():
+    """
+    Run the transitivity pass over all existing high-confidence bridges.
+    A→B + B→C  →  infer A→C candidate.
+    Returns the list of newly created transitive bridges.
+    """
+    try:
+        from dialog_agent.kg_inference_engine import infer_transitive_bridges
+        saved = infer_transitive_bridges()
+        return {
+            "bridges_created": len(saved),
+            "bridges": [b.to_dict() for b in saved],
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

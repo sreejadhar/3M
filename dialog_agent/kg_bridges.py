@@ -9,7 +9,6 @@ See dialog_agent/pg_store.py for backend configuration.
 """
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -218,59 +217,34 @@ def _row(r: dict) -> Bridge:
 
 
 # ── Bridge inference ──────────────────────────────────────────────────────────
-
-_ID_RE = re.compile(r"(^|_)(id|key|code|uuid|guid|fk|ref)($|_)", re.IGNORECASE)
-
-
-def infer_bridges(
-    kg_a_id: str, kg_a_nodes: List[Dict],
-    kg_b_id: str, kg_b_nodes: List[Dict],
-    min_confidence: float = 0.5,
-) -> List[Bridge]:
-    """Compare column names across two KGs to find likely join keys."""
-    def _cols(nodes):
-        out: Dict[str, List[Dict]] = {}
-        for n in nodes:
-            entity = n.get("label") or n.get("title", "")
-            for prop in n.get("properties", []):
-                col = (prop.get("name") or prop.get("column", "")).lower().strip()
-                if col:
-                    out.setdefault(col, []).append({"entity": entity})
-        return out
-
-    cols_a = _cols(kg_a_nodes)
-    cols_b = _cols(kg_b_nodes)
-    bridges: List[Bridge] = []
-    for col, refs_a in cols_a.items():
-        if col not in cols_b:
-            continue
-        refs_b  = cols_b[col]
-        ents_a  = {r["entity"] for r in refs_a}
-        ents_b  = {r["entity"] for r in refs_b}
-        conf    = 0.9 if (ents_a & ents_b) else 0.6
-        if _ID_RE.search(col):
-            conf = max(conf, 0.75)
-        if conf < min_confidence:
-            continue
-        bridges.append(Bridge(
-            from_kg=kg_a_id, from_entity=refs_a[0]["entity"], from_column=col,
-            to_kg=kg_b_id,   to_entity=refs_b[0]["entity"],   to_column=col,
-            join_type="FK" if _ID_RE.search(col) else "soft",
-            source="inferred", confidence=round(conf, 2), enabled=conf >= 0.75,
-        ))
-    return bridges
-
+# The enterprise inference engine lives in kg_inference_engine.py.
+# run_inference_and_save() delegates to it; extra kwargs let callers pass
+# metadata reports and domain tags for richer signals.
 
 def run_inference_and_save(
-    kg_a_id, kg_a_nodes, kg_b_id, kg_b_nodes
+    kg_a_id: str,
+    kg_a_nodes: List[Dict],
+    kg_b_id: str,
+    kg_b_nodes: List[Dict],
+    kg_a_report: Optional[Dict] = None,
+    kg_b_report: Optional[Dict] = None,
+    kg_a_domain: str = "",
+    kg_b_domain: str = "",
+    background_tasks: Any = None,
 ) -> List[Bridge]:
-    """Infer bridges and persist them, never overwriting declared bridges."""
-    candidates = infer_bridges(kg_a_id, kg_a_nodes, kg_b_id, kg_b_nodes)
-    saved = []
-    for b in candidates:
-        existing = _find_existing(b.from_kg, b.from_column, b.to_kg, b.to_column)
-        if existing and existing.source == "declared":
-            continue
-        upsert(b)
-        saved.append(b)
-    return saved
+    """
+    Infer bridges between two KGs using the enterprise multi-tier engine.
+    Never overwrites declared bridges.  LLM validation runs asynchronously.
+    """
+    from .kg_inference_engine import KGContext, run_enterprise_inference_and_save
+
+    ctx_a = KGContext(
+        kg_id=kg_a_id, display_name=kg_a_id,
+        domain=kg_a_domain, nodes=kg_a_nodes, report=kg_a_report,
+    )
+    ctx_b = KGContext(
+        kg_id=kg_b_id, display_name=kg_b_id,
+        domain=kg_b_domain, nodes=kg_b_nodes, report=kg_b_report,
+    )
+    return run_enterprise_inference_and_save(ctx_a, ctx_b,
+                                             background_tasks=background_tasks)

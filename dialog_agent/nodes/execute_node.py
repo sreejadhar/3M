@@ -294,13 +294,40 @@ def _run_oracle(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
 
 
 def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
-    import pyodbc
+    # Try pyodbc first, fall back to pymssql if not installed
+    try:
+        import pyodbc as _driver
+        _driver_name = "pyodbc"
+    except ImportError:
+        try:
+            import pymssql as _driver  # type: ignore[no-redef]
+            _driver_name = "pymssql"
+        except ImportError:
+            raise ImportError(
+                "No SQL Server driver found. "
+                "Run: pip install pyodbc  (requires unixODBC + 'ODBC Driver 18 for SQL Server')\n"
+                "or:  pip install pymssql  (pure-Python, no ODBC setup needed)"
+            )
 
-    if cfg.db_connection_string:
-        conn = pyodbc.connect(cfg.db_connection_string)
+    if _driver_name == "pymssql":
+        # pymssql uses a different connect API
+        if cfg.db_connection_string:
+            raise ValueError(
+                "pymssql does not support raw connection strings; "
+                "provide db_host / db_user / db_password / db_name instead."
+            )
+        conn = _driver.connect(  # type: ignore[call-arg]
+            server=cfg.db_host,
+            port=cfg.db_port or 1433,
+            user=cfg.db_user,
+            password=cfg.db_password,
+            database=cfg.db_name,
+        )
+    elif cfg.db_connection_string:
+        conn = _driver.connect(cfg.db_connection_string)
     else:
         driver = cfg.db_extra.get("driver", "ODBC Driver 18 for SQL Server")
-        conn = pyodbc.connect(
+        conn = _driver.connect(
             f"DRIVER={{{driver}}};SERVER={cfg.db_host},{cfg.db_port or 1433};"
             f"DATABASE={cfg.db_name};UID={cfg.db_user};PWD={cfg.db_password}"
         )

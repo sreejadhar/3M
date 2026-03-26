@@ -16,8 +16,25 @@ scikit-learn>=1.4.0                    # TF-IDF embedding backend (recommended)
 # sentence-transformers>=3.0.0         # best-quality local embedding backend (optional)
 # openai>=1.0.0                        # OpenAI embedding backend (optional, needs OPENAI_API_KEY)
 
-# Database drivers (optional — only the target DB driver is needed at runtime)
-psycopg2-binary>=2.9.9        # PostgreSQL / Redshift
-# cx_Oracle>=8.3.0            # Oracle (install manually if needed)
-pyodbc>=5.0.0                  # SQL Server
-# google-cloud-bigquery>=3.0  # BigQuery (install manually if needed)
+# Database drivers (install only the driver for your target DB)
+psycopg2-binary>=2.9.9        # PostgreSQL / Redshift (always included — no side-effects)
+pyodbc>=5.0.0                  # SQL Server  (requires unixODBC + ODBC Driver 18 for SQL Server)
+# pymssql>=2.2.0               # SQL Server alternative (pure-Python fallback, no ODBC setup needed)
+
+# Oracle — uncomment one:
+# oracledb>=2.0.0              # Recommended: thin mode, no Instant Client required
+# cx_Oracle>=8.3.0             # Legacy: requires Oracle Instant Client
+
+# BigQuery — uncomment both:
+# google-cloud-bigquery>=3.0.0
+# google-auth>=2.0.0
+
+# Teradata:
+# teradatasql>=20.0.0
+
+# Databricks SQL (REST transport):
+# databricks-sql-connector>=3.0.0
+
+# Delta Lake local / PySpark:
+# pyspark>=3.4.0
+# delta-spark>=3.0.0

@@ -10,7 +10,9 @@ from typing import Dict, Any
 @dataclass
 class DialogConfig:
     # ── Target database (SQL execution) ───────────────────────────────────────
-    db_type: str = "postgres"          # "postgres" | "oracle" | "sqlserver" | "sqlite" | "csv" | "excel"
+    db_type: str = "postgres"          # "postgres" | "redshift" | "oracle" | "sqlserver" |
+                                       # "bigquery" | "teradata" | "delta_lake" | "databricks" |
+                                       # "sqlite" | "csv" | "excel"
     db_host: str = ""
     db_port: int = 5432
     db_name: str = ""

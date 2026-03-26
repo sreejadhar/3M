@@ -236,6 +236,10 @@ def _run_sql(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
             return _run_sqlserver(cfg, sql)
         elif db == "bigquery":
             return _run_bigquery(cfg, sql)
+        elif db == "teradata":
+            return _run_teradata(cfg, sql)
+        elif db in ("delta_lake", "databricks"):
+            return _run_databricks(cfg, sql)
         else:
             return {"columns": [], "rows": [], "error": f"Unsupported db_type: {db}"}
     except Exception as exc:
@@ -275,14 +279,25 @@ def _run_postgres(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
 
 
 def _run_oracle(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
-    import cx_Oracle
+    # Try oracledb first (modern thin-mode driver, no Instant Client required),
+    # fall back to cx_Oracle (legacy).
+    try:
+        import oracledb as cx  # type: ignore[import-untyped]
+    except ImportError:
+        try:
+            import cx_Oracle as cx  # type: ignore[no-redef]
+        except ImportError:
+            raise ImportError(
+                "No Oracle driver found. "
+                "Run: pip install oracledb  (recommended, no Instant Client needed for thin mode)\n"
+                "or:  pip install cx_Oracle  (legacy, requires Oracle Instant Client)"
+            )
 
     if cfg.db_connection_string:
-        conn = cx_Oracle.connect(cfg.db_connection_string)
+        conn = cx.connect(cfg.db_connection_string)
     else:
-        dsn  = cx_Oracle.makedsn(cfg.db_host, cfg.db_port or 1521,
-                                  service_name=cfg.db_name)
-        conn = cx_Oracle.connect(cfg.db_user, cfg.db_password, dsn)
+        dsn = f"{cfg.db_host}:{cfg.db_port or 1521}/{cfg.db_name}"
+        conn = cx.connect(user=cfg.db_user, password=cfg.db_password, dsn=dsn)
     try:
         with conn.cursor() as cur:
             if cfg.db_schema:
@@ -333,9 +348,11 @@ def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
         )
     try:
         with conn.cursor() as cur:
-            if cfg.db_schema:
+            # SQL Server has no session-level SET SCHEMA; schema is embedded in
+            # table names by the planner (e.g. [dbo].[orders]).
+            # USE switches the active database — harmless if already connected to it.
+            if cfg.db_name:
                 cur.execute(f"USE [{cfg.db_name}]")
-                cur.execute(f"SET SCHEMA [{cfg.db_schema}]")
             cur.execute(sql)
             return _cursor_to_result(cur)
     finally:
@@ -357,6 +374,88 @@ def _run_bigquery(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
     columns = [f.name for f in results.schema]
     rows    = [[r[c] for c in columns] for r in results]
     return {"columns": columns, "rows": rows, "error": None}
+
+
+def _run_teradata(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
+    try:
+        import teradatasql  # type: ignore[import-untyped]
+    except ImportError:
+        raise ImportError(
+            "teradatasql is not installed. Run: pip install teradatasql"
+        )
+
+    params: Dict[str, Any] = {
+        "host": cfg.db_host,
+        "user": cfg.db_user,
+        "password": cfg.db_password,
+        "logmech": cfg.db_extra.get("logmech", "TD2"),
+    }
+    if cfg.db_name:
+        params["database"] = cfg.db_name
+    params.update({k: v for k, v in cfg.db_extra.items() if k != "logmech"})
+
+    conn = teradatasql.connect(**params)
+    cur = conn.cursor()
+    try:
+        # Teradata: switch default database so unqualified table names resolve
+        if cfg.db_schema and cfg.db_schema != cfg.db_name:
+            cur.execute(f"DATABASE {cfg.db_schema}")
+        cur.execute(sql)
+        return _cursor_to_result(cur)
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _run_databricks(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
+    if cfg.db_host:
+        # Databricks SQL via REST / HTTP transport
+        try:
+            from databricks import sql as dbsql  # type: ignore[import-untyped]
+        except ImportError:
+            raise ImportError(
+                "databricks-sql-connector is not installed. "
+                "Run: pip install databricks-sql-connector"
+            )
+        token = cfg.db_password or cfg.db_extra.get("token", "")
+        conn = dbsql.connect(
+            server_hostname=cfg.db_host,
+            http_path=cfg.db_extra.get("http_path", ""),
+            access_token=token,
+        )
+        try:
+            with conn.cursor() as cur:
+                if cfg.db_schema:
+                    cur.execute(f"USE {cfg.db_schema}")
+                cur.execute(sql)
+                return _cursor_to_result(cur)
+        finally:
+            conn.close()
+    else:
+        # Local PySpark + Delta Lake
+        try:
+            from pyspark.sql import SparkSession  # type: ignore[import-untyped]
+        except ImportError:
+            raise ImportError(
+                "pyspark is not installed. Run: pip install pyspark delta-spark"
+            )
+        master = cfg.db_extra.get("spark_master", "local[*]")
+        spark = (
+            SparkSession.builder
+            .master(master)
+            .appName("DialogAgent")
+            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+            .config("spark.sql.catalog.spark_catalog",
+                    "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+            .getOrCreate()
+        )
+        # Do NOT call spark.stop() — SparkSession is a process-level singleton
+        if cfg.db_schema:
+            spark.sql(f"USE {cfg.db_schema}")
+        df = spark.sql(sql)
+        columns = df.columns
+        rows = [[r[c] for c in columns] for r in df.collect()]
+        return {"columns": columns, "rows": rows, "error": None}
 
 
 def _exec_on_conn(conn, sql: str) -> Dict[str, Any]:

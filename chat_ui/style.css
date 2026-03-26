@@ -2207,3 +2207,33 @@ body {
   .md-entity-panel  { padding: 0 8px 12px; }
   .md-attr-panel    { padding: 0 8px 12px; }
 }
+
+/* ── Metadata: Tab bar ────────────────────────────────────────────────────── */
+.md-tab-bar { display:flex; gap:4px; padding:8px 12px 0; border-bottom:1px solid var(--clr-border); background:var(--clr-surface, var(--clr-bg)); }
+.md-tab { padding:6px 16px; border:1px solid transparent; border-bottom:none; border-radius:4px 4px 0 0; cursor:pointer; font-size:13px; background:none; color:var(--clr-text-mute); }
+.md-tab:hover { background:var(--clr-bg); color:var(--clr-text); }
+.md-tab.active { background:var(--clr-bg); color:var(--clr-text); border-color:var(--clr-border); border-bottom-color:var(--clr-bg); margin-bottom:-1px; font-weight:600; }
+.md-tab-pane { display:none; }
+.md-tab-pane.active { display:block; }
+
+/* ── Metadata: Deleted from source ──────────────────────────────────────── */
+tr.md-row-deleted td { color:var(--clr-text-mute); text-decoration:line-through; opacity:0.65; }
+tr.md-row-deleted td:last-child { text-decoration:none; }
+.md-deleted-badge { display:inline-block; font-size:10px; font-weight:600; padding:1px 6px; border-radius:3px; background:#fee2e2; color:#b91c1c; margin-left:6px; vertical-align:middle; text-decoration:none; }
+
+/* ── Metadata: Redundancy badge & table ──────────────────────────────────── */
+.md-redundancy-badge { display:inline-block; font-size:10px; font-weight:600; padding:1px 6px; border-radius:3px; background:#fef3c7; color:#b45309; margin-left:6px; vertical-align:middle; cursor:default; }
+.md-redundancy-row td { vertical-align:top; padding:8px 10px; }
+.md-overlap-pct { display:inline-block; font-weight:700; padding:2px 8px; border-radius:10px; font-size:12px; }
+.md-overlap-pct.high { background:#fee2e2; color:#b91c1c; }
+.md-shared-cols { font-size:11px; color:var(--clr-text-mute); max-width:300px; word-break:break-word; }
+
+/* ── Metadata: Change log ────────────────────────────────────────────────── */
+.md-change-type { font-size:11px; font-weight:600; padding:1px 6px; border-radius:3px; display:inline-block; }
+.md-change-type.green  { background:#dcfce7; color:#15803d; }
+.md-change-type.red    { background:#fee2e2; color:#b91c1c; }
+.md-change-type.blue   { background:#dbeafe; color:#1d4ed8; }
+.md-change-type.orange { background:#ffedd5; color:#c2410c; }
+.md-change-label { font-family:monospace; font-size:12px; }
+.md-change-detail { font-size:11px; color:var(--clr-text-mute); font-family:monospace; }
+.md-ts { font-size:11px; color:var(--clr-text-mute); white-space:nowrap; }

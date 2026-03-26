@@ -1931,6 +1931,28 @@ async def patch_metadata_attribute(attr_id: str, req: UpdateAttributeRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/metadata/redundancies")
+async def list_metadata_redundancies(source_id: Optional[str] = None):
+    """List entity pairs with >= 90% column overlap (potential redundant sources)."""
+    try:
+        return _mc.list_redundancies(source_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/metadata/changes")
+async def list_metadata_changes(
+    entity_id: Optional[str] = None,
+    source_id: Optional[str] = None,
+    limit: int = 200,
+):
+    """Return the CDC change log, newest first."""
+    try:
+        return _mc.list_changes(entity_id=entity_id, source_id=source_id, limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ── KG Bridge Inference endpoints ─────────────────────────────────────────────
 
 class InferRequest(BaseModel):

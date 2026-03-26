@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DataChat</title>
-  <link rel="stylesheet" href="/ui/style.css?v=4" />
+  <link rel="stylesheet" href="/ui/style.css?v=5" />
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.min.js"></script>
@@ -181,52 +181,83 @@
           <input class="md-search" id="mdSearch" type="search" placeholder="Search entities…" />
           <button class="btn-secondary" id="mdRefreshBtn">Refresh</button>
         </div>
+        <div id="mdTabBar" class="md-tab-bar">
+          <button class="md-tab active" data-tab="entities">Entities</button>
+          <button class="md-tab" data-tab="redundancies">Redundancies</button>
+          <button class="md-tab" data-tab="changes">Change Log</button>
+        </div>
       </div>
 
-      <!-- Entity table -->
-      <div class="md-entity-panel">
-        <table class="md-table" id="mdEntityTable">
-          <thead>
-            <tr>
-              <th style="width:36px"></th>
-              <th>Metadata ID</th>
-              <th>Source</th>
-              <th>Schema</th>
-              <th>Table / Entity</th>
-              <th>Description</th>
-              <th>Rows</th>
-              <th style="width:100px">Golden Record</th>
-            </tr>
-          </thead>
-          <tbody id="mdEntityBody">
-            <tr><td colspan="8" class="md-empty">Loading metadata…</td></tr>
-          </tbody>
+      <!-- Tab: Entities -->
+      <div id="mdTabEntities" class="md-tab-pane active">
+        <!-- Entity table -->
+        <div class="md-entity-panel">
+          <table class="md-table" id="mdEntityTable">
+            <thead>
+              <tr>
+                <th style="width:36px"></th>
+                <th>Metadata ID</th>
+                <th>Source</th>
+                <th>Schema</th>
+                <th>Table / Entity</th>
+                <th>Description</th>
+                <th>Rows</th>
+                <th style="width:100px">Golden Record</th>
+              </tr>
+            </thead>
+            <tbody id="mdEntityBody">
+              <tr><td colspan="8" class="md-empty">Loading metadata…</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Attribute detail panel (expands below selected entity row) -->
+        <div class="md-attr-panel" id="mdAttrPanel" style="display:none">
+          <div class="md-attr-panel-header">
+            <span id="mdAttrPanelTitle">Attributes</span>
+            <button class="modal-close" id="mdAttrClose">✕</button>
+          </div>
+          <table class="md-table md-attr-table" id="mdAttrTable">
+            <thead>
+              <tr>
+                <th>Column</th>
+                <th>Type</th>
+                <th>Domain</th>
+                <th>Description</th>
+                <th>PK</th>
+                <th>FK</th>
+                <th>Unique</th>
+                <th>Null %</th>
+                <th style="width:100px">Golden Record</th>
+              </tr>
+            </thead>
+            <tbody id="mdAttrBody">
+              <tr><td colspan="9" class="md-empty">Select an entity to view attributes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Tab: Redundancies -->
+      <div id="mdTabRedundancies" class="md-tab-pane" style="display:none">
+        <div class="md-empty" id="mdRedundancyEmpty" style="display:none">No redundant entity pairs detected.</div>
+        <table class="md-table" id="mdRedundancyTable" style="display:none">
+          <thead><tr>
+            <th>Entity A</th><th>Entity B</th>
+            <th>Overlap</th><th>Shared Columns</th><th>Detected</th>
+          </tr></thead>
+          <tbody id="mdRedundancyBody"></tbody>
         </table>
       </div>
 
-      <!-- Attribute detail panel (expands below selected entity row) -->
-      <div class="md-attr-panel" id="mdAttrPanel" style="display:none">
-        <div class="md-attr-panel-header">
-          <span id="mdAttrPanelTitle">Attributes</span>
-          <button class="modal-close" id="mdAttrClose">✕</button>
-        </div>
-        <table class="md-table md-attr-table" id="mdAttrTable">
-          <thead>
-            <tr>
-              <th>Column</th>
-              <th>Type</th>
-              <th>Domain</th>
-              <th>Description</th>
-              <th>PK</th>
-              <th>FK</th>
-              <th>Unique</th>
-              <th>Null %</th>
-              <th style="width:100px">Golden Record</th>
-            </tr>
-          </thead>
-          <tbody id="mdAttrBody">
-            <tr><td colspan="9" class="md-empty">Select an entity to view attributes.</td></tr>
-          </tbody>
+      <!-- Tab: Change Log -->
+      <div id="mdTabChanges" class="md-tab-pane" style="display:none">
+        <div class="md-empty" id="mdChangesEmpty" style="display:none">No changes recorded.</div>
+        <table class="md-table" id="mdChangesTable" style="display:none">
+          <thead><tr>
+            <th>When</th><th>Type</th><th>Entity</th><th>Change</th><th>Detail</th>
+          </tr></thead>
+          <tbody id="mdChangesBody"></tbody>
         </table>
       </div>
     </div>
@@ -631,6 +662,6 @@
     </div>
   </div>
 
-  <script src="/ui/app.js?v=4"></script>
+  <script src="/ui/app.js?v=5"></script>
 </body>
 </html>

@@ -100,6 +100,13 @@ const mdAttrPanel          = document.getElementById('mdAttrPanel');
 const mdAttrPanelTitle     = document.getElementById('mdAttrPanelTitle');
 const mdAttrClose          = document.getElementById('mdAttrClose');
 const mdAttrBody           = document.getElementById('mdAttrBody');
+const mdTabBar             = document.getElementById('mdTabBar');
+const mdRedundancyBody     = document.getElementById('mdRedundancyBody');
+const mdRedundancyEmpty    = document.getElementById('mdRedundancyEmpty');
+const mdRedundancyTable    = document.getElementById('mdRedundancyTable');
+const mdChangesBody        = document.getElementById('mdChangesBody');
+const mdChangesEmpty       = document.getElementById('mdChangesEmpty');
+const mdChangesTable       = document.getElementById('mdChangesTable');
 
 const bridgeManagerOverlay = document.getElementById('bridgeManagerOverlay');
 const bridgeManagerClose   = document.getElementById('bridgeManagerClose');
@@ -2598,6 +2605,7 @@ async function saveBridgeForm() {
 // Raw data cache
 let _mdEntities  = [];   // full list from API
 let _mdActiveId  = null; // currently expanded entity metadata_id
+let _mdActiveTab = 'entities';
 
 // API helpers
 const apiMdListEntities  = (sourceId) =>
@@ -2612,6 +2620,20 @@ const apiMdPatchAttr     = (attrId, body) =>
   fetch(`${API}/metadata/attributes/${encodeURIComponent(attrId)}`, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
   }).then(r => r.json());
+
+async function apiMdListRedundancies(sourceId) {
+  const qs = sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : '';
+  const r = await fetch(`${API}/metadata/redundancies${qs}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function apiMdListChanges(sourceId) {
+  const qs = sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : '';
+  const r = await fetch(`${API}/metadata/changes${qs}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
 
 async function loadMdCatalog() {
   mdEntityBody.innerHTML = '<tr><td colspan="8" class="md-empty">Loading…</td></tr>';
@@ -2630,6 +2652,9 @@ async function loadMdCatalog() {
   } catch (e) {
     mdEntityBody.innerHTML = `<tr><td colspan="8" class="md-empty">Error loading metadata: ${e.message}</td></tr>`;
   }
+  // Refresh whichever tab is active
+  if (_mdActiveTab === 'redundancies') loadMdRedundancies();
+  if (_mdActiveTab === 'changes')      loadMdChanges();
 }
 
 function _populateMdSourceFilter() {
@@ -2662,13 +2687,17 @@ function renderMdEntityTable() {
   }
 
   mdEntityBody.innerHTML = rows.map(e => {
-    const shortId  = e.metadata_id.slice(0, 8) + '…';
-    const isActive = e.metadata_id === _mdActiveId;
-    const desc     = e.description || '';
-    const golden   = e.is_golden_record;
-    const rows_n   = e.row_count != null ? e.row_count.toLocaleString() : '—';
+    const shortId    = e.metadata_id.slice(0, 8) + '…';
+    const isActive   = e.metadata_id === _mdActiveId;
+    const desc       = e.description || '';
+    const golden     = e.is_golden_record;
+    const rows_n     = e.row_count != null ? e.row_count.toLocaleString() : '—';
+    const isDeleted  = e.deleted_from_source;
+    const redundant  = e.redundancy_count > 0;
+    const deletedBadge    = isDeleted  ? '<span class="md-deleted-badge">Deleted from source</span>' : '';
+    const redundancyBadge = redundant  ? `<span class="md-redundancy-badge" title="${e.redundancy_count} overlapping entity pair(s)">⚠ Redundant</span>` : '';
 
-    return `<tr class="md-entity-row${isActive ? ' md-row-selected' : ''}" data-mid="${e.metadata_id}">
+    return `<tr class="md-entity-row${isActive ? ' md-row-selected' : ''}${isDeleted ? ' md-row-deleted' : ''}" data-mid="${e.metadata_id}">
       <td>
         <button class="md-expand-btn" data-mid="${e.metadata_id}" title="View attributes">
           ${isActive ? '▼' : '▶'}
@@ -2677,7 +2706,7 @@ function renderMdEntityTable() {
       <td><span class="md-id-badge" title="${e.metadata_id}">${shortId}</span></td>
       <td>${_esc(e.source_name || e.source_id)}</td>
       <td>${_esc(e.schema_name || '')}</td>
-      <td><strong>${_esc(e.table_name)}</strong></td>
+      <td><strong>${_esc(e.table_name)}</strong>${deletedBadge}${redundancyBadge}</td>
       <td>
         <div class="md-desc-cell">
           <span class="md-desc-text${desc ? '' : ' empty'}" data-mid="${e.metadata_id}" title="${_esc(desc)}">${_esc(desc) || 'No description'}</span>
@@ -2772,14 +2801,16 @@ function renderMdAttributeTable(attrs) {
           <span class="md-null-pct">${nullPct}%</span>
          </div>`
       : '—';
-    const pkChip = a.is_primary_key ? '<span class="md-chip md-chip-pk">PK</span>' : '<span class="md-chip md-chip-no">—</span>';
-    const fkChip = a.is_foreign_key ? '<span class="md-chip md-chip-fk">FK</span>' : '<span class="md-chip md-chip-no">—</span>';
-    const desc   = a.description || '';
+    const pkChip  = a.is_primary_key ? '<span class="md-chip md-chip-pk">PK</span>' : '<span class="md-chip md-chip-no">—</span>';
+    const fkChip  = a.is_foreign_key ? '<span class="md-chip md-chip-fk">FK</span>' : '<span class="md-chip md-chip-no">—</span>';
+    const desc    = a.description || '';
     const uniqueN = a.unique_count != null ? a.unique_count.toLocaleString() : '—';
     const golden  = a.is_golden_record;
+    const isAttrDeleted  = a.deleted_from_source;
+    const attrDeletedBadge = isAttrDeleted ? '<span class="md-deleted-badge">Deleted</span>' : '';
 
-    return `<tr>
-      <td><strong>${_esc(a.column_name)}</strong></td>
+    return `<tr${isAttrDeleted ? ' class="md-row-deleted"' : ''}>
+      <td><strong>${_esc(a.column_name)}</strong>${attrDeletedBadge}</td>
       <td><code style="font-size:12px">${_esc(a.data_type)}</code></td>
       <td>${_esc(a.domain || '—')}</td>
       <td>
@@ -2901,6 +2932,82 @@ function _esc(s) {
   return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+async function loadMdRedundancies() {
+  const srcId = mdSourceFilter ? mdSourceFilter.value : '';
+  try {
+    const rows = await apiMdListRedundancies(srcId || null);
+    renderMdRedundancyTable(rows);
+  } catch (e) {
+    mdRedundancyEmpty.textContent = 'Error loading redundancies: ' + e.message;
+    mdRedundancyEmpty.style.display = '';
+    mdRedundancyTable.style.display = 'none';
+  }
+}
+
+function renderMdRedundancyTable(rows) {
+  if (!rows || !rows.length) {
+    mdRedundancyEmpty.style.display = '';
+    mdRedundancyTable.style.display = 'none';
+    return;
+  }
+  mdRedundancyEmpty.style.display = 'none';
+  mdRedundancyTable.style.display = '';
+  mdRedundancyBody.innerHTML = rows.map(r => {
+    const aLabel = (r.a_schema ? r.a_schema + '.' : '') + r.a_table + ` <small>(${_esc(r.a_source_name || r.a_source_id)})</small>`;
+    const bLabel = (r.b_schema ? r.b_schema + '.' : '') + r.b_table + ` <small>(${_esc(r.b_source_name || r.b_source_id)})</small>`;
+    const pct    = (r.overlap_pct * 100).toFixed(1) + '%';
+    const shared = Array.isArray(r.shared_columns) ? r.shared_columns.slice(0, 8).join(', ') + (r.shared_columns.length > 8 ? '…' : '') : '';
+    const when   = r.detected_at ? new Date(r.detected_at).toLocaleString() : '';
+    return `<tr class="md-redundancy-row">
+      <td>${aLabel}</td>
+      <td>${bLabel}</td>
+      <td><span class="md-overlap-pct high">${pct}</span></td>
+      <td class="md-shared-cols">${_esc(shared)}</td>
+      <td class="md-ts">${when}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadMdChanges() {
+  const srcId = mdSourceFilter ? mdSourceFilter.value : '';
+  try {
+    const rows = await apiMdListChanges(srcId || null);
+    renderMdChangesTable(rows);
+  } catch (e) {
+    mdChangesEmpty.textContent = 'Error loading changes: ' + e.message;
+    mdChangesEmpty.style.display = '';
+    mdChangesTable.style.display = 'none';
+  }
+}
+
+function renderMdChangesTable(rows) {
+  if (!rows || !rows.length) {
+    mdChangesEmpty.style.display = '';
+    mdChangesTable.style.display = 'none';
+    return;
+  }
+  mdChangesEmpty.style.display = 'none';
+  mdChangesTable.style.display = '';
+  mdChangesBody.innerHTML = rows.map(r => {
+    const ICONS  = { added: '✚', deleted: '✕', restored: '↩', type_changed: '⟳' };
+    const COLORS = { added: 'green', deleted: 'red', restored: 'blue', type_changed: 'orange' };
+    const icon   = ICONS[r.change_type] || '•';
+    const color  = COLORS[r.change_type] || '';
+    const when   = r.detected_at ? new Date(r.detected_at).toLocaleString() : '';
+    let detail   = '';
+    if (r.change_type === 'type_changed' && r.changed_fields && r.changed_fields.data_type) {
+      detail = `${r.changed_fields.data_type.old} → ${r.changed_fields.data_type.new}`;
+    }
+    return `<tr>
+      <td class="md-ts">${when}</td>
+      <td><span class="md-change-type ${color}">${icon} ${r.change_type}</span></td>
+      <td class="md-change-label">${_esc(r.entity_label || r.entity_id)}</td>
+      <td>${_esc(r.entity_type)}</td>
+      <td class="md-change-detail">${_esc(detail)}</td>
+    </tr>`;
+  }).join('');
+}
+
 // Event listeners for metadata catalog
 dmCatalogBtn.addEventListener('click', loadMdCatalog);
 mdRefreshBtn.addEventListener('click', loadMdCatalog);
@@ -2911,6 +3018,21 @@ mdAttrClose.addEventListener('click', () => {
   mdAttrPanel.style.display = 'none';
   renderMdEntityTable();
 });
+
+if (mdTabBar) {
+  mdTabBar.addEventListener('click', e => {
+    const btn = e.target.closest('.md-tab');
+    if (!btn) return;
+    _mdActiveTab = btn.dataset.tab;
+    mdTabBar.querySelectorAll('.md-tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('mdTabEntities').style.display     = _mdActiveTab === 'entities'     ? '' : 'none';
+    document.getElementById('mdTabRedundancies').style.display = _mdActiveTab === 'redundancies' ? '' : 'none';
+    document.getElementById('mdTabChanges').style.display      = _mdActiveTab === 'changes'      ? '' : 'none';
+    if (_mdActiveTab === 'redundancies') loadMdRedundancies();
+    if (_mdActiveTab === 'changes')      loadMdChanges();
+  });
+}
 
 // Event listeners for bridge manager
 document.getElementById('adminBridgesBtn').addEventListener('click', openBridgeManager);

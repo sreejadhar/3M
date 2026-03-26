@@ -57,7 +57,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_PROJECT_ROOT = str(Path(__file__).resolve().parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import metadata_catalog as _mc   # standalone catalog module (no dialog_agent dep)
 
 # ── GraphRAG helpers (inlined — no dialog_agent import needed) ─────────────────
 # These functions mirror dialog_agent/nodes/retrieve_node.py but have no
@@ -770,8 +774,7 @@ async def _index_source(source_id: str) -> None:
 
         # ── Persist metadata to catalog store ──────────────────────────────────
         try:
-            from metadata_catalog import persist as _persist_meta
-            n = _persist_meta(source_id, src.get("name", ""), report)
+            n = _mc.persist(source_id, src.get("name", ""), report)
             logger.info("Persisted %d metadata entities for source %s", n, source_id[:8])
         except Exception as _me:
             logger.warning("Metadata persistence failed for %s: %s", source_id[:8], _me)
@@ -1864,8 +1867,7 @@ class UpdateAttributeRequest(BaseModel):
 async def list_metadata_entities(source_id: Optional[str] = None):
     """List persisted metadata entities, optionally filtered by source."""
     try:
-        from metadata_catalog import list_entities
-        return list_entities(source_id)
+        return _mc.list_entities(source_id)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -1874,8 +1876,7 @@ async def list_metadata_entities(source_id: Optional[str] = None):
 async def get_metadata_entity(metadata_id: str):
     """Get a single metadata entity with its attributes."""
     try:
-        from metadata_catalog import get_entity
-        entity = get_entity(metadata_id)
+        entity = _mc.get_entity(metadata_id)
         if not entity:
             raise HTTPException(status_code=404, detail="Entity not found")
         return entity
@@ -1889,7 +1890,6 @@ async def get_metadata_entity(metadata_id: str):
 async def patch_metadata_entity(metadata_id: str, req: UpdateEntityRequest):
     """Update entity description and/or golden-record flag."""
     try:
-        from metadata_catalog import update_entity
         kwargs: Dict[str, Any] = {}
         if req.description is not None:
             kwargs["description"] = req.description
@@ -1897,12 +1897,10 @@ async def patch_metadata_entity(metadata_id: str, req: UpdateEntityRequest):
             kwargs["is_golden_record"] = req.is_golden_record
         if not kwargs:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
-        update_entity(metadata_id, **kwargs)
-        from metadata_catalog import get_entity
-        updated = get_entity(metadata_id)
+        _mc.update_entity(metadata_id, **kwargs)
+        updated = _mc.get_entity(metadata_id)
         if not updated:
             raise HTTPException(status_code=404, detail="Entity not found")
-        # Return without attributes for brevity
         updated.pop("attributes", None)
         return updated
     except HTTPException:
@@ -1915,7 +1913,6 @@ async def patch_metadata_entity(metadata_id: str, req: UpdateEntityRequest):
 async def patch_metadata_attribute(attr_id: str, req: UpdateAttributeRequest):
     """Update attribute description and/or golden-record flag."""
     try:
-        from metadata_catalog import update_attribute, get_attribute
         kwargs: Dict[str, Any] = {}
         if req.description is not None:
             kwargs["description"] = req.description
@@ -1923,8 +1920,8 @@ async def patch_metadata_attribute(attr_id: str, req: UpdateAttributeRequest):
             kwargs["is_golden_record"] = req.is_golden_record
         if not kwargs:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
-        update_attribute(attr_id, **kwargs)
-        row = get_attribute(attr_id)
+        _mc.update_attribute(attr_id, **kwargs)
+        row = _mc.get_attribute(attr_id)
         if not row:
             raise HTTPException(status_code=404, detail="Attribute not found")
         return row

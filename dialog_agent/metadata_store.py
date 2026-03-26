@@ -21,13 +21,54 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from . import pg_store
 
 logger = logging.getLogger(__name__)
+
+
+# ── Backend selection ──────────────────────────────────────────────────────────
+# Production  (APP_ENV=production + KG_POSTGRES_DSN set) → PostgreSQL
+# Dev / test  (default)                                  → SQLite  data/metadata.db
+#
+# Override the SQLite path with the METADATA_DB env var.
+
+def _sqlite_path() -> str:
+    return os.environ.get("METADATA_DB", "data/metadata.db")
+
+
+@contextmanager
+def _cursor_ctx() -> Iterator[Any]:
+    """
+    Yield a backend-agnostic cursor for the metadata store.
+
+    Production  → PostgreSQL (reuses pg_store connection logic).
+    Dev / test  → dedicated SQLite file (METADATA_DB, default data/metadata.db).
+                  Separate from the KG federation tables (data/kg_federation.db).
+    """
+    if pg_store.is_postgres():
+        with pg_store.cursor_ctx() as cur:
+            yield cur
+    else:
+        import sqlite3
+        path = _sqlite_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        cur = pg_store._SQLiteCursor(conn)
+        try:
+            yield cur
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 # ── DDL ────────────────────────────────────────────────────────────────────────
@@ -157,7 +198,7 @@ def persist(source_id: str, source_name: str, report: Dict) -> int:
     now = _now()
     count = 0
 
-    with pg_store.cursor_ctx() as cur:
+    with _cursor_ctx() as cur:
         _ensure(cur)
 
         for table_name, table_data in tables.items():
@@ -318,7 +359,7 @@ def persist(source_id: str, source_name: str, report: Dict) -> int:
 
 def list_entities(source_id: Optional[str] = None) -> List[Dict]:
     """Return all entities, optionally filtered by source_id."""
-    with pg_store.cursor_ctx() as cur:
+    with _cursor_ctx() as cur:
         _ensure(cur)
         if source_id:
             rows = cur.execute(
@@ -335,7 +376,7 @@ def list_entities(source_id: Optional[str] = None) -> List[Dict]:
 
 def get_entity(metadata_id: str) -> Optional[Dict]:
     """Return entity dict with attributes list, or None if not found."""
-    with pg_store.cursor_ctx() as cur:
+    with _cursor_ctx() as cur:
         _ensure(cur)
         entity = cur.execute(
             "SELECT * FROM md_entities WHERE metadata_id=?", (metadata_id,)
@@ -367,7 +408,7 @@ def update_entity(metadata_id: str, **fields: Any) -> bool:
     set_clause = ", ".join(f"{k}=?" for k in updates)
     params = tuple(updates.values()) + (metadata_id,)
 
-    with pg_store.cursor_ctx() as cur:
+    with _cursor_ctx() as cur:
         _ensure(cur)
         cur.execute(f"UPDATE md_entities SET {set_clause} WHERE metadata_id=?", params)
     return True
@@ -389,7 +430,7 @@ def update_attribute(attr_id: str, **fields: Any) -> bool:
     set_clause = ", ".join(f"{k}=?" for k in updates)
     params = tuple(updates.values()) + (attr_id,)
 
-    with pg_store.cursor_ctx() as cur:
+    with _cursor_ctx() as cur:
         _ensure(cur)
         cur.execute(f"UPDATE md_attributes SET {set_clause} WHERE attr_id=?", params)
     return True

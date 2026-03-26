@@ -33,8 +33,10 @@ NEO4J_USERNAME     default neo4j
 NEO4J_PASSWORD     Neo4j password (required when NEO4J_URI is set)
 NEO4J_DATABASE     default neo4j
 
-KG_POSTGRES_DSN    psycopg2 DSN — when set, kg_registry and kg_bridges use PG
-KG_FEDERATION_DB   SQLite path for federation tables (default data/kg_federation.db)
+KG_POSTGRES_DSN    psycopg2 DSN — when set, kg_registry, kg_bridges and metadata use PG
+KG_FEDERATION_DB   SQLite path for KG federation tables (default data/kg_federation.db)
+METADATA_DB        SQLite path for metadata catalog     (default data/metadata.db)
+                   In production (APP_ENV=production) both tables use KG_POSTGRES_DSN.
 """
 from __future__ import annotations
 

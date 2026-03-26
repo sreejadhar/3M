@@ -210,13 +210,27 @@ ONTOLOGY_API = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001")
 KG_API       = os.environ.get("KG_API_URL",       "http://localhost:8002")
 DIALOG_API   = os.environ.get("DIALOG_API_URL",   "http://localhost:8003")
 
-# ── Neo4j persistence (optional) ───────────────────────────────────────────────
-# When NEO4J_URI is set, every KG build is automatically persisted to Neo4j.
-# All other NEO4J_* vars default to neo4j/neo4j/neo4j if not overridden.
+# ── Neo4j persistence ──────────────────────────────────────────────────────────
+# KG nodes/edges are persisted to Neo4j only in production (APP_ENV=production)
+# and only when NEO4J_URI is provided.
+# In development / test the KG stays in-process memory (no Neo4j required).
 _NEO4J_URI      = os.environ.get("NEO4J_URI",      "")
 _NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
 _NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
 _NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
+
+
+def _use_neo4j() -> bool:
+    """True only in production when NEO4J_URI is configured."""
+    if os.environ.get("APP_ENV", "").strip().lower() != "production":
+        return False
+    if _NEO4J_URI:
+        return True
+    logger.warning(
+        "APP_ENV=production but NEO4J_URI is not set — "
+        "KG will not be persisted to Neo4j."
+    )
+    return False
 
 DATA_DIR  = Path(os.environ.get("DATA_DIR", "./reports"))
 UI_DIR    = Path(__file__).parent / "chat_ui"
@@ -791,8 +805,9 @@ async def _index_source(source_id: str) -> None:
 
         # ── 3. Knowledge Graph ─────────────────────────────────────────────────
         if ontology_content:
+            _persist_neo4j = _use_neo4j()
             _kg_msg = "Translating ontology to knowledge graph"
-            if _NEO4J_URI:
+            if _persist_neo4j:
                 _kg_msg += " and persisting to Neo4j"
             _push_index_event(source_id, "kg", "running", _kg_msg + "…")
             try:
@@ -800,9 +815,9 @@ async def _index_source(source_id: str) -> None:
                     "ontology_text": ontology_content,
                     "kg_id":         source_id,
                 }
-                # Pass Neo4j connection when configured — KG pipeline writes
-                # nodes/edges directly to Neo4j stamped with kg_id = source_id.
-                if _NEO4J_URI:
+                # Production only: write nodes/edges directly to Neo4j,
+                # stamped with kg_id = source_id for multi-KG isolation.
+                if _persist_neo4j:
                     kg_req.update({
                         "neo4j_uri":      _NEO4J_URI,
                         "neo4j_username": _NEO4J_USERNAME,

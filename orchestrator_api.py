@@ -964,7 +964,7 @@ async def serve_ui():
     index = UI_DIR / "index.html"
     if not index.exists():
         return {"error": "UI not found. Ensure chat_ui/index.html exists."}
-    return FileResponse(str(index))
+    return FileResponse(str(index), headers={"Cache-Control": "no-store"})
 
 
 # ── Session endpoints ──────────────────────────────────────────────────────────

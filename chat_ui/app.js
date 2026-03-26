@@ -107,6 +107,9 @@ const mdRedundancyTable    = document.getElementById('mdRedundancyTable');
 const mdChangesBody        = document.getElementById('mdChangesBody');
 const mdChangesEmpty       = document.getElementById('mdChangesEmpty');
 const mdChangesTable       = document.getElementById('mdChangesTable');
+const mdSourcesBody        = document.getElementById('mdSourcesBody');
+const mdSourcesEmpty       = document.getElementById('mdSourcesEmpty');
+const mdSourcesTable       = document.getElementById('mdSourcesTable');
 
 const bridgeManagerOverlay = document.getElementById('bridgeManagerOverlay');
 const bridgeManagerClose   = document.getElementById('bridgeManagerClose');
@@ -2634,6 +2637,18 @@ async function apiMdListChanges(sourceId) {
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
+async function apiMdListSources() {
+  const r = await fetch(`${API}/metadata/sources`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function apiMdPatchSource(sourceId, body) {
+  const r = await fetch(`${API}/metadata/sources/${encodeURIComponent(sourceId)}`, {
+    method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
 
 async function loadMdCatalog() {
   mdEntityBody.innerHTML = '<tr><td colspan="8" class="md-empty">Loading…</td></tr>';
@@ -3008,6 +3023,80 @@ function renderMdChangesTable(rows) {
   }).join('');
 }
 
+async function loadMdSources() {
+  try {
+    const rows = await apiMdListSources();
+    renderMdSourcesTable(rows);
+  } catch (e) {
+    if (mdSourcesEmpty) { mdSourcesEmpty.textContent = 'Error: ' + e.message; mdSourcesEmpty.style.display = ''; }
+    if (mdSourcesTable) mdSourcesTable.style.display = 'none';
+  }
+}
+
+function renderMdSourcesTable(rows) {
+  if (!rows || !rows.length) {
+    if (mdSourcesEmpty) mdSourcesEmpty.style.display = '';
+    if (mdSourcesTable) mdSourcesTable.style.display = 'none';
+    return;
+  }
+  if (mdSourcesEmpty) mdSourcesEmpty.style.display = 'none';
+  if (mdSourcesTable) mdSourcesTable.style.display = '';
+  mdSourcesBody.innerHTML = rows.map(src => {
+    const domainVal = _esc(src.domain || '');
+    const domainDisplay = src.domain
+      ? `<span class="md-domain-badge">${domainVal}</span>`
+      : `<span class="md-domain-unset">— unset —</span>`;
+    return `<tr data-source-id="${_esc(src.source_id)}">
+      <td class="md-source-name">${_esc(src.source_name || src.source_id)}</td>
+      <td class="md-domain-cell">
+        ${domainDisplay}
+        <button class="md-edit-btn md-domain-edit-btn" title="Edit domain">✎</button>
+        <span class="md-domain-edit-form" style="display:none">
+          <input class="md-domain-input" type="text" value="${domainVal}" placeholder="e.g. Sales &amp; CRM" />
+          <button class="md-domain-save-btn">Save</button>
+          <button class="md-domain-cancel-btn">✕</button>
+        </span>
+      </td>
+      <td>${src.active_entity_count ?? 0}</td>
+      <td>${src.redundancy_count ?? 0}</td>
+      <td class="md-source-desc">${_esc(src.description || '')}</td>
+    </tr>`;
+  }).join('');
+
+  // Attach inline-edit handlers
+  mdSourcesBody.querySelectorAll('tr[data-source-id]').forEach(row => {
+    const srcId      = row.dataset.sourceId;
+    const editBtn    = row.querySelector('.md-domain-edit-btn');
+    const editForm   = row.querySelector('.md-domain-edit-form');
+    const domainCell = row.querySelector('.md-domain-cell');
+    const input      = row.querySelector('.md-domain-input');
+    const saveBtn    = row.querySelector('.md-domain-save-btn');
+    const cancelBtn  = row.querySelector('.md-domain-cancel-btn');
+
+    editBtn.addEventListener('click', () => {
+      domainCell.querySelector('.md-domain-badge, .md-domain-unset').style.display = 'none';
+      editBtn.style.display = 'none';
+      editForm.style.display = 'inline-flex';
+      input.focus();
+    });
+    cancelBtn.addEventListener('click', () => {
+      editForm.style.display = 'none';
+      domainCell.querySelector('.md-domain-badge, .md-domain-unset').style.display = '';
+      editBtn.style.display = '';
+    });
+    saveBtn.addEventListener('click', async () => {
+      saveBtn.disabled = true;
+      try {
+        await apiMdPatchSource(srcId, { domain: input.value.trim() });
+        loadMdSources();
+      } catch (e) {
+        alert('Save failed: ' + e.message);
+        saveBtn.disabled = false;
+      }
+    });
+  });
+}
+
 // Event listeners for metadata catalog
 dmCatalogBtn.addEventListener('click', loadMdCatalog);
 mdRefreshBtn.addEventListener('click', loadMdCatalog);
@@ -3029,8 +3118,10 @@ if (mdTabBar) {
     document.getElementById('mdTabEntities').style.display     = _mdActiveTab === 'entities'     ? '' : 'none';
     document.getElementById('mdTabRedundancies').style.display = _mdActiveTab === 'redundancies' ? '' : 'none';
     document.getElementById('mdTabChanges').style.display      = _mdActiveTab === 'changes'      ? '' : 'none';
+    document.getElementById('mdTabSources').style.display      = _mdActiveTab === 'sources'      ? '' : 'none';
     if (_mdActiveTab === 'redundancies') loadMdRedundancies();
     if (_mdActiveTab === 'changes')      loadMdChanges();
+    if (_mdActiveTab === 'sources')      loadMdSources();
   });
 }
 

@@ -2237,3 +2237,15 @@ tr.md-row-deleted td:last-child { text-decoration:none; }
 .md-change-label { font-family:monospace; font-size:12px; }
 .md-change-detail { font-size:11px; color:var(--clr-text-mute); font-family:monospace; }
 .md-ts { font-size:11px; color:var(--clr-text-mute); white-space:nowrap; }
+
+/* ── Metadata: Source domain management ──────────────────────────────────────── */
+.md-domain-badge { display:inline-block; font-size:11px; font-weight:600; padding:2px 8px; border-radius:10px; background:#dbeafe; color:#1e40af; }
+.md-domain-unset { font-size:11px; color:var(--clr-text-mute); font-style:italic; }
+.md-domain-edit-btn { margin-left:4px; }
+.md-domain-edit-form { display:inline-flex; align-items:center; gap:4px; }
+.md-domain-input { font-size:12px; padding:2px 6px; border:1px solid var(--clr-border); border-radius:3px; width:160px; }
+.md-domain-save-btn { font-size:11px; padding:2px 8px; background:var(--clr-primary); color:#fff; border:none; border-radius:3px; cursor:pointer; }
+.md-domain-save-btn:hover { opacity:0.85; }
+.md-domain-cancel-btn { font-size:11px; padding:2px 6px; background:none; border:1px solid var(--clr-border); border-radius:3px; cursor:pointer; color:var(--clr-text-mute); }
+.md-source-name { font-weight:600; }
+.md-source-desc { font-size:12px; color:var(--clr-text-mute); max-width:250px; }

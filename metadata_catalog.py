@@ -22,6 +22,8 @@ update_entity(metadata_id, **fields)           → bool
 update_attribute(attr_id, **fields)            → bool
 list_redundancies(source_id=None)              → List[dict]  (Jaccard >= 0.9 pairs)
 list_changes(entity_id=None, source_id=None, limit=200)  → List[dict]  (CDC log)
+list_sources()                                 → List[dict]  (all sources with domain + counts)
+update_source(source_id, **fields)             → bool  (update domain / description)
 """
 from __future__ import annotations
 
@@ -308,6 +310,48 @@ CREATE TABLE IF NOT EXISTS md_changes (
 )
 """
 
+_DDL_SOURCES_SQLITE = """
+CREATE TABLE IF NOT EXISTS md_sources (
+    source_id    TEXT PRIMARY KEY,
+    source_name  TEXT NOT NULL DEFAULT '',
+    domain       TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+)
+"""
+
+_DDL_SOURCES_PG = """
+CREATE TABLE IF NOT EXISTS md_sources (
+    source_id    TEXT PRIMARY KEY,
+    source_name  TEXT NOT NULL DEFAULT '',
+    domain       TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+)
+"""
+
+
+_DOMAIN_KEYWORDS: List[tuple] = [
+    ("Sales & CRM",     ["sales", "revenue", "order", "crm", "customer", "deal", "opportunity", "quote"]),
+    ("HR & Workforce",  ["hr", "employee", "people", "workforce", "payroll", "talent", "headcount", "staff"]),
+    ("Finance",         ["finance", "accounting", "ledger", "budget", "cost", "invoice", "payment", "gl", "ap", "ar"]),
+    ("Supply Chain",    ["supply", "inventory", "warehouse", "logistics", "shipment", "procurement", "vendor"]),
+    ("Product",         ["product", "catalog", "item", "sku", "material", "part", "bom", "spec"]),
+    ("Marketing",       ["marketing", "campaign", "email", "social", "lead", "attribution", "channel"]),
+    ("IT & Operations", ["it", "infra", "server", "network", "incident", "ticket", "asset", "config"]),
+    ("Customer",        ["customer", "client", "account", "contact", "subscriber", "user"]),
+]
+
+def _infer_domain(source_name: str) -> str:
+    """Infer a business domain from a source name using keyword matching. Returns '' if unclear."""
+    low = source_name.lower()
+    for domain, keywords in _DOMAIN_KEYWORDS:
+        if any(k in low for k in keywords):
+            return domain
+    return ""
+
 
 def _ensure(cur: Any) -> None:
     global _schema_migrated
@@ -318,6 +362,7 @@ def _ensure(cur: Any) -> None:
             _DDL_ATTRIBUTES_PG,
             _DDL_REDUNDANCIES_PG,
             _DDL_CHANGES_PG,
+            _DDL_SOURCES_PG,
         )
         if not _schema_migrated:
             cur.execute(
@@ -335,6 +380,7 @@ def _ensure(cur: Any) -> None:
             _DDL_ATTRIBUTES_SQLITE,
             _DDL_REDUNDANCIES_SQLITE,
             _DDL_CHANGES_SQLITE,
+            _DDL_SOURCES_SQLITE,
         )
         if not _schema_migrated:
             # Add deleted_from_source to md_entities if missing
@@ -375,51 +421,67 @@ def _log_change(
 
 def _run_redundancy_check(cur: Any, source_id: str, now: str) -> None:
     """
-    For each active entity in source_id, compare against all other active entities.
-    Upsert/delete md_redundancies based on Jaccard >= 0.9 threshold.
-    Pre-fetches ALL column sets to minimise DB round-trips.
-    """
-    # 1. Fetch all active entity IDs
-    all_active = [
-        r["metadata_id"]
-        for r in cur.execute(
-            "SELECT metadata_id FROM md_entities WHERE deleted_from_source=?",
-            (_enc_bool(False),),
-        ).fetchall()
-    ]
+    Redundancy check with domain gating:
+    - Within-source: always compare (detect duplicate tables inside the same source)
+    - Cross-source:  only compare when BOTH sources share the same non-empty domain
 
-    if len(all_active) < 2:
+    This prevents spurious cross-domain matches (e.g., Sales DB vs HR DB).
+    """
+    # Resolve domain of the source being indexed
+    src_row = cur.execute(
+        "SELECT domain FROM md_sources WHERE source_id=?", (source_id,)
+    ).fetchone()
+    source_domain = (src_row["domain"] if src_row else "") or ""
+
+    # Collect candidate source_ids to compare against:
+    # 1. Always include the source itself (within-source)
+    # 2. Include other sources only when they share the same non-empty domain
+    candidate_source_ids: set = {source_id}
+    if source_domain:
+        same_domain_rows = cur.execute(
+            "SELECT source_id FROM md_sources WHERE domain=? AND source_id != ?",
+            (source_domain, source_id),
+        ).fetchall()
+        candidate_source_ids.update(r["source_id"] for r in same_domain_rows)
+
+    # Fetch all active entities from candidate sources only
+    placeholders = ",".join("?" * len(candidate_source_ids))
+    candidate_entities = cur.execute(
+        f"SELECT metadata_id, source_id FROM md_entities "
+        f"WHERE source_id IN ({placeholders}) AND deleted_from_source=?",
+        (*candidate_source_ids, _enc_bool(False)),
+    ).fetchall()
+
+    if len(candidate_entities) < 2:
         return
 
-    # 2. Pre-fetch column name sets for all active entities
+    candidate_ids = [r["metadata_id"] for r in candidate_entities]
+    entity_source_map = {r["metadata_id"]: r["source_id"] for r in candidate_entities}
+
+    # Pre-fetch column name sets for all candidate entities
     col_sets: Dict[str, set] = {}
-    for eid in all_active:
+    for eid in candidate_ids:
         rows = cur.execute(
             "SELECT column_name FROM md_attributes WHERE metadata_id=? AND deleted_from_source=?",
             (eid, _enc_bool(False)),
         ).fetchall()
         col_sets[eid] = {r["column_name"].lower() for r in rows}
 
-    # 3. Source entities (the ones we just indexed)
-    source_active = {
-        r["metadata_id"]
-        for r in cur.execute(
-            "SELECT metadata_id FROM md_entities WHERE source_id=? AND deleted_from_source=?",
-            (source_id, _enc_bool(False)),
-        ).fetchall()
-    }
+    # Source entities (the ones we just indexed)
+    source_active = {eid for eid in candidate_ids if entity_source_map[eid] == source_id}
 
-    # 4. Compare each source entity against all_active
+    # Compare each source entity against all candidate entities
     for a_id in source_active:
         cols_a = col_sets.get(a_id, set())
         if not cols_a:
             continue
-        for b_id in all_active:
+        for b_id in candidate_ids:
             if a_id == b_id:
                 continue
             cols_b = col_sets.get(b_id, set())
             if not cols_b:
                 continue
+
             # Canonical ordering so UNIQUE constraint is respected
             pair_a, pair_b = (a_id, b_id) if a_id < b_id else (b_id, a_id)
             union = cols_a | cols_b
@@ -451,6 +513,11 @@ def _run_redundancy_check(cur: Any, source_id: str, now: str) -> None:
                     (pair_a, pair_b),
                 )
 
+    logger.debug(
+        "Redundancy check: source=%s domain=%r candidates=%d",
+        source_id, source_domain or "(unset — within-source only)", len(candidate_ids),
+    )
+
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -469,6 +536,22 @@ def persist(source_id: str, source_name: str, report: Dict) -> int:
 
     with _cursor_ctx() as cur:
         _ensure(cur)
+
+        # ── Register/update source in md_sources ───────────────────────────────
+        existing_src = cur.execute(
+            "SELECT source_id, domain FROM md_sources WHERE source_id=?", (source_id,)
+        ).fetchone()
+        if existing_src:
+            cur.execute(
+                "UPDATE md_sources SET source_name=?, updated_at=? WHERE source_id=?",
+                (source_name, now, source_id),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO md_sources (source_id, source_name, domain, description, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (source_id, source_name, _infer_domain(source_name), "", now, now),
+            )
 
         # Pre-fetch all existing entities for this source
         existing_rows = cur.execute(
@@ -819,6 +902,42 @@ def list_changes(
                 "SELECT * FROM md_changes ORDER BY detected_at DESC LIMIT ?", (limit,)
             ).fetchall()
     return [_coerce_change(r) for r in rows]
+
+
+def list_sources() -> List[Dict]:
+    """Return all registered metadata sources with their domain assignments."""
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        rows = cur.execute(
+            "SELECT s.*, "
+            "  (SELECT COUNT(*) FROM md_entities e WHERE e.source_id=s.source_id AND e.deleted_from_source=0) AS active_entity_count, "
+            "  (SELECT COUNT(*) FROM md_redundancies r "
+            "   JOIN md_entities ea ON r.entity_a_id=ea.metadata_id "
+            "   WHERE ea.source_id=s.source_id) AS redundancy_count "
+            "FROM md_sources s ORDER BY s.domain, s.source_name"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_source(source_id: str, **fields: Any) -> bool:
+    """
+    Update allowed fields on a source: domain, description.
+    Changing the domain will take effect on the next reindex for redundancy checks.
+    Returns True if updated.
+    """
+    allowed = {"domain", "description"}
+    updates: Dict[str, Any] = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return False
+    updates["updated_at"] = _now()
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute(
+            f"UPDATE md_sources SET {set_clause} WHERE source_id=?",
+            tuple(updates.values()) + (source_id,),
+        )
+    return True
 
 
 # ── Coercion helpers ───────────────────────────────────────────────────────────

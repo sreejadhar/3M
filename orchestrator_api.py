@@ -1953,6 +1953,43 @@ async def list_metadata_changes(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/metadata/sources")
+async def list_metadata_sources():
+    """List all registered metadata sources with domain assignments and entity counts."""
+    try:
+        return _mc.list_sources()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class UpdateSourceRequest(BaseModel):
+    domain:      Optional[str] = None
+    description: Optional[str] = None
+
+
+@app.patch("/metadata/sources/{source_id}")
+async def patch_metadata_source(source_id: str, req: UpdateSourceRequest):
+    """Update domain and/or description of a metadata source."""
+    try:
+        kwargs: Dict[str, Any] = {}
+        if req.domain is not None:
+            kwargs["domain"] = req.domain.strip()
+        if req.description is not None:
+            kwargs["description"] = req.description
+        if not kwargs:
+            raise HTTPException(status_code=400, detail="No updatable fields provided")
+        _mc.update_source(source_id, **kwargs)
+        sources = _mc.list_sources()
+        updated = next((s for s in sources if s["source_id"] == source_id), None)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Source not found")
+        return updated
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ── KG Bridge Inference endpoints ─────────────────────────────────────────────
 
 class InferRequest(BaseModel):

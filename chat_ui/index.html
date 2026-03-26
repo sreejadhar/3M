@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DataChat</title>
-  <link rel="stylesheet" href="/ui/style.css?v=5" />
+  <link rel="stylesheet" href="/ui/style.css?v=6" />
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.min.js"></script>
@@ -185,6 +185,7 @@
           <button class="md-tab active" data-tab="entities">Entities</button>
           <button class="md-tab" data-tab="redundancies">Redundancies</button>
           <button class="md-tab" data-tab="changes">Change Log</button>
+          <button class="md-tab" data-tab="sources">Sources</button>
         </div>
       </div>
 
@@ -258,6 +259,21 @@
             <th>When</th><th>Type</th><th>Entity</th><th>Change</th><th>Detail</th>
           </tr></thead>
           <tbody id="mdChangesBody"></tbody>
+        </table>
+      </div>
+
+      <!-- Tab: Sources -->
+      <div id="mdTabSources" class="md-tab-pane" style="display:none">
+        <div class="md-empty" id="mdSourcesEmpty" style="display:none">No sources indexed yet.</div>
+        <table class="md-table" id="mdSourcesTable" style="display:none">
+          <thead><tr>
+            <th>Source</th>
+            <th>Domain <small>(click to edit)</small></th>
+            <th>Entities</th>
+            <th>Redundancies</th>
+            <th>Description</th>
+          </tr></thead>
+          <tbody id="mdSourcesBody"></tbody>
         </table>
       </div>
     </div>
@@ -662,6 +678,6 @@
     </div>
   </div>
 
-  <script src="/ui/app.js?v=5"></script>
+  <script src="/ui/app.js?v=6"></script>
 </body>
 </html>

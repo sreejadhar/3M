@@ -123,12 +123,18 @@ _RETRYABLE_RE = re.compile(
     r"|invalid cast"
     r"|cannot be cast"
     r"|ambiguous column"                        # qualify with table name
-    r"|syntax error"                            # wrong dialect (e.g. LIMIT on SQL Server)
+    r"|syntax error"                            # generic / PostgreSQL / SQLite
+    r"|incorrect syntax"                        # SQL Server: "Incorrect syntax near ..."
     r"|no such function"                        # wrong function for this DB
     r"|is not a recognized .{0,30} function"    # SQL Server: wrong function name
+    r"|is not a recognized built-in"            # SQL Server
     r"|numeric value out of range"
     r"|out of range"
     r"|truncated incorrect"                     # MySQL/MariaDB compat
+    r"|not supported"                           # feature not available in this dialect
+    r"|does not support"
+    r"|invalid use of"                          # SQL Server: e.g. window fn in WHERE
+    r"|windowed functions can only"             # SQL Server: window fn placement error
     , re.IGNORECASE,
 )
 

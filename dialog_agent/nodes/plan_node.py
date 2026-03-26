@@ -74,20 +74,29 @@ WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully 
 ROW LIMITING      : SELECT TOP N col FROM t   — LIMIT does NOT exist in SQL Server
                     For top-N with ordering: SELECT TOP 10 col FROM t ORDER BY col DESC
                     For paging: ORDER BY col OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
-CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')  (collation-dependent; ILIKE not supported)
+DISTINCT + TOP    : ALWAYS write SELECT DISTINCT TOP N ... — NEVER SELECT TOP N DISTINCT ...
+                    "SELECT TOP N DISTINCT" is a SYNTAX ERROR in SQL Server.
+                    Correct : SELECT DISTINCT TOP 10 [col] FROM t ORDER BY [col]
+                    Wrong   : SELECT TOP 10 DISTINCT [col] FROM t   ← SYNTAX ERROR
+CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')  (ILIKE does NOT exist in SQL Server)
 DATE EXTRACTION   : YEAR(date_col), MONTH(date_col), DAY(date_col)
                     DATEPART(year, date_col), DATEPART(month, date_col)
                     FORMAT(date_col, 'yyyy-MM')
 DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
-STRING CONCAT     : col1 + col2   or   CONCAT(col1, col2)
-IDENTIFIER QUOTING: square brackets [col name] when needed, or double-quotes
+CURRENT DATETIME  : GETDATE()  — do NOT use NOW(), CURRENT_TIMESTAMP is also valid
+STRING CONCAT     : col1 + col2   or   CONCAT(col1, col2)   — do NOT use ||
+IDENTIFIER QUOTING: square brackets [col name] when needed — never backticks (`)
 PERCENTILES       : PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) OVER () AS median
                     PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY col) OVER () AS q1
 PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
 NULL HANDLING     : ISNULL(col, 0) or COALESCE(col, 0)
 STRING LENGTH     : LEN(col)   — LENGTH() does NOT exist in SQL Server
 TYPE CASTING      : CAST(col AS INT), CAST(col AS DECIMAL(10,2)), CAST(col AS NVARCHAR(100))
-WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported"""
+                    NEVER use :: PostgreSQL-style casting (col::int is a SYNTAX ERROR)
+DATE TRUNCATION   : DATEADD(month, DATEDIFF(month, 0, date_col), 0) for month-start
+                    DATE_TRUNC does NOT exist in SQL Server
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
+                    Window functions cannot be used in WHERE clause — use a CTE or subquery"""
 
     if db == "oracle":
         return """\

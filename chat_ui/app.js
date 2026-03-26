@@ -5,9 +5,10 @@ const API = '';   // same origin
 
 // ── Persona ───────────────────────────────────────────────────────────────────
 const PERSONAS = {
-  business_user: { label: 'Business User',    icon: '👤', showSQL: false, canConnect: false, isAdmin: false },
-  analyst:       { label: 'Business Analyst', icon: '🔬', showSQL: true,  canConnect: true,  isAdmin: false },
-  admin:         { label: 'Data Admin',       icon: '⚙️', showSQL: true,  canConnect: true,  isAdmin: true  },
+  business_user: { label: 'Business User',    icon: '👤', showSQL: false, canConnect: false, isAdmin: false, isDataManager: false },
+  analyst:       { label: 'Business Analyst', icon: '🔬', showSQL: true,  canConnect: true,  isAdmin: false, isDataManager: false },
+  admin:         { label: 'Data Admin',       icon: '⚙️', showSQL: true,  canConnect: true,  isAdmin: true,  isDataManager: false },
+  data_manager:  { label: 'Data Manager',     icon: '🗂️', showSQL: false, canConnect: false, isAdmin: false, isDataManager: true  },
 };
 
 // ── Analyst roles (business_user sub-personas) ─────────────────────────────
@@ -88,6 +89,17 @@ const adminClose       = document.getElementById('adminClose');
 const adminAddBtn      = document.getElementById('adminAddBtn');
 const adminRefreshBtn  = document.getElementById('adminRefreshBtn');
 const adminTableBody   = document.getElementById('adminTableBody');
+
+const dmCatalogBtn         = document.getElementById('dmCatalogBtn');
+const mdCatalog            = document.getElementById('mdCatalog');
+const mdSourceFilter       = document.getElementById('mdSourceFilter');
+const mdSearch             = document.getElementById('mdSearch');
+const mdRefreshBtn         = document.getElementById('mdRefreshBtn');
+const mdEntityBody         = document.getElementById('mdEntityBody');
+const mdAttrPanel          = document.getElementById('mdAttrPanel');
+const mdAttrPanelTitle     = document.getElementById('mdAttrPanelTitle');
+const mdAttrClose          = document.getElementById('mdAttrClose');
+const mdAttrBody           = document.getElementById('mdAttrBody');
 
 const bridgeManagerOverlay = document.getElementById('bridgeManagerOverlay');
 const bridgeManagerClose   = document.getElementById('bridgeManagerClose');
@@ -449,14 +461,31 @@ function applyPersona() {
   renderAnalystRoleSection();
   updateRoleBadge();
 
-  // Admin button visibility
-  sidebarBottom.style.display = p.isAdmin ? '' : 'none';
+  // Admin / Data Manager button visibility
+  sidebarBottom.style.display = (p.isAdmin || p.isDataManager) ? '' : 'none';
+  adminBtn.style.display      = p.isAdmin       ? '' : 'none';
+  dmCatalogBtn.style.display  = p.isDataManager ? '' : 'none';
 
   // Upload button: admins only
   uploadBtn.style.display = p.isAdmin ? '' : 'none';
 
   // SQL disclosure: show by default for analysts/admins
   document.documentElement.dataset.showSql = p.showSQL ? 'true' : 'false';
+
+  // Data manager sees the metadata catalog instead of chat/landing
+  if (p.isDataManager) {
+    landing.style.display  = 'none';
+    chatView.style.display = 'none';
+    mdCatalog.style.display = 'flex';
+    loadMdCatalog();
+  } else {
+    mdCatalog.style.display = 'none';
+    // Reload source catalog and session list with persona filter
+    renderSourceCatalog();
+    renderSourceSidebar();
+    loadSessions();
+    return;
+  }
 
   // Reload source catalog and session list with persona filter
   renderSourceCatalog();
@@ -2563,6 +2592,321 @@ async function saveBridgeForm() {
     showToast(err.message, 'error');
   }
 }
+
+// ── Metadata Catalog (Data Manager persona) ───────────────────────────────────
+
+// Raw data cache
+let _mdEntities  = [];   // full list from API
+let _mdActiveId  = null; // currently expanded entity metadata_id
+
+// API helpers
+const apiMdListEntities  = (sourceId) =>
+  fetch(`${API}/metadata/entities${sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : ''}`).then(r => r.json());
+const apiMdGetEntity     = (mid) =>
+  fetch(`${API}/metadata/entities/${encodeURIComponent(mid)}`).then(r => r.json());
+const apiMdPatchEntity   = (mid, body) =>
+  fetch(`${API}/metadata/entities/${encodeURIComponent(mid)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  }).then(r => r.json());
+const apiMdPatchAttr     = (attrId, body) =>
+  fetch(`${API}/metadata/attributes/${encodeURIComponent(attrId)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  }).then(r => r.json());
+
+async function loadMdCatalog() {
+  mdEntityBody.innerHTML = '<tr><td colspan="8" class="md-empty">Loading…</td></tr>';
+  mdAttrPanel.style.display = 'none';
+  _mdActiveId = null;
+  try {
+    const srcId = mdSourceFilter.value || '';
+    _mdEntities = await apiMdListEntities(srcId);
+    // Populate source filter dropdown (first load)
+    _populateMdSourceFilter();
+    renderMdEntityTable();
+  } catch (e) {
+    mdEntityBody.innerHTML = `<tr><td colspan="8" class="md-empty">Error loading metadata: ${e.message}</td></tr>`;
+  }
+}
+
+function _populateMdSourceFilter() {
+  const existing = new Set([...mdSourceFilter.options].map(o => o.value));
+  _mdEntities.forEach(e => {
+    if (!existing.has(e.source_id)) {
+      const opt = document.createElement('option');
+      opt.value = e.source_id;
+      opt.textContent = e.source_name || e.source_id;
+      mdSourceFilter.appendChild(opt);
+      existing.add(e.source_id);
+    }
+  });
+}
+
+function renderMdEntityTable() {
+  const query   = (mdSearch.value || '').toLowerCase().trim();
+  const srcId   = mdSourceFilter.value || '';
+  let rows = _mdEntities;
+  if (srcId)   rows = rows.filter(e => e.source_id === srcId);
+  if (query)   rows = rows.filter(e =>
+    e.table_name.toLowerCase().includes(query) ||
+    (e.schema_name || '').toLowerCase().includes(query) ||
+    (e.description || '').toLowerCase().includes(query)
+  );
+
+  if (!rows.length) {
+    mdEntityBody.innerHTML = '<tr><td colspan="8" class="md-empty">No entities found.</td></tr>';
+    return;
+  }
+
+  mdEntityBody.innerHTML = rows.map(e => {
+    const shortId  = e.metadata_id.slice(0, 8) + '…';
+    const isActive = e.metadata_id === _mdActiveId;
+    const desc     = e.description || '';
+    const golden   = e.is_golden_record;
+    const rows_n   = e.row_count != null ? e.row_count.toLocaleString() : '—';
+
+    return `<tr class="md-entity-row${isActive ? ' md-row-selected' : ''}" data-mid="${e.metadata_id}">
+      <td>
+        <button class="md-expand-btn" data-mid="${e.metadata_id}" title="View attributes">
+          ${isActive ? '▼' : '▶'}
+        </button>
+      </td>
+      <td><span class="md-id-badge" title="${e.metadata_id}">${shortId}</span></td>
+      <td>${_esc(e.source_name || e.source_id)}</td>
+      <td>${_esc(e.schema_name || '')}</td>
+      <td><strong>${_esc(e.table_name)}</strong></td>
+      <td>
+        <div class="md-desc-cell">
+          <span class="md-desc-text${desc ? '' : ' empty'}" data-mid="${e.metadata_id}" title="${_esc(desc)}">${_esc(desc) || 'No description'}</span>
+          <button class="md-edit-btn" data-edit-entity="${e.metadata_id}" title="Edit description">✏️</button>
+        </div>
+      </td>
+      <td>${rows_n}</td>
+      <td>
+        <label class="md-golden-toggle" title="Mark as golden record">
+          <input type="checkbox" class="md-golden-chk" data-mid="${e.metadata_id}" ${golden ? 'checked' : ''}>
+          <span class="md-golden-pip">★</span>
+          <span class="md-golden-label">${golden ? 'Golden' : ''}</span>
+        </label>
+      </td>
+    </tr>`;
+  }).join('');
+
+  // Bind expand buttons
+  mdEntityBody.querySelectorAll('.md-expand-btn').forEach(btn => {
+    btn.addEventListener('click', () => toggleMdEntityRow(btn.dataset.mid));
+  });
+
+  // Bind entity description edit
+  mdEntityBody.querySelectorAll('[data-edit-entity]').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      startEntityDescEdit(btn.dataset.editEntity);
+    });
+  });
+
+  // Bind golden record toggles for entities
+  mdEntityBody.querySelectorAll('.md-golden-chk').forEach(chk => {
+    chk.addEventListener('change', async () => {
+      const mid = chk.dataset.mid;
+      const val = chk.checked;
+      // Optimistic update in cache
+      const ent = _mdEntities.find(e => e.metadata_id === mid);
+      if (ent) ent.is_golden_record = val;
+      const label = chk.closest('.md-golden-toggle').querySelector('.md-golden-label');
+      if (label) label.textContent = val ? 'Golden' : '';
+      try {
+        await apiMdPatchEntity(mid, { is_golden_record: val });
+      } catch (_) {
+        showToast('Failed to update golden record flag', 'error');
+        if (ent) ent.is_golden_record = !val;
+        chk.checked = !val;
+      }
+    });
+  });
+}
+
+async function toggleMdEntityRow(mid) {
+  if (_mdActiveId === mid) {
+    _mdActiveId = null;
+    mdAttrPanel.style.display = 'none';
+    renderMdEntityTable();
+    return;
+  }
+  _mdActiveId = mid;
+  renderMdEntityTable();
+  await loadMdAttributes(mid);
+}
+
+async function loadMdAttributes(mid) {
+  const ent = _mdEntities.find(e => e.metadata_id === mid);
+  mdAttrPanelTitle.textContent = ent
+    ? `Attributes — ${ent.schema_name ? ent.schema_name + '.' : ''}${ent.table_name}`
+    : 'Attributes';
+  mdAttrPanel.style.display = '';
+  mdAttrBody.innerHTML = '<tr><td colspan="9" class="md-empty">Loading…</td></tr>';
+
+  try {
+    const entity = await apiMdGetEntity(mid);
+    renderMdAttributeTable(entity.attributes || []);
+  } catch (e) {
+    mdAttrBody.innerHTML = `<tr><td colspan="9" class="md-empty">Error: ${e.message}</td></tr>`;
+  }
+}
+
+function renderMdAttributeTable(attrs) {
+  if (!attrs.length) {
+    mdAttrBody.innerHTML = '<tr><td colspan="9" class="md-empty">No attributes found.</td></tr>';
+    return;
+  }
+
+  mdAttrBody.innerHTML = attrs.map(a => {
+    const nullPct = (a.row_count && a.null_count != null)
+      ? Math.round((a.null_count / a.row_count) * 100) : null;
+    const nullBar = nullPct != null
+      ? `<div class="md-null-bar">
+          <div class="md-null-track"><div class="md-null-fill" style="width:${nullPct}%"></div></div>
+          <span class="md-null-pct">${nullPct}%</span>
+         </div>`
+      : '—';
+    const pkChip = a.is_primary_key ? '<span class="md-chip md-chip-pk">PK</span>' : '<span class="md-chip md-chip-no">—</span>';
+    const fkChip = a.is_foreign_key ? '<span class="md-chip md-chip-fk">FK</span>' : '<span class="md-chip md-chip-no">—</span>';
+    const desc   = a.description || '';
+    const uniqueN = a.unique_count != null ? a.unique_count.toLocaleString() : '—';
+    const golden  = a.is_golden_record;
+
+    return `<tr>
+      <td><strong>${_esc(a.column_name)}</strong></td>
+      <td><code style="font-size:12px">${_esc(a.data_type)}</code></td>
+      <td>${_esc(a.domain || '—')}</td>
+      <td>
+        <div class="md-desc-cell">
+          <span class="md-desc-text${desc ? '' : ' empty'}" title="${_esc(desc)}">${_esc(desc) || 'No description'}</span>
+          <button class="md-edit-btn" data-edit-attr="${a.attr_id}" title="Edit description">✏️</button>
+        </div>
+      </td>
+      <td>${pkChip}</td>
+      <td>${fkChip}</td>
+      <td>${uniqueN}</td>
+      <td>${nullBar}</td>
+      <td>
+        <label class="md-golden-toggle" title="Mark as golden record">
+          <input type="checkbox" class="md-attr-golden-chk" data-attr-id="${a.attr_id}" ${golden ? 'checked' : ''}>
+          <span class="md-golden-pip">★</span>
+          <span class="md-golden-label">${golden ? 'Golden' : ''}</span>
+        </label>
+      </td>
+    </tr>`;
+  }).join('');
+
+  // Bind attribute description edit
+  mdAttrBody.querySelectorAll('[data-edit-attr]').forEach(btn => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      startAttrDescEdit(btn.dataset.editAttr, btn);
+    });
+  });
+
+  // Bind golden record toggles for attributes
+  mdAttrBody.querySelectorAll('.md-attr-golden-chk').forEach(chk => {
+    chk.addEventListener('change', async () => {
+      const attrId = chk.dataset.attrId;
+      const val    = chk.checked;
+      const label  = chk.closest('.md-golden-toggle').querySelector('.md-golden-label');
+      if (label) label.textContent = val ? 'Golden' : '';
+      try {
+        await apiMdPatchAttr(attrId, { is_golden_record: val });
+      } catch (_) {
+        showToast('Failed to update golden record flag', 'error');
+        chk.checked = !val;
+        if (label) label.textContent = !val ? 'Golden' : '';
+      }
+    });
+  });
+}
+
+// ── Inline description editing ─────────────────────────────────────────────
+
+function startEntityDescEdit(mid) {
+  const ent  = _mdEntities.find(e => e.metadata_id === mid);
+  const cell = mdEntityBody.querySelector(`.md-desc-text[data-mid="${mid}"]`);
+  if (!cell) return;
+  const descCell = cell.closest('.md-desc-cell');
+  const current  = ent ? (ent.description || '') : '';
+  descCell.innerHTML = `
+    <input class="md-desc-input" value="${_esc(current)}" maxlength="500" />
+    <button class="btn-primary" style="padding:3px 8px;font-size:12px" id="mdSaveDesc_${mid}">Save</button>
+    <button class="btn-secondary" style="padding:3px 8px;font-size:12px" id="mdCancelDesc_${mid}">✕</button>`;
+  const inp = descCell.querySelector('.md-desc-input');
+  inp.focus();
+  inp.select();
+
+  descCell.querySelector(`#mdSaveDesc_${mid}`).addEventListener('click', async () => {
+    const newDesc = inp.value.trim();
+    if (ent) ent.description = newDesc;
+    try {
+      await apiMdPatchEntity(mid, { description: newDesc });
+      showToast('Description saved', 'success', 1800);
+    } catch (_) { showToast('Save failed', 'error'); }
+    renderMdEntityTable();
+  });
+
+  descCell.querySelector(`#mdCancelDesc_${mid}`).addEventListener('click', () => {
+    renderMdEntityTable();
+  });
+
+  inp.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') descCell.querySelector(`#mdSaveDesc_${mid}`).click();
+    if (ev.key === 'Escape') descCell.querySelector(`#mdCancelDesc_${mid}`).click();
+  });
+}
+
+function startAttrDescEdit(attrId, editBtn) {
+  const td      = editBtn.closest('td');
+  const descCell = td.querySelector('.md-desc-cell');
+  const current  = td.querySelector('.md-desc-text')?.title || '';
+  descCell.innerHTML = `
+    <input class="md-desc-input" value="${_esc(current)}" maxlength="500" />
+    <button class="btn-primary" style="padding:3px 8px;font-size:12px" id="mdSaveAttr_${attrId}">Save</button>
+    <button class="btn-secondary" style="padding:3px 8px;font-size:12px" id="mdCancelAttr_${attrId}">✕</button>`;
+  const inp = descCell.querySelector('.md-desc-input');
+  inp.focus();
+  inp.select();
+
+  descCell.querySelector(`#mdSaveAttr_${attrId}`).addEventListener('click', async () => {
+    const newDesc = inp.value.trim();
+    try {
+      await apiMdPatchAttr(attrId, { description: newDesc });
+      showToast('Description saved', 'success', 1800);
+    } catch (_) { showToast('Save failed', 'error'); }
+    // Re-render attribute table from API to reflect saved value
+    if (_mdActiveId) await loadMdAttributes(_mdActiveId);
+  });
+
+  descCell.querySelector(`#mdCancelAttr_${attrId}`).addEventListener('click', async () => {
+    if (_mdActiveId) await loadMdAttributes(_mdActiveId);
+  });
+
+  inp.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') descCell.querySelector(`#mdSaveAttr_${attrId}`).click();
+    if (ev.key === 'Escape') descCell.querySelector(`#mdCancelAttr_${attrId}`).click();
+  });
+}
+
+// Tiny HTML-escape helper (reuse or define if not already present)
+function _esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Event listeners for metadata catalog
+dmCatalogBtn.addEventListener('click', loadMdCatalog);
+mdRefreshBtn.addEventListener('click', loadMdCatalog);
+mdSourceFilter.addEventListener('change', loadMdCatalog);
+mdSearch.addEventListener('input', renderMdEntityTable);
+mdAttrClose.addEventListener('click', () => {
+  _mdActiveId = null;
+  mdAttrPanel.style.display = 'none';
+  renderMdEntityTable();
+});
 
 // Event listeners for bridge manager
 document.getElementById('adminBridgesBtn').addEventListener('click', openBridgeManager);

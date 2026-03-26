@@ -18,8 +18,8 @@ scikit-learn>=1.4.0                    # TF-IDF embedding backend (recommended)
 
 # Database drivers (install only the driver for your target DB)
 psycopg2-binary>=2.9.9        # PostgreSQL / Redshift (always included — no side-effects)
-pyodbc>=5.0.0                  # SQL Server  (requires unixODBC + ODBC Driver 18 for SQL Server)
-# pymssql>=2.2.0               # SQL Server alternative (pure-Python fallback, no ODBC setup needed)
+pymssql>=2.2.0                 # SQL Server — pure-Python wheel, no ODBC driver required
+# pyodbc>=5.0.0                # SQL Server alternative — needs unixODBC + ODBC Driver 18 (enterprise setups)
 
 # Oracle — uncomment one:
 # oracledb>=2.0.0              # Recommended: thin mode, no Instant Client required

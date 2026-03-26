@@ -13,54 +13,63 @@ class SQLServerConnector(BaseConnector):
         self._conn = None
 
     def connect(self) -> None:
+        # pymssql first: pure-Python wheel, no ODBC driver installation needed.
         try:
-            import pyodbc
-            if self._config.connection_string:
-                self._conn = pyodbc.connect(self._config.connection_string, timeout=30)
-            else:
-                driver = self._config.extra.get("driver", "ODBC Driver 18 for SQL Server")
-                timeout = int(self._config.extra.get("login_timeout", 30))
-                cs = (
-                    f"DRIVER={{{driver}}};"
-                    f"SERVER={self._config.host},{self._config.port or 1433};"
-                    f"DATABASE={self._config.database};"
-                    f"UID={self._config.username};"
-                    f"PWD={self._config.password};"
-                    "TrustServerCertificate=yes;"
-                    f"LoginTimeout={timeout};"
-                    "Encrypt=yes;"
-                )
-                try:
-                    self._conn = pyodbc.connect(cs, timeout=timeout)
-                except pyodbc.Error as exc:
-                    state = exc.args[0] if exc.args else ""
-                    msg   = exc.args[1] if len(exc.args) > 1 else str(exc)
-                    if "HYT00" in str(state) or "timeout" in msg.lower():
-                        raise ConnectionError(
-                            f"Login timeout connecting to SQL Server at "
-                            f"{self._config.host}:{self._config.port or 1433}. "
-                            "Check that: (1) the host/IP is correct, "
-                            "(2) port 1433 is open and reachable, "
-                            "(3) SQL Server is running and allows remote connections."
-                        ) from exc
-                    raise
-        except ImportError:
-            try:
-                import pymssql
+            import pymssql  # type: ignore[import-untyped]
+            if not self._config.connection_string:
                 self._conn = pymssql.connect(
                     server=self._config.host,
-                    port=self._config.port or 1433,
+                    port=int(self._config.port or 1433),
                     database=self._config.database,
                     user=self._config.username,
                     password=self._config.password,
                     login_timeout=30,
                 )
-            except ImportError:
-                raise ImportError(
-                    "No SQL Server driver found. "
-                    "Install pyodbc (recommended): pip install pyodbc  "
-                    "or pymssql: pip install pymssql"
-                )
+                return
+            # pymssql doesn't accept raw ODBC connection strings; fall through to pyodbc
+        except ImportError:
+            pass
+
+        # pyodbc fallback: requires OS-level ODBC Driver 18 for SQL Server
+        try:
+            import pyodbc  # type: ignore[import-untyped]
+        except ImportError:
+            raise ImportError(
+                "No SQL Server driver found. "
+                "Easiest fix — run:  pip install pymssql  (pure-Python, no system setup needed)\n"
+                "Or for enterprise ODBC:  pip install pyodbc  "
+                "(then install 'ODBC Driver 18 for SQL Server' at the OS level)"
+            )
+
+        if self._config.connection_string:
+            self._conn = pyodbc.connect(self._config.connection_string, timeout=30)
+        else:
+            driver  = self._config.extra.get("driver", "ODBC Driver 18 for SQL Server")
+            timeout = int(self._config.extra.get("login_timeout", 30))
+            cs = (
+                f"DRIVER={{{driver}}};"
+                f"SERVER={self._config.host},{self._config.port or 1433};"
+                f"DATABASE={self._config.database};"
+                f"UID={self._config.username};"
+                f"PWD={self._config.password};"
+                "TrustServerCertificate=yes;"
+                f"LoginTimeout={timeout};"
+                "Encrypt=yes;"
+            )
+            try:
+                self._conn = pyodbc.connect(cs, timeout=timeout)
+            except pyodbc.Error as exc:
+                state = exc.args[0] if exc.args else ""
+                msg   = exc.args[1] if len(exc.args) > 1 else str(exc)
+                if "HYT00" in str(state) or "timeout" in msg.lower():
+                    raise ConnectionError(
+                        f"Login timeout connecting to SQL Server at "
+                        f"{self._config.host}:{self._config.port or 1433}. "
+                        "Check that: (1) the host/IP is correct, "
+                        "(2) port 1433 is open and reachable, "
+                        "(3) SQL Server is running and allows remote connections."
+                    ) from exc
+                raise
 
     def close(self) -> None:
         if self._conn:

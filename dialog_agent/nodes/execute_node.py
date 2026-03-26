@@ -309,43 +309,46 @@ def _run_oracle(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
 
 
 def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
-    # Try pyodbc first, fall back to pymssql if not installed
+    # pymssql is tried first: pure-Python wheel, no ODBC driver installation needed.
+    # pyodbc is the fallback for environments that have the Microsoft ODBC Driver installed.
     try:
-        import pyodbc as _driver
-        _driver_name = "pyodbc"
+        import pymssql as _mssql  # type: ignore[import-untyped]
+        _driver_name = "pymssql"
     except ImportError:
+        _mssql = None  # type: ignore[assignment]
+        _driver_name = "pyodbc"
+
+    if _driver_name == "pymssql":
+        if cfg.db_connection_string:
+            # pymssql doesn't accept a raw ODBC connection string; fall through to pyodbc
+            _driver_name = "pyodbc"
+        else:
+            conn = _mssql.connect(
+                server=cfg.db_host,
+                port=int(cfg.db_port or 1433),
+                user=cfg.db_user,
+                password=cfg.db_password,
+                database=cfg.db_name,
+            )
+
+    if _driver_name == "pyodbc":
         try:
-            import pymssql as _driver  # type: ignore[no-redef]
-            _driver_name = "pymssql"
+            import pyodbc  # type: ignore[import-untyped]
         except ImportError:
             raise ImportError(
                 "No SQL Server driver found. "
-                "Run: pip install pyodbc  (requires unixODBC + 'ODBC Driver 18 for SQL Server')\n"
-                "or:  pip install pymssql  (pure-Python, no ODBC setup needed)"
+                "Easiest fix — run:  pip install pymssql  (pure-Python, no system setup needed)\n"
+                "Or for enterprise ODBC:  pip install pyodbc  "
+                "(then install 'ODBC Driver 18 for SQL Server' at the OS level)"
             )
-
-    if _driver_name == "pymssql":
-        # pymssql uses a different connect API
         if cfg.db_connection_string:
-            raise ValueError(
-                "pymssql does not support raw connection strings; "
-                "provide db_host / db_user / db_password / db_name instead."
+            conn = pyodbc.connect(cfg.db_connection_string)
+        else:
+            odbc_driver = cfg.db_extra.get("driver", "ODBC Driver 18 for SQL Server")
+            conn = pyodbc.connect(
+                f"DRIVER={{{odbc_driver}}};SERVER={cfg.db_host},{cfg.db_port or 1433};"
+                f"DATABASE={cfg.db_name};UID={cfg.db_user};PWD={cfg.db_password}"
             )
-        conn = _driver.connect(  # type: ignore[call-arg]
-            server=cfg.db_host,
-            port=cfg.db_port or 1433,
-            user=cfg.db_user,
-            password=cfg.db_password,
-            database=cfg.db_name,
-        )
-    elif cfg.db_connection_string:
-        conn = _driver.connect(cfg.db_connection_string)
-    else:
-        driver = cfg.db_extra.get("driver", "ODBC Driver 18 for SQL Server")
-        conn = _driver.connect(
-            f"DRIVER={{{driver}}};SERVER={cfg.db_host},{cfg.db_port or 1433};"
-            f"DATABASE={cfg.db_name};UID={cfg.db_user};PWD={cfg.db_password}"
-        )
     try:
         with conn.cursor() as cur:
             # SQL Server has no session-level SET SCHEMA; schema is embedded in

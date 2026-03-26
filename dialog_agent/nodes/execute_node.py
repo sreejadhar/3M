@@ -88,6 +88,224 @@ def list_file_dbs() -> Dict[str, str]:
         return dict(_FILE_DB_CACHE)
 
 
+# ── Self-healing SQL retry ────────────────────────────────────────────────────
+#
+# When a query fails, we check whether the error looks like a fixable type-
+# coercion / SQL-dialect problem.  If so, we ask the LLM to patch the SQL and
+# retry — up to _MAX_RETRIES times per query.
+#
+# We never retry errors rooted in the *data* or *schema* (missing tables /
+# columns, division-by-zero, constraint violations, auth/connection failures)
+# because the LLM cannot invent rows or tables that don't exist.
+
+_MAX_RETRIES = 3
+
+# Errors the LLM can plausibly fix by adjusting casts, dialect syntax, or
+# column qualification.
+_RETRYABLE_RE = re.compile(
+    r"invalid input syntax for type"           # PostgreSQL: string → int cast
+    r"|cannot cast type"                        # PostgreSQL: explicit cast fail
+    r"|operator does not exist"                 # PostgreSQL: type mismatch in comparison
+    r"|could not convert"
+    r"|invalid text representation"             # PostgreSQL
+    r"|value .{0,40} out of range for type"     # PostgreSQL: numeric overflow
+    r"|value too long for type"                 # PostgreSQL: string truncation
+    r"|conversion failed when converting"       # SQL Server: CAST / CONVERT fail
+    r"|operand type clash"                      # SQL Server: incompatible types
+    r"|error converting data type"              # SQL Server
+    r"|ORA-01722"                               # Oracle: invalid number
+    r"|ORA-06502"                               # Oracle: value / program error
+    r"|ORA-01858"                               # Oracle: non-numeric char
+    r"|ORA-01843"                               # Oracle: not a valid month
+    r"|datatype mismatch"                       # SQLite
+    r"|type mismatch"
+    r"|incompatible data type"
+    r"|invalid cast"
+    r"|cannot be cast"
+    r"|ambiguous column"                        # qualify with table name
+    r"|syntax error"                            # wrong dialect (e.g. LIMIT on SQL Server)
+    r"|no such function"                        # wrong function for this DB
+    r"|is not a recognized .{0,30} function"    # SQL Server: wrong function name
+    r"|numeric value out of range"
+    r"|out of range"
+    r"|truncated incorrect"                     # MySQL/MariaDB compat
+    , re.IGNORECASE,
+)
+
+# Errors rooted in actual data / schema / infrastructure — the LLM cannot fix
+# these by changing SQL syntax.
+_NOT_RETRYABLE_RE = re.compile(
+    r"no such table"
+    r"|relation .{0,80} does not exist"
+    r"|table .{0,80} doesn't exist"
+    r"|invalid object name"                     # SQL Server: table not found
+    r"|no such column"
+    r"|column .{0,80} does not exist"
+    r"|unknown column"
+    r"|invalid column name"                     # SQL Server: column not found
+    r"|division by zero"
+    r"|divide by zero"
+    r"|unique constraint"
+    r"|primary key constraint"
+    r"|foreign key constraint"
+    r"|not null constraint"
+    r"|check constraint"
+    r"|permission denied"
+    r"|access denied"
+    r"|login fail"
+    r"|authentication"
+    r"|connect"                                 # connection / cannot connect
+    r"|timeout"
+    r"|server closed"
+    r"|out of memory"
+    , re.IGNORECASE,
+)
+
+
+def _is_retryable(error: str) -> bool:
+    """Return True only if the error looks like a fixable type / dialect issue."""
+    if _NOT_RETRYABLE_RE.search(error):
+        return False
+    return bool(_RETRYABLE_RE.search(error))
+
+
+def _llm_fix_sql(
+    sql: str,
+    error: str,
+    db_type: str,
+    model: str,
+    temperature: float,
+) -> str:
+    """
+    Ask the LLM to repair *sql* based on the reported *error*.
+    Returns the corrected SQL, or the original if the LLM call fails or returns
+    the same SQL.
+    """
+    import os
+    import anthropic
+
+    system = (
+        "You are a SQL expert. Fix the type-conversion, type-casting, or SQL-dialect "
+        "error in the query below so it executes without error.\n"
+        "Rules:\n"
+        "1. Change ONLY what is necessary to fix the reported error — preserve all logic.\n"
+        "2. Use correct syntax for the target database type.\n"
+        "3. If an integer/numeric value is compared to a text column, add an explicit CAST.\n"
+        "4. If the dialect is wrong (e.g. LIMIT used in SQL Server), rewrite to the correct form.\n"
+        "5. Return ONLY the corrected SQL — no explanation, no markdown fences."
+    )
+    user = (
+        f"Target database: {db_type}\n"
+        f"Error message:\n{error}\n\n"
+        f"Original SQL:\n{sql}\n\n"
+        "Return the corrected SQL only."
+    )
+    try:
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            temperature=temperature,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        fixed = (msg.content[0].text if msg.content else "").strip()
+        # Strip accidental markdown fences
+        fixed = re.sub(r"^```[a-z]*\s*", "", fixed, flags=re.IGNORECASE)
+        fixed = re.sub(r"\s*```$", "", fixed).strip()
+        return fixed if fixed else sql
+    except Exception as exc:
+        logger.warning("self-heal: LLM fix call failed — %s", exc)
+        return sql
+
+
+def _run_sql_with_retry(cfg: "DialogConfig", sql: str) -> Dict[str, Any]:
+    """
+    Execute *sql* against a live DB, retrying up to _MAX_RETRIES times when
+    the failure looks like a fixable type-coercion / dialect error.
+    """
+    current_sql = sql
+    last_result: Dict[str, Any] = {}
+
+    for attempt in range(_MAX_RETRIES + 1):   # attempt 0 = original
+        result = _run_sql(cfg, current_sql)
+        if not result.get("error"):
+            if attempt > 0:
+                logger.info("self-heal: query fixed after %d attempt(s)", attempt)
+            return result
+
+        error_msg: str = result["error"] or ""
+        last_result = result
+
+        if attempt == _MAX_RETRIES:
+            logger.info("self-heal: max retries (%d) exhausted", _MAX_RETRIES)
+            break
+
+        if not _is_retryable(error_msg):
+            logger.info("self-heal: non-retryable error — %s", error_msg[:120])
+            break
+
+        logger.info(
+            "self-heal: attempt %d/%d — type/dialect error, asking LLM to fix SQL\n"
+            "  error: %s",
+            attempt + 1, _MAX_RETRIES, error_msg[:200],
+        )
+        fixed = _llm_fix_sql(
+            current_sql, error_msg, cfg.db_type,
+            cfg.plan_llm_model, cfg.llm_temperature,
+        )
+        if fixed == current_sql:
+            logger.info("self-heal: LLM returned unchanged SQL — stopping")
+            break
+        current_sql = fixed
+
+    return last_result
+
+
+def _exec_on_conn_with_retry(
+    conn: sqlite3.Connection,
+    sql: str,
+    cfg: "DialogConfig",
+) -> Dict[str, Any]:
+    """
+    Like _exec_on_conn but with LLM-based self-healing for type / dialect errors.
+    """
+    current_sql = sql
+    last_result: Dict[str, Any] = {}
+
+    for attempt in range(_MAX_RETRIES + 1):
+        result = _exec_on_conn(conn, current_sql)
+        if not result.get("error"):
+            if attempt > 0:
+                logger.info("self-heal (file-db): query fixed after %d attempt(s)", attempt)
+            return result
+
+        error_msg: str = result["error"] or ""
+        last_result = result
+
+        if attempt == _MAX_RETRIES:
+            break
+
+        if not _is_retryable(error_msg):
+            logger.info("self-heal (file-db): non-retryable — %s", error_msg[:120])
+            break
+
+        logger.info(
+            "self-heal (file-db): attempt %d/%d — asking LLM to fix SQL\n"
+            "  error: %s",
+            attempt + 1, _MAX_RETRIES, error_msg[:200],
+        )
+        fixed = _llm_fix_sql(
+            current_sql, error_msg, cfg.db_type,
+            cfg.plan_llm_model, cfg.llm_temperature,
+        )
+        if fixed == current_sql:
+            break
+        current_sql = fixed
+
+    return last_result
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _safe_col(name: str) -> str:
@@ -521,9 +739,9 @@ def execute_node(state: DialogState) -> DialogState:
         for q in sql_queries:
             logger.info("  Running %s: %s", q["query_id"], q["description"])
             if file_conn is not None:
-                outcome = _exec_on_conn(file_conn, q["sql"])
+                outcome = _exec_on_conn_with_retry(file_conn, q["sql"], config)
             else:
-                outcome = _run_sql(config, q["sql"])
+                outcome = _run_sql_with_retry(config, q["sql"])
 
             rows      = outcome.get("rows") or []
             columns   = outcome.get("columns") or []

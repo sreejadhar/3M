@@ -74,6 +74,11 @@ class GenerateRequest(BaseModel):
     gremlin_url:              str = ""
     gremlin_traversal_source: str = "g"
 
+    # KG identity — must match KGConfig.kg_id / DialogConfig.graphrag_kg_id.
+    # When set, nodes are stamped with this id so multiple KGs can coexist
+    # in the same Neo4j database.  Defaults to "default" when empty.
+    kg_id: str = ""
+
     # Behaviour: "generate" (default) | "update" (incremental, never clears)
     mode:           str  = "generate"
     clear_existing: bool = False
@@ -231,6 +236,7 @@ def generate_kg(req: GenerateRequest, background_tasks: BackgroundTasks):
         neo4j_database           = req.neo4j_database,
         gremlin_url              = req.gremlin_url,
         gremlin_traversal_source = req.gremlin_traversal_source,
+        kg_id                    = req.kg_id,
         mode                     = req.mode,
         clear_existing           = clear,
     )

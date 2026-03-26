@@ -27,6 +27,14 @@ ONTOLOGY_API_URL   default http://localhost:8001
 KG_API_URL         default http://localhost:8002
 DIALOG_API_URL     default http://localhost:8003
 DATA_DIR           default ./reports
+
+NEO4J_URI          bolt://… — when set, every KG build is persisted to Neo4j
+NEO4J_USERNAME     default neo4j
+NEO4J_PASSWORD     Neo4j password (required when NEO4J_URI is set)
+NEO4J_DATABASE     default neo4j
+
+KG_POSTGRES_DSN    psycopg2 DSN — when set, kg_registry and kg_bridges use PG
+KG_FEDERATION_DB   SQLite path for federation tables (default data/kg_federation.db)
 """
 from __future__ import annotations
 
@@ -201,6 +209,14 @@ METADATA_API = os.environ.get("METADATA_API_URL", "http://localhost:8000")
 ONTOLOGY_API = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001")
 KG_API       = os.environ.get("KG_API_URL",       "http://localhost:8002")
 DIALOG_API   = os.environ.get("DIALOG_API_URL",   "http://localhost:8003")
+
+# ── Neo4j persistence (optional) ───────────────────────────────────────────────
+# When NEO4J_URI is set, every KG build is automatically persisted to Neo4j.
+# All other NEO4J_* vars default to neo4j/neo4j/neo4j if not overridden.
+_NEO4J_URI      = os.environ.get("NEO4J_URI",      "")
+_NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
+_NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
+_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
 
 DATA_DIR  = Path(os.environ.get("DATA_DIR", "./reports"))
 UI_DIR    = Path(__file__).parent / "chat_ui"
@@ -775,11 +791,26 @@ async def _index_source(source_id: str) -> None:
 
         # ── 3. Knowledge Graph ─────────────────────────────────────────────────
         if ontology_content:
-            _push_index_event(source_id, "kg", "running", "Translating ontology to knowledge graph…")
+            _kg_msg = "Translating ontology to knowledge graph"
+            if _NEO4J_URI:
+                _kg_msg += " and persisting to Neo4j"
+            _push_index_event(source_id, "kg", "running", _kg_msg + "…")
             try:
+                kg_req: Dict[str, Any] = {
+                    "ontology_text": ontology_content,
+                    "kg_id":         source_id,
+                }
+                # Pass Neo4j connection when configured — KG pipeline writes
+                # nodes/edges directly to Neo4j stamped with kg_id = source_id.
+                if _NEO4J_URI:
+                    kg_req.update({
+                        "neo4j_uri":      _NEO4J_URI,
+                        "neo4j_username": _NEO4J_USERNAME,
+                        "neo4j_password": _NEO4J_PASSWORD,
+                        "neo4j_database": _NEO4J_DATABASE,
+                    })
                 async with httpx.AsyncClient(timeout=30.0) as client:
-                    rk = await client.post(f"{KG_API}/generate",
-                                           json={"ontology_text": ontology_content})
+                    rk = await client.post(f"{KG_API}/generate", json=kg_req)
                     rk.raise_for_status()
                     kg_job_id = rk.json()["job_id"]
 

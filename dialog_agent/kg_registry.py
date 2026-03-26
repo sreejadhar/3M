@@ -1,14 +1,18 @@
 """
-KG Registry — SQLite-backed catalog of all built Knowledge Graphs.
-Each KG registers here after the build pipeline completes.
-Used by the NLQ router to pick the right KG(s) for a question.
+KG Registry — catalog of all built Knowledge Graphs.
+
+Persists to PostgreSQL when KG_POSTGRES_DSN is set; falls back to SQLite.
+See dialog_agent/pg_store.py for backend configuration.
 """
 from __future__ import annotations
-import json, os, sqlite3, time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
 
-_DB_PATH = os.environ.get("KG_FEDERATION_DB", "data/kg_federation.db")
+import json
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from . import pg_store
+
 
 @dataclass
 class KGEntry:
@@ -26,49 +30,50 @@ class KGEntry:
     created_at:      float                 = 0.0
     updated_at:      float                 = 0.0
 
-def _conn() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(_DB_PATH) or ".", exist_ok=True)
-    c = sqlite3.connect(_DB_PATH, check_same_thread=False)
-    c.row_factory = sqlite3.Row
-    _init(c)
-    return c
 
-def _init(c: sqlite3.Connection) -> None:
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS kg_registry (
-        kg_id             TEXT PRIMARY KEY,
-        display_name      TEXT NOT NULL DEFAULT '',
-        description       TEXT NOT NULL DEFAULT '',
-        keywords_json     TEXT NOT NULL DEFAULT '[]',
-        entity_types_json TEXT NOT NULL DEFAULT '[]',
-        source_id         TEXT NOT NULL DEFAULT '',
-        source_db_type    TEXT NOT NULL DEFAULT '',
-        source_db_host    TEXT NOT NULL DEFAULT '',
-        source_db_name    TEXT NOT NULL DEFAULT '',
-        source_schema     TEXT NOT NULL DEFAULT '',
-        embedding_json    TEXT,
-        created_at        REAL NOT NULL DEFAULT 0,
-        updated_at        REAL NOT NULL DEFAULT 0
-    );
-    """)
-    c.commit()
+# DDL is identical for both PG and SQLite (TEXT PK, REAL timestamps).
+_DDL = """
+CREATE TABLE IF NOT EXISTS kg_registry (
+    kg_id             TEXT PRIMARY KEY,
+    display_name      TEXT NOT NULL DEFAULT '',
+    description       TEXT NOT NULL DEFAULT '',
+    keywords_json     TEXT NOT NULL DEFAULT '[]',
+    entity_types_json TEXT NOT NULL DEFAULT '[]',
+    source_id         TEXT NOT NULL DEFAULT '',
+    source_db_type    TEXT NOT NULL DEFAULT '',
+    source_db_host    TEXT NOT NULL DEFAULT '',
+    source_db_name    TEXT NOT NULL DEFAULT '',
+    source_schema     TEXT NOT NULL DEFAULT '',
+    embedding_json    TEXT,
+    created_at        REAL NOT NULL DEFAULT 0,
+    updated_at        REAL NOT NULL DEFAULT 0
+)
+"""
+
+
+def _ensure(cur) -> None:
+    cur.ddl(_DDL)
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
 
 def upsert(entry: KGEntry) -> None:
     now = time.time()
-    with _conn() as c:
-        c.execute("""
+    with pg_store.cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute("""
         INSERT INTO kg_registry
             (kg_id,display_name,description,keywords_json,entity_types_json,
              source_id,source_db_type,source_db_host,source_db_name,source_schema,
              embedding_json,created_at,updated_at)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(kg_id) DO UPDATE SET
-            display_name=excluded.display_name, description=excluded.description,
-            keywords_json=excluded.keywords_json, entity_types_json=excluded.entity_types_json,
-            source_id=excluded.source_id, source_db_type=excluded.source_db_type,
-            source_db_host=excluded.source_db_host, source_db_name=excluded.source_db_name,
-            source_schema=excluded.source_schema, embedding_json=excluded.embedding_json,
-            updated_at=excluded.updated_at
+            display_name=EXCLUDED.display_name, description=EXCLUDED.description,
+            keywords_json=EXCLUDED.keywords_json, entity_types_json=EXCLUDED.entity_types_json,
+            source_id=EXCLUDED.source_id, source_db_type=EXCLUDED.source_db_type,
+            source_db_host=EXCLUDED.source_db_host, source_db_name=EXCLUDED.source_db_name,
+            source_schema=EXCLUDED.source_schema, embedding_json=EXCLUDED.embedding_json,
+            updated_at=EXCLUDED.updated_at
         """, (
             entry.kg_id, entry.display_name, entry.description,
             json.dumps(entry.domain_keywords), json.dumps(entry.entity_types),
@@ -78,21 +83,34 @@ def upsert(entry: KGEntry) -> None:
             entry.created_at or now, now,
         ))
 
+
 def list_all() -> List[KGEntry]:
-    with _conn() as c:
-        rows = c.execute("SELECT * FROM kg_registry ORDER BY kg_id").fetchall()
+    with pg_store.cursor_ctx() as cur:
+        _ensure(cur)
+        rows = cur.execute(
+            "SELECT * FROM kg_registry ORDER BY kg_id"
+        ).fetchall()
     return [_row(r) for r in rows]
 
+
 def get(kg_id: str) -> Optional[KGEntry]:
-    with _conn() as c:
-        row = c.execute("SELECT * FROM kg_registry WHERE kg_id=?", (kg_id,)).fetchone()
-    return _row(row) if row else None
+    with pg_store.cursor_ctx() as cur:
+        _ensure(cur)
+        r = cur.execute(
+            "SELECT * FROM kg_registry WHERE kg_id=?", (kg_id,)
+        ).fetchone()
+    return _row(r) if r else None
+
 
 def delete(kg_id: str) -> None:
-    with _conn() as c:
-        c.execute("DELETE FROM kg_registry WHERE kg_id=?", (kg_id,))
+    with pg_store.cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute("DELETE FROM kg_registry WHERE kg_id=?", (kg_id,))
 
-def _row(r) -> KGEntry:
+
+# ── Internal ──────────────────────────────────────────────────────────────────
+
+def _row(r: dict) -> KGEntry:
     return KGEntry(
         kg_id=r["kg_id"], display_name=r["display_name"], description=r["description"],
         domain_keywords=json.loads(r["keywords_json"] or "[]"),
@@ -101,5 +119,5 @@ def _row(r) -> KGEntry:
         source_db_host=r["source_db_host"], source_db_name=r["source_db_name"],
         source_schema=r["source_schema"],
         embedding=json.loads(r["embedding_json"]) if r["embedding_json"] else None,
-        created_at=r["created_at"], updated_at=r["updated_at"],
+        created_at=float(r["created_at"]), updated_at=float(r["updated_at"]),
     )

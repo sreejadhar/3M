@@ -57,7 +57,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # ── GraphRAG helpers (inlined — no dialog_agent import needed) ─────────────────
 # These functions mirror dialog_agent/nodes/retrieve_node.py but have no

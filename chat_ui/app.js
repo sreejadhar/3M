@@ -89,6 +89,25 @@ const adminAddBtn      = document.getElementById('adminAddBtn');
 const adminRefreshBtn  = document.getElementById('adminRefreshBtn');
 const adminTableBody   = document.getElementById('adminTableBody');
 
+const bridgeManagerOverlay = document.getElementById('bridgeManagerOverlay');
+const bridgeManagerClose   = document.getElementById('bridgeManagerClose');
+const bridgeAddBtn         = document.getElementById('bridgeAddBtn');
+const bridgeRefreshBtn     = document.getElementById('bridgeRefreshBtn');
+const bridgeFilterSource   = document.getElementById('bridgeFilterSource');
+const bridgeTableBody      = document.getElementById('bridgeTableBody');
+const bridgeFormPanel      = document.getElementById('bridgeFormPanel');
+const bridgeFormTitle      = document.getElementById('bridgeFormTitle');
+const bridgeFormSave       = document.getElementById('bridgeFormSave');
+const bridgeFormCancel     = document.getElementById('bridgeFormCancel');
+const bfFromKg             = document.getElementById('bfFromKg');
+const bfFromEntity         = document.getElementById('bfFromEntity');
+const bfFromCol            = document.getElementById('bfFromCol');
+const bfToKg               = document.getElementById('bfToKg');
+const bfToEntity           = document.getElementById('bfToEntity');
+const bfToCol              = document.getElementById('bfToCol');
+const bfJoinType           = document.getElementById('bfJoinType');
+const bfNotes              = document.getElementById('bfNotes');
+
 // ── Chart state ───────────────────────────────────────────────────────────────
 const _charts = {};   // canvasId → Chart.js instance
 
@@ -2346,25 +2365,6 @@ window.addEventListener('beforeunload', () => {
 
 // ── Bridge Manager ────────────────────────────────────────────────────────────
 
-const bridgeManagerOverlay = document.getElementById('bridgeManagerOverlay');
-const bridgeManagerClose   = document.getElementById('bridgeManagerClose');
-const bridgeAddBtn         = document.getElementById('bridgeAddBtn');
-const bridgeRefreshBtn     = document.getElementById('bridgeRefreshBtn');
-const bridgeFilterSource   = document.getElementById('bridgeFilterSource');
-const bridgeTableBody      = document.getElementById('bridgeTableBody');
-const bridgeFormPanel      = document.getElementById('bridgeFormPanel');
-const bridgeFormTitle      = document.getElementById('bridgeFormTitle');
-const bridgeFormSave       = document.getElementById('bridgeFormSave');
-const bridgeFormCancel     = document.getElementById('bridgeFormCancel');
-const bfFromKg             = document.getElementById('bfFromKg');
-const bfFromEntity         = document.getElementById('bfFromEntity');
-const bfFromCol            = document.getElementById('bfFromCol');
-const bfToKg               = document.getElementById('bfToKg');
-const bfToEntity           = document.getElementById('bfToEntity');
-const bfToCol              = document.getElementById('bfToCol');
-const bfJoinType           = document.getElementById('bfJoinType');
-const bfNotes              = document.getElementById('bfNotes');
-
 let _bridges        = [];   // cached bridge list
 let _bridgeEditId   = null; // null = create mode, string = edit mode
 
@@ -2400,6 +2400,7 @@ async function apiBridgeDelete(id) {
 }
 
 function openBridgeManager() {
+  closeAdminPanel();
   bridgeManagerOverlay.style.display = 'flex';
   hideBridgeForm();
   loadAndRenderBridges();

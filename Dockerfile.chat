@@ -13,8 +13,9 @@ WORKDIR /app
 # Copy installed packages
 COPY --from=builder /install /usr/local
 
-# Copy the orchestrator API and the static chat UI
+# Copy the orchestrator API, metadata catalog, and the static chat UI
 COPY orchestrator_api.py .
+COPY metadata_catalog.py .
 COPY chat_ui/ ./chat_ui/
 
 ENV PYTHONUNBUFFERED=1 \

@@ -137,6 +137,8 @@ services:
     restart: unless-stopped
     ports:
       - "${CHAT_PORT:-8005}:8005"
+    volumes:
+      - metadata_catalog_data:/data
     environment:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
       # Internal Docker DNS — matches service names above
@@ -145,6 +147,7 @@ services:
       KG_API_URL:       "http://kg-api:8002"
       DIALOG_API_URL:   "http://dialog-api:8003"
       LOG_LEVEL:        "${LOG_LEVEL:-info}"
+      METADATA_DB:      "/data/metadata.db"
     depends_on:
       agent-api:
         condition: service_healthy
@@ -205,6 +208,8 @@ services:
 # ── Named volume so reports persist across container restarts ─────────────────
 volumes:
   reports_data:
+    driver: local
+  metadata_catalog_data:
     driver: local
 
 # ── Internal network — UI reaches API via service name, not localhost ─────────

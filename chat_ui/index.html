@@ -387,6 +387,7 @@
       <div class="admin-toolbar">
         <button class="btn-primary" id="adminAddBtn">+ Add data source</button>
         <button class="btn-secondary" id="adminRefreshBtn">Refresh</button>
+        <button class="btn-secondary" id="adminBridgesBtn">KG Bridges</button>
       </div>
       <div class="admin-table-wrap">
         <table class="admin-table" id="adminTable">
@@ -465,6 +466,93 @@
             Editing the ontology will update the graph preview. Admin can save changes.
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Bridge Manager Modal ─────────────────────────────────────────────── -->
+  <div class="modal-overlay" id="bridgeManagerOverlay" style="display:none">
+    <div class="modal bridge-manager-modal">
+      <div class="modal-header">
+        <h2 class="modal-title">KG Bridge Manager</h2>
+        <button class="modal-close" id="bridgeManagerClose">✕</button>
+      </div>
+      <div class="bridge-manager-toolbar">
+        <button class="btn-primary" id="bridgeAddBtn">+ Declare bridge</button>
+        <button class="btn-secondary" id="bridgeRefreshBtn">Refresh</button>
+        <div class="bridge-filter-wrap">
+          <select class="form-select bridge-filter-select" id="bridgeFilterSource">
+            <option value="">All sources</option>
+            <option value="declared">Declared only</option>
+            <option value="inferred">Inferred only</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Add / Edit form (collapsed by default) -->
+      <div class="bridge-form-panel" id="bridgeFormPanel" style="display:none">
+        <div class="bridge-form-title" id="bridgeFormTitle">Declare a new bridge</div>
+        <div class="bridge-form-grid">
+          <div class="form-group">
+            <label class="form-label">From KG</label>
+            <input class="form-input" id="bfFromKg" placeholder="logistics_kg" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">From entity / table</label>
+            <input class="form-input" id="bfFromEntity" placeholder="shipment" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">From column</label>
+            <input class="form-input" id="bfFromCol" placeholder="order_id" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">To KG</label>
+            <input class="form-input" id="bfToKg" placeholder="wms_kg" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">To entity / table</label>
+            <input class="form-input" id="bfToEntity" placeholder="warehouse_order" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">To column</label>
+            <input class="form-input" id="bfToCol" placeholder="order_id" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">Join type</label>
+            <select class="form-select" id="bfJoinType">
+              <option value="FK">FK (foreign key)</option>
+              <option value="soft">Soft (value match)</option>
+            </select>
+          </div>
+          <div class="form-group bridge-form-notes">
+            <label class="form-label">Notes <span class="form-label-opt">(optional)</span></label>
+            <input class="form-input" id="bfNotes" placeholder="Business context for this link…" />
+          </div>
+        </div>
+        <div class="bridge-form-actions">
+          <button class="btn-primary" id="bridgeFormSave">Save</button>
+          <button class="btn-secondary" id="bridgeFormCancel">Cancel</button>
+        </div>
+      </div>
+
+      <!-- Bridge table -->
+      <div class="bridge-table-wrap">
+        <table class="admin-table bridge-table" id="bridgeTable">
+          <thead>
+            <tr>
+              <th>From KG → Entity.Column</th>
+              <th>To KG → Entity.Column</th>
+              <th>Join</th>
+              <th>Source</th>
+              <th>Confidence</th>
+              <th>Enabled</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="bridgeTableBody">
+            <tr><td colspan="7" style="text-align:center;color:var(--clr-text-mute);padding:24px">Loading…</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
   </div>

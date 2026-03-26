@@ -11,6 +11,7 @@ class SQLQuery(TypedDict):
     description: str
     sql: str
     table_refs: List[str]
+    kg_id: str  # which KG this query targets (empty = use default config)
 
 
 class QueryResult(TypedDict):
@@ -52,3 +53,8 @@ class DialogState(TypedDict, total=False):
 
     errors: List[str]
     phase: str                         # understand | plan | execute | synthesize | done | error
+
+    # Multi-KG federation (empty = single-KG mode)
+    active_kg_ids: List[str]           # KG ids selected by router
+    kg_bridges_active: List[Dict[str, Any]]  # bridges between active KGs
+    multi_kg_configs: List[Any]        # one DialogConfig per active KG (for execute_node routing)

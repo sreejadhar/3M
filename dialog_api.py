@@ -177,8 +177,49 @@ def _run_dialog(
         with _sessions_lock:
             history = list(_sessions.get(session_id, []))
 
+        # ── Multi-KG routing ───────────────────────────────────────────────────
+        from dialog_agent.kg_router import route as _kg_route
+        from dialog_agent.kg_registry import list_all as _list_kgs, get as _get_kg
+        from dialog_agent.kg_bridges import list_for_kgs as _list_bridges
+
+        active_kg_ids: List[str] = []
+        multi_kg_configs: List[Dict] = []
+        kg_bridges_active: List[Dict] = []
+
+        if cfg.multi_kg_enabled and len(_list_kgs()) > 1:
+            if cfg.kg_ids:
+                active_kg_ids = list(cfg.kg_ids)
+            else:
+                active_kg_ids = _kg_route(
+                    natural_query,
+                    threshold=cfg.kg_router_threshold,
+                    llm_model=cfg.plan_llm_model,
+                    llm_temperature=cfg.llm_temperature,
+                )
+
+            if len(active_kg_ids) > 1:
+                # Load bridges between active KGs
+                bridges = _list_bridges(active_kg_ids)
+                kg_bridges_active = [b.to_dict() for b in bridges]
+                logger.info(
+                    "Multi-KG routing: active_kg_ids=%s, bridges=%d",
+                    active_kg_ids, len(kg_bridges_active),
+                )
+                # Tag kg_nodes with their kg_id (nodes should have kg_id set by orchestrator)
+                # multi_kg_configs left empty — orchestrator source configs not available here
+                # without ORCHESTRATOR_API integration; execute_node falls back to default cfg
+            else:
+                # Only one KG selected — behave as single-KG
+                active_kg_ids = []
+
         agent  = DialogAgent(cfg)
-        result = agent.run(natural_query, kg_nodes, kg_edges, conversation_history=history)
+        result = agent.run(
+            natural_query, kg_nodes, kg_edges,
+            conversation_history=history,
+            active_kg_ids=active_kg_ids,
+            kg_bridges_active=kg_bridges_active,
+            multi_kg_configs=multi_kg_configs,
+        )
 
         insights = result.get("insights", "")
         sql_queries = result.get("sql_queries") or []
@@ -469,6 +510,105 @@ def clear_session(session_id: str):
     logger.info("Session %s cleared", session_id[:8])
     return {"deleted": session_id}
 
+
+# ── KG Registry endpoints ──────────────────────────────────────────────────────
+
+@app.get("/kg-registry")
+def list_kg_registry():
+    """List all registered Knowledge Graphs."""
+    from dialog_agent.kg_registry import list_all as _list_kgs
+    return [
+        {
+            "kg_id":           e.kg_id,
+            "display_name":    e.display_name,
+            "description":     e.description,
+            "domain_keywords": e.domain_keywords,
+            "entity_types":    e.entity_types,
+            "source_id":       e.source_id,
+            "source_db_type":  e.source_db_type,
+            "created_at":      e.created_at,
+            "updated_at":      e.updated_at,
+        }
+        for e in _list_kgs()
+    ]
+
+
+@app.get("/kg-bridges")
+def list_kg_bridges(enabled_only: bool = False):
+    """List all cross-KG bridges."""
+    from dialog_agent.kg_bridges import list_all as _list_bridges
+    return [b.to_dict() for b in _list_bridges(enabled_only=enabled_only)]
+
+
+class BridgeCreateRequest(BaseModel):
+    from_kg:     str
+    from_column: str
+    to_kg:       str
+    to_column:   str
+    from_entity: str   = ""
+    to_entity:   str   = ""
+    join_type:   str   = "FK"
+    notes:       str   = ""
+
+
+@app.post("/kg-bridges", status_code=201)
+def create_kg_bridge(req: BridgeCreateRequest):
+    """Create a declared bridge between two KGs."""
+    from dialog_agent.kg_bridges import Bridge, upsert as _upsert_bridge
+    b = Bridge(
+        from_kg=req.from_kg, from_column=req.from_column,
+        to_kg=req.to_kg,     to_column=req.to_column,
+        from_entity=req.from_entity, to_entity=req.to_entity,
+        join_type=req.join_type, notes=req.notes,
+        source="declared", confidence=1.0, enabled=True,
+    )
+    bridge_id = _upsert_bridge(b)
+    return {"bridge_id": bridge_id}
+
+
+class BridgeUpdateRequest(BaseModel):
+    enabled:  Optional[bool] = None
+    notes:    Optional[str]  = None
+    promote:  bool           = False   # promote inferred → declared
+
+
+@app.put("/kg-bridges/{bridge_id}")
+def update_kg_bridge(bridge_id: int, req: BridgeUpdateRequest):
+    """Update a bridge: enable/disable, update notes, or promote to declared."""
+    from dialog_agent.kg_bridges import (
+        get_by_id as _get_bridge,
+        set_enabled as _set_enabled,
+        promote_to_declared as _promote,
+    )
+    import dialog_agent.kg_bridges as _kb
+    b = _get_bridge(bridge_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+    if req.enabled is not None:
+        _set_enabled(bridge_id, req.enabled)
+    if req.notes is not None:
+        import sqlite3, time as _time
+        with _kb._conn() as c:
+            c.execute("UPDATE kg_bridges SET notes=?,updated_at=? WHERE id=?",
+                      (req.notes, _time.time(), bridge_id))
+    if req.promote:
+        _promote(bridge_id)
+    updated = _get_bridge(bridge_id)
+    return updated.to_dict() if updated else {}
+
+
+@app.delete("/kg-bridges/{bridge_id}", status_code=200)
+def delete_kg_bridge(bridge_id: int):
+    """Delete a bridge."""
+    from dialog_agent.kg_bridges import get_by_id as _get_bridge, delete as _del_bridge
+    b = _get_bridge(bridge_id)
+    if not b:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+    _del_bridge(bridge_id)
+    return {"deleted": bridge_id}
+
+
+# ── File-DB cache endpoints ────────────────────────────────────────────────────
 
 @app.delete("/file-cache/{file_path:path}", status_code=200)
 def delete_file_cache_entry(file_path: str):

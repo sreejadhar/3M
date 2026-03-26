@@ -407,6 +407,44 @@ def understand_node(state: DialogState) -> DialogState:
     config: DialogConfig = state["config"]
     db_schema = config.db_schema or ""
 
+    # ── Multi-KG path ──────────────────────────────────────────────────────────
+    active_kg_ids = state.get("active_kg_ids") or []
+    if len(active_kg_ids) > 1:
+        # Group nodes by kg_id property (nodes tagged by dialog_api with their source kg_id)
+        kg_node_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for n in nodes:
+            kid = n.get("kg_id", "")
+            kg_node_groups.setdefault(kid, []).append(n)
+
+        sections: List[str] = []
+        for kid in active_kg_ids:
+            kg_nodes_group = kg_node_groups.get(kid, [])
+            section_text = _summarise_graph(kg_nodes_group, edges, db_schema, None)
+            sections.append(f"=== KG: {kid} ===\n{section_text}")
+
+        # Append cross-KG bridge section
+        bridges = state.get("kg_bridges_active") or []
+        if bridges:
+            bridge_lines: List[str] = []
+            for b in bridges:
+                bridge_lines.append(
+                    f"  {b.get('from_kg','')}.{b.get('from_column','')}  →  "
+                    f"{b.get('to_kg','')}.{b.get('to_column','')}  "
+                    f"[{b.get('join_type','FK')}]  "
+                    f"(use this as the join key when combining results)"
+                )
+            sections.append("=== CROSS-KG BRIDGES ===\n" + "\n".join(bridge_lines))
+
+        schema_context = "\n\n".join(sections)
+        logger.info(
+            "Multi-KG schema context built: %d chars, %d KGs, %d bridges",
+            len(schema_context), len(active_kg_ids), len(bridges),
+        )
+        state["schema_context"] = schema_context
+        state["phase"] = "understand"
+        return state
+
+    # ── Single-KG path (unchanged) ─────────────────────────────────────────────
     # If the KG pipeline didn't run or failed, fall back to reading the schema
     # directly from the SQLite DB so queries still work.
     if not nodes and config.db_type.lower() in _FILE_BASED_TYPES and config.db_file_path:

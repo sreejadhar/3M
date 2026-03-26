@@ -805,6 +805,46 @@ async def _index_source(source_id: str) -> None:
                 logger.warning("Source %s: KG failed: %s", source_id[:8], exc)
                 _push_index_event(source_id, "kg", "warn", f"KG build failed: {exc}")
 
+        # ── Register KG in federation registry ────────────────────────────────
+        try:
+            from dialog_agent.kg_registry import upsert as _reg_upsert, KGEntry, list_all as _reg_list
+            from dialog_agent.kg_bridges import run_inference_and_save as _infer_bridges
+            from dialog_agent.kg_router import embed_kg_description
+
+            entry = KGEntry(
+                kg_id=src["id"],
+                display_name=src["name"],
+                description=src.get("description", ""),
+                domain_keywords=[src.get("domain", "")],
+                entity_types=list({n.get("label", "") for n in src.get("kg_nodes", []) if n.get("label")}),
+                source_id=src["id"],
+                source_db_type=src.get("db_type", ""),
+                source_db_host=src.get("connection", {}).get("host", ""),
+                source_db_name=src.get("connection", {}).get("database", ""),
+                source_schema=src.get("connection", {}).get("schema_", ""),
+            )
+            entry.embedding = embed_kg_description(entry)
+            _reg_upsert(entry)
+            logger.info("KG registry: registered %s (%s)", entry.kg_id[:8], entry.display_name)
+
+            # Run bridge inference against all other registered KGs
+            for other in _reg_list():
+                if other.kg_id == entry.kg_id:
+                    continue
+                other_src = _sources.get(other.source_id)
+                if other_src:
+                    saved = _infer_bridges(
+                        entry.kg_id, src.get("kg_nodes", []),
+                        other.kg_id, other_src.get("kg_nodes", []),
+                    )
+                    if saved:
+                        logger.info(
+                            "KG bridges: inferred %d bridges between %s and %s",
+                            len(saved), entry.kg_id[:8], other.kg_id[:8],
+                        )
+        except Exception as _reg_exc:
+            logger.warning("KG registry registration failed (non-fatal): %s", _reg_exc)
+
         src["status"]     = "ready"
         src["indexed_at"] = time.time()
         _push_index_event(source_id, "complete", "done",
@@ -1599,3 +1639,141 @@ async def _rebuild_kg(source_id: str, ontology_text: str) -> None:
         logger.warning("Source %s: KG rebuild failed: %s", source_id[:8], exc)
         _push_index_event(source_id, "kg", "error", f"KG rebuild failed: {exc}")
         _push_index_event(source_id, "complete", "error", f"KG rebuild failed: {exc}")
+
+
+# ── KG Federation admin endpoints ──────────────────────────────────────────────
+
+@app.get("/kg-registry")
+async def orc_list_kg_registry():
+    """List all registered Knowledge Graphs."""
+    try:
+        from dialog_agent.kg_registry import list_all as _list_kgs
+        return [
+            {
+                "kg_id":           e.kg_id,
+                "display_name":    e.display_name,
+                "description":     e.description,
+                "domain_keywords": e.domain_keywords,
+                "entity_types":    e.entity_types,
+                "source_id":       e.source_id,
+                "source_db_type":  e.source_db_type,
+                "created_at":      e.created_at,
+                "updated_at":      e.updated_at,
+            }
+            for e in _list_kgs()
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/kg-bridges")
+async def orc_list_kg_bridges(enabled_only: bool = False):
+    """List all cross-KG bridges."""
+    try:
+        from dialog_agent.kg_bridges import list_all as _list_bridges
+        return [b.to_dict() for b in _list_bridges(enabled_only=enabled_only)]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class OrcBridgeCreateRequest(BaseModel):
+    from_kg:     str
+    from_column: str
+    to_kg:       str
+    to_column:   str
+    from_entity: str   = ""
+    to_entity:   str   = ""
+    join_type:   str   = "FK"
+    notes:       str   = ""
+
+
+@app.post("/kg-bridges", status_code=201)
+async def orc_create_kg_bridge(req: OrcBridgeCreateRequest):
+    """Create a declared bridge between two KGs."""
+    try:
+        from dialog_agent.kg_bridges import Bridge, upsert as _upsert_bridge
+        b = Bridge(
+            from_kg=req.from_kg, from_column=req.from_column,
+            to_kg=req.to_kg,     to_column=req.to_column,
+            from_entity=req.from_entity, to_entity=req.to_entity,
+            join_type=req.join_type, notes=req.notes,
+            source="declared", confidence=1.0, enabled=True,
+        )
+        bridge_id = _upsert_bridge(b)
+        return {"bridge_id": bridge_id}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class OrcBridgeUpdateRequest(BaseModel):
+    enabled:  Optional[bool] = None
+    notes:    Optional[str]  = None
+    promote:  bool           = False
+
+
+@app.put("/kg-bridges/{bridge_id}")
+async def orc_update_kg_bridge(bridge_id: int, req: OrcBridgeUpdateRequest):
+    """Update a bridge: enable/disable, update notes, or promote to declared."""
+    try:
+        import dialog_agent.kg_bridges as _kb
+        from dialog_agent.kg_bridges import (
+            get_by_id as _get_bridge,
+            set_enabled as _set_enabled,
+            promote_to_declared as _promote,
+        )
+        b = _get_bridge(bridge_id)
+        if not b:
+            raise HTTPException(status_code=404, detail="Bridge not found")
+        if req.enabled is not None:
+            _set_enabled(bridge_id, req.enabled)
+        if req.notes is not None:
+            with _kb._conn() as c:
+                c.execute("UPDATE kg_bridges SET notes=?,updated_at=? WHERE id=?",
+                          (req.notes, time.time(), bridge_id))
+        if req.promote:
+            _promote(bridge_id)
+        updated = _get_bridge(bridge_id)
+        return updated.to_dict() if updated else {}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/kg-bridges/{bridge_id}", status_code=200)
+async def orc_delete_kg_bridge(bridge_id: int):
+    """Delete a bridge."""
+    try:
+        from dialog_agent.kg_bridges import get_by_id as _get_bridge, delete as _del_bridge
+        b = _get_bridge(bridge_id)
+        if not b:
+            raise HTTPException(status_code=404, detail="Bridge not found")
+        _del_bridge(bridge_id)
+        return {"deleted": bridge_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/sources/{source_id}/dialog-config")
+async def get_source_dialog_config(source_id: str):
+    """
+    Return connection details for building a DialogConfig for this source.
+    Used by dialog_api multi-KG routing to get per-KG connection info.
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    conn = s.get("connection") or {}
+    return {
+        "kg_id":      source_id,
+        "db_type":    s.get("db_type", ""),
+        "host":       conn.get("host", ""),
+        "port":       conn.get("port", 0),
+        "db_name":    conn.get("database", ""),
+        "schema":     conn.get("schema_", "public"),
+        "username":   conn.get("username", ""),
+        "password":   conn.get("password", ""),
+        "file_path":  conn.get("file_path", ""),
+    }

@@ -225,7 +225,7 @@ def _llm_fix_sql(
         return sql
 
 
-def _run_sql_with_retry(cfg: "DialogConfig", sql: str) -> Dict[str, Any]:
+def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = None, kg_id: str = "") -> Dict[str, Any]:
     """
     Execute *sql* against a live DB, retrying up to _MAX_RETRIES times when
     the failure looks like a fixable type-coercion / dialect error.
@@ -234,7 +234,7 @@ def _run_sql_with_retry(cfg: "DialogConfig", sql: str) -> Dict[str, Any]:
     last_result: Dict[str, Any] = {}
 
     for attempt in range(_MAX_RETRIES + 1):   # attempt 0 = original
-        result = _run_sql(cfg, current_sql)
+        result = _run_sql(cfg, current_sql, state=state, kg_id=kg_id)
         if not result.get("error"):
             if attempt > 0:
                 logger.info("self-heal: query fixed after %d attempt(s)", attempt)
@@ -445,11 +445,22 @@ def _open_file_conn(cfg: DialogConfig) -> sqlite3.Connection:
 
 # ── Thin DB runner ────────────────────────────────────────────────────────────
 
-def _run_sql(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
+def _run_sql(cfg: DialogConfig, sql: str, state: Optional[Dict] = None, kg_id: str = "") -> Dict[str, Any]:
     """
     Execute *sql* and return {columns, rows, error}.
     Supports postgres/redshift, oracle, sqlserver, bigquery, sqlite, csv, excel.
+
+    Multi-KG: if kg_id is set and cfg.db_type is empty, look up the right config
+    from state["multi_kg_configs"] matching that kg_id.
     """
+    # Multi-KG config routing
+    if kg_id and cfg.db_type == "" and state:
+        multi_kg_configs = state.get("multi_kg_configs") or []
+        for entry in multi_kg_configs:
+            if entry.get("kg_id") == kg_id:
+                cfg = entry["config"]
+                break
+
     db = cfg.db_type.lower()
     try:
         if db in ("postgres", "redshift"):
@@ -710,6 +721,84 @@ def _exec_on_conn(conn, sql: str) -> Dict[str, Any]:
         return {"columns": [], "rows": [], "error": str(exc)}
 
 
+# ── Federation merge ──────────────────────────────────────────────────────────
+
+def _federation_merge(results: List[QueryResult], bridges: List[Dict]) -> List[QueryResult]:
+    """
+    Try to join QueryResult pairs that have a matching bridge key.
+    Uses pandas if available, otherwise returns results unchanged.
+    Falls back gracefully — never raises.
+    """
+    if not bridges or len(results) < 2:
+        return results
+    try:
+        import pandas as pd
+
+        # Index results by query_id for quick lookup
+        result_map: Dict[str, QueryResult] = {r["query_id"]: r for r in results}
+        merged_ids: set = set()
+        merged_results: List[QueryResult] = []
+
+        for bridge in bridges:
+            from_col = bridge.get("from_column", "")
+            to_col   = bridge.get("to_column", "")
+            if not from_col or not to_col:
+                continue
+
+            # Find result pairs that share the bridge column
+            left_result: Optional[QueryResult] = None
+            right_result: Optional[QueryResult] = None
+            for r in results:
+                if r["query_id"] in merged_ids:
+                    continue
+                cols_lower = [c.lower() for c in (r.get("columns") or [])]
+                if from_col.lower() in cols_lower and left_result is None:
+                    left_result = r
+                elif to_col.lower() in cols_lower and right_result is None:
+                    right_result = r
+                if left_result and right_result:
+                    break
+
+            if not left_result or not right_result:
+                continue
+
+            try:
+                df_left  = pd.DataFrame(left_result["rows"],  columns=left_result["columns"])
+                df_right = pd.DataFrame(right_result["rows"], columns=right_result["columns"])
+
+                # Rename to_col to from_col if they differ (for merge key alignment)
+                if from_col != to_col and to_col in df_right.columns:
+                    df_right = df_right.rename(columns={to_col: from_col})
+
+                merged = pd.merge(df_left, df_right, on=from_col, how="outer", suffixes=("_l", "_r"))
+                merged_qr = QueryResult(
+                    query_id    = f"{left_result['query_id']}+{right_result['query_id']}",
+                    description = f"Federated merge: {left_result['description']} + {right_result['description']}",
+                    sql         = f"-- federation merge on {from_col}",
+                    columns     = list(merged.columns),
+                    rows        = merged.where(pd.notnull(merged), None).values.tolist(),
+                    row_count   = len(merged),
+                    error       = None,
+                )
+                merged_results.append(merged_qr)
+                merged_ids.add(left_result["query_id"])
+                merged_ids.add(right_result["query_id"])
+                logger.info(
+                    "federation_merge: merged %s + %s on %s → %d rows",
+                    left_result["query_id"], right_result["query_id"], from_col, len(merged),
+                )
+            except Exception as exc:
+                logger.warning("federation_merge: merge failed for bridge %s → %s: %s", from_col, to_col, exc)
+
+        # Keep unmerged results + append merged results
+        final = [r for r in results if r["query_id"] not in merged_ids] + merged_results
+        return final if final else results
+
+    except Exception as exc:
+        logger.warning("federation_merge: overall failure — %s", exc)
+        return results
+
+
 # ── node ──────────────────────────────────────────────────────────────────────
 
 def execute_node(state: DialogState) -> DialogState:
@@ -744,10 +833,11 @@ def execute_node(state: DialogState) -> DialogState:
     try:
         for q in sql_queries:
             logger.info("  Running %s: %s", q["query_id"], q["description"])
+            q_kg_id = q.get("kg_id", "")
             if file_conn is not None:
                 outcome = _exec_on_conn_with_retry(file_conn, q["sql"], config)
             else:
-                outcome = _run_sql_with_retry(config, q["sql"])
+                outcome = _run_sql_with_retry(config, q["sql"], state=state, kg_id=q_kg_id)
 
             rows      = outcome.get("rows") or []
             columns   = outcome.get("columns") or []
@@ -788,6 +878,11 @@ def execute_node(state: DialogState) -> DialogState:
                 file_conn.close()
             except Exception:
                 pass
+
+    # Multi-KG federation merge
+    if len(state.get("active_kg_ids") or []) > 1:
+        bridges = state.get("kg_bridges_active") or []
+        results = _federation_merge(results, bridges)
 
     state["query_results"] = results
     state["phase"] = "execute"

@@ -240,6 +240,14 @@ General Rules:
            COUNT(*) AS denominator,
            ROUND(SUM(CASE WHEN condition THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS Pct
          FROM table_name
+14. Multi-KG federation — when ACTIVE KG IDS contains multiple entries:
+    a. Each query in your JSON array MUST include a "kg_id" field set to one of
+       the active KG ids listed in ACTIVE KG IDS.
+    b. Use the bridge keys listed under CROSS-KG BRIDGES to plan which queries
+       join data across KGs. The bridge key is the shared column that links two KGs.
+    c. When a question requires data from multiple KGs, emit one query per KG
+       and use the bridge column names so the synthesizer can merge them.
+    d. If no bridges are listed, treat each KG independently.
 """
 
 _USER_PROMPT = """\
@@ -248,8 +256,7 @@ SCHEMA CONTEXT:
 
 TARGET DATABASE TYPE: {db_type}
 {schema_line}
-{history_section}
-NATURAL LANGUAGE QUESTION:
+{history_section}{multi_kg_section}NATURAL LANGUAGE QUESTION:
 {natural_query}
 
 CRITICAL REMINDERS:
@@ -826,11 +833,28 @@ def plan_node(state: DialogState) -> DialogState:
     else:
         history_section = ""
 
+    # Build multi-KG section if applicable
+    active_kg_ids = state.get("active_kg_ids") or []
+    kg_bridges_active = state.get("kg_bridges_active") or []
+    if len(active_kg_ids) > 1:
+        bridges_text = "\n".join(
+            f"  {b.get('from_kg','')}.{b.get('from_column','')}  →  "
+            f"{b.get('to_kg','')}.{b.get('to_column','')}  [{b.get('join_type','FK')}]"
+            for b in kg_bridges_active
+        ) or "  (none detected)"
+        multi_kg_section = (
+            f"ACTIVE KG IDS: {active_kg_ids}\n"
+            f"CROSS-KG BRIDGES (join keys between schemas):\n{bridges_text}\n\n"
+        )
+    else:
+        multi_kg_section = ""
+
     user = _USER_PROMPT.format(
         schema_context=schema_context,
         db_type=config.db_type,
         schema_line=schema_line,
         history_section=history_section,
+        multi_kg_section=multi_kg_section,
         natural_query=natural_query,
     )
 
@@ -954,6 +978,7 @@ def plan_node(state: DialogState) -> DialogState:
                 description = item.get("description", ""),
                 sql         = sql,
                 table_refs  = item.get("table_refs", []),
+                kg_id       = item.get("kg_id", ""),  # multi-KG: which KG this query targets
             )
         )
 

@@ -2344,6 +2344,235 @@ window.addEventListener('beforeunload', () => {
   if (activeSessionId) navigator.sendBeacon(`${API}/sessions/${activeSessionId}/file-cache`);
 });
 
+// ── Bridge Manager ────────────────────────────────────────────────────────────
+
+const bridgeManagerOverlay = document.getElementById('bridgeManagerOverlay');
+const bridgeManagerClose   = document.getElementById('bridgeManagerClose');
+const bridgeAddBtn         = document.getElementById('bridgeAddBtn');
+const bridgeRefreshBtn     = document.getElementById('bridgeRefreshBtn');
+const bridgeFilterSource   = document.getElementById('bridgeFilterSource');
+const bridgeTableBody      = document.getElementById('bridgeTableBody');
+const bridgeFormPanel      = document.getElementById('bridgeFormPanel');
+const bridgeFormTitle      = document.getElementById('bridgeFormTitle');
+const bridgeFormSave       = document.getElementById('bridgeFormSave');
+const bridgeFormCancel     = document.getElementById('bridgeFormCancel');
+const bfFromKg             = document.getElementById('bfFromKg');
+const bfFromEntity         = document.getElementById('bfFromEntity');
+const bfFromCol            = document.getElementById('bfFromCol');
+const bfToKg               = document.getElementById('bfToKg');
+const bfToEntity           = document.getElementById('bfToEntity');
+const bfToCol              = document.getElementById('bfToCol');
+const bfJoinType           = document.getElementById('bfJoinType');
+const bfNotes              = document.getElementById('bfNotes');
+
+let _bridges        = [];   // cached bridge list
+let _bridgeEditId   = null; // null = create mode, string = edit mode
+
+async function apiBridgeList() {
+  const r = await fetch(`${API}/kg-bridges`);
+  if (!r.ok) return [];
+  return r.json();
+}
+
+async function apiBridgeCreate(payload) {
+  const r = await fetch(`${API}/kg-bridges`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function apiBridgeUpdate(id, payload) {
+  const r = await fetch(`${API}/kg-bridges/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function apiBridgeDelete(id) {
+  const r = await fetch(`${API}/kg-bridges/${id}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+function openBridgeManager() {
+  bridgeManagerOverlay.style.display = 'flex';
+  hideBridgeForm();
+  loadAndRenderBridges();
+}
+
+function closeBridgeManager() {
+  bridgeManagerOverlay.style.display = 'none';
+}
+
+async function loadAndRenderBridges() {
+  bridgeTableBody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--clr-text-mute);padding:24px">Loading…</td></tr>';
+  try {
+    _bridges = await apiBridgeList();
+  } catch (_) {
+    _bridges = [];
+  }
+  renderBridgeTable();
+}
+
+function renderBridgeTable() {
+  const filter = bridgeFilterSource.value;
+  const list   = filter ? _bridges.filter(b => b.source === filter) : _bridges;
+
+  if (list.length === 0) {
+    bridgeTableBody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--clr-text-mute);padding:24px">No bridges found.</td></tr>';
+    return;
+  }
+
+  bridgeTableBody.innerHTML = list.map(b => {
+    const confPct = Math.round((b.confidence || 0) * 100);
+    const fromLabel = `<strong>${escHtml(b.from_kg)}</strong> → ${escHtml(b.from_entity || '')}.${escHtml(b.from_column)}`;
+    const toLabel   = `<strong>${escHtml(b.to_kg)}</strong> → ${escHtml(b.to_entity || '')}.${escHtml(b.to_column)}`;
+    const canPromote = b.source === 'inferred';
+    return `
+    <tr data-bridge-id="${escHtml(b.id)}">
+      <td>${fromLabel}</td>
+      <td>${toLabel}</td>
+      <td>${escHtml(b.join_type || 'FK')}</td>
+      <td><span class="bridge-source-badge ${escHtml(b.source)}">${escHtml(b.source)}</span></td>
+      <td>
+        <div class="bridge-confidence-bar">
+          <div class="bridge-confidence-track">
+            <div class="bridge-confidence-fill" style="width:${confPct}%"></div>
+          </div>
+          <span class="bridge-confidence-label">${confPct}%</span>
+        </div>
+      </td>
+      <td>
+        <label class="bridge-toggle" title="${b.enabled ? 'Enabled — click to disable' : 'Disabled — click to enable'}">
+          <input type="checkbox" class="bridge-enable-chk" data-id="${escHtml(b.id)}" ${b.enabled ? 'checked' : ''}>
+          <span class="bridge-toggle-slider"></span>
+        </label>
+      </td>
+      <td>
+        <div class="admin-actions">
+          <button class="admin-action-btn" data-action="edit" data-id="${escHtml(b.id)}">Edit</button>
+          ${canPromote ? `<button class="admin-action-btn" data-action="promote" data-id="${escHtml(b.id)}">Declare</button>` : ''}
+          <button class="admin-action-btn danger" data-action="delete" data-id="${escHtml(b.id)}">Delete</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+
+  // Toggle enable/disable
+  bridgeTableBody.querySelectorAll('.bridge-enable-chk').forEach(chk => {
+    chk.addEventListener('change', async () => {
+      const id      = chk.dataset.id;
+      const enabled = chk.checked;
+      try {
+        await apiBridgeUpdate(id, { enabled });
+        const b = _bridges.find(x => x.id === id);
+        if (b) b.enabled = enabled;
+      } catch (err) {
+        showToast(err.message, 'error');
+        chk.checked = !enabled; // revert
+      }
+    });
+  });
+
+  // Row action buttons
+  bridgeTableBody.querySelectorAll('[data-action]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id     = btn.dataset.id;
+      const action = btn.dataset.action;
+      const b      = _bridges.find(x => x.id === id);
+      if (!b) return;
+
+      if (action === 'edit') {
+        showBridgeForm(b);
+      } else if (action === 'promote') {
+        try {
+          await apiBridgeUpdate(id, { source: 'declared', confidence: 1.0 });
+          showToast('Bridge promoted to declared', 'success');
+          await loadAndRenderBridges();
+        } catch (err) { showToast(err.message, 'error'); }
+      } else if (action === 'delete') {
+        if (!confirm('Delete this bridge? This cannot be undone.')) return;
+        try {
+          await apiBridgeDelete(id);
+          showToast('Bridge deleted', 'info');
+          await loadAndRenderBridges();
+        } catch (err) { showToast(err.message, 'error'); }
+      }
+    });
+  });
+}
+
+function showBridgeForm(bridge = null) {
+  _bridgeEditId = bridge ? bridge.id : null;
+  bridgeFormTitle.textContent = bridge ? 'Edit bridge' : 'Declare a new bridge';
+  bfFromKg.value     = bridge ? (bridge.from_kg     || '') : '';
+  bfFromEntity.value = bridge ? (bridge.from_entity || '') : '';
+  bfFromCol.value    = bridge ? (bridge.from_column  || '') : '';
+  bfToKg.value       = bridge ? (bridge.to_kg       || '') : '';
+  bfToEntity.value   = bridge ? (bridge.to_entity   || '') : '';
+  bfToCol.value      = bridge ? (bridge.to_column    || '') : '';
+  bfJoinType.value   = bridge ? (bridge.join_type    || 'FK') : 'FK';
+  bfNotes.value      = bridge ? (bridge.notes        || '') : '';
+  bridgeFormPanel.style.display = 'block';
+  bfFromKg.focus();
+}
+
+function hideBridgeForm() {
+  bridgeFormPanel.style.display = 'none';
+  _bridgeEditId = null;
+}
+
+async function saveBridgeForm() {
+  const payload = {
+    from_kg:     bfFromKg.value.trim(),
+    from_entity: bfFromEntity.value.trim(),
+    from_column: bfFromCol.value.trim(),
+    to_kg:       bfToKg.value.trim(),
+    to_entity:   bfToEntity.value.trim(),
+    to_column:   bfToCol.value.trim(),
+    join_type:   bfJoinType.value,
+    notes:       bfNotes.value.trim(),
+  };
+
+  if (!payload.from_kg || !payload.from_column || !payload.to_kg || !payload.to_column) {
+    showToast('From KG, From column, To KG, and To column are required.', 'error');
+    return;
+  }
+
+  try {
+    if (_bridgeEditId) {
+      await apiBridgeUpdate(_bridgeEditId, payload);
+      showToast('Bridge updated', 'success');
+    } else {
+      // Declared bridges always get confidence 1.0 and source=declared
+      payload.source     = 'declared';
+      payload.confidence = 1.0;
+      payload.enabled    = true;
+      await apiBridgeCreate(payload);
+      showToast('Bridge declared', 'success');
+    }
+    hideBridgeForm();
+    await loadAndRenderBridges();
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
+
+// Event listeners for bridge manager
+document.getElementById('adminBridgesBtn').addEventListener('click', openBridgeManager);
+bridgeManagerClose.addEventListener('click', closeBridgeManager);
+bridgeManagerOverlay.addEventListener('click', (e) => { if (e.target === bridgeManagerOverlay) closeBridgeManager(); });
+bridgeRefreshBtn.addEventListener('click', loadAndRenderBridges);
+bridgeFilterSource.addEventListener('change', renderBridgeTable);
+bridgeAddBtn.addEventListener('click', () => showBridgeForm(null));
+bridgeFormSave.addEventListener('click', saveBridgeForm);
+bridgeFormCancel.addEventListener('click', hideBridgeForm);
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 (async function init() {

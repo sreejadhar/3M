@@ -4,7 +4,7 @@ Configuration for the Dialog with Data Agent.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 
 @dataclass
@@ -79,3 +79,8 @@ class DialogConfig:
     # so it matches the index created by embed_node.  Only set this explicitly
     # if you used a custom KGConfig.embed_index_name.
     graphrag_neo4j_index:    str = ""
+
+    # ── Multi-KG federation ───────────────────────────────────────────────────────
+    multi_kg_enabled: bool = True          # enable NLQ router
+    kg_ids: List[str] = field(default_factory=list)  # explicit KG list (bypasses router)
+    kg_router_threshold: float = 0.30      # min cosine similarity for routing

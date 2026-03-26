@@ -62,6 +62,9 @@ class DialogAgent:
         kg_nodes: Optional[List[Dict]] = None,
         kg_edges: Optional[List[Dict]] = None,
         conversation_history: Optional[List[ConversationTurn]] = None,
+        active_kg_ids: Optional[List[str]] = None,
+        kg_bridges_active: Optional[List[Dict]] = None,
+        multi_kg_configs: Optional[List[Any]] = None,
     ) -> DialogState:
         return DialogState(
             config               = self._config,
@@ -75,6 +78,10 @@ class DialogAgent:
             insights             = "",
             errors               = [],
             phase                = "start",
+            # Multi-KG federation fields (default to empty = single-KG mode)
+            active_kg_ids        = active_kg_ids or [],
+            kg_bridges_active    = kg_bridges_active or [],
+            multi_kg_configs     = multi_kg_configs or [],
         )
 
     def run(
@@ -83,9 +90,17 @@ class DialogAgent:
         kg_nodes: Optional[List[Dict]] = None,
         kg_edges: Optional[List[Dict]] = None,
         conversation_history: Optional[List[ConversationTurn]] = None,
+        active_kg_ids: Optional[List[str]] = None,
+        kg_bridges_active: Optional[List[Dict]] = None,
+        multi_kg_configs: Optional[List[Any]] = None,
     ) -> DialogState:
         """Synchronous end-to-end execution; returns the final state."""
-        state = self._initial_state(natural_query, kg_nodes, kg_edges, conversation_history)
+        state = self._initial_state(
+            natural_query, kg_nodes, kg_edges, conversation_history,
+            active_kg_ids=active_kg_ids,
+            kg_bridges_active=kg_bridges_active,
+            multi_kg_configs=multi_kg_configs,
+        )
         result = self._graph.invoke(state)
         result["phase"] = "done"
         return result
@@ -96,9 +111,17 @@ class DialogAgent:
         kg_nodes: Optional[List[Dict]] = None,
         kg_edges: Optional[List[Dict]] = None,
         conversation_history: Optional[List[ConversationTurn]] = None,
+        active_kg_ids: Optional[List[str]] = None,
+        kg_bridges_active: Optional[List[Dict]] = None,
+        multi_kg_configs: Optional[List[Any]] = None,
     ) -> Generator[Tuple[str, DialogState], None, None]:
         """Yield (node_name, state_update) for each completed pipeline node."""
-        state = self._initial_state(natural_query, kg_nodes, kg_edges, conversation_history)
+        state = self._initial_state(
+            natural_query, kg_nodes, kg_edges, conversation_history,
+            active_kg_ids=active_kg_ids,
+            kg_bridges_active=kg_bridges_active,
+            multi_kg_configs=multi_kg_configs,
+        )
         for event in self._graph.stream(state, stream_mode="updates"):
             for node_name, state_update in event.items():
                 yield node_name, state_update

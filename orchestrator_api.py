@@ -770,7 +770,7 @@ async def _index_source(source_id: str) -> None:
 
         # ── Persist metadata to catalog store ──────────────────────────────────
         try:
-            from dialog_agent.metadata_store import persist as _persist_meta
+            from metadata_catalog import persist as _persist_meta
             n = _persist_meta(source_id, src.get("name", ""), report)
             logger.info("Persisted %d metadata entities for source %s", n, source_id[:8])
         except Exception as _me:
@@ -1864,7 +1864,7 @@ class UpdateAttributeRequest(BaseModel):
 async def list_metadata_entities(source_id: Optional[str] = None):
     """List persisted metadata entities, optionally filtered by source."""
     try:
-        from dialog_agent.metadata_store import list_entities
+        from metadata_catalog import list_entities
         return list_entities(source_id)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -1874,7 +1874,7 @@ async def list_metadata_entities(source_id: Optional[str] = None):
 async def get_metadata_entity(metadata_id: str):
     """Get a single metadata entity with its attributes."""
     try:
-        from dialog_agent.metadata_store import get_entity
+        from metadata_catalog import get_entity
         entity = get_entity(metadata_id)
         if not entity:
             raise HTTPException(status_code=404, detail="Entity not found")
@@ -1889,7 +1889,7 @@ async def get_metadata_entity(metadata_id: str):
 async def patch_metadata_entity(metadata_id: str, req: UpdateEntityRequest):
     """Update entity description and/or golden-record flag."""
     try:
-        from dialog_agent.metadata_store import update_entity
+        from metadata_catalog import update_entity
         kwargs: Dict[str, Any] = {}
         if req.description is not None:
             kwargs["description"] = req.description
@@ -1898,7 +1898,7 @@ async def patch_metadata_entity(metadata_id: str, req: UpdateEntityRequest):
         if not kwargs:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
         update_entity(metadata_id, **kwargs)
-        from dialog_agent.metadata_store import get_entity
+        from metadata_catalog import get_entity
         updated = get_entity(metadata_id)
         if not updated:
             raise HTTPException(status_code=404, detail="Entity not found")
@@ -1915,8 +1915,7 @@ async def patch_metadata_entity(metadata_id: str, req: UpdateEntityRequest):
 async def patch_metadata_attribute(attr_id: str, req: UpdateAttributeRequest):
     """Update attribute description and/or golden-record flag."""
     try:
-        from dialog_agent.metadata_store import update_attribute
-        from dialog_agent import pg_store
+        from metadata_catalog import update_attribute, get_attribute
         kwargs: Dict[str, Any] = {}
         if req.description is not None:
             kwargs["description"] = req.description
@@ -1925,15 +1924,10 @@ async def patch_metadata_attribute(attr_id: str, req: UpdateAttributeRequest):
         if not kwargs:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
         update_attribute(attr_id, **kwargs)
-        # Fetch the updated attribute row
-        with pg_store.cursor_ctx() as cur:
-            row = cur.execute(
-                "SELECT * FROM md_attributes WHERE attr_id=?", (attr_id,)
-            ).fetchone()
+        row = get_attribute(attr_id)
         if not row:
             raise HTTPException(status_code=404, detail="Attribute not found")
-        from dialog_agent.metadata_store import _coerce_attr
-        return _coerce_attr(dict(row))
+        return row
     except HTTPException:
         raise
     except Exception as exc:

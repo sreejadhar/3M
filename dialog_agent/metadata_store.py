@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from dialog_agent import pg_store
+from . import pg_store
 
 logger = logging.getLogger(__name__)
 

@@ -2619,7 +2619,11 @@ async function loadMdCatalog() {
   _mdActiveId = null;
   try {
     const srcId = mdSourceFilter.value || '';
-    _mdEntities = await apiMdListEntities(srcId);
+    const raw = await apiMdListEntities(srcId);
+    if (!Array.isArray(raw)) {
+      throw new Error(raw?.detail || raw?.message || JSON.stringify(raw));
+    }
+    _mdEntities = raw;
     // Populate source filter dropdown (first load)
     _populateMdSourceFilter();
     renderMdEntityTable();

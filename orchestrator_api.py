@@ -62,6 +62,8 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import metadata_catalog as _mc   # standalone catalog module (no dialog_agent dep)
+import kg_store as _kg_store           # KG snapshot persistence
+import access_control as _ac           # RBAC / ABAC engine
 
 # ── GraphRAG helpers (inlined — no dialog_agent import needed) ─────────────────
 # These functions mirror dialog_agent/nodes/retrieve_node.py but have no
@@ -384,6 +386,34 @@ app.add_middleware(
 # Serve static UI assets under /ui/
 if UI_DIR.exists():
     app.mount("/ui", StaticFiles(directory=str(UI_DIR)), name="ui")
+
+
+# ── Startup: restore KG snapshots + bootstrap RBAC ────────────────────────────
+
+@app.on_event("startup")
+async def _startup() -> None:
+    """
+    In production: reload all previously-indexed sources from kg_store so that
+    their KG nodes/edges are immediately available without re-indexing.
+    Also bootstrap the RBAC store (creates tables, seeds default admin if needed).
+    """
+    try:
+        _ac.bootstrap()
+        logger.info("access_control: RBAC store bootstrapped (enforced=%s)", _ac.is_enforced())
+    except Exception as exc:
+        logger.warning("access_control bootstrap failed (non-fatal): %s", exc)
+
+    if os.environ.get("APP_ENV", "").strip().lower() == "production":
+        try:
+            restored = _kg_store.load_all()
+            for src in restored:
+                if src["id"] not in _sources:
+                    _sources[src["id"]] = src
+            logger.info("kg_store: restored %d sources from persistent store", len(restored))
+        except Exception as exc:
+            logger.warning("kg_store restore failed (non-fatal): %s", exc)
+    else:
+        logger.info("kg_store: dev/test mode — skipping KG snapshot restore")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -919,6 +949,14 @@ async def _index_source(source_id: str) -> None:
 
         src["status"]     = "ready"
         src["indexed_at"] = time.time()
+
+        # ── Persist KG snapshot so it survives restarts ────────────────────────
+        try:
+            _kg_store.save(src)
+            logger.info("kg_store: snapshot saved for %s", source_id[:8])
+        except Exception as _ks_exc:
+            logger.warning("kg_store.save failed (non-fatal): %s", _ks_exc)
+
         _push_index_event(source_id, "complete", "done",
                           f"Indexing complete — {src['table_count']} tables ready for querying")
         logger.info("Source %s indexed: %d tables", source_id[:8], src["table_count"])
@@ -1420,6 +1458,11 @@ async def delete_source(source_id: str):
                                      json={"path": file_path})
         except Exception as exc:
             logger.warning("Could not purge source file %s: %s", file_path, exc)
+    # Remove from KG snapshot store
+    try:
+        _kg_store.delete(source_id)
+    except Exception as exc:
+        logger.warning("kg_store.delete failed (non-fatal): %s", exc)
     logger.info("Source deleted: %s (%s)", source_id[:8], s["name"])
     return {"deleted": source_id}
 
@@ -2095,3 +2138,106 @@ async def run_bridge_transitivity():
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Access Control (RBAC / ABAC) endpoints ─────────────────────────────────────
+# Enforcement is active only in production (APP_ENV=production).
+# In dev/test all checks pass through — use these endpoints to configure users
+# in advance and the rules will take effect automatically once deployed.
+
+class AccessUserCreate(BaseModel):
+    user_id: Optional[str] = None
+    name:    str
+    email:   str
+    role:    str = "viewer"   # viewer | analyst | manager | admin
+    domain:  str = "*"        # "*" = all domains, or e.g. "Finance"
+
+class AccessUserUpdate(BaseModel):
+    name:      Optional[str] = None
+    email:     Optional[str] = None
+    role:      Optional[str] = None
+    domain:    Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+@app.get("/access/status")
+async def access_control_status():
+    """Return whether RBAC enforcement is active."""
+    return {
+        "enforced": _ac.is_enforced(),
+        "mode":     "production" if _ac.is_enforced() else "dev/test (pass-through)",
+        "roles":    list(_ac.ROLES),
+    }
+
+
+@app.get("/access/users")
+async def list_access_users():
+    """List all users in the RBAC store."""
+    try:
+        return _ac.list_users()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/access/users", status_code=201)
+async def create_access_user(req: AccessUserCreate):
+    """Create a new RBAC user."""
+    try:
+        user = _ac.add_user(req.user_id, req.name, req.email, req.role, req.domain)
+        return user
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/access/users/{user_id}")
+async def get_access_user(user_id: str):
+    user = _ac.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+@app.patch("/access/users/{user_id}")
+async def update_access_user(user_id: str, req: AccessUserUpdate):
+    """Update name, email, role, domain or is_active for a user."""
+    updates = {k: v for k, v in req.dict().items() if v is not None}
+    try:
+        updated = _ac.update_user(user_id, **updates)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found or no valid fields")
+    return _ac.get_user(user_id) or {}
+
+
+@app.delete("/access/users/{user_id}", status_code=200)
+async def delete_access_user(user_id: str):
+    _ac.delete_user(user_id)
+    return {"deleted": user_id}
+
+
+@app.get("/access/check")
+async def access_check(user_id: str, source_id: Optional[str] = None, action: Optional[str] = None):
+    """
+    Dry-run access check for a user.
+    Pass source_id to check source access, action to check permission.
+    In dev/test always returns allowed=True.
+    """
+    result: Dict[str, Any] = {
+        "user_id":  user_id,
+        "enforced": _ac.is_enforced(),
+        "allowed":  True,
+    }
+    if source_id:
+        src = _sources.get(source_id)
+        if not src:
+            raise HTTPException(status_code=404, detail="Source not found")
+        result["source_access"] = _ac.can_access_source(user_id, src)
+        result["allowed"]       = result["source_access"]
+    if action:
+        result["action"]      = action
+        result["can_perform"] = _ac.can_perform(user_id, action)
+        result["allowed"]     = result.get("allowed", True) and result["can_perform"]
+    return result

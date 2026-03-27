@@ -2350,6 +2350,7 @@ adminClose.addEventListener('click', closeAdminPanel);
 adminRefreshBtn.addEventListener('click', async () => { await loadSources(); renderAdminTable(); });
 adminAddBtn.addEventListener('click', () => { closeAdminPanel(); openWizard(); });
 adminOverlay.addEventListener('click', (e) => { if (e.target === adminOverlay) closeAdminPanel(); });
+document.getElementById('adminRbacBtn').addEventListener('click', () => { closeAdminPanel(); openRbacPanel(); });
 
 // Wizard
 wizardClose.addEventListener('click', closeWizard);
@@ -3160,3 +3161,159 @@ bridgeFormCancel.addEventListener('click', hideBridgeForm);
     if (s.status === 'indexing') pollSourceStatus(s.id);
   });
 })();
+
+// ── RBAC / Users & Access Panel ──────────────────────────────────────────────
+
+const rbacOverlay         = document.getElementById('rbacOverlay');
+const rbacClose           = document.getElementById('rbacClose');
+const rbacRefreshBtn      = document.getElementById('rbacRefreshBtn');
+const rbacAddBtn          = document.getElementById('rbacAddBtn');
+const rbacTableBody       = document.getElementById('rbacTableBody');
+const rbacEnforcedBadge   = document.getElementById('rbacEnforcedBadge');
+const rbacUserFormOverlay = document.getElementById('rbacUserFormOverlay');
+const rbacUserFormTitle   = document.getElementById('rbacUserFormTitle');
+const rbacUserFormClose   = document.getElementById('rbacUserFormClose');
+const rbacUserFormCancel  = document.getElementById('rbacUserFormCancel');
+const rbacUserFormSave    = document.getElementById('rbacUserFormSave');
+
+let _rbacEditUserId = null;   // null = adding, string = editing
+
+async function openRbacPanel() {
+  rbacOverlay.style.display = 'flex';
+  await loadRbacStatus();
+  await renderRbacTable();
+}
+
+function closeRbacPanel() {
+  rbacOverlay.style.display = 'none';
+}
+
+async function loadRbacStatus() {
+  try {
+    const r = await fetch(`${API}/access/status`);
+    if (!r.ok) return;
+    const d = await r.json();
+    rbacEnforcedBadge.textContent = d.enforced
+      ? '🔒 Enforcement: ACTIVE (production)'
+      : '🔓 Enforcement: OFF (dev/test — rules are stored but not checked)';
+    rbacEnforcedBadge.style.color = d.enforced ? 'var(--clr-accent)' : 'var(--clr-text-mute)';
+  } catch (_) { /* non-fatal */ }
+}
+
+async function renderRbacTable() {
+  try {
+    const r = await fetch(`${API}/access/users`);
+    if (!r.ok) throw new Error(await r.text());
+    const users = await r.json();
+    if (users.length === 0) {
+      rbacTableBody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--clr-text-mute);padding:24px">No users defined yet.</td></tr>';
+      return;
+    }
+    const ROLE_COLORS = { viewer: '#6b7280', analyst: '#2563eb', manager: '#7c3aed', admin: '#dc2626' };
+    rbacTableBody.innerHTML = users.map(u => `
+      <tr>
+        <td style="font-weight:600">${escHtml(u.name)}</td>
+        <td style="font-size:12px;color:var(--clr-text-mute)">${escHtml(u.email)}</td>
+        <td><span style="background:${ROLE_COLORS[u.role] || '#6b7280'};color:#fff;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600">${escHtml(u.role)}</span></td>
+        <td>${escHtml(u.domain === '*' ? '(all domains)' : u.domain)}</td>
+        <td>${u.is_active ? '✓' : '<span style="color:var(--clr-text-mute)">off</span>'}</td>
+        <td>
+          <div class="admin-actions">
+            <button class="admin-action-btn" data-rbac-action="edit"   data-uid="${u.user_id}">Edit</button>
+            <button class="admin-action-btn" data-rbac-action="toggle" data-uid="${u.user_id}" data-active="${u.is_active}">${u.is_active ? 'Deactivate' : 'Activate'}</button>
+            <button class="admin-action-btn danger" data-rbac-action="delete" data-uid="${u.user_id}" data-name="${escHtml(u.name)}">Delete</button>
+          </div>
+        </td>
+      </tr>`).join('');
+
+    rbacTableBody.querySelectorAll('[data-rbac-action]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const uid    = btn.dataset.uid;
+        const action = btn.dataset.rbacAction;
+        if (action === 'edit') {
+          openUserForm(uid);
+        } else if (action === 'toggle') {
+          const active = btn.dataset.active === 'true';
+          try {
+            await fetch(`${API}/access/users/${uid}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ is_active: !active }),
+            });
+            await renderRbacTable();
+          } catch (err) { showToast(err.message, 'error'); }
+        } else if (action === 'delete') {
+          if (!confirm(`Delete user "${btn.dataset.name}"?`)) return;
+          try {
+            await fetch(`${API}/access/users/${uid}`, { method: 'DELETE' });
+            await renderRbacTable();
+          } catch (err) { showToast(err.message, 'error'); }
+        }
+      });
+    });
+  } catch (err) {
+    rbacTableBody.innerHTML = `<tr><td colspan="6" style="color:var(--clr-danger);padding:16px">Failed to load users: ${escHtml(err.message)}</td></tr>`;
+  }
+}
+
+async function openUserForm(userId = null) {
+  _rbacEditUserId = userId;
+  rbacUserFormTitle.textContent = userId ? 'Edit User' : 'Add User';
+  document.getElementById('rbacFormName').value   = '';
+  document.getElementById('rbacFormEmail').value  = '';
+  document.getElementById('rbacFormRole').value   = 'viewer';
+  document.getElementById('rbacFormDomain').value = '*';
+
+  if (userId) {
+    try {
+      const r = await fetch(`${API}/access/users/${userId}`);
+      if (r.ok) {
+        const u = await r.json();
+        document.getElementById('rbacFormName').value   = u.name   || '';
+        document.getElementById('rbacFormEmail').value  = u.email  || '';
+        document.getElementById('rbacFormRole').value   = u.role   || 'viewer';
+        document.getElementById('rbacFormDomain').value = u.domain || '*';
+      }
+    } catch (_) { /* pre-fill failed — open blank */ }
+  }
+  rbacUserFormOverlay.style.display = 'flex';
+}
+
+function closeUserForm() {
+  rbacUserFormOverlay.style.display = 'none';
+  _rbacEditUserId = null;
+}
+
+rbacUserFormSave.addEventListener('click', async () => {
+  const name   = document.getElementById('rbacFormName').value.trim();
+  const email  = document.getElementById('rbacFormEmail').value.trim();
+  const role   = document.getElementById('rbacFormRole').value;
+  const domain = document.getElementById('rbacFormDomain').value.trim() || '*';
+  if (!name || !email) { showToast('Name and email are required', 'error'); return; }
+  try {
+    if (_rbacEditUserId) {
+      await fetch(`${API}/access/users/${_rbacEditUserId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, email, role, domain }),
+      });
+    } else {
+      await fetch(`${API}/access/users`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, email, role, domain }),
+      });
+    }
+    closeUserForm();
+    await renderRbacTable();
+    showToast(_rbacEditUserId ? 'User updated' : 'User created', 'success');
+  } catch (err) { showToast(err.message, 'error'); }
+});
+
+rbacClose.addEventListener('click', closeRbacPanel);
+rbacUserFormClose.addEventListener('click', closeUserForm);
+rbacUserFormCancel.addEventListener('click', closeUserForm);
+rbacRefreshBtn.addEventListener('click', async () => { await loadRbacStatus(); await renderRbacTable(); });
+rbacAddBtn.addEventListener('click', () => openUserForm(null));
+rbacOverlay.addEventListener('click', (e) => { if (e.target === rbacOverlay) closeRbacPanel(); });
+rbacUserFormOverlay.addEventListener('click', (e) => { if (e.target === rbacUserFormOverlay) closeUserForm(); });

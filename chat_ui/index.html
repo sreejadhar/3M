@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DataChat</title>
-  <link rel="stylesheet" href="/ui/style.css?v=6" />
+  <link rel="stylesheet" href="/ui/style.css?v=7" />
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2/dist/chartjs-plugin-datalabels.min.js"></script>
@@ -509,6 +509,7 @@
         <button class="btn-primary" id="adminAddBtn">+ Add data source</button>
         <button class="btn-secondary" id="adminRefreshBtn">Refresh</button>
         <button class="btn-secondary" id="adminBridgesBtn">KG Bridges</button>
+        <button class="btn-secondary" id="adminRbacBtn">Users &amp; Access</button>
       </div>
       <div class="admin-table-wrap">
         <table class="admin-table" id="adminTable">
@@ -526,6 +527,65 @@
             <tr><td colspan="6" style="text-align:center;color:var(--clr-text-mute);padding:24px">Loading…</td></tr>
           </tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── RBAC / Users Modal ───────────────────────────────────────────────── -->
+  <div class="modal-overlay" id="rbacOverlay" style="display:none">
+    <div class="modal admin-modal">
+      <div class="modal-header">
+        <div>
+          <h2 class="modal-title">Users &amp; Access Control</h2>
+          <div id="rbacEnforcedBadge" style="font-size:12px;margin-top:2px;color:var(--clr-text-mute)">Loading…</div>
+        </div>
+        <button class="modal-close" id="rbacClose">✕</button>
+      </div>
+      <div class="admin-toolbar">
+        <button class="btn-primary" id="rbacAddBtn">+ Add user</button>
+        <button class="btn-secondary" id="rbacRefreshBtn">Refresh</button>
+      </div>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Email</th>
+              <th>Role</th>
+              <th>Domain</th>
+              <th>Active</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="rbacTableBody">
+            <tr><td colspan="6" style="text-align:center;color:var(--clr-text-mute);padding:24px">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Add/Edit User Modal ───────────────────────────────────────────────── -->
+  <div class="modal-overlay" id="rbacUserFormOverlay" style="display:none">
+    <div class="modal" style="max-width:460px">
+      <div class="modal-header">
+        <h2 class="modal-title" id="rbacUserFormTitle">Add User</h2>
+        <button class="modal-close" id="rbacUserFormClose">✕</button>
+      </div>
+      <div style="padding:20px;display:flex;flex-direction:column;gap:14px">
+        <input id="rbacFormName"   class="wiz-input" type="text"  placeholder="Full name" />
+        <input id="rbacFormEmail"  class="wiz-input" type="email" placeholder="Email address" />
+        <select id="rbacFormRole"  class="wiz-input">
+          <option value="viewer">viewer — read-only</option>
+          <option value="analyst">analyst — queries + ontology</option>
+          <option value="manager">manager — reindex + metadata edits</option>
+          <option value="admin">admin — full access</option>
+        </select>
+        <input id="rbacFormDomain" class="wiz-input" type="text" placeholder="Domain filter (* = all domains)" value="*" />
+        <div style="display:flex;gap:10px;justify-content:flex-end">
+          <button class="btn-secondary" id="rbacUserFormCancel">Cancel</button>
+          <button class="btn-primary"   id="rbacUserFormSave">Save</button>
+        </div>
       </div>
     </div>
   </div>
@@ -678,6 +738,6 @@
     </div>
   </div>
 
-  <script src="/ui/app.js?v=6"></script>
+  <script src="/ui/app.js?v=7"></script>
 </body>
 </html>

@@ -38,14 +38,37 @@ Your task:
 - Return ONLY a JSON object — no prose, no markdown fences
 
 MATCHING RULES:
-- Exact match (case-insensitive): use that exact value
-- Semantic match (synonym, subcategory, broader/narrower term):
-    e.g. user "savoury snacks" → stored "Snacks & Foods" (and related sub-categories)
-    e.g. user "beverages" → stored "Drinks" or "Beverages"
-    e.g. user "EMEA" → stored "Europe", "Middle East", "Africa"
-  Include ALL semantically related stored values
-- No match: set matched_values to [] and sql_fragment to null
-- Never invent values that are not in the stored list
+
+1. EXACT MATCH (case-insensitive): use that exact stored value.
+   sql_fragment: LOWER(col) = 'stored value'
+
+2. YEAR / PERIOD FORMAT: The user writes a plain year (e.g. "2024") but the column
+   stores it with a prefix or suffix (e.g. 'FY2024', 'CY2024', '2024-Q1').
+   Always scan the stored values for the format pattern and match accordingly.
+   Examples:
+     user "2024"   → stored 'FY2024'  → sql_fragment: LOWER(fiscal_year) = 'fy2024'
+     user "2023"   → stored 'CY2023'  → sql_fragment: LOWER(calendar_year) = 'cy2023'
+     user "Q1"     → stored 'FY2024-Q1', 'FY2023-Q1'  → use LIKE '%q1%'
+   NEVER write WHERE fiscal_year = '2024' if the column stores 'FY2024'.
+
+3. PARENT-CATEGORY MATCH: If the user's term maps to a broad category that has a clear
+   exact match in a parent/category column, prefer the exact parent-category match over
+   LIKE patterns on sub-category columns.  This captures ALL sub-categories reliably.
+   Examples:
+     user "savoury snacks" → category col has 'Snacks & Foods'
+       → sql_fragment: LOWER(category) = 'snacks & foods'
+       NOT: LIKE '%snack%'  ← this misses sub-categories like 'Potato Chips & Crisps'
+     user "beverages" → category col has 'Beverages'
+       → sql_fragment: LOWER(category) = 'beverages'
+   If the parent-category match is clear, DO NOT fall back to LIKE on sub-category columns.
+
+4. SEMANTIC MATCH (synonyms, shorthand, no exact or parent match):
+     user "EMEA"    → stored "Europe", "Middle East", "Africa"
+       → sql_fragment: LOWER(region) IN ('europe', 'middle east', 'africa')
+   Include ALL semantically related stored values.
+
+5. NO MATCH: set matched_values to [] and sql_fragment to null.
+   Never invent values not in the stored list.
 
 OUTPUT FORMAT (return exactly this JSON, no other text):
 {

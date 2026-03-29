@@ -238,9 +238,15 @@ General Rules:
     d. Always use case-insensitive matching (LOWER/ILIKE) — never raw equality on text.
     e. When using LIKE, anchor to the most distinctive part of the term to avoid
        false positives (e.g. LIKE '%snack%' not LIKE '%and%').
-11. Date/period filters — use the date extraction functions shown above for this database.
-    Check column names carefully and match the sample value format (e.g. integer 2026
-    vs string '2026').
+11. Date/period filters — always check the [sample values] for the period column before
+    writing a year filter.  Period columns often store values with a prefix or suffix:
+      WRONG : WHERE fiscal_year = '2024'       ← if samples show 'FY2024'
+      CORRECT: WHERE LOWER(fiscal_year) = 'fy2024'
+      WRONG : WHERE calendar_year = '2023'     ← if samples show 'CY2023'
+      CORRECT: WHERE LOWER(calendar_year) = 'cy2023'
+    If the PRE-RESOLVED CATEGORY MAPPINGS section provides a fiscal_year sql_fragment,
+    use it verbatim — do not rewrite the year value.
+    For true date columns use the date extraction functions shown above.
 12. COUNT vs SUM — choose the correct aggregate:
     a. Use COUNT(*) or COUNT(column) when the question asks for:
          headcount, number of people, how many employees/records/rows,
@@ -592,12 +598,19 @@ def _find_invalid_join_conditions(sql: str, valid_join_pairs: set) -> List[str]:
         col2 = rhs_col.lower()
         pair = frozenset([col1, col2])
 
-        # A single-element frozenset covers same-name joins (col = col)
-        same_name_pair = frozenset([col1])
-        if pair not in valid_join_pairs and same_name_pair not in valid_join_pairs:
-            invalid.append(
-                f"{lhs_alias}.{lhs_col} = {rhs_alias}.{rhs_col}"
-            )
+        if col1 == col2:
+            # Same-name join (e.g. ON a.customer_id = b.customer_id):
+            # valid when the column appears as a shared key (single-element frozenset)
+            # OR as part of an explicit FK pair.
+            if frozenset([col1]) not in valid_join_pairs and pair not in valid_join_pairs:
+                invalid.append(f"{lhs_alias}.{lhs_col} = {rhs_alias}.{rhs_col}")
+        else:
+            # Cross-name join (e.g. ON fms.segment_id = dr.region_id):
+            # ONLY valid when this exact (col1, col2) pair appears in an FK line.
+            # The fact that col1 is a shared column elsewhere does NOT make this
+            # join valid — frozenset fallback must NOT apply here.
+            if pair not in valid_join_pairs:
+                invalid.append(f"{lhs_alias}.{lhs_col} = {rhs_alias}.{rhs_col}")
 
     return invalid
 

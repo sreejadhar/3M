@@ -1045,128 +1045,161 @@ def plan_node(state: DialogState) -> DialogState:
     valid_join_pairs = _extract_valid_join_pairs(schema_context)
     logger.debug("plan_node: %d valid join pair(s) extracted from schema context", len(valid_join_pairs))
 
-    # Validate, qualify, and cap
-    sql_queries: List[SQLQuery] = []
-    for item in plan[: config.max_sql_queries]:
-        if not item.get("sql"):
-            continue
+    def _validate_plan_items(
+        plan_items: List[Dict],
+        offset: int = 0,
+    ) -> tuple:
+        """
+        Validate, qualify, and post-process a list of LLM-generated plan items.
 
-        # Strip trailing semicolons so downstream regexes match end-of-string ($)
-        sql = item["sql"].strip().rstrip(";").strip()
-        # Safety net: ensure table names are schema-qualified even if LLM forgot
-        sql = _qualify_sql(sql, db_schema, table_labels)
-        # Headcount fix: replace SUM() with COUNT(*) when question is about people
-        sql = _fix_count_vs_sum(sql, natural_query)
-        # Percentage fix: inject window-function percentage column when % is asked for
-        # (skipped for SQLite/CSV/Excel to avoid nested-aggregate syntax errors)
-        sql = _fix_percentage(sql, natural_query, config.db_type)
-        # Limit enforcement: use db-appropriate syntax (LIMIT / TOP N / FETCH FIRST)
-        sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
+        Returns:
+            valid_queries   : List[SQLQuery] — items that passed all checks
+            retry_reasons   : List[str]      — human-readable rejection reasons
+                              (only for invalid-join drops, which benefit from retry)
+        """
+        valid: List[SQLQuery] = []
+        reasons: List[str] = []
 
-        # Multi-table check: reject any query that references more than one table
-        # when no valid join key was listed in the schema context.  This catches
-        # "cross-reference approach" patterns (subqueries, IN (...), EXISTS, etc.)
-        # that the LLM uses to sneak cross-table lookups past the JOIN ON check.
-        #
-        # Strip string literals first to avoid false positives where a table name
-        # appears as a WHERE clause value (e.g. WHERE dept = 'Sales' when 'Sales'
-        # is also a table label).
-        sql_no_strings = re.sub(r"'[^']*'", "''", sql)
-        tables_in_sql = [
-            t for t in table_labels
-            if re.search(r'\b' + re.escape(t) + r'\b', sql_no_strings, re.IGNORECASE)
-        ]
-        if len(tables_in_sql) > 1:
-            # Check whether the schema advertises a valid join key for this pair
-            possible_join_section = ""
-            if "POSSIBLE JOIN KEYS" in schema_context:
-                possible_join_section = schema_context
-            elif "JOIN KEYS: No columns" in schema_context:
-                # Explicit "no join keys" message — drop immediately
+        for item in plan_items[: config.max_sql_queries]:
+            if not item.get("sql"):
+                continue
+
+            sql = item["sql"].strip().rstrip(";").strip()
+            sql = _qualify_sql(sql, db_schema, table_labels)
+            sql = _fix_count_vs_sum(sql, natural_query)
+            sql = _fix_percentage(sql, natural_query, config.db_type)
+            sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
+
+            # Multi-table / no-join-key check
+            sql_no_strings = re.sub(r"'[^']*'", "''", sql)
+            tables_in_sql = [
+                t for t in table_labels
+                if re.search(r'\b' + re.escape(t) + r'\b', sql_no_strings, re.IGNORECASE)
+            ]
+            if len(tables_in_sql) > 1 and "JOIN KEYS: No columns" in schema_context:
                 logger.warning(
-                    "plan_node: dropping query %s — references %d tables %s but "
-                    "schema has no POSSIBLE JOIN KEYS. SQL: %s",
-                    item.get("query_id", "?"), len(tables_in_sql), tables_in_sql, sql[:200],
+                    "plan_node: dropping query %s — cross-table ref with no valid join key: %s",
+                    item.get("query_id", "?"), tables_in_sql,
                 )
                 state["errors"].append(
                     f"plan_node: query {item.get('query_id','?')} skipped — "
                     f"cross-table reference with no valid join key: {tables_in_sql}"
                 )
-                continue
-
-        # Column hallucination check: strip conditions that reference columns not
-        # in the schema context (e.g. md.Check_PC invented by the LLM).
-        # If the hallucinated column appears in a JOIN ON clause we cannot salvage
-        # the query — drop it entirely.  For WHERE/AND/OR conditions we strip the
-        # bad predicate and keep the rest.
-        if known_columns:
-            bad_cols = _find_hallucinated_columns(sql, known_columns)
-            if bad_cols:
-                if _has_hallucinated_join(sql, bad_cols):
-                    logger.warning(
-                        "plan_node: dropping query %s — hallucinated column(s) %s "
-                        "used in JOIN ON clause (cannot salvage). SQL: %s",
-                        item.get("query_id", "?"), bad_cols, sql[:200],
-                    )
-                    state["errors"].append(
-                        f"plan_node: query {item.get('query_id','?')} skipped — "
-                        f"hallucinated JOIN key(s): {bad_cols}"
-                    )
-                    continue
-
-                logger.warning(
-                    "plan_node: query %s references unknown column(s) %s — "
-                    "stripping those conditions. SQL: %s",
-                    item.get("query_id", "?"), bad_cols, sql[:200],
-                )
-                sql = _strip_hallucinated_conditions(sql, bad_cols)
-                # After stripping, verify no bad columns remain; drop only if still present
-                still_bad = _find_hallucinated_columns(sql, known_columns)
-                if still_bad:
-                    logger.warning(
-                        "plan_node: dropping query %s — could not remove all "
-                        "hallucinated columns %s", item.get("query_id", "?"), still_bad,
-                    )
-                    state["errors"].append(
-                        f"plan_node: query {item.get('query_id','?')} skipped — "
-                        f"unremovable hallucinated column(s): {still_bad}"
-                    )
-                    continue
-                else:
-                    state["errors"].append(
-                        f"plan_node: query {item.get('query_id','?')} — "
-                        f"stripped hallucinated condition(s) for column(s): {bad_cols}"
-                    )
-
-        # Join pair validation: detect ON clauses that cross-join semantically
-        # unrelated columns (e.g. fms.segment_id = r.region_id).
-        # Both columns may exist in the schema but form no valid FK relationship.
-        # We only enforce this when the schema advertised at least one valid join key
-        # (valid_join_pairs non-empty), so we never falsely reject queries when the
-        # schema context had no join key information at all.
-        if valid_join_pairs:
-            invalid_joins = _find_invalid_join_conditions(sql, valid_join_pairs)
-            if invalid_joins:
-                logger.warning(
-                    "plan_node: dropping query %s — JOIN ON condition(s) use "
-                    "column pairs not listed as valid join keys in the schema: %s. SQL: %s",
-                    item.get("query_id", "?"), invalid_joins, sql[:300],
-                )
-                state["errors"].append(
-                    f"plan_node: query {item.get('query_id','?')} skipped — "
-                    f"invalid JOIN column pair(s) not in schema join keys: {invalid_joins}"
+                reasons.append(
+                    f"Query {item.get('query_id','?')} referenced {tables_in_sql} but "
+                    "there are no valid join keys between those tables."
                 )
                 continue
 
-        sql_queries.append(
-            SQLQuery(
-                query_id    = item.get("query_id", f"q{len(sql_queries)+1}"),
-                description = item.get("description", ""),
-                sql         = sql,
-                table_refs  = item.get("table_refs", []),
-                kg_id       = item.get("kg_id", ""),  # multi-KG: which KG this query targets
+            # Column hallucination check
+            if known_columns:
+                bad_cols = _find_hallucinated_columns(sql, known_columns)
+                if bad_cols:
+                    if _has_hallucinated_join(sql, bad_cols):
+                        logger.warning(
+                            "plan_node: dropping query %s — hallucinated column(s) %s in JOIN",
+                            item.get("query_id", "?"), bad_cols,
+                        )
+                        state["errors"].append(
+                            f"plan_node: query {item.get('query_id','?')} skipped — "
+                            f"hallucinated JOIN key(s): {bad_cols}"
+                        )
+                        reasons.append(
+                            f"Query {item.get('query_id','?')} used JOIN column(s) "
+                            f"{bad_cols} that do not exist in the schema."
+                        )
+                        continue
+
+                    sql = _strip_hallucinated_conditions(sql, bad_cols)
+                    still_bad = _find_hallucinated_columns(sql, known_columns)
+                    if still_bad:
+                        logger.warning(
+                            "plan_node: dropping query %s — unremovable hallucinated cols %s",
+                            item.get("query_id", "?"), still_bad,
+                        )
+                        state["errors"].append(
+                            f"plan_node: query {item.get('query_id','?')} skipped — "
+                            f"unremovable hallucinated column(s): {still_bad}"
+                        )
+                        continue
+                    else:
+                        state["errors"].append(
+                            f"plan_node: query {item.get('query_id','?')} — "
+                            f"stripped hallucinated condition(s) for column(s): {bad_cols}"
+                        )
+
+            # Join pair validation
+            if valid_join_pairs:
+                invalid_joins = _find_invalid_join_conditions(sql, valid_join_pairs)
+                if invalid_joins:
+                    logger.warning(
+                        "plan_node: dropping query %s — invalid JOIN pair(s): %s",
+                        item.get("query_id", "?"), invalid_joins,
+                    )
+                    state["errors"].append(
+                        f"plan_node: query {item.get('query_id','?')} skipped — "
+                        f"invalid JOIN column pair(s) not in schema join keys: {invalid_joins}"
+                    )
+                    reasons.append(
+                        f"Query {item.get('query_id','?')} used JOIN ON condition(s) "
+                        f"{invalid_joins} — these column pairs are NOT valid join keys "
+                        "in the schema. Check POSSIBLE JOIN KEYS; do not join tables via "
+                        "unrelated FK columns from different dimension tables."
+                    )
+                    continue
+
+            valid.append(
+                SQLQuery(
+                    query_id    = item.get("query_id", f"q{offset + len(valid) + 1}"),
+                    description = item.get("description", ""),
+                    sql         = sql,
+                    table_refs  = item.get("table_refs", []),
+                    kg_id       = item.get("kg_id", ""),
+                )
             )
+
+        return valid, reasons
+
+    # ── First pass ────────────────────────────────────────────────────────────
+    sql_queries, retry_reasons = _validate_plan_items(plan)
+
+    # ── Retry pass (once) when all queries were dropped due to fixable errors ─
+    # Feed the specific rejection reasons back to the LLM so it can rewrite
+    # without the invalid constructs (invalid joins, hallucinated columns, etc.)
+    if not sql_queries and retry_reasons and plan:
+        reason_text = "\n".join(f"  • {r}" for r in retry_reasons)
+        retry_user = (
+            "CORRECTION REQUIRED\n"
+            "=" * 60 + "\n"
+            "Your previous query attempt was REJECTED for the following reason(s):\n\n"
+            f"{reason_text}\n\n"
+            "Rules for the corrected query:\n"
+            "1. Do NOT use any of the invalid JOIN conditions listed above.\n"
+            "2. Only use JOIN ON conditions that appear in POSSIBLE JOIN KEYS or FK lines.\n"
+            "3. If filtering by a dimension requires a join that is NOT in the schema "
+            "(e.g. no valid path from the fact table to a geography dimension), "
+            "OMIT that filter — do not attempt to route through an unrelated dimension "
+            "table (e.g. do not use dim_segment to reach dim_region).\n"
+            "4. Note in the query 'description' field any dimension you could not filter.\n"
+            "5. Return the best query you can from the available schema.\n"
+            "=" * 60 + "\n\n"
+            + user
         )
+        logger.info(
+            "plan_node: all queries dropped — retrying with %d rejection reason(s)",
+            len(retry_reasons),
+        )
+        try:
+            retry_raw  = _call_llm(system, retry_user, config.plan_llm_model, config.llm_temperature)
+            logger.info("plan_node: retry LLM response (first 500 chars): %s", retry_raw[:500])
+            retry_plan = _extract_json(retry_raw)
+            sql_queries, _ = _validate_plan_items(retry_plan, offset=0)
+            if sql_queries:
+                logger.info("plan_node: retry produced %d valid query/queries", len(sql_queries))
+            else:
+                logger.warning("plan_node: retry also produced no valid queries")
+        except Exception as exc:
+            logger.warning("plan_node: retry LLM call failed — %s", exc)
 
     if not sql_queries:
         state["errors"] = state.get("errors") or []

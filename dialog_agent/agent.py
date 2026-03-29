@@ -84,6 +84,7 @@ class DialogAgent:
             phase                = "start",
             # Categorical resolution fields
             categorical_columns  = {},
+            column_hierarchy     = {},
             term_resolution      = [],
             # Multi-KG federation fields (default to empty = single-KG mode)
             active_kg_ids        = active_kg_ids or [],

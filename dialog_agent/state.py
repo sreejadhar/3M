@@ -58,6 +58,11 @@ class DialogState(TypedDict, total=False):
     # { sql_table_name: { sql_col_name: [val1, val2, ...] } }
     categorical_columns: Dict[str, Dict[str, List[str]]]
 
+    # Taxonomy hierarchy between related categorical columns (parent → children)
+    # { sql_table_name: { parent_col: { parent_value: [child_values] } } }
+    # e.g. { "fact_market_share": { "category": { "Snacks & Foods": ["Potato Chips & Crisps", ...] } } }
+    column_hierarchy: Dict[str, Dict[str, Dict[str, List[str]]]]
+
     # Resolved term → data-value mappings produced by resolve_node
     # [{"user_term": "savoury snacks", "column": "category",
     #   "matched_values": ["Snacks & Foods"], "sql_fragment": "LOWER(category) = 'snacks & foods'"}]

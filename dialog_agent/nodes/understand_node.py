@@ -52,18 +52,19 @@ def _to_sql_table(name: str) -> str:
     return ("t_" + s if s and s[0].isdigit() else s) or "tbl"
 
 
-def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, Any]]:
+def _sample_file_data(config: DialogConfig) -> tuple:
     """
-    Collect distinct non-null values per column from the cached temp SQLite DB.
+    Collect distinct non-null values per column from the cached temp SQLite DB,
+    and build taxonomy hierarchies for parent-child categorical column pairs.
 
     For categorical columns (distinct count <= _CATEGORICAL_DISTINCT_MAX) we
     retrieve ALL distinct values (up to _SAMPLE_LIMIT_CATEGORICAL) and mark
-    the column as categorical so the schema context can annotate it.  This gives
-    the LLM enough information to resolve synonym mismatches (e.g. user says
-    "savoury snacks" but data stores "food and snacks").
+    the column as categorical.  Parent-child pairs (e.g. category → sub_category)
+    are detected by naming convention and the full cross-tab hierarchy is queried.
 
     Returns:
-        { sql_table_name: { sql_col_name: {"values": [...], "categorical": bool} } }
+        samples   : { sql_table_name: { sql_col_name: {"values": [...], "categorical": bool} } }
+        hierarchy : { sql_table_name: { parent_col: { parent_val: [child_vals] } } }
     """
     import sqlite3
 
@@ -114,12 +115,91 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, Any]]:
             except Exception:
                 pass
 
+        # Build taxonomy hierarchies for parent-child categorical column pairs
+        full_hierarchy: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
+        for tbl, col_map in samples.items():
+            pairs = _detect_parent_child_pairs(col_map)
+            if pairs:
+                tbl_hier = _build_taxonomy_hierarchy(conn, tbl, pairs)
+                if tbl_hier:
+                    full_hierarchy[tbl] = tbl_hier
+                    logger.info(
+                        "understand_node: built taxonomy hierarchy for table %r: %s",
+                        tbl, {p: list(m.keys()) for p, m in tbl_hier.items()},
+                    )
+
         conn.close()
-        return samples
+        return samples, full_hierarchy
 
     except Exception as exc:
         logger.warning("understand_node: sample_file_data failed — %s", exc)
-        return {}
+        return {}, {}
+
+
+def _detect_parent_child_pairs(col_samples: Dict[str, Any]) -> List[tuple]:
+    """
+    Detect parent→child column pairs from categorical columns in a single table.
+
+    Two heuristics (both must agree before a pair is returned):
+
+    1. Naming pattern — "sub_X" is a child of "X":
+         sub_category → category
+         sub_region   → region
+         sub_segment  → segment
+
+    2. Cardinality — the parent has FEWER distinct values than the child:
+         parent distinct count  <  child distinct count
+
+    Returns a list of (parent_col, child_col) tuples.
+    """
+    cat_cols = {
+        col for col, info in col_samples.items()
+        if isinstance(info, dict) and info.get("categorical")
+    }
+    pairs: List[tuple] = []
+    for col in sorted(cat_cols):
+        if col.startswith("sub_"):
+            parent_candidate = col[4:]          # strip "sub_" prefix
+            if parent_candidate in cat_cols:
+                p_count = len(col_samples[parent_candidate].get("values", []))
+                c_count = len(col_samples[col].get("values", []))
+                if p_count <= c_count:          # parent must have ≤ distinct vals
+                    pairs.append((parent_candidate, col))
+    return pairs
+
+
+def _build_taxonomy_hierarchy(
+    conn: Any,
+    tbl: str,
+    pairs: List[tuple],
+) -> Dict[str, Dict[str, List[str]]]:
+    """
+    For each (parent_col, child_col) pair, query the cross-tab to get
+    the mapping from every parent value → list of child values.
+
+    Returns:
+        { parent_col: { parent_value: [child_value, ...] } }
+    """
+    import sqlite3
+
+    hierarchy: Dict[str, Dict[str, List[str]]] = {}
+    cur = conn.cursor()
+    for parent_col, child_col in pairs:
+        try:
+            cur.execute(
+                f'SELECT DISTINCT "{parent_col}", "{child_col}" '
+                f'FROM "{tbl}" '
+                f'WHERE "{parent_col}" IS NOT NULL AND "{child_col}" IS NOT NULL '
+                f'ORDER BY "{parent_col}", "{child_col}"'
+            )
+            mapping: Dict[str, List[str]] = {}
+            for pval, cval in cur.fetchall():
+                mapping.setdefault(str(pval), []).append(str(cval))
+            if mapping:
+                hierarchy[parent_col] = mapping
+        except Exception:
+            pass
+    return hierarchy
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -187,6 +267,7 @@ def _summarise_graph(
     edges: List[Dict[str, Any]],
     db_schema: str,
     samples: Optional[Dict[str, Dict[str, List]]] = None,
+    hierarchy: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None,
 ) -> str:
     """
     Convert KG nodes/edges to a schema description the SQL planner can use.
@@ -317,8 +398,9 @@ def _summarise_graph(
             lines.append("  Columns:")
             # For file-based sources, look up sample values using the sanitized
             # table name, since that is what is actually stored in SQLite.
-            sql_table = _to_sql_table(label) if samples is not None else label
-            tbl_samples = (samples or {}).get(sql_table, {})
+            sql_table  = _to_sql_table(label) if samples is not None else label
+            tbl_samples   = (samples or {}).get(sql_table, {})
+            tbl_hierarchy = (hierarchy or {}).get(sql_table, {})
             for col in cols:
                 original_col = col.split(":")[0].strip()
                 col_type     = col[len(original_col):].strip()  # e.g. ": integer"
@@ -327,16 +409,38 @@ def _summarise_graph(
                 col_info = tbl_samples.get(sql_col)
                 display  = f"{sql_col}{col_type}" if samples is not None else col
                 if col_info:
-                    # col_info is {"values": [...], "categorical": bool} (new format)
-                    # or a plain list for backward compatibility
+                    # col_info is {"values": [...], "categorical": bool}
                     vals        = col_info.get("values", []) if isinstance(col_info, dict) else col_info
                     categorical = col_info.get("categorical", False) if isinstance(col_info, dict) else False
                     sample_str  = ", ".join(repr(v) for v in vals)
                     if categorical:
                         lines.append(
                             f"    {display}  [categorical — ALL stored values: {sample_str}]"
-                            f"  ← your filter term may differ from these labels; use LIKE or IN"
+                            f"  ← your filter term may differ from these labels"
                         )
+                        # Show taxonomy hierarchy when this column is a parent
+                        if sql_col in tbl_hierarchy:
+                            child_col = next(
+                                (c for c in tbl_samples if f"sub_{sql_col}" == c or c.startswith(f"sub_{sql_col}")),
+                                None,
+                            )
+                            # Find the child column name by matching tbl_hierarchy key
+                            # (hierarchy is keyed by parent_col, values are {parent_val: [child_vals]})
+                            mapping = tbl_hierarchy[sql_col]
+                            # Detect child column name from detect_parent_child_pairs output
+                            pairs = _detect_parent_child_pairs(tbl_samples)
+                            child_col_name = next((c for p, c in pairs if p == sql_col), None)
+                            if child_col_name:
+                                lines.append(
+                                    f"      TAXONOMY HIERARCHY ({sql_col} → {child_col_name}):"
+                                )
+                                for pval, cvals in sorted(mapping.items()):
+                                    children = " | ".join(cvals)
+                                    lines.append(f"        '{pval}' → [{children}]")
+                                lines.append(
+                                    f"      ← Filter at {sql_col} level to include ALL {child_col_name} values:"
+                                    f" WHERE {sql_col} = '<parent>' captures every child automatically"
+                                )
                     else:
                         lines.append(f"    {display}  [sample values: {sample_str}]")
                 else:
@@ -489,13 +593,18 @@ def understand_node(state: DialogState) -> DialogState:
 
     # For file-based sources, inject sample values so the LLM sees actual data
     # values (e.g. exact company names) and generates accurate WHERE clauses.
-    samples: Optional[Dict[str, Dict[str, List]]] = None
+    samples:   Optional[Dict[str, Dict[str, List]]] = None
+    hierarchy: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None
     if config.db_type.lower() in _FILE_BASED_TYPES and config.db_file_path:
-        samples = _sample_file_data(config)
+        samples, hierarchy = _sample_file_data(config)
         if samples:
             logger.info("understand_node: sampled %d tables for value hints", len(samples))
+        if hierarchy:
+            logger.info(
+                "understand_node: taxonomy hierarchy built for %d table(s)", len(hierarchy)
+            )
 
-    schema_context = _summarise_graph(nodes, edges, db_schema, samples)
+    schema_context = _summarise_graph(nodes, edges, db_schema, samples, hierarchy)
 
     logger.info(
         "Schema context built: %d chars, %d tables, %d relationships, schema=%r",
@@ -513,5 +622,6 @@ def understand_node(state: DialogState) -> DialogState:
 
     state["schema_context"]      = schema_context
     state["categorical_columns"] = categorical_columns
+    state["column_hierarchy"]    = hierarchy or {}
     state["phase"]               = "understand"
     return state

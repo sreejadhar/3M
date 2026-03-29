@@ -51,16 +51,21 @@ MATCHING RULES:
      user "Q1"     → stored 'FY2024-Q1', 'FY2023-Q1'  → use LIKE '%q1%'
    NEVER write WHERE fiscal_year = '2024' if the column stores 'FY2024'.
 
-3. PARENT-CATEGORY MATCH: If the user's term maps to a broad category that has a clear
-   exact match in a parent/category column, prefer the exact parent-category match over
-   LIKE patterns on sub-category columns.  This captures ALL sub-categories reliably.
+3. PARENT-CATEGORY MATCH WITH TAXONOMY HIERARCHY: If a TAXONOMY HIERARCHY is shown for
+   a column, filtering at the PARENT level (e.g. category = 'Snacks & Foods') automatically
+   captures EVERY child value listed under that parent.  Always prefer this over LIKE or
+   IN on child columns when a clear parent match exists.
    Examples:
-     user "savoury snacks" → category col has 'Snacks & Foods'
+     user "savoury snacks" → taxonomy shows: 'Snacks & Foods' → [Potato Chips & Crisps, ...]
        → sql_fragment: LOWER(category) = 'snacks & foods'
-       NOT: LIKE '%snack%'  ← this misses sub-categories like 'Potato Chips & Crisps'
-     user "beverages" → category col has 'Beverages'
+       NOT: LOWER(sub_category) LIKE '%snack%'  ← misses 'Potato Chips & Crisps'
+     user "beverages" → taxonomy shows: 'Beverages' → [Carbonated Drinks, Juices, ...]
        → sql_fragment: LOWER(category) = 'beverages'
-   If the parent-category match is clear, DO NOT fall back to LIKE on sub-category columns.
+   When INCLUDING ALL CHILDREN IS EXPLICITLY REQUIRED (e.g. user asks for
+   "breakdown by sub-category"), return BOTH:
+     • parent filter: LOWER(category) = 'snacks & foods'
+     • child filter:  LOWER(sub_category) IN ('potato chips & crisps', 'tortilla chips & corn snacks', ...)
+   Use the child IN list from the taxonomy hierarchy — never invent or guess child values.
 
 4. SEMANTIC MATCH (synonyms, shorthand, no exact or parent match):
      user "EMEA"    → stored "Europe", "Middle East", "Africa"
@@ -89,15 +94,42 @@ If no categorical filters are needed (e.g. purely numeric aggregation), return:
 """
 
 
-def _build_categorical_context(categorical_columns: Dict[str, Dict[str, List[str]]]) -> str:
-    """Format categorical columns for the resolve prompt."""
+def _build_categorical_context(
+    categorical_columns: Dict[str, Dict[str, List[str]]],
+    column_hierarchy: Dict[str, Dict[str, Dict[str, List[str]]]] = None,
+) -> str:
+    """
+    Format categorical columns (with taxonomy hierarchy when available) for the resolve prompt.
+
+    For parent columns that have a hierarchy (e.g. category → sub_category), the context
+    shows the full parent→children mapping so the LLM can:
+      1. Match the user term to the correct parent value
+      2. Understand that filtering at parent level captures all children automatically
+    """
     if not categorical_columns:
         return "(No categorical columns found in schema)"
+
+    hierarchy = column_hierarchy or {}
     lines: List[str] = []
+
     for tbl, col_map in categorical_columns.items():
+        tbl_hier = hierarchy.get(tbl, {})
         for col, vals in col_map.items():
             quoted = ", ".join(repr(v) for v in vals)
-            lines.append(f"  table={tbl!r}  column={col!r}  stored values: [{quoted}]")
+            if col in tbl_hier:
+                # Parent column: show the hierarchy so the LLM can filter at parent level
+                lines.append(
+                    f"  table={tbl!r}  column={col!r}  [PARENT — stored values: [{quoted}]]"
+                )
+                lines.append(
+                    f"    TAXONOMY HIERARCHY (filtering at {col!r} level captures ALL children automatically):"
+                )
+                for pval, cvals in sorted(tbl_hier[col].items()):
+                    children_str = " | ".join(cvals)
+                    lines.append(f"      '{pval}' → [{children_str}]")
+            else:
+                lines.append(f"  table={tbl!r}  column={col!r}  stored values: [{quoted}]")
+
     return "\n".join(lines)
 
 
@@ -142,6 +174,7 @@ def resolve_node(state: DialogState) -> DialogState:
     logger.info("=== resolve_node ===")
 
     categorical_columns: Dict[str, Dict[str, List[str]]] = state.get("categorical_columns") or {}
+    column_hierarchy: Dict[str, Dict[str, Dict[str, List[str]]]] = state.get("column_hierarchy") or {}
     natural_query: str = state.get("natural_query", "")
 
     # Skip if no categorical data was found (DB-backed sources without samples,
@@ -156,7 +189,7 @@ def resolve_node(state: DialogState) -> DialogState:
         "DIALOG_LLM_MODEL", "claude-haiku-4-5-20251001"
     )
 
-    categorical_context = _build_categorical_context(categorical_columns)
+    categorical_context = _build_categorical_context(categorical_columns, column_hierarchy)
 
     user_prompt = (
         f"USER QUESTION:\n{natural_query}\n\n"

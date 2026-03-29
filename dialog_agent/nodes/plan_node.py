@@ -191,7 +191,14 @@ General Rules:
     a. To JOIN two tables you MUST have a column listed under "POSSIBLE JOIN KEYS"
        in the schema context, or one shown on a "FK:" line.
        NEVER invent or guess a join key (e.g. Check_PC, CP_ID, PC_ID, Center_ID).
-    b. If no POSSIBLE JOIN KEYS are listed between two tables you want to combine,
+    b. CRITICAL — column pairs in JOIN ON must BOTH appear together in the
+       "POSSIBLE JOIN KEYS" or a "FK: JOIN ON" line.  Two columns that each exist
+       in the schema but are NOT listed as a join pair are NOT a valid join key.
+       WRONG example: "JOIN dim_region AS r ON fms.segment_id = r.region_id"
+         segment_id and region_id may both exist but are unrelated — no FK listed.
+       CORRECT: only write ON col_a = col_b when that exact pair appears under
+         "POSSIBLE JOIN KEYS" or "FK: JOIN ON tbl1.col_a = tbl2.col_b".
+    c. If no POSSIBLE JOIN KEYS are listed between two tables you want to combine,
        you MUST query each table SEPARATELY — one query per table.
        Do NOT use any of these workarounds to fake a cross-table result:
          • subqueries that reference a second table (e.g. WHERE x IN (SELECT ...))
@@ -201,7 +208,7 @@ General Rules:
          • CROSS JOIN or implicit comma-joins
        Each query in your JSON array must reference ONLY ONE table (or joined
        tables with a valid key).  The synthesise step will combine the results.
-    c. If a column you need (e.g. SBU1) is only in Table A, write a query for
+    d. If a column you need (e.g. SBU1) is only in Table A, write a query for
        Table A that retrieves it.  Write a second query for Table B with its
        own columns.  Do NOT try to bridge them without a valid join key.
 10. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
@@ -517,6 +524,82 @@ def _has_hallucinated_join(sql: str, bad_cols: List[str]) -> bool:
             return True
 
     return False
+
+
+def _extract_valid_join_pairs(schema_context: str) -> set:
+    """
+    Parse the schema context text and return a set of frozensets, each
+    containing the two lower-cased column names that form a valid join key.
+
+    Recognises two formats produced by _summarise_graph:
+      • Shared column  : "  - colname: shared by table1, table2"
+      • Explicit FK    : "  - JOIN ON schema.tbl1.col1 = schema.tbl2.col2"
+      • Per-table FK   : "  FK (rel): JOIN ON schema.tbl1.col1 = schema.tbl2.col2"
+
+    frozenset({'customer_id'}) — same-name join (both sides use same col)
+    frozenset({'order_id', 'fk_order'}) — cross-name FK
+    """
+    valid: set = set()
+
+    for line in schema_context.splitlines():
+        stripped = line.strip()
+
+        # Shared column: "- colname: shared by ..."
+        m = re.match(r'^-\s+([\w]+):\s+shared\s+by\s+', stripped, re.IGNORECASE)
+        if m:
+            col = m.group(1).lower()
+            valid.add(frozenset([col]))  # single-element frozenset = same-name join
+            continue
+
+        # FK / join-on lines: both "  - JOIN ON ..." and "  FK (...): JOIN ON ..."
+        m = re.search(
+            r'\bJOIN\s+ON\s+\S+?\.(\w+)\s*=\s*\S+?\.(\w+)',
+            stripped, re.IGNORECASE,
+        )
+        if m:
+            c1 = m.group(1).lower()
+            c2 = m.group(2).lower()
+            valid.add(frozenset([c1, c2]))
+
+    return valid
+
+
+def _find_invalid_join_conditions(sql: str, valid_join_pairs: set) -> List[str]:
+    """
+    Scan every JOIN ... ON lhs.col1 = rhs.col2 in the SQL.
+    Return a list of human-readable strings describing join conditions whose
+    column pair does NOT appear in valid_join_pairs.
+
+    If valid_join_pairs is empty the schema had no join key info — return [].
+    """
+    if not valid_join_pairs:
+        return []
+
+    # Strip string literals to avoid false positives inside quoted values
+    sql_clean = re.sub(r"'[^']*'", "''", sql)
+
+    invalid: List[str] = []
+    # Match:  [JOIN ...] ON alias.col1 = alias.col2
+    # Handles multi-line SQL with DOTALL, stops at the next JOIN/WHERE keyword
+    for m in re.finditer(
+        r'\bON\s+(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)',
+        sql_clean, re.IGNORECASE,
+    ):
+        lhs_alias, lhs_col, rhs_alias, rhs_col = (
+            m.group(1), m.group(2), m.group(3), m.group(4),
+        )
+        col1 = lhs_col.lower()
+        col2 = rhs_col.lower()
+        pair = frozenset([col1, col2])
+
+        # A single-element frozenset covers same-name joins (col = col)
+        same_name_pair = frozenset([col1])
+        if pair not in valid_join_pairs and same_name_pair not in valid_join_pairs:
+            invalid.append(
+                f"{lhs_alias}.{lhs_col} = {rhs_alias}.{rhs_col}"
+            )
+
+    return invalid
 
 
 def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
@@ -945,6 +1028,10 @@ def plan_node(state: DialogState) -> DialogState:
             state["plan_explanation"] = prose
             logger.info("plan_node: LLM returned [] with explanation (%d chars)", len(prose))
 
+    # Build valid join pair whitelist from schema context (used in join validation below)
+    valid_join_pairs = _extract_valid_join_pairs(schema_context)
+    logger.debug("plan_node: %d valid join pair(s) extracted from schema context", len(valid_join_pairs))
+
     # Validate, qualify, and cap
     sql_queries: List[SQLQuery] = []
     for item in plan[: config.max_sql_queries]:
@@ -1037,6 +1124,26 @@ def plan_node(state: DialogState) -> DialogState:
                         f"plan_node: query {item.get('query_id','?')} — "
                         f"stripped hallucinated condition(s) for column(s): {bad_cols}"
                     )
+
+        # Join pair validation: detect ON clauses that cross-join semantically
+        # unrelated columns (e.g. fms.segment_id = r.region_id).
+        # Both columns may exist in the schema but form no valid FK relationship.
+        # We only enforce this when the schema advertised at least one valid join key
+        # (valid_join_pairs non-empty), so we never falsely reject queries when the
+        # schema context had no join key information at all.
+        if valid_join_pairs:
+            invalid_joins = _find_invalid_join_conditions(sql, valid_join_pairs)
+            if invalid_joins:
+                logger.warning(
+                    "plan_node: dropping query %s — JOIN ON condition(s) use "
+                    "column pairs not listed as valid join keys in the schema: %s. SQL: %s",
+                    item.get("query_id", "?"), invalid_joins, sql[:300],
+                )
+                state["errors"].append(
+                    f"plan_node: query {item.get('query_id','?')} skipped — "
+                    f"invalid JOIN column pair(s) not in schema join keys: {invalid_joins}"
+                )
+                continue
 
         sql_queries.append(
             SQLQuery(

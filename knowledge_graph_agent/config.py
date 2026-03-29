@@ -34,6 +34,12 @@ class KGConfig:
     clear_existing: bool = False       # Drop all existing vertices/edges before loading
     batch_size:     int  = 50          # Queries executed per batch (for progress tracking)
 
+    # ── Column taxonomy profiling ─────────────────────────────────────────────
+    # When enabled, profile_node runs after parse_node to annotate each column
+    # with statistical_type, semantic_role, and format_pattern via an LLM call.
+    # Requires ANTHROPIC_API_KEY.  Disable to skip the LLM enrichment step.
+    profile_enabled: bool = True
+
     # ── GraphRAG embedding (production) ───────────────────────────────────────
     # When enabled, embed_node runs after execute_node to write embedding
     # vectors onto Neo4j nodes, enabling production vector-search retrieval

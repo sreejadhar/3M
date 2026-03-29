@@ -3,6 +3,7 @@ Knowledge Graph Agent — LangGraph pipeline.
 
 Graph topology (mode = "generate" or "update"):
     START → parse → [error] → error_end → END
+                 → profile  (LLM taxonomy enrichment — adds rdfs:comment annotations)
                  → translate → execute → END
 
 Graph topology (mode = "load"):
@@ -19,7 +20,7 @@ from typing import Any, Dict, Optional
 from langgraph.graph import END, START, StateGraph
 
 from .config import KGConfig
-from .nodes import embed_node, execute_node, fetch_node, parse_node, translate_node
+from .nodes import embed_node, execute_node, fetch_node, parse_node, profile_node, translate_node
 from .state import KGState
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,12 @@ def _route_from_start(state: KGState) -> str:
 
 
 def _route_after_parse(state: KGState) -> str:
-    return "error_end" if state.get("phase") == "error" else "translate"
+    return "error_end" if state.get("phase") == "error" else "profile"
+
+
+def _route_after_profile(state: KGState) -> str:
+    # profile_node never sets phase=error (failures are non-fatal warnings)
+    return "translate"
 
 
 def _route_after_translate(state: KGState) -> str:
@@ -65,6 +71,7 @@ def _error_end_node(state: KGState) -> KGState:
 def _build_graph() -> Any:
     graph = StateGraph(KGState)
     graph.add_node("parse",     parse_node)
+    graph.add_node("profile",   profile_node)
     graph.add_node("translate", translate_node)
     graph.add_node("execute",   execute_node)
     graph.add_node("embed",     embed_node)
@@ -79,7 +86,12 @@ def _build_graph() -> Any:
     graph.add_conditional_edges(
         "parse",
         _route_after_parse,
-        {"translate": "translate", "error_end": "error_end"},
+        {"profile": "profile", "error_end": "error_end"},
+    )
+    graph.add_conditional_edges(
+        "profile",
+        _route_after_profile,
+        {"translate": "translate"},
     )
     graph.add_conditional_edges(
         "translate",

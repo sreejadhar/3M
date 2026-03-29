@@ -25,8 +25,13 @@ logger = logging.getLogger(__name__)
 
 _FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
 
-# Max distinct sample values shown per column in the schema context
+# Max distinct sample values for high-cardinality columns (IDs, free text)
 _SAMPLE_LIMIT = 8
+# Categorical columns (low distinct count) get more samples so the LLM can
+# resolve synonym mismatches between user terminology and data labels.
+_SAMPLE_LIMIT_CATEGORICAL = 20
+# Threshold: columns with <= this many distinct values are treated as categorical
+_CATEGORICAL_DISTINCT_MAX = 50
 # Only sample columns whose distinct count is <= this (to skip IDs/timestamps)
 _SAMPLE_DISTINCT_MAX = 200
 
@@ -47,11 +52,18 @@ def _to_sql_table(name: str) -> str:
     return ("t_" + s if s and s[0].isdigit() else s) or "tbl"
 
 
-def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
+def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, Any]]:
     """
-    Collect up to _SAMPLE_LIMIT distinct non-null values per column by querying
-    the shared cached temp SQLite DB (built by execute_node._get_cached_file_db).
-    Returns { sql_table_name: { sql_col_name: [val1, ...] } }, or {} on failure.
+    Collect distinct non-null values per column from the cached temp SQLite DB.
+
+    For categorical columns (distinct count <= _CATEGORICAL_DISTINCT_MAX) we
+    retrieve ALL distinct values (up to _SAMPLE_LIMIT_CATEGORICAL) and mark
+    the column as categorical so the schema context can annotate it.  This gives
+    the LLM enough information to resolve synonym mismatches (e.g. user says
+    "savoury snacks" but data stores "food and snacks").
+
+    Returns:
+        { sql_table_name: { sql_col_name: {"values": [...], "categorical": bool} } }
     """
     import sqlite3
 
@@ -64,8 +76,6 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
         if db == "sqlite":
             conn = sqlite3.connect(fpath, check_same_thread=False)
         else:
-            # Reuse the same cached temp DB that execute_node will query —
-            # this also pre-warms the cache so the first query is fast.
             tmp_path = _get_cached_file_db(config)
             conn = sqlite3.connect(tmp_path, check_same_thread=False)
 
@@ -73,25 +83,30 @@ def _sample_file_data(config: DialogConfig) -> Dict[str, Dict[str, List]]:
         cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [r[0] for r in cur.fetchall()]
 
-        samples: Dict[str, Dict[str, List]] = {}
+        samples: Dict[str, Dict[str, Any]] = {}
         for tbl in tables:
             try:
                 cur.execute(f'PRAGMA table_info("{tbl}")')
-                cols = [r[1] for r in cur.fetchall()]
-                col_samples: Dict[str, List] = {}
-                for col in cols:
+                col_rows = cur.fetchall()   # (cid, name, type, notnull, dflt, pk)
+                col_samples: Dict[str, Any] = {}
+                for row in col_rows:
+                    col      = row[1]
+                    col_type = (row[2] or "").lower()
+                    is_text  = not any(t in col_type for t in ("int", "real", "float", "double", "numeric", "decimal", "bool"))
                     try:
                         cur.execute(f'SELECT COUNT(DISTINCT "{col}") FROM "{tbl}"')
                         distinct_count = (cur.fetchone() or [0])[0]
                         if distinct_count > _SAMPLE_DISTINCT_MAX:
                             continue
+                        is_categorical = is_text and distinct_count <= _CATEGORICAL_DISTINCT_MAX
+                        limit = _SAMPLE_LIMIT_CATEGORICAL if is_categorical else _SAMPLE_LIMIT
                         cur.execute(
                             f'SELECT DISTINCT "{col}" FROM "{tbl}" '
-                            f'WHERE "{col}" IS NOT NULL LIMIT {_SAMPLE_LIMIT}'
+                            f'WHERE "{col}" IS NOT NULL ORDER BY "{col}" LIMIT {limit}'
                         )
                         vals = [str(r[0]) for r in cur.fetchall() if r[0] is not None]
                         if vals:
-                            col_samples[col] = vals
+                            col_samples[col] = {"values": vals, "categorical": is_categorical}
                     except Exception:
                         pass
                 if col_samples:
@@ -308,11 +323,22 @@ def _summarise_graph(
                 original_col = col.split(":")[0].strip()
                 col_type     = col[len(original_col):].strip()  # e.g. ": integer"
                 # Translate original KG column name → SQL-safe name used in SQLite
-                sql_col = _to_sql_col(original_col) if samples is not None else original_col
-                sample_vals = tbl_samples.get(sql_col)
-                display = f"{sql_col}{col_type}" if samples is not None else col
-                if sample_vals:
-                    lines.append(f"    {display}  [sample values: {', '.join(repr(v) for v in sample_vals)}]")
+                sql_col  = _to_sql_col(original_col) if samples is not None else original_col
+                col_info = tbl_samples.get(sql_col)
+                display  = f"{sql_col}{col_type}" if samples is not None else col
+                if col_info:
+                    # col_info is {"values": [...], "categorical": bool} (new format)
+                    # or a plain list for backward compatibility
+                    vals        = col_info.get("values", []) if isinstance(col_info, dict) else col_info
+                    categorical = col_info.get("categorical", False) if isinstance(col_info, dict) else False
+                    sample_str  = ", ".join(repr(v) for v in vals)
+                    if categorical:
+                        lines.append(
+                            f"    {display}  [categorical — ALL stored values: {sample_str}]"
+                            f"  ← your filter term may differ from these labels; use LIKE or IN"
+                        )
+                    else:
+                        lines.append(f"    {display}  [sample values: {sample_str}]")
                 else:
                     lines.append(f"    {display}")
 

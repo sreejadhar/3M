@@ -204,9 +204,33 @@ General Rules:
     c. If a column you need (e.g. SBU1) is only in Table A, write a query for
        Table A that retrieves it.  Write a second query for Table B with its
        own columns.  Do NOT try to bridge them without a valid join key.
-10. String/text filters — use the case-insensitive syntax shown above for this database.
-    - If [sample values] are shown for a column, use the exact spelling from the samples.
-    - Never rely on a case-sensitive equality match unless copying verbatim from samples.
+10. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
+    The user's terminology will often DIFFER from the values stored in the database.
+    You MUST resolve this mismatch before writing any WHERE clause.
+
+    STEP-BY-STEP RESOLUTION PROCESS:
+    a. Read the [sample values] shown for every text column in the schema context.
+    b. Compare the user's term to those sample values.
+       - EXACT MATCH  → use that exact value with a case-insensitive equality filter:
+           LOWER(col) = LOWER('exact_value')
+       - NO EXACT MATCH but SEMANTIC MATCH (synonyms, subcategories, shorthand):
+           Example: user says "savoury snacks" but samples show "food and snacks"
+           Example: user says "beverages" but samples show "drinks"
+           Example: user says "Q1" but samples show "January,February,March"
+           → Use LIKE with the closest matching sample value:
+               LOWER(col) LIKE '%food%' OR LOWER(col) LIKE '%snack%'
+           → Or use IN with ALL semantically related sample values:
+               LOWER(col) IN ('food and snacks', 'snacks', 'savoury')
+           → NEVER write WHERE col = 'savoury snacks' if that exact string is not in [sample values].
+       - NO MATCH AT ALL → do NOT add a filter for that dimension; retrieve all values
+           and let the user see what categories exist. Add a comment in "description"
+           noting that the exact term was not found.
+
+    c. If a column is marked [categorical] in the schema context, you MUST follow this
+       rule — do not use exact equality unless the term appears verbatim in the samples.
+    d. Always use case-insensitive matching (LOWER/ILIKE) — never raw equality on text.
+    e. When using LIKE, anchor to the most distinctive part of the term to avoid
+       false positives (e.g. LIKE '%snack%' not LIKE '%and%').
 11. Date/period filters — use the date extraction functions shown above for this database.
     Check column names carefully and match the sample value format (e.g. integer 2026
     vs string '2026').
@@ -265,8 +289,15 @@ CRITICAL REMINDERS:
 - CROSS-TABLE: If no POSSIBLE JOIN KEYS exist between two tables, query them SEPARATELY.
   Do NOT use subqueries, IN (...), EXISTS, correlated queries, or any trick to combine
   data from two tables that have no valid join key. One query = one table (or validly joined tables).
-- For any text/string filter, use case-insensitive matching (LOWER() LIKE or exact sample value).
-- If [sample values] are shown for a column, pick the matching value verbatim from that list.
+- SEMANTIC TERM RESOLUTION (most important for categorical filters):
+  Before writing any WHERE clause on a text column, CHECK the [sample values] shown
+  in the schema. If the user's term does not appear verbatim in those samples, you MUST
+  use LIKE or IN with the closest matching sample value(s) — NEVER use exact equality
+  with a term that is not in the samples. User terminology and data labels frequently differ:
+    user: "savoury snacks"   → data: "food and snacks"   → use LIKE '%snack%'
+    user: "beverages"        → data: "drinks"             → use LIKE '%drink%'
+    user: "EMEA"             → data: "Europe","Middle East","Africa" → use IN (...)
+  If no sample value is semantically close, omit the filter and retrieve all values.
 - COUNT vs SUM: use COUNT(*) for headcount/how-many questions; use SUM(col) only for
   monetary/quantity totals. NEVER use SUM() to count people or rows.
 - PERCENTAGES: if the question asks for %, share, or proportion — compute it in SQL

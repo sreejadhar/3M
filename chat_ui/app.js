@@ -100,6 +100,7 @@ const mdAttrPanel          = document.getElementById('mdAttrPanel');
 const mdAttrPanelTitle     = document.getElementById('mdAttrPanelTitle');
 const mdAttrClose          = document.getElementById('mdAttrClose');
 const mdAttrBody           = document.getElementById('mdAttrBody');
+const mdEnrichTaxonomyBtn  = document.getElementById('mdEnrichTaxonomyBtn');
 const mdTabBar             = document.getElementById('mdTabBar');
 const mdRedundancyBody     = document.getElementById('mdRedundancyBody');
 const mdRedundancyEmpty    = document.getElementById('mdRedundancyEmpty');
@@ -2643,6 +2644,14 @@ async function apiMdListSources() {
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
+async function apiMdEnrichTaxonomy(sourceId) {
+  const r = await fetch(`${API}/metadata/sources/${encodeURIComponent(sourceId)}/enrich-taxonomy`, {
+    method: 'POST',
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 async function apiMdPatchSource(sourceId, body) {
   const r = await fetch(`${API}/metadata/sources/${encodeURIComponent(sourceId)}`, {
     method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body),
@@ -2791,20 +2800,73 @@ async function loadMdAttributes(mid) {
   mdAttrPanelTitle.textContent = ent
     ? `Attributes — ${ent.schema_name ? ent.schema_name + '.' : ''}${ent.table_name}`
     : 'Attributes';
+  // Store source_id on the button for enrichment
+  if (mdEnrichTaxonomyBtn && ent) {
+    mdEnrichTaxonomyBtn.dataset.sourceId = ent.source_id || '';
+  }
   mdAttrPanel.style.display = '';
-  mdAttrBody.innerHTML = '<tr><td colspan="9" class="md-empty">Loading…</td></tr>';
+  mdAttrBody.innerHTML = '<tr><td colspan="11" class="md-empty">Loading…</td></tr>';
 
   try {
     const entity = await apiMdGetEntity(mid);
     renderMdAttributeTable(entity.attributes || []);
   } catch (e) {
-    mdAttrBody.innerHTML = `<tr><td colspan="9" class="md-empty">Error: ${e.message}</td></tr>`;
+    mdAttrBody.innerHTML = `<tr><td colspan="11" class="md-empty">Error: ${e.message}</td></tr>`;
   }
+}
+
+// Badge colour map for statistical_type
+const _STAT_TYPE_COLOURS = {
+  categorical: '#7c3aed', ordinal: '#0891b2', nominal: '#6366f1',
+  continuous:  '#059669', identifier: '#94a3b8', boolean: '#f59e0b',
+  free_text:   '#78716c', date: '#db2777',
+};
+// Badge colour map for semantic_role
+const _ROLE_COLOURS = {
+  measure: '#059669', time_period: '#d97706', product_category: '#7c3aed',
+  product_sub_category: '#9333ea', geography: '#0284c7',
+  geography_dimension_key: '#0369a1', product_dimension_key: '#6d28d9',
+  time_dimension_key: '#b45309', identifier: '#94a3b8', boolean_flag: '#f59e0b',
+};
+
+function _statTypeBadge(t) {
+  if (!t) return '<span class="md-chip md-chip-no">—</span>';
+  const bg = _STAT_TYPE_COLOURS[t] || '#475569';
+  return `<span class="md-tax-badge" style="background:${bg}" title="${_esc(t)}">${_esc(t)}</span>`;
+}
+
+function _roleBadge(r) {
+  if (!r) return '<span class="md-chip md-chip-no">—</span>';
+  const bg = _ROLE_COLOURS[r] || '#475569';
+  const short = r.replace(/_dimension_key$/, '_fk').replace(/_/g, ' ');
+  return `<span class="md-tax-badge" style="background:${bg}" title="${_esc(r)}">${_esc(short)}</span>`;
+}
+
+function _taxonomyCell(tree) {
+  if (!tree || !tree.length) return '<span class="md-chip md-chip-no">—</span>';
+  // tree is an array of values (flat) or object (hierarchy)
+  if (Array.isArray(tree)) {
+    const shown = tree.slice(0, 5);
+    const more  = tree.length > 5 ? `<span class="md-tax-more">+${tree.length - 5} more</span>` : '';
+    const chips = shown.map(v => `<span class="md-tax-val" title="${_esc(String(v))}">${_esc(String(v))}</span>`).join('');
+    return `<div class="md-tax-list">${chips}${more}</div>`;
+  }
+  // Object = hierarchy {parent: [children]}
+  const entries = Object.entries(tree);
+  const shown = entries.slice(0, 3);
+  const html = shown.map(([p, ch]) =>
+    `<div class="md-tax-parent"><span class="md-tax-val">${_esc(p)}</span>` +
+    `<span class="md-tax-arrow">›</span>` +
+    `<span class="md-tax-children">${Array.isArray(ch) ? ch.slice(0,3).map(c => `<span class="md-tax-val">${_esc(c)}</span>`).join('') : ''}` +
+    `${Array.isArray(ch) && ch.length > 3 ? `<span class="md-tax-more">+${ch.length-3}</span>` : ''}</span></div>`
+  ).join('');
+  const moreParents = entries.length > 3 ? `<span class="md-tax-more">+${entries.length-3} more</span>` : '';
+  return `<div class="md-tax-list">${html}${moreParents}</div>`;
 }
 
 function renderMdAttributeTable(attrs) {
   if (!attrs.length) {
-    mdAttrBody.innerHTML = '<tr><td colspan="9" class="md-empty">No attributes found.</td></tr>';
+    mdAttrBody.innerHTML = '<tr><td colspan="11" class="md-empty">No attributes found.</td></tr>';
     return;
   }
 
@@ -2828,6 +2890,8 @@ function renderMdAttributeTable(attrs) {
     return `<tr${isAttrDeleted ? ' class="md-row-deleted"' : ''}>
       <td><strong>${_esc(a.column_name)}</strong>${attrDeletedBadge}</td>
       <td><code style="font-size:12px">${_esc(a.data_type)}</code></td>
+      <td>${_statTypeBadge(a.statistical_type)}</td>
+      <td>${_roleBadge(a.semantic_role)}${_taxonomyCell(a.taxonomy_tree)}</td>
       <td>${_esc(a.domain || '—')}</td>
       <td>
         <div class="md-desc-cell">
@@ -3107,6 +3171,26 @@ mdAttrClose.addEventListener('click', () => {
   _mdActiveId = null;
   mdAttrPanel.style.display = 'none';
   renderMdEntityTable();
+});
+
+mdEnrichTaxonomyBtn.addEventListener('click', async () => {
+  const sourceId = mdEnrichTaxonomyBtn.dataset.sourceId || mdSourceFilter.value;
+  if (!sourceId) {
+    showToast('Open an entity\'s attributes first to identify the source', 'error');
+    return;
+  }
+  mdEnrichTaxonomyBtn.disabled = true;
+  mdEnrichTaxonomyBtn.textContent = 'Enriching…';
+  try {
+    await apiMdEnrichTaxonomy(sourceId);
+    showToast('Taxonomy enrichment started — reload in a moment', 'success');
+    setTimeout(loadMdCatalog, 4000);
+  } catch (e) {
+    showToast(`Enrich failed: ${e.message}`, 'error');
+  } finally {
+    mdEnrichTaxonomyBtn.disabled = false;
+    mdEnrichTaxonomyBtn.textContent = 'Enrich Taxonomy';
+  }
 });
 
 if (mdTabBar) {

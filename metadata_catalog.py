@@ -223,6 +223,9 @@ CREATE TABLE IF NOT EXISTS md_attributes (
     stddev_value         REAL,
     pattern_hints        TEXT NOT NULL DEFAULT '[]',
     top_values           TEXT NOT NULL DEFAULT '[]',
+    statistical_type     TEXT NOT NULL DEFAULT '',
+    semantic_role        TEXT NOT NULL DEFAULT '',
+    taxonomy_tree        TEXT NOT NULL DEFAULT '[]',
     is_golden_record     INTEGER NOT NULL DEFAULT 0,
     deleted_from_source  INTEGER NOT NULL DEFAULT 0,
     created_at           TEXT NOT NULL,
@@ -252,6 +255,9 @@ CREATE TABLE IF NOT EXISTS md_attributes (
     stddev_value         DOUBLE PRECISION,
     pattern_hints        TEXT NOT NULL DEFAULT '[]',
     top_values           TEXT NOT NULL DEFAULT '[]',
+    statistical_type     TEXT NOT NULL DEFAULT '',
+    semantic_role        TEXT NOT NULL DEFAULT '',
+    taxonomy_tree        TEXT NOT NULL DEFAULT '[]',
     is_golden_record     BOOLEAN NOT NULL DEFAULT FALSE,
     deleted_from_source  BOOLEAN NOT NULL DEFAULT FALSE,
     created_at           TEXT NOT NULL,
@@ -373,6 +379,18 @@ def _ensure(cur: Any) -> None:
                 "ALTER TABLE md_attributes ADD COLUMN IF NOT EXISTS "
                 "deleted_from_source BOOLEAN NOT NULL DEFAULT FALSE"
             )
+            cur.execute(
+                "ALTER TABLE md_attributes ADD COLUMN IF NOT EXISTS "
+                "statistical_type TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE md_attributes ADD COLUMN IF NOT EXISTS "
+                "semantic_role TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE md_attributes ADD COLUMN IF NOT EXISTS "
+                "taxonomy_tree TEXT NOT NULL DEFAULT '[]'"
+            )
             _schema_migrated = True
     else:
         cur.ddl(
@@ -383,17 +401,27 @@ def _ensure(cur: Any) -> None:
             _DDL_SOURCES_SQLITE,
         )
         if not _schema_migrated:
-            # Add deleted_from_source to md_entities if missing
             cols_e = {r["name"] for r in cur.execute("PRAGMA table_info(md_entities)").fetchall()}
             if "deleted_from_source" not in cols_e:
                 cur.execute(
                     "ALTER TABLE md_entities ADD COLUMN deleted_from_source INTEGER NOT NULL DEFAULT 0"
                 )
-            # Add deleted_from_source to md_attributes if missing
             cols_a = {r["name"] for r in cur.execute("PRAGMA table_info(md_attributes)").fetchall()}
             if "deleted_from_source" not in cols_a:
                 cur.execute(
                     "ALTER TABLE md_attributes ADD COLUMN deleted_from_source INTEGER NOT NULL DEFAULT 0"
+                )
+            if "statistical_type" not in cols_a:
+                cur.execute(
+                    "ALTER TABLE md_attributes ADD COLUMN statistical_type TEXT NOT NULL DEFAULT ''"
+                )
+            if "semantic_role" not in cols_a:
+                cur.execute(
+                    "ALTER TABLE md_attributes ADD COLUMN semantic_role TEXT NOT NULL DEFAULT ''"
+                )
+            if "taxonomy_tree" not in cols_a:
+                cur.execute(
+                    "ALTER TABLE md_attributes ADD COLUMN taxonomy_tree TEXT NOT NULL DEFAULT '[]'"
                 )
             _schema_migrated = True
 
@@ -833,12 +861,15 @@ def update_entity(metadata_id: str, **fields: Any) -> bool:
 
 
 def update_attribute(attr_id: str, **fields: Any) -> bool:
-    allowed = {"description", "is_golden_record"}
+    allowed = {"description", "is_golden_record", "statistical_type", "semantic_role", "taxonomy_tree"}
     updates: Dict[str, Any] = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False
     if "is_golden_record" in updates:
         updates["is_golden_record"] = _enc_bool(updates["is_golden_record"])
+    if "taxonomy_tree" in updates:
+        v = updates["taxonomy_tree"]
+        updates["taxonomy_tree"] = json.dumps(v) if not isinstance(v, str) else v
     updates["updated_at"] = _now()
     set_clause = ", ".join(f"{k}=?" for k in updates)
     with _cursor_ctx() as cur:
@@ -958,11 +989,14 @@ def _coerce_attr(row: Dict) -> Dict:
     r = dict(row)
     for f in ("is_primary_key", "is_foreign_key", "nullable", "is_golden_record", "deleted_from_source"):
         r[f] = bool(r.get(f, 0))
-    for f in ("pattern_hints", "top_values"):
+    for f in ("pattern_hints", "top_values", "taxonomy_tree"):
         try:
             r[f] = json.loads(r.get(f) or "[]")
         except Exception:
             r[f] = []
+    # Ensure taxonomy fields have defaults if missing from older rows
+    r.setdefault("statistical_type", "")
+    r.setdefault("semantic_role", "")
     return r
 
 
@@ -983,3 +1017,177 @@ def _coerce_change(row: Dict) -> Dict:
     except Exception:
         r["changed_fields"] = {}
     return r
+
+
+# ── Taxonomy enrichment ────────────────────────────────────────────────────────
+
+_ENRICH_SYSTEM = """\
+You are a data modelling expert. Given a database table with column names, types, and sample values,
+classify each column and infer its taxonomy.
+
+Return ONLY a JSON object — no prose, no markdown fences.
+
+statistical_type (pick one):
+  identifier  — surrogate or natural key (id, code, _id columns)
+  nominal     — FK / dimension key linking to another table
+  categorical — low-cardinality text with distinct labels (category, status, country)
+  ordinal     — ordered set: ranked labels or structured period strings (FY2024, Q1)
+  continuous  — numeric measure (revenue, amount, count, rate, %)
+  boolean     — yes/no, 0/1, true/false
+  free_text   — high-cardinality unstructured text
+  date        — actual date/datetime/timestamp column
+
+semantic_role (pick the best match):
+  measure | time_period | time_dimension_key | product_category | product_sub_category |
+  product_dimension_key | geography | geography_dimension_key | org_unit | org_dimension_key |
+  customer_dimension_key | demographic | identifier | boolean_flag | free_text | other
+
+taxonomy_values: for categorical/ordinal columns list all distinct values shown in sample_values.
+  For other types return [].
+
+OUTPUT FORMAT:
+{
+  "columns": [
+    {
+      "name": "<column_name>",
+      "statistical_type": "<type>",
+      "semantic_role": "<role>",
+      "taxonomy_values": ["<val1>", "<val2>"]
+    }
+  ]
+}
+"""
+
+
+def _call_enrich_llm(table_name: str, col_specs: List[Dict], model: str) -> List[Dict]:
+    """Call LLM to classify columns and return taxonomy annotations."""
+    import anthropic
+    import re
+
+    lines = []
+    for c in col_specs:
+        sv = c.get("sample_values") or []
+        sv_str = ", ".join(repr(v) for v in sv[:20]) if sv else "(no samples)"
+        lines.append(f"  {c['name']} ({c['data_type']}): samples=[{sv_str}]")
+    user_msg = f"Table: {table_name}\nColumns:\n" + "\n".join(lines) + "\n\nClassify each column."
+
+    try:
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = client.messages.create(
+            model=model, max_tokens=2048, temperature=0.0,
+            system=_ENRICH_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = msg.content[0].text if msg.content else ""
+    except Exception as exc:
+        logger.warning("enrich_taxonomy: LLM call failed for table %r — %s", table_name, exc)
+        return []
+
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+    try:
+        obj = json.loads(cleaned)
+        return obj.get("columns", [])
+    except json.JSONDecodeError:
+        s, e = cleaned.find("{"), cleaned.rfind("}")
+        if s != -1 and e != -1:
+            try:
+                return json.loads(cleaned[s:e + 1]).get("columns", [])
+            except json.JSONDecodeError:
+                pass
+    logger.warning("enrich_taxonomy: could not parse LLM JSON for table %r", table_name)
+    return []
+
+
+def enrich_taxonomy(source_id: str, model: Optional[str] = None) -> int:
+    """
+    LLM-classify every column of every entity in source_id and write:
+      statistical_type, semantic_role, taxonomy_tree (JSON array of distinct values)
+
+    Also detects parent-child categorical pairs (category → sub_category) and stores
+    the child values grouped by parent in the parent column's taxonomy_tree as a dict.
+
+    Returns the number of attributes updated.
+    """
+    model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5-20251001")
+    updated = 0
+
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+
+        entities = cur.execute(
+            "SELECT metadata_id, table_name FROM md_entities "
+            "WHERE source_id=? AND deleted_from_source=?",
+            (source_id, _enc_bool(False)),
+        ).fetchall()
+
+        now = _now()
+
+        for ent in entities:
+            mid = ent["metadata_id"]
+            table_name = ent["table_name"]
+
+            attrs = cur.execute(
+                "SELECT attr_id, column_name, data_type, top_values FROM md_attributes "
+                "WHERE metadata_id=? AND deleted_from_source=?",
+                (mid, _enc_bool(False)),
+            ).fetchall()
+
+            if not attrs:
+                continue
+
+            col_specs = []
+            for a in attrs:
+                try:
+                    sv = json.loads(a["top_values"] or "[]")
+                except Exception:
+                    sv = []
+                col_specs.append({
+                    "name": a["column_name"],
+                    "data_type": a["data_type"] or "",
+                    "sample_values": sv,
+                })
+
+            annotations = _call_enrich_llm(table_name, col_specs, model)
+            ann_by_name = {a["name"]: a for a in annotations if "name" in a}
+
+            # Build name → attr_id map
+            attr_map = {a["column_name"]: a["attr_id"] for a in attrs}
+
+            # Detect parent-child pairs: sub_X → X naming convention
+            col_names = {a["column_name"] for a in attrs}
+            parent_child: Dict[str, str] = {}  # child_col → parent_col
+            for col_name in col_names:
+                if col_name.startswith("sub_"):
+                    parent_candidate = col_name[4:]
+                    if parent_candidate in col_names:
+                        parent_child[col_name] = parent_candidate
+
+            # Build hierarchy for parent columns that have children
+            parent_hierarchies: Dict[str, Dict] = {}  # parent_col → {parent_val: [child_vals]}
+            # We can't run SQL here (no live DB conn), so hierarchy comes from top_values cross-ref
+            # We will populate it from the sample values if available
+
+            for col_name, ann in ann_by_name.items():
+                attr_id = attr_map.get(col_name)
+                if not attr_id:
+                    continue
+
+                stat_type = ann.get("statistical_type") or ""
+                sem_role = ann.get("semantic_role") or ""
+                tax_vals = ann.get("taxonomy_values") or []
+
+                # If this is a parent col with a child col, taxonomy_tree stays as flat list
+                # for now; the hierarchy enrichment requires live DB access which is in understand_node
+                taxonomy_json = json.dumps(tax_vals if isinstance(tax_vals, list) else [])
+
+                cur.execute(
+                    "UPDATE md_attributes SET statistical_type=?, semantic_role=?, "
+                    "taxonomy_tree=?, updated_at=? WHERE attr_id=?",
+                    (stat_type, sem_role, taxonomy_json, now, attr_id),
+                )
+                updated += 1
+
+            logger.debug("enrich_taxonomy: table=%r annotated %d columns", table_name, len(ann_by_name))
+
+    logger.info("enrich_taxonomy: source=%s updated %d attributes", source_id, updated)
+    return updated

@@ -216,6 +216,7 @@
         <div class="md-attr-panel" id="mdAttrPanel" style="display:none">
           <div class="md-attr-panel-header">
             <span id="mdAttrPanelTitle">Attributes</span>
+            <button class="btn-secondary btn-sm" id="mdEnrichTaxonomyBtn" title="Run LLM taxonomy enrichment on this source">Enrich Taxonomy</button>
             <button class="modal-close" id="mdAttrClose">✕</button>
           </div>
           <table class="md-table md-attr-table" id="mdAttrTable">
@@ -223,6 +224,8 @@
               <tr>
                 <th>Column</th>
                 <th>Type</th>
+                <th>Stat. Type</th>
+                <th>Semantic Role</th>
                 <th>Domain</th>
                 <th>Description</th>
                 <th>PK</th>
@@ -233,7 +236,7 @@
               </tr>
             </thead>
             <tbody id="mdAttrBody">
-              <tr><td colspan="9" class="md-empty">Select an entity to view attributes.</td></tr>
+              <tr><td colspan="11" class="md-empty">Select an entity to view attributes.</td></tr>
             </tbody>
           </table>
         </div>

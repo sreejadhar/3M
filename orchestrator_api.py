@@ -1904,6 +1904,9 @@ class UpdateEntityRequest(BaseModel):
 class UpdateAttributeRequest(BaseModel):
     description:      Optional[str]  = None
     is_golden_record: Optional[bool] = None
+    statistical_type: Optional[str]  = None
+    semantic_role:    Optional[str]  = None
+    taxonomy_tree:    Optional[Any]  = None
 
 
 @app.get("/metadata/entities")
@@ -1954,13 +1957,19 @@ async def patch_metadata_entity(metadata_id: str, req: UpdateEntityRequest):
 
 @app.patch("/metadata/attributes/{attr_id}")
 async def patch_metadata_attribute(attr_id: str, req: UpdateAttributeRequest):
-    """Update attribute description and/or golden-record flag."""
+    """Update attribute fields: description, golden-record, statistical_type, semantic_role, taxonomy_tree."""
     try:
         kwargs: Dict[str, Any] = {}
         if req.description is not None:
             kwargs["description"] = req.description
         if req.is_golden_record is not None:
             kwargs["is_golden_record"] = req.is_golden_record
+        if req.statistical_type is not None:
+            kwargs["statistical_type"] = req.statistical_type
+        if req.semantic_role is not None:
+            kwargs["semantic_role"] = req.semantic_role
+        if req.taxonomy_tree is not None:
+            kwargs["taxonomy_tree"] = req.taxonomy_tree
         if not kwargs:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
         _mc.update_attribute(attr_id, **kwargs)
@@ -1972,6 +1981,18 @@ async def patch_metadata_attribute(attr_id: str, req: UpdateAttributeRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/metadata/sources/{source_id}/enrich-taxonomy", status_code=202)
+async def enrich_source_taxonomy(source_id: str, background_tasks: BackgroundTasks):
+    """
+    Trigger LLM-based taxonomy enrichment for all columns of a metadata source.
+    Populates statistical_type, semantic_role, taxonomy_tree on md_attributes rows.
+    Runs in the background; returns immediately with a status message.
+    """
+    background_tasks.add_task(_mc.enrich_taxonomy, source_id)
+    return {"status": "accepted", "source_id": source_id,
+            "message": "Taxonomy enrichment started in background"}
 
 
 @app.get("/metadata/redundancies")

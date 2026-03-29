@@ -280,7 +280,7 @@ SCHEMA CONTEXT:
 
 TARGET DATABASE TYPE: {db_type}
 {schema_line}
-{history_section}{multi_kg_section}NATURAL LANGUAGE QUESTION:
+{history_section}{multi_kg_section}{resolution_section}NATURAL LANGUAGE QUESTION:
 {natural_query}
 
 CRITICAL REMINDERS:
@@ -289,15 +289,14 @@ CRITICAL REMINDERS:
 - CROSS-TABLE: If no POSSIBLE JOIN KEYS exist between two tables, query them SEPARATELY.
   Do NOT use subqueries, IN (...), EXISTS, correlated queries, or any trick to combine
   data from two tables that have no valid join key. One query = one table (or validly joined tables).
-- SEMANTIC TERM RESOLUTION (most important for categorical filters):
-  Before writing any WHERE clause on a text column, CHECK the [sample values] shown
-  in the schema. If the user's term does not appear verbatim in those samples, you MUST
-  use LIKE or IN with the closest matching sample value(s) — NEVER use exact equality
-  with a term that is not in the samples. User terminology and data labels frequently differ:
-    user: "savoury snacks"   → data: "food and snacks"   → use LIKE '%snack%'
-    user: "beverages"        → data: "drinks"             → use LIKE '%drink%'
+- CATEGORICAL FILTERS — PRE-RESOLVED MAPPINGS (see PRE-RESOLVED section above if present):
+  If PRE-RESOLVED CATEGORY MAPPINGS are shown above, you MUST copy those sql_fragment
+  values verbatim into your WHERE clauses. Do NOT substitute your own terminology.
+  If no pre-resolved section is shown, check [categorical] sample values in the schema
+  and use LIKE or IN when the user's term does not appear verbatim in the samples.
+    user: "savoury snacks"   → data: "Snacks & Foods"    → use LOWER(col) = 'snacks & foods'
+    user: "beverages"        → data: "Drinks"             → use LOWER(col) LIKE '%drink%'
     user: "EMEA"             → data: "Europe","Middle East","Africa" → use IN (...)
-  If no sample value is semantically close, omit the filter and retrieve all values.
 - COUNT vs SUM: use COUNT(*) for headcount/how-many questions; use SUM(col) only for
   monetary/quantity totals. NEVER use SUM() to count people or rows.
 - PERCENTAGES: if the question asks for %, share, or proportion — compute it in SQL
@@ -880,12 +879,48 @@ def plan_node(state: DialogState) -> DialogState:
     else:
         multi_kg_section = ""
 
+    # Build resolution section from resolve_node output (if any)
+    term_resolution = state.get("term_resolution") or []
+    if term_resolution:
+        res_lines = [
+            "PRE-RESOLVED CATEGORY MAPPINGS — MANDATORY",
+            "=" * 60,
+            "These mappings were computed BEFORE SQL generation by inspecting the",
+            "actual stored values.  You MUST use the sql_fragment shown for each",
+            "filter.  Do NOT replace these with the user's original terminology.",
+            "",
+        ]
+        for r in term_resolution:
+            user_term      = r.get("user_term", "")
+            column         = r.get("column", "")
+            matched        = r.get("matched_values") or []
+            sql_frag       = r.get("sql_fragment") or ""
+            reasoning      = r.get("reasoning", "")
+            if sql_frag:
+                res_lines.append(
+                    f'  User said "{user_term}"  →  column "{column}"'
+                )
+                if reasoning:
+                    res_lines.append(f"    Reasoning: {reasoning}")
+                res_lines.append(f"    Matched stored values: {matched}")
+                res_lines.append(f"    ⚡ USE THIS IN WHERE CLAUSE: {sql_frag}")
+                res_lines.append("")
+        res_lines.append(
+            "⚠ Any WHERE clause on a categorical column MUST use the sql_fragment "
+            "above.  NEVER write WHERE col = '<user terminology>' directly."
+        )
+        res_lines.append("=" * 60)
+        resolution_section = "\n".join(res_lines) + "\n\n"
+    else:
+        resolution_section = ""
+
     user = _USER_PROMPT.format(
         schema_context=schema_context,
         db_type=config.db_type,
         schema_line=schema_line,
         history_section=history_section,
         multi_kg_section=multi_kg_section,
+        resolution_section=resolution_section,
         natural_query=natural_query,
     )
 

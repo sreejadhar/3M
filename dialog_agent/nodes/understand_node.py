@@ -502,6 +502,16 @@ def understand_node(state: DialogState) -> DialogState:
         len(schema_context), len(nodes), len(edges), db_schema,
     )
 
-    state["schema_context"] = schema_context
-    state["phase"] = "understand"
+    # Populate categorical_columns for resolve_node so it can map user terms
+    # to exact stored data values without re-parsing the schema context string.
+    categorical_columns: Dict[str, Dict[str, list]] = {}
+    if samples:
+        for tbl, col_map in samples.items():
+            for col, info in col_map.items():
+                if isinstance(info, dict) and info.get("categorical"):
+                    categorical_columns.setdefault(tbl, {})[col] = info.get("values", [])
+
+    state["schema_context"]      = schema_context
+    state["categorical_columns"] = categorical_columns
+    state["phase"]               = "understand"
     return state

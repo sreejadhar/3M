@@ -5,7 +5,8 @@ Pipeline:
     START
       → retrieve     (GraphRAG: embed KG nodes, retrieve relevant subgraph)
       → understand   (build schema context from retrieved subgraph)
-      → plan         (LLM decomposes NQL → SQL queries)
+      → resolve      (LLM maps user query terms → exact categorical DB values)
+      → plan         (LLM decomposes NQL → SQL queries using resolved values)
       → execute      (run SQL against target DB)
       → synthesize   (LLM stitches results → insights)
       → END
@@ -22,6 +23,7 @@ from .nodes import (
     retrieve_node,
     execute_node,
     plan_node,
+    resolve_node,
     synthesize_node,
     understand_node,
 )
@@ -29,7 +31,7 @@ from .state import ConversationTurn, DialogState
 
 logger = logging.getLogger(__name__)
 
-_NODES = ["retrieve", "understand", "plan", "execute", "synthesize"]
+_NODES = ["retrieve", "understand", "resolve", "plan", "execute", "synthesize"]
 
 
 def _build_graph() -> Any:
@@ -37,13 +39,15 @@ def _build_graph() -> Any:
 
     g.add_node("retrieve",   retrieve_node)
     g.add_node("understand", understand_node)
+    g.add_node("resolve",    resolve_node)
     g.add_node("plan",       plan_node)
     g.add_node("execute",    execute_node)
     g.add_node("synthesize", synthesize_node)
 
     g.add_edge(START,        "retrieve")
     g.add_edge("retrieve",   "understand")
-    g.add_edge("understand", "plan")
+    g.add_edge("understand", "resolve")
+    g.add_edge("resolve",    "plan")
     g.add_edge("plan",       "execute")
     g.add_edge("execute",    "synthesize")
     g.add_edge("synthesize", END)
@@ -78,6 +82,9 @@ class DialogAgent:
             insights             = "",
             errors               = [],
             phase                = "start",
+            # Categorical resolution fields
+            categorical_columns  = {},
+            term_resolution      = [],
             # Multi-KG federation fields (default to empty = single-KG mode)
             active_kg_ids        = active_kg_ids or [],
             kg_bridges_active    = kg_bridges_active or [],

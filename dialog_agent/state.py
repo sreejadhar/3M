@@ -54,6 +54,15 @@ class DialogState(TypedDict, total=False):
     errors: List[str]
     phase: str                         # understand | plan | execute | synthesize | done | error
 
+    # Categorical column values extracted from schema (used by resolve_node)
+    # { sql_table_name: { sql_col_name: [val1, val2, ...] } }
+    categorical_columns: Dict[str, Dict[str, List[str]]]
+
+    # Resolved term → data-value mappings produced by resolve_node
+    # [{"user_term": "savoury snacks", "column": "category",
+    #   "matched_values": ["Snacks & Foods"], "sql_fragment": "LOWER(category) = 'snacks & foods'"}]
+    term_resolution: List[Dict[str, Any]]
+
     # Multi-KG federation (empty = single-KG mode)
     active_kg_ids: List[str]           # KG ids selected by router
     kg_bridges_active: List[Dict[str, Any]]  # bridges between active KGs

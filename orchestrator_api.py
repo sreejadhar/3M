@@ -411,6 +411,15 @@ async def _startup() -> None:
                 if src["id"] not in _sources:
                     _sources[src["id"]] = src
             logger.info("kg_store: restored %d sources from persistent store", len(restored))
+            # Back-fill taxonomy annotations for all restored sources whose
+            # md_attributes have not yet been annotated.
+            for src in restored:
+                try:
+                    n = _sync_taxonomy_from_kg_nodes(src["id"], src.get("kg_nodes") or [])
+                    if n:
+                        logger.info("Startup taxonomy sync: %d columns for %s", n, src["id"][:8])
+                except Exception as _ts_exc:
+                    logger.warning("Startup taxonomy sync failed for %s: %s", src["id"][:8], _ts_exc)
         except Exception as exc:
             logger.warning("kg_store restore failed (non-fatal): %s", exc)
     else:
@@ -755,6 +764,103 @@ def _push_index_event(source_id: str, step: str, status: str, message: str, deta
             pass
 
 
+_TAX_RE = _re.compile(
+    r"taxonomy:\s*"
+    r"statistical_type=([^\s|]+)"
+    r".*?semantic_role=([^\s|]+)"
+    r"(?:.*?format_pattern=([^\s|]+))?",
+    _re.IGNORECASE,
+)
+
+def _sync_taxonomy_from_kg_nodes(source_id: str, kg_nodes: List[Dict]) -> int:
+    """
+    Parse taxonomy: annotations from KG node titles (written by profile_node)
+    and sync them back into md_attributes.
+
+    Each KG node title for a Class node contains lines like:
+        Properties:
+          fiscal_year: xsd:string  -- taxonomy: statistical_type=ordinal | semantic_role=time_period | ...
+          category: xsd:string     -- taxonomy: statistical_type=categorical | semantic_role=product_category | ...
+
+    We parse these and write statistical_type + semantic_role into md_attributes
+    by matching on (source_id, column_name). top_values already in the row are
+    preserved as taxonomy_tree if the column is categorical/ordinal.
+    """
+    import json as _json
+
+    # Parse every node title for "col_name: xsd_type  -- taxonomy: ..." lines
+    col_tax: Dict[str, Dict[str, str]] = {}  # column_name → {statistical_type, semantic_role, format_pattern}
+    _prop_line_re = _re.compile(r"^\s{2}(\w+):\s+\S+.*?--\s*(taxonomy:\s*.+)$", _re.IGNORECASE)
+
+    for node in kg_nodes:
+        title = node.get("title") or ""
+        for line in title.splitlines():
+            m = _prop_line_re.match(line)
+            if not m:
+                continue
+            col_name, tax_str = m.group(1), m.group(2)
+            tm = _TAX_RE.search(tax_str)
+            if not tm:
+                continue
+            col_tax[col_name] = {
+                "statistical_type": tm.group(1) or "",
+                "semantic_role":    tm.group(2) or "",
+                "format_pattern":   tm.group(3) or "",
+            }
+
+    if not col_tax:
+        return 0
+
+    # Fetch all attributes for this source from md_attributes
+    # Use _mc (already imported at module level as metadata_catalog)
+    import json as _json
+
+    now = _mc._now()
+    updated = 0
+    try:
+        with _mc._cursor_ctx() as cur:
+            _mc._ensure(cur)
+            # Get all active attrs for this source with their top_values
+            attrs = cur.execute(
+                "SELECT a.attr_id, a.column_name, a.top_values "
+                "FROM md_attributes a "
+                "JOIN md_entities e ON a.metadata_id = e.metadata_id "
+                "WHERE e.source_id=? AND a.deleted_from_source=?",
+                (source_id, _mc._enc_bool(False)),
+            ).fetchall()
+
+            for attr in attrs:
+                col_name = attr["column_name"]
+                if col_name not in col_tax:
+                    continue
+                tax = col_tax[col_name]
+                stat_type = tax["statistical_type"]
+                sem_role  = tax["semantic_role"]
+
+                # For categorical/ordinal columns, reuse top_values as taxonomy_tree
+                tree = "[]"
+                if stat_type in ("categorical", "ordinal"):
+                    try:
+                        tv = _json.loads(attr.get("top_values") or "[]")
+                        tree = _json.dumps(tv) if tv else "[]"
+                    except Exception:
+                        pass
+
+                cur.execute(
+                    "UPDATE md_attributes SET statistical_type=?, semantic_role=?, "
+                    "taxonomy_tree=?, updated_at=? WHERE attr_id=?",
+                    (stat_type, sem_role, tree, now, attr["attr_id"]),
+                )
+                updated += 1
+
+    except Exception as exc:
+        logger.warning("_sync_taxonomy_from_kg_nodes failed for %s: %s", source_id[:8], exc)
+        return 0
+
+    logger.info("Taxonomy sync: %d columns annotated for source %s", updated, source_id[:8])
+    return updated
+
+
 async def _index_source(source_id: str) -> None:
     """Full pipeline for a registered data source: extract → ontology → KG."""
     src = _sources.get(source_id)
@@ -891,6 +997,13 @@ async def _index_source(source_id: str) -> None:
                         await asyncio.sleep(2.0)
                 _push_index_event(source_id, "kg", "done",
                                   f"Knowledge graph built — {len(src['kg_nodes'])} nodes, {len(src['kg_edges'])} edges")
+
+                # Sync profile_node taxonomy annotations → md_attributes
+                n_tax = _sync_taxonomy_from_kg_nodes(source_id, src["kg_nodes"])
+                if n_tax:
+                    _push_index_event(source_id, "taxonomy", "done",
+                                      f"Taxonomy annotations synced — {n_tax} columns classified")
+                    logger.info("Taxonomy sync: %d columns for %s", n_tax, source_id[:8])
             except Exception as exc:
                 logger.warning("Source %s: KG failed: %s", source_id[:8], exc)
                 _push_index_event(source_id, "kg", "warn", f"KG build failed: {exc}")

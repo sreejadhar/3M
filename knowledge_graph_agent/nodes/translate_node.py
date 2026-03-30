@@ -301,11 +301,17 @@ def _build_graph_data(classes: Dict, obj_props: List) -> Dict:
         dt_line_parts = []
         for p in cls["datatype_props"]:
             col_line = f"  {p['name']}: {p['range']}"
-            # Surface the first column-level comment (contains top values /
-            # statistics for PostgreSQL-sourced ontologies).
+            # Include ALL column-level comments: statistics/description first,
+            # then taxonomy annotation (if profile_node ran).
+            # Taxonomy comment must come last so _sync_taxonomy_from_kg_nodes
+            # regex can reliably find it at the end of the line.
             col_comments = p.get("comments", [])
             if col_comments:
-                col_line += f"  -- {col_comments[0]}"
+                non_tax = [c for c in col_comments if not str(c).startswith("taxonomy:")]
+                tax_com = [c for c in col_comments if str(c).startswith("taxonomy:")]
+                # First non-taxonomy comment (statistics / description), then taxonomy
+                for c in (non_tax[:1] + tax_com):
+                    col_line += f"  -- {c}"
             dt_line_parts.append(col_line)
         dt_lines = "\n".join(dt_line_parts)
 

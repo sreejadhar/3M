@@ -68,6 +68,10 @@ class DialogState(TypedDict, total=False):
     #   "matched_values": ["Snacks & Foods"], "sql_fragment": "LOWER(category) = 'snacks & foods'"}]
     term_resolution: List[Dict[str, Any]]
 
+    # Active KPI definitions for this source (loaded by understand_node from kpi_store)
+    # [{"kpi_id": "...", "name": "RSV Growth", "nl_formula": "...", "sql_expression": "...", ...}]
+    active_kpis: List[Dict[str, Any]]
+
     # Multi-KG federation (empty = single-KG mode)
     active_kg_ids: List[str]           # KG ids selected by router
     kg_bridges_active: List[Dict[str, Any]]  # bridges between active KGs

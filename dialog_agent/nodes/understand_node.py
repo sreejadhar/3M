@@ -571,6 +571,7 @@ def understand_node(state: DialogState) -> DialogState:
             len(schema_context), len(active_kg_ids), len(bridges),
         )
         state["schema_context"] = schema_context
+        state["active_kpis"]   = []
         state["phase"] = "understand"
         return state
 
@@ -620,8 +621,48 @@ def understand_node(state: DialogState) -> DialogState:
                 if isinstance(info, dict) and info.get("categorical"):
                     categorical_columns.setdefault(tbl, {})[col] = info.get("values", [])
 
+    # Load active KPI definitions for this source (if source_id is set)
+    active_kpis: List[Dict] = []
+    source_id = getattr(config, "source_id", "") or ""
+    if source_id:
+        try:
+            import kpi_store as _kpi_store
+            active_kpis = _kpi_store.list_kpis(source_id=source_id, status="active")
+            if active_kpis:
+                logger.info(
+                    "understand_node: loaded %d active KPI(s) for source %s",
+                    len(active_kpis), source_id[:8],
+                )
+                kpi_lines = [
+                    "",
+                    "=" * 60,
+                    "DEFINED KPIs — PRE-CONFIGURED BUSINESS METRICS",
+                    "=" * 60,
+                    "The following KPIs have been defined by the BI Manager for this data source.",
+                    "When a user asks about one of these metrics, use the sql_expression directly.",
+                    "",
+                ]
+                for kpi in active_kpis:
+                    kpi_lines.append(f"KPI: {kpi['name']}")
+                    if kpi.get("description"):
+                        kpi_lines.append(f"  Description : {kpi['description']}")
+                    if kpi.get("category"):
+                        kpi_lines.append(f"  Category    : {kpi['category']}")
+                    if kpi.get("unit"):
+                        kpi_lines.append(f"  Unit        : {kpi['unit']}")
+                    if kpi.get("sql_expression"):
+                        kpi_lines.append(f"  SQL formula : {kpi['sql_expression']}")
+                    elif kpi.get("nl_formula"):
+                        kpi_lines.append(f"  NL formula  : {kpi['nl_formula']} (not yet compiled to SQL)")
+                    kpi_lines.append("")
+                kpi_lines.append("=" * 60)
+                schema_context = schema_context + "\n" + "\n".join(kpi_lines)
+        except Exception as exc:
+            logger.warning("understand_node: failed to load KPIs for source %s — %s", source_id[:8], exc)
+
     state["schema_context"]      = schema_context
     state["categorical_columns"] = categorical_columns
     state["column_hierarchy"]    = hierarchy or {}
+    state["active_kpis"]         = active_kpis
     state["phase"]               = "understand"
     return state

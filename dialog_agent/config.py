@@ -9,6 +9,9 @@ from typing import Dict, Any, List
 
 @dataclass
 class DialogConfig:
+    # ── Source / KG identity ──────────────────────────────────────────────────
+    source_id: str = ""                 # orchestrator source id — used to load active KPIs
+
     # ── Target database (SQL execution) ───────────────────────────────────────
     db_type: str = "postgres"          # "postgres" | "redshift" | "oracle" | "sqlserver" |
                                        # "bigquery" | "teradata" | "delta_lake" | "databricks" |

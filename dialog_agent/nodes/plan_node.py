@@ -285,6 +285,18 @@ General Rules:
     c. When a question requires data from multiple KGs, emit one query per KG
        and use the bridge column names so the synthesizer can merge them.
     d. If no bridges are listed, treat each KG independently.
+15. Pre-defined KPI formulas — when DEFINED KPIs section is present:
+    a. If the user's question references a KPI by name (e.g. "RSV Growth", "Market Share"),
+       check the DEFINED KPIs section for a matching KPI with a sql_expression.
+    b. When a match is found AND sql_expression is non-empty, use that expression
+       verbatim as the measure in your SELECT clause — do NOT rewrite it.
+    c. For growth / period-over-period KPIs:
+       - "Last Full Period" means the latest complete period available in the data.
+         Use a subquery: WHERE period_col = (SELECT MAX(period_col) FROM table)
+       - Growth formula: (current_val - prior_val) / NULLIF(prior_val, 0) * 100
+       - Use LAG() window function when comparing consecutive periods in a single query.
+    d. If the KPI has no sql_expression yet, use the nl_formula as a hint and write
+       your best SQL equivalent — note in "description" that the formula was inferred.
 """
 
 _USER_PROMPT = """\
@@ -293,7 +305,7 @@ SCHEMA CONTEXT:
 
 TARGET DATABASE TYPE: {db_type}
 {schema_line}
-{history_section}{multi_kg_section}{resolution_section}NATURAL LANGUAGE QUESTION:
+{history_section}{multi_kg_section}{kpi_section}{resolution_section}NATURAL LANGUAGE QUESTION:
 {natural_query}
 
 CRITICAL REMINDERS:
@@ -315,6 +327,8 @@ CRITICAL REMINDERS:
 - PERCENTAGES: if the question asks for %, share, or proportion — compute it in SQL
   using the PERCENTAGE CALC syntax from the DATABASE-SPECIFIC SYNTAX section in your
   instructions. Always include both the raw value and the percentage column.
+- KPI FORMULAS: if a DEFINED KPIs section is shown above and the question mentions a
+  KPI by name, use the pre-defined sql_expression verbatim — do not rewrite it.
 
 Return the JSON array of SQL queries now.
 """
@@ -975,6 +989,31 @@ def plan_node(state: DialogState) -> DialogState:
     else:
         multi_kg_section = ""
 
+    # Build KPI section from active KPI definitions loaded by understand_node
+    active_kpis = state.get("active_kpis") or []
+    compiled_kpis = [k for k in active_kpis if k.get("sql_expression")]
+    if compiled_kpis:
+        kpi_lines = [
+            "DEFINED KPIs — USE THESE SQL EXPRESSIONS FOR MATCHING METRICS",
+            "=" * 60,
+        ]
+        for kpi in compiled_kpis:
+            kpi_lines.append(f"  KPI name    : {kpi['name']}")
+            if kpi.get("description"):
+                kpi_lines.append(f"  Description : {kpi['description']}")
+            if kpi.get("unit"):
+                kpi_lines.append(f"  Unit/dir    : {kpi['unit']} ({kpi.get('direction','up')})")
+            kpi_lines.append(f"  SQL formula : {kpi['sql_expression']}")
+            kpi_lines.append(
+                "  ⚡ When the user asks about this metric, embed this SQL expression "
+                "directly into your SELECT clause."
+            )
+            kpi_lines.append("")
+        kpi_lines.append("=" * 60)
+        kpi_section = "\n".join(kpi_lines) + "\n\n"
+    else:
+        kpi_section = ""
+
     # Build resolution section from resolve_node output (if any)
     term_resolution = state.get("term_resolution") or []
     if term_resolution:
@@ -1016,6 +1055,7 @@ def plan_node(state: DialogState) -> DialogState:
         schema_line=schema_line,
         history_section=history_section,
         multi_kg_section=multi_kg_section,
+        kpi_section=kpi_section,
         resolution_section=resolution_section,
         natural_query=natural_query,
     )

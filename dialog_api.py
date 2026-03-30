@@ -146,6 +146,9 @@ class QueryRequest(BaseModel):
     # User context — used to personalise insight framing
     analyst_role: str = ""   # e.g. "Financial Analyst", "Supply Chain Analyst"
 
+    # Source identity (used to load active KPI definitions for this source)
+    source_id: Optional[str] = None
+
     # Cache control
     skip_cache: bool = False   # Set True to force a fresh run even if cached
 
@@ -316,6 +319,7 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
         db_connection_string = req.db_connection_string,
         db_extra             = req.db_extra,
         db_file_path         = req.db_file_path or "",
+        source_id            = req.source_id or "",
         llm_model            = req.llm_model,
         plan_llm_model       = req.plan_llm_model,
         max_sql_queries      = req.max_sql_queries,

@@ -790,7 +790,7 @@ def _sync_taxonomy_from_kg_nodes(source_id: str, kg_nodes: List[Dict]) -> int:
 
     # Parse every node title for "col_name: xsd_type  -- taxonomy: ..." lines
     col_tax: Dict[str, Dict[str, str]] = {}  # column_name → {statistical_type, semantic_role, format_pattern}
-    _prop_line_re = _re.compile(r"^\s{2}(\w+):\s+\S+.*?--\s*(taxonomy:\s*.+)$", _re.IGNORECASE)
+    _prop_line_re = _re.compile(r"^\s{2}(.+?):\s+\S+.*?--\s*(taxonomy:\s*.+)$", _re.IGNORECASE)
 
     for node in kg_nodes:
         title = node.get("title") or ""
@@ -1405,6 +1405,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
         "row_limit":       500,
         "max_sql_queries": 10,
         "analyst_role":    analyst_role,
+        "source_id":       session.get("source_id") or "",
     }
     if db_type.lower() in _FILE_BASED_TYPES:
         dialog_payload["db_file_path"] = session.get("db_file_path") or ""

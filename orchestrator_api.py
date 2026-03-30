@@ -811,8 +811,13 @@ def _sync_taxonomy_from_kg_nodes(source_id: str, kg_nodes: List[Dict]) -> int:
     if not col_tax:
         return 0
 
+    # Build a normalised lookup: lowercase + underscores-replace-spaces
+    def _norm(s: str) -> str:
+        return s.strip().lower().replace(" ", "_")
+
+    col_tax_norm = {_norm(k): v for k, v in col_tax.items()}
+
     # Fetch all attributes for this source from md_attributes
-    # Use _mc (already imported at module level as metadata_catalog)
     import json as _json
 
     now = _mc._now()
@@ -831,9 +836,10 @@ def _sync_taxonomy_from_kg_nodes(source_id: str, kg_nodes: List[Dict]) -> int:
 
             for attr in attrs:
                 col_name = attr["column_name"]
-                if col_name not in col_tax:
+                # Try exact match first, then normalised match
+                tax = col_tax.get(col_name) or col_tax_norm.get(_norm(col_name))
+                if not tax:
                     continue
-                tax = col_tax[col_name]
                 stat_type = tax["statistical_type"]
                 sem_role  = tax["semantic_role"]
 
@@ -913,6 +919,16 @@ async def _index_source(source_id: str) -> None:
         try:
             n = _mc.persist(source_id, src.get("name", ""), report)
             logger.info("Persisted %d metadata entities for source %s", n, source_id[:8])
+            # Run deterministic taxonomy inference immediately after persist
+            # so taxonomy fields are populated even before the KG / LLM steps run.
+            try:
+                n_inf = _mc.infer_taxonomy(source_id)
+                if n_inf:
+                    _push_index_event(source_id, "taxonomy", "done",
+                                      f"Taxonomy inferred — {n_inf} columns classified (pattern-based)")
+                    logger.info("Pattern taxonomy: %d columns for %s", n_inf, source_id[:8])
+            except Exception as _ti:
+                logger.warning("Pattern taxonomy inference failed for %s: %s", source_id[:8], _ti)
         except Exception as _me:
             logger.warning("Metadata persistence failed for %s: %s", source_id[:8], _me)
 
@@ -2101,11 +2117,25 @@ async def patch_metadata_attribute(attr_id: str, req: UpdateAttributeRequest):
 @app.post("/metadata/sources/{source_id}/enrich-taxonomy", status_code=202)
 async def enrich_source_taxonomy(source_id: str, background_tasks: BackgroundTasks):
     """
-    Trigger LLM-based taxonomy enrichment for all columns of a metadata source.
-    Populates statistical_type, semantic_role, taxonomy_tree on md_attributes rows.
+    Trigger taxonomy enrichment for all columns of a metadata source.
+    Runs pattern-based inference first (always works), then LLM enrichment.
     Runs in the background; returns immediately with a status message.
     """
-    background_tasks.add_task(_mc.enrich_taxonomy, source_id)
+    async def _run_enrichment(sid: str) -> None:
+        # Step 1: deterministic pattern-based inference (no LLM, always runs)
+        try:
+            n_pat = _mc.infer_taxonomy(sid)
+            logger.info("Enrich: pattern taxonomy %d columns for %s", n_pat, sid[:8])
+        except Exception as exc:
+            logger.warning("Enrich: pattern taxonomy failed for %s: %s", sid[:8], exc)
+        # Step 2: LLM enrichment — overwrites/improves the pattern classifications
+        try:
+            n_llm = _mc.enrich_taxonomy(sid)
+            logger.info("Enrich: LLM taxonomy %d columns for %s", n_llm, sid[:8])
+        except Exception as exc:
+            logger.warning("Enrich: LLM taxonomy failed for %s: %s", sid[:8], exc)
+
+    background_tasks.add_task(_run_enrichment, source_id)
     return {"status": "accepted", "source_id": source_id,
             "message": "Taxonomy enrichment started in background"}
 

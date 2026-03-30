@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -1096,6 +1097,160 @@ def _call_enrich_llm(table_name: str, col_specs: List[Dict], model: str) -> List
                 pass
     logger.warning("enrich_taxonomy: could not parse LLM JSON for table %r", table_name)
     return []
+
+
+def infer_taxonomy(source_id: str) -> int:
+    """
+    Deterministic (no LLM) taxonomy inference using data_type, column name patterns,
+    and sample values already stored in top_values.
+
+    Runs immediately after persist() so taxonomy is populated even if the KG pipeline
+    or LLM enrichment hasn't run yet.  Does NOT overwrite columns that already have
+    a statistical_type set (LLM/KG annotations take precedence).
+
+    Returns the number of attributes updated.
+    """
+    # ── Column-name keyword patterns ──────────────────────────────────────────
+    # Each entry: (regex_pattern, statistical_type, semantic_role)
+    # Checked in order; first match wins.
+    _NAME_RULES = [
+        # Boolean flags
+        (re.compile(r'\b(is|has|flag|active|enabled|status_flag)\b', re.I),
+         "boolean", "boolean_flag"),
+        # Identifiers / surrogate keys
+        (re.compile(r'(^|_)(id|key|code|pk|sk|seq|num|nr|no)($|_)', re.I),
+         "identifier", "identifier"),
+        # Time — specific periods
+        (re.compile(r'\b(fiscal_year|fy|calendar_year|cy|year_period|year_qtr)\b', re.I),
+         "ordinal", "time_period"),
+        (re.compile(r'\b(year|month|quarter|week|period|qtr|mth|yr)\b', re.I),
+         "ordinal", "time_period"),
+        # Time — dates
+        (re.compile(r'\b(date|datetime|timestamp|time)\b', re.I),
+         "date", "time_dimension_key"),
+        # Geography
+        (re.compile(r'\b(country|nation|region|market|geography|geo|territory|area|zone|city|state|province)\b', re.I),
+         "categorical", "geography"),
+        # Product hierarchy
+        (re.compile(r'\b(sub_category|subcategory|sub_segment|subsegment)\b', re.I),
+         "categorical", "product_sub_category"),
+        (re.compile(r'\b(category|segment|vertical|product_type|item_type)\b', re.I),
+         "categorical", "product_category"),
+        # Brand / manufacturer
+        (re.compile(r'\b(brand|manufacturer|vendor|supplier|maker|label)\b', re.I),
+         "categorical", "product_dimension_key"),
+        # Customer / account
+        (re.compile(r'\b(customer|account|client|retailer|buyer|shopper)\b', re.I),
+         "categorical", "customer_dimension_key"),
+        # Org / channel
+        (re.compile(r'\b(channel|distribution|outlet|store|shop|depot)\b', re.I),
+         "categorical", "org_unit"),
+        (re.compile(r'\b(division|business_unit|bu|department|dept|team|org)\b', re.I),
+         "categorical", "org_unit"),
+    ]
+
+    _NUMERIC_TYPES = re.compile(
+        r'\b(int|integer|bigint|smallint|tinyint|number|numeric|decimal|float|double|real|money|currency)\b',
+        re.I,
+    )
+    _DATE_TYPES = re.compile(
+        r'\b(date|datetime|timestamp|time)\b', re.I
+    )
+    _TEXT_TYPES = re.compile(
+        r'\b(char|varchar|text|string|nvarchar|clob|blob|object|variant)\b', re.I
+    )
+
+    _CATEGORICAL_MAX_UNIQUE = 50
+
+    now = _now()
+    updated = 0
+
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+
+        entities = cur.execute(
+            "SELECT metadata_id, table_name FROM md_entities "
+            "WHERE source_id=? AND deleted_from_source=?",
+            (source_id, _enc_bool(False)),
+        ).fetchall()
+
+        for ent in entities:
+            mid = ent["metadata_id"]
+
+            attrs = cur.execute(
+                "SELECT attr_id, column_name, data_type, unique_count, "
+                "top_values, statistical_type FROM md_attributes "
+                "WHERE metadata_id=? AND deleted_from_source=?",
+                (mid, _enc_bool(False)),
+            ).fetchall()
+
+            for a in attrs:
+                # Skip if already annotated (LLM / KG annotations take precedence)
+                if (a["statistical_type"] or "").strip():
+                    continue
+
+                col    = (a["column_name"] or "").lower()
+                dtype  = (a["data_type"] or "").lower()
+                unique = a["unique_count"]
+                try:
+                    top_vals = json.loads(a["top_values"] or "[]")
+                except Exception:
+                    top_vals = []
+
+                stat_type  = ""
+                sem_role   = ""
+
+                # 1. Column-name rules for boolean / identifier always win
+                #    (numeric dtype like int/tinyint doesn't mean it's a measure)
+                for pattern, st, sr in _NAME_RULES[:2]:   # boolean, identifier
+                    if pattern.search(col):
+                        stat_type = st
+                        sem_role  = sr
+                        break
+
+                if not stat_type:
+                    # 2. Data type wins for clear date / numeric types
+                    if _DATE_TYPES.search(dtype):
+                        stat_type = "date"
+                        sem_role  = "time_dimension_key"
+                    elif _NUMERIC_TYPES.search(dtype):
+                        stat_type = "continuous"
+                        sem_role  = "measure"
+                    else:
+                        # 3. Remaining column-name rules (skip first two already checked)
+                        for pattern, st, sr in _NAME_RULES[2:]:
+                            if pattern.search(col):
+                                stat_type = st
+                                sem_role  = sr
+                                break
+
+                        # 4. Fallback: text column with few distinct values → categorical
+                        if not stat_type:
+                            is_text = _TEXT_TYPES.search(dtype) or not dtype
+                            few_vals = (unique is not None and unique <= _CATEGORICAL_MAX_UNIQUE) \
+                                       or (unique is None and len(top_vals) <= _CATEGORICAL_MAX_UNIQUE)
+                            if is_text and few_vals:
+                                stat_type = "categorical"
+                                sem_role  = "other"
+
+                if not stat_type:
+                    continue
+
+                # Build taxonomy_tree from top_values for categorical/ordinal
+                if stat_type in ("categorical", "ordinal") and top_vals:
+                    tree_json = json.dumps(top_vals)
+                else:
+                    tree_json = "[]"
+
+                cur.execute(
+                    "UPDATE md_attributes SET statistical_type=?, semantic_role=?, "
+                    "taxonomy_tree=?, updated_at=? WHERE attr_id=?",
+                    (stat_type, sem_role, tree_json, now, a["attr_id"]),
+                )
+                updated += 1
+
+    logger.info("infer_taxonomy: source=%s inferred %d attributes", source_id, updated)
+    return updated
 
 
 def enrich_taxonomy(source_id: str, model: Optional[str] = None) -> int:

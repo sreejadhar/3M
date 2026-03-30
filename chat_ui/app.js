@@ -2863,6 +2863,9 @@ const _ROLE_COLOURS = {
   product_sub_category: '#9333ea', geography: '#0284c7',
   geography_dimension_key: '#0369a1', product_dimension_key: '#6d28d9',
   time_dimension_key: '#b45309', identifier: '#94a3b8', boolean_flag: '#f59e0b',
+  org_unit: '#0f766e', org_dimension_key: '#0d9488',
+  customer_dimension_key: '#b91c1c', demographic: '#c2410c',
+  free_text: '#78716c', other: '#64748b',
 };
 
 function _statTypeBadge(t) {

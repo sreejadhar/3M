@@ -2287,3 +2287,261 @@ tr.md-row-deleted td:last-child { text-decoration:none; }
 .md-domain-cancel-btn { font-size:11px; padding:2px 6px; background:none; border:1px solid var(--clr-border); border-radius:3px; cursor:pointer; color:var(--clr-text-mute); }
 .md-source-name { font-weight:600; }
 .md-source-desc { font-size:12px; color:var(--clr-text-mute); max-width:250px; }
+
+/* ── BI Manager Panel ────────────────────────────────────────────────────── */
+
+.bim-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--clr-bg);
+}
+
+.bim-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 18px 24px 0;
+  border-bottom: 1px solid var(--clr-border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.bim-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--clr-text);
+  margin: 0;
+  white-space: nowrap;
+}
+
+.bim-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  flex-wrap: wrap;
+  padding-bottom: 0;
+}
+
+.bim-tab-bar {
+  display: flex;
+  gap: 0;
+  margin-left: auto;
+}
+
+.bim-tab {
+  background: none;
+  border: none;
+  border-bottom: 3px solid transparent;
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--clr-text-sec);
+  cursor: pointer;
+  transition: color var(--transition), border-color var(--transition);
+}
+.bim-tab:hover { color: var(--clr-text); }
+.bim-tab.active {
+  color: var(--clr-primary);
+  border-bottom-color: var(--clr-primary);
+}
+
+.bim-tab-pane {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 24px;
+  min-height: 0;
+}
+
+/* KPI toolbar */
+.bim-kpi-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.bim-category-filter,
+.bim-status-filter {
+  background: var(--clr-surface);
+  border: 1px solid var(--clr-border);
+  border-radius: 6px;
+  color: var(--clr-text);
+  font-size: 13px;
+  padding: 6px 10px;
+  outline: none;
+  min-width: 140px;
+}
+.bim-category-filter:focus,
+.bim-status-filter:focus { border-color: var(--clr-primary); }
+
+/* KPI table */
+.bim-kpi-table td { vertical-align: top; padding: 10px 10px; }
+.bim-kpi-desc { font-size: 11px; color: var(--clr-text-mute); margin-top: 2px; max-width: 200px; }
+.bim-formula-cell { max-width: 240px; word-break: break-word; font-size: 12px; }
+
+.bim-dir-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+.bim-dir-up   { background: #dcfce7; color: #15803d; }
+.bim-dir-down { background: #fee2e2; color: #b91c1c; }
+
+.bim-status-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  color: #fff;
+  letter-spacing: 0.03em;
+}
+
+.bim-actions { white-space: nowrap; }
+.bim-action-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 15px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: background var(--transition);
+}
+.bim-action-btn:hover { background: var(--clr-bg); }
+.bim-action-del:hover { background: #fee2e2; }
+
+/* Taxonomy tab */
+.bim-tax-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.bim-taxonomy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.bim-tax-entity {
+  background: var(--clr-surface);
+  border: 1px solid var(--clr-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.bim-tax-entity-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--clr-text);
+  padding: 8px 14px;
+  background: var(--clr-bg);
+  border-bottom: 1px solid var(--clr-border);
+}
+
+.bim-tax-cols {
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bim-tax-col-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.bim-tax-col-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--clr-text);
+  min-width: 140px;
+  padding-top: 2px;
+  font-family: monospace;
+}
+
+/* KPI Editor Modal */
+.kpi-editor-modal {
+  width: 680px;
+  max-width: 96vw;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.kpi-editor-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.kpi-nl-input,
+.kpi-sql-input {
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+
+.kpi-formula-hint {
+  font-size: 11px;
+  color: var(--clr-text-mute);
+  margin-top: 4px;
+}
+
+.kpi-compile-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.kpi-compile-status {
+  font-size: 12px;
+  color: var(--clr-text-mute);
+}
+
+.kpi-column-hints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 80px;
+  overflow-y: auto;
+}
+
+.bim-col-chip {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--clr-bg);
+  border: 1px solid var(--clr-border);
+  color: var(--clr-text-sec);
+  cursor: pointer;
+  font-family: monospace;
+  transition: background var(--transition);
+}
+.bim-col-chip:hover {
+  background: #dbeafe;
+  border-color: var(--clr-primary);
+  color: var(--clr-primary);
+}
+
+.kpi-editor-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 24px;
+  border-top: 1px solid var(--clr-border);
+  flex-shrink: 0;
+}

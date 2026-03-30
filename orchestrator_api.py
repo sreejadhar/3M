@@ -62,6 +62,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import metadata_catalog as _mc   # standalone catalog module (no dialog_agent dep)
+import kpi_store as _kpi              # BI Manager KPI definitions
 import kg_store as _kg_store           # KG snapshot persistence
 import access_control as _ac           # RBAC / ABAC engine
 
@@ -2050,6 +2051,115 @@ async def patch_metadata_source(source_id: str, req: UpdateSourceRequest):
         return updated
     except HTTPException:
         raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── BI Manager — KPI endpoints ────────────────────────────────────────────────
+
+class CreateKpiRequest(BaseModel):
+    name:           str
+    description:    Optional[str]  = None
+    category:       Optional[str]  = None
+    source_id:      Optional[str]  = None
+    nl_formula:     Optional[str]  = None
+    sql_expression: Optional[str]  = None
+    unit:           Optional[str]  = None
+    direction:      Optional[str]  = None
+    status:         Optional[str]  = None
+
+
+class UpdateKpiRequest(BaseModel):
+    name:           Optional[str]  = None
+    description:    Optional[str]  = None
+    category:       Optional[str]  = None
+    source_id:      Optional[str]  = None
+    nl_formula:     Optional[str]  = None
+    sql_expression: Optional[str]  = None
+    unit:           Optional[str]  = None
+    direction:      Optional[str]  = None
+    status:         Optional[str]  = None
+
+
+@app.get("/kpis")
+async def list_kpis(
+    source_id: Optional[str] = None,
+    category:  Optional[str] = None,
+    status:    Optional[str] = None,
+):
+    """List KPI definitions, optionally filtered."""
+    try:
+        return _kpi.list_kpis(source_id=source_id, category=category, status=status)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/kpis", status_code=201)
+async def create_kpi(req: CreateKpiRequest):
+    """Create a new KPI definition."""
+    try:
+        return _kpi.create_kpi(**req.dict(exclude_none=True))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/kpis/{kpi_id}")
+async def get_kpi(kpi_id: str):
+    """Get a single KPI definition."""
+    try:
+        row = _kpi.get_kpi(kpi_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="KPI not found")
+        return row
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.patch("/kpis/{kpi_id}")
+async def update_kpi(kpi_id: str, req: UpdateKpiRequest):
+    """Update fields on a KPI definition."""
+    try:
+        updates = {k: v for k, v in req.dict(exclude_none=True).items()}
+        if not updates:
+            raise HTTPException(status_code=400, detail="No updatable fields provided")
+        _kpi.update_kpi(kpi_id, **updates)
+        row = _kpi.get_kpi(kpi_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="KPI not found")
+        return row
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/kpis/{kpi_id}", status_code=204)
+async def delete_kpi(kpi_id: str):
+    """Delete a KPI definition."""
+    try:
+        _kpi.delete_kpi(kpi_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class CompileFormulaRequest(BaseModel):
+    column_context: str   # e.g. "rsv_value REAL, fiscal_year TEXT, brand TEXT, …"
+    model:          Optional[str] = None
+
+
+@app.post("/kpis/{kpi_id}/compile")
+async def compile_kpi_formula(kpi_id: str, req: CompileFormulaRequest):
+    """
+    Use a lightweight LLM (Haiku) to compile the KPI's natural language formula
+    into a SQL expression. Saves and returns the compiled expression.
+    """
+    try:
+        expr = _kpi.compile_formula(kpi_id, req.column_context, req.model)
+        return {"kpi_id": kpi_id, "sql_expression": expr}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

@@ -5,10 +5,11 @@ const API = '';   // same origin
 
 // ── Persona ───────────────────────────────────────────────────────────────────
 const PERSONAS = {
-  business_user: { label: 'Business User',    icon: '👤', showSQL: false, canConnect: false, isAdmin: false, isDataManager: false },
-  analyst:       { label: 'Business Analyst', icon: '🔬', showSQL: true,  canConnect: true,  isAdmin: false, isDataManager: false },
-  admin:         { label: 'Data Admin',       icon: '⚙️', showSQL: true,  canConnect: true,  isAdmin: true,  isDataManager: false },
-  data_manager:  { label: 'Data Manager',     icon: '🗂️', showSQL: false, canConnect: false, isAdmin: false, isDataManager: true  },
+  business_user: { label: 'Business User',    icon: '👤', showSQL: false, canConnect: false, isAdmin: false, isDataManager: false, isBiManager: false },
+  analyst:       { label: 'Business Analyst', icon: '🔬', showSQL: true,  canConnect: true,  isAdmin: false, isDataManager: false, isBiManager: false },
+  admin:         { label: 'Data Admin',       icon: '⚙️', showSQL: true,  canConnect: true,  isAdmin: true,  isDataManager: false, isBiManager: false },
+  data_manager:  { label: 'Data Manager',     icon: '🗂️', showSQL: false, canConnect: false, isAdmin: false, isDataManager: true,  isBiManager: false },
+  bi_manager:    { label: 'BI Manager',       icon: '📊', showSQL: false, canConnect: false, isAdmin: false, isDataManager: false, isBiManager: true  },
 };
 
 // ── Analyst roles (business_user sub-personas) ─────────────────────────────
@@ -91,6 +92,34 @@ const adminRefreshBtn  = document.getElementById('adminRefreshBtn');
 const adminTableBody   = document.getElementById('adminTableBody');
 
 const dmCatalogBtn         = document.getElementById('dmCatalogBtn');
+const bimBtn               = document.getElementById('bimBtn');
+const bimPanel             = document.getElementById('bimPanel');
+const bimSourceFilter      = document.getElementById('bimSourceFilter');
+const bimCategoryFilter    = document.getElementById('bimCategoryFilter');
+const bimStatusFilter      = document.getElementById('bimStatusFilter');
+const bimAddKpiBtn         = document.getElementById('bimAddKpiBtn');
+const bimKpiBody           = document.getElementById('bimKpiBody');
+const bimEnrichTaxBtn      = document.getElementById('bimEnrichTaxBtn');
+const bimTaxSearch         = document.getElementById('bimTaxSearch');
+const bimTaxonomyList      = document.getElementById('bimTaxonomyList');
+const kpiEditorOverlay     = document.getElementById('kpiEditorOverlay');
+const kpiEditorClose       = document.getElementById('kpiEditorClose');
+const kpiEditorCancel      = document.getElementById('kpiEditorCancel');
+const kpiEditorSave        = document.getElementById('kpiEditorSave');
+const kpiEditorTitle       = document.getElementById('kpiEditorTitle');
+const kpiEditingId         = document.getElementById('kpiEditingId');
+const kpiName              = document.getElementById('kpiName');
+const kpiCategory          = document.getElementById('kpiCategory');
+const kpiDescription       = document.getElementById('kpiDescription');
+const kpiUnit              = document.getElementById('kpiUnit');
+const kpiDirection         = document.getElementById('kpiDirection');
+const kpiStatus            = document.getElementById('kpiStatus');
+const kpiNlFormula         = document.getElementById('kpiNlFormula');
+const kpiSqlExpression     = document.getElementById('kpiSqlExpression');
+const kpiCompileBtn        = document.getElementById('kpiCompileBtn');
+const kpiCompileStatus     = document.getElementById('kpiCompileStatus');
+const kpiColumnHintsGroup  = document.getElementById('kpiColumnHintsGroup');
+const kpiColumnHints       = document.getElementById('kpiColumnHints');
 const mdCatalog            = document.getElementById('mdCatalog');
 const mdSourceFilter       = document.getElementById('mdSourceFilter');
 const mdSearch             = document.getElementById('mdSearch');
@@ -472,10 +501,11 @@ function applyPersona() {
   renderAnalystRoleSection();
   updateRoleBadge();
 
-  // Admin / Data Manager button visibility
-  sidebarBottom.style.display = (p.isAdmin || p.isDataManager) ? '' : 'none';
+  // Admin / Data Manager / BI Manager button visibility
+  sidebarBottom.style.display = (p.isAdmin || p.isDataManager || p.isBiManager) ? '' : 'none';
   adminBtn.style.display      = p.isAdmin       ? '' : 'none';
   dmCatalogBtn.style.display  = p.isDataManager ? '' : 'none';
+  bimBtn.style.display        = p.isBiManager   ? '' : 'none';
 
   // Upload button: admins only
   uploadBtn.style.display = p.isAdmin ? '' : 'none';
@@ -485,20 +515,26 @@ function applyPersona() {
 
   // Data manager sees the metadata catalog instead of chat/landing
   if (p.isDataManager) {
-    landing.style.display  = 'none';
-    chatView.style.display = 'none';
+    landing.style.display   = 'none';
+    chatView.style.display  = 'none';
+    bimPanel.style.display  = 'none';
     mdCatalog.style.display = 'flex';
     loadMdCatalog();
+  } else if (p.isBiManager) {
+    landing.style.display   = 'none';
+    chatView.style.display  = 'none';
+    mdCatalog.style.display = 'none';
+    bimPanel.style.display  = 'flex';
+    loadBimPanel();
   } else {
     mdCatalog.style.display = 'none';
-    // Reload source catalog and session list with persona filter
+    bimPanel.style.display  = 'none';
     renderSourceCatalog();
     renderSourceSidebar();
     loadSessions();
     return;
   }
 
-  // Reload source catalog and session list with persona filter
   renderSourceCatalog();
   renderSourceSidebar();
   loadSessions();
@@ -3219,6 +3255,391 @@ bridgeFilterSource.addEventListener('change', renderBridgeTable);
 bridgeAddBtn.addEventListener('click', () => showBridgeForm(null));
 bridgeFormSave.addEventListener('click', saveBridgeForm);
 bridgeFormCancel.addEventListener('click', hideBridgeForm);
+
+// ── BI Manager ───────────────────────────────────────────────────────────────
+
+let _bimKpis        = [];   // full KPI list from API
+let _bimActiveTab   = 'kpis';
+let _bimAllAttrs    = [];   // flattened attrs for taxonomy browser
+
+// ── KPI API helpers ──────────────────────────────────────────────────────────
+
+const apiKpiList   = (sourceId, category, status) => {
+  const qs = new URLSearchParams();
+  if (sourceId) qs.set('source_id', sourceId);
+  if (category) qs.set('category', category);
+  if (status)   qs.set('status', status);
+  return fetch(`${API}/kpis?${qs}`).then(r => r.json());
+};
+const apiKpiGet    = (id)       => fetch(`${API}/kpis/${id}`).then(r => r.json());
+const apiKpiCreate = (body)     => fetch(`${API}/kpis`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(r => r.json());
+const apiKpiUpdate = (id, body) => fetch(`${API}/kpis/${id}`, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(r => r.json());
+const apiKpiDelete = (id)       => fetch(`${API}/kpis/${id}`, { method: 'DELETE' });
+const apiKpiCompile = (id, column_context) =>
+  fetch(`${API}/kpis/${id}/compile`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ column_context }) }).then(r => r.json());
+
+// ── Source filter populate ───────────────────────────────────────────────────
+
+async function _populateBimSourceFilter() {
+  try {
+    const srcs = await apiMdListSources();
+    const existing = new Set([...bimSourceFilter.options].map(o => o.value));
+    srcs.forEach(s => {
+      if (!existing.has(s.source_id)) {
+        const opt = document.createElement('option');
+        opt.value = s.source_id;
+        opt.textContent = s.source_name || s.source_id;
+        bimSourceFilter.appendChild(opt);
+      }
+    });
+  } catch (_) {}
+}
+
+// ── Main loader ──────────────────────────────────────────────────────────────
+
+async function loadBimPanel() {
+  await _populateBimSourceFilter();
+  await loadBimKpis();
+  if (_bimActiveTab === 'taxonomy') await loadBimTaxonomy();
+}
+
+// ── KPI tab ──────────────────────────────────────────────────────────────────
+
+async function loadBimKpis() {
+  bimKpiBody.innerHTML = '<tr><td colspan="8" class="md-empty">Loading…</td></tr>';
+  const sourceId = bimSourceFilter.value || '';
+  const category = bimCategoryFilter.value || '';
+  const status   = bimStatusFilter.value   || '';
+  try {
+    _bimKpis = await apiKpiList(sourceId, category, status);
+    _populateBimCategoryFilter();
+    renderBimKpiTable();
+  } catch (e) {
+    bimKpiBody.innerHTML = `<tr><td colspan="8" class="md-empty">Error: ${_esc(e.message)}</td></tr>`;
+  }
+}
+
+function _populateBimCategoryFilter() {
+  const cats = [...new Set(_bimKpis.map(k => k.category).filter(Boolean))].sort();
+  const current = bimCategoryFilter.value;
+  bimCategoryFilter.innerHTML = '<option value="">All categories</option>';
+  cats.forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c; opt.textContent = c;
+    if (c === current) opt.selected = true;
+    bimCategoryFilter.appendChild(opt);
+  });
+}
+
+const _DIRECTION_LABELS = { up: '↑ Higher', down: '↓ Lower' };
+const _STATUS_COLOURS   = { draft: '#94a3b8', active: '#059669', deprecated: '#f59e0b' };
+
+function renderBimKpiTable() {
+  if (!_bimKpis.length) {
+    bimKpiBody.innerHTML = '<tr><td colspan="8" class="md-empty">No KPIs found. Click + New KPI to get started.</td></tr>';
+    return;
+  }
+  bimKpiBody.innerHTML = _bimKpis.map(k => {
+    const statusBg   = _STATUS_COLOURS[k.status] || '#94a3b8';
+    const dirLabel   = _DIRECTION_LABELS[k.direction] || k.direction;
+    const nlShort    = k.nl_formula ? _esc(k.nl_formula.slice(0, 80)) + (k.nl_formula.length > 80 ? '…' : '') : '<span style="color:var(--clr-text-mute)">—</span>';
+    const sqlShort   = k.sql_expression ? `<code style="font-size:11px">${_esc(k.sql_expression.slice(0, 80))}${k.sql_expression.length > 80 ? '…' : ''}</code>` : '<span style="color:var(--clr-text-mute)">—</span>';
+    return `<tr>
+      <td><strong>${_esc(k.name)}</strong>${k.description ? `<div class="bim-kpi-desc">${_esc(k.description)}</div>` : ''}</td>
+      <td>${k.category ? `<span class="md-tax-val">${_esc(k.category)}</span>` : '—'}</td>
+      <td>${_esc(k.unit || '—')}</td>
+      <td><span class="bim-dir-badge bim-dir-${_esc(k.direction)}">${dirLabel}</span></td>
+      <td class="bim-formula-cell" title="${_esc(k.nl_formula || '')}">${nlShort}</td>
+      <td class="bim-formula-cell">${sqlShort}</td>
+      <td><span class="bim-status-badge" style="background:${statusBg}">${_esc(k.status)}</span></td>
+      <td class="bim-actions">
+        <button class="bim-action-btn" data-kpi-edit="${_esc(k.kpi_id)}" title="Edit">✏️</button>
+        <button class="bim-action-btn bim-action-del" data-kpi-del="${_esc(k.kpi_id)}" title="Delete">🗑️</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  bimKpiBody.querySelectorAll('[data-kpi-edit]').forEach(btn =>
+    btn.addEventListener('click', () => openKpiEditor(btn.dataset.kpiEdit))
+  );
+  bimKpiBody.querySelectorAll('[data-kpi-del]').forEach(btn =>
+    btn.addEventListener('click', () => deleteKpi(btn.dataset.kpiDel))
+  );
+}
+
+async function deleteKpi(kpiId) {
+  if (!confirm('Delete this KPI?')) return;
+  try {
+    await apiKpiDelete(kpiId);
+    showToast('KPI deleted', 'info', 2500);
+    await loadBimKpis();
+  } catch (e) {
+    showToast('Delete failed: ' + e.message, 'error');
+  }
+}
+
+// ── KPI Editor modal ─────────────────────────────────────────────────────────
+
+function _clearKpiEditor() {
+  kpiEditingId.value      = '';
+  kpiName.value           = '';
+  kpiCategory.value       = '';
+  kpiDescription.value    = '';
+  kpiUnit.value           = '';
+  kpiDirection.value      = 'up';
+  kpiStatus.value         = 'draft';
+  kpiNlFormula.value      = '';
+  kpiSqlExpression.value  = '';
+  kpiCompileStatus.textContent = '';
+}
+
+async function openKpiEditor(kpiId) {
+  _clearKpiEditor();
+  if (kpiId) {
+    kpiEditorTitle.textContent = 'Edit KPI';
+    kpiEditingId.value = kpiId;
+    try {
+      const k = await apiKpiGet(kpiId);
+      kpiName.value          = k.name          || '';
+      kpiCategory.value      = k.category      || '';
+      kpiDescription.value   = k.description   || '';
+      kpiUnit.value          = k.unit          || '';
+      kpiDirection.value     = k.direction     || 'up';
+      kpiStatus.value        = k.status        || 'draft';
+      kpiNlFormula.value     = k.nl_formula    || '';
+      kpiSqlExpression.value = k.sql_expression || '';
+    } catch (e) {
+      showToast('Failed to load KPI: ' + e.message, 'error');
+      return;
+    }
+  } else {
+    kpiEditorTitle.textContent = 'New KPI';
+  }
+  // Populate column hints from active source attrs
+  _renderKpiColumnHints();
+  kpiEditorOverlay.style.display = 'flex';
+}
+
+function _renderKpiColumnHints() {
+  const sourceId = bimSourceFilter.value;
+  if (!sourceId || !_bimAllAttrs.length) {
+    kpiColumnHintsGroup.style.display = 'none';
+    return;
+  }
+  const attrs = _bimAllAttrs.filter(a => a.source_id === sourceId || !a.source_id);
+  if (!attrs.length) { kpiColumnHintsGroup.style.display = 'none'; return; }
+  kpiColumnHintsGroup.style.display = '';
+  kpiColumnHints.innerHTML = attrs.map(a =>
+    `<span class="bim-col-chip" title="${_esc(a.data_type || '')}" data-col="${_esc(a.column_name)}">${_esc(a.column_name)}</span>`
+  ).join('');
+  kpiColumnHints.querySelectorAll('.bim-col-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const col = chip.dataset.col;
+      const ta = document.activeElement === kpiSqlExpression ? kpiSqlExpression : kpiNlFormula;
+      const pos = ta.selectionStart;
+      ta.value = ta.value.slice(0, pos) + col + ta.value.slice(ta.selectionEnd);
+      ta.selectionStart = ta.selectionEnd = pos + col.length;
+      ta.focus();
+    });
+  });
+}
+
+function _buildColumnContext() {
+  const sourceId = bimSourceFilter.value;
+  const attrs = sourceId ? _bimAllAttrs.filter(a => a.source_id === sourceId) : _bimAllAttrs;
+  if (!attrs.length) return '(no columns available — select a source)';
+  return attrs.map(a => {
+    const parts = [`${a.column_name} (${a.data_type || 'TEXT'})`];
+    if (a.statistical_type) parts.push(`[${a.statistical_type}]`);
+    if (a.semantic_role)    parts.push(`role:${a.semantic_role}`);
+    return parts.join(' ');
+  }).join('\n');
+}
+
+kpiCompileBtn.addEventListener('click', async () => {
+  const kpiId = kpiEditingId.value;
+  if (!kpiId) {
+    // Save first as draft, then compile
+    try {
+      const saved = await _saveKpiFields('draft');
+      kpiEditingId.value = saved.kpi_id;
+      kpiEditorTitle.textContent = 'Edit KPI';
+      await _doCompile(saved.kpi_id);
+    } catch (e) {
+      showToast('Save failed before compile: ' + e.message, 'error');
+    }
+    return;
+  }
+  await _doCompile(kpiId);
+});
+
+async function _doCompile(kpiId) {
+  kpiCompileStatus.textContent = 'Compiling…';
+  kpiCompileBtn.disabled = true;
+  try {
+    const ctx = _buildColumnContext();
+    // Persist the current nl_formula first
+    await apiKpiUpdate(kpiId, { nl_formula: kpiNlFormula.value.trim() });
+    const res = await apiKpiCompile(kpiId, ctx);
+    kpiSqlExpression.value = res.sql_expression || '';
+    kpiCompileStatus.textContent = res.sql_expression ? '✓ Compiled' : '⚠ No output';
+  } catch (e) {
+    kpiCompileStatus.textContent = '✗ Failed';
+    showToast('Compile error: ' + e.message, 'error');
+  } finally {
+    kpiCompileBtn.disabled = false;
+  }
+}
+
+async function _saveKpiFields(statusOverride) {
+  const body = {
+    name:           kpiName.value.trim(),
+    category:       kpiCategory.value.trim(),
+    description:    kpiDescription.value.trim(),
+    unit:           kpiUnit.value.trim(),
+    direction:      kpiDirection.value,
+    status:         statusOverride || kpiStatus.value,
+    nl_formula:     kpiNlFormula.value.trim(),
+    sql_expression: kpiSqlExpression.value.trim(),
+    source_id:      bimSourceFilter.value || '',
+  };
+  if (!body.name) throw new Error('KPI Name is required');
+  const kpiId = kpiEditingId.value;
+  return kpiId ? apiKpiUpdate(kpiId, body) : apiKpiCreate(body);
+}
+
+kpiEditorSave.addEventListener('click', async () => {
+  kpiEditorSave.disabled = true;
+  try {
+    await _saveKpiFields();
+    kpiEditorOverlay.style.display = 'none';
+    showToast('KPI saved', 'success', 2500);
+    await loadBimKpis();
+  } catch (e) {
+    showToast('Save failed: ' + e.message, 'error');
+  } finally {
+    kpiEditorSave.disabled = false;
+  }
+});
+
+function _closeKpiEditor() {
+  kpiEditorOverlay.style.display = 'none';
+  _clearKpiEditor();
+}
+kpiEditorClose.addEventListener('click', _closeKpiEditor);
+kpiEditorCancel.addEventListener('click', _closeKpiEditor);
+kpiEditorOverlay.addEventListener('click', e => { if (e.target === kpiEditorOverlay) _closeKpiEditor(); });
+
+// ── Taxonomy tab ─────────────────────────────────────────────────────────────
+
+async function loadBimTaxonomy() {
+  bimTaxonomyList.innerHTML = '<div class="md-empty">Loading taxonomy…</div>';
+  const sourceId = bimSourceFilter.value;
+  if (!sourceId) {
+    bimTaxonomyList.innerHTML = '<div class="md-empty">Select a source to browse taxonomy.</div>';
+    return;
+  }
+  try {
+    const entities = await apiMdListEntities(sourceId);
+    // Fetch all attributes for this source
+    const allAttrs = [];
+    for (const ent of entities.slice(0, 30)) {
+      const full = await apiMdGetEntity(ent.metadata_id);
+      (full.attributes || []).forEach(a => { a._entity = ent; allAttrs.push(a); });
+    }
+    _bimAllAttrs = allAttrs.map(a => ({ ...a, source_id: sourceId }));
+    _renderBimTaxonomy();
+  } catch (e) {
+    bimTaxonomyList.innerHTML = `<div class="md-empty">Error: ${_esc(e.message)}</div>`;
+  }
+}
+
+function _renderBimTaxonomy() {
+  const q = (bimTaxSearch.value || '').toLowerCase();
+  const attrs = _bimAllAttrs.filter(a =>
+    !a.deleted_from_source &&
+    (a.statistical_type || a.semantic_role || (a.taxonomy_tree && a.taxonomy_tree.length)) &&
+    (!q || a.column_name.toLowerCase().includes(q) || (a.statistical_type || '').includes(q) || (a.semantic_role || '').includes(q))
+  );
+
+  if (!attrs.length) {
+    bimTaxonomyList.innerHTML = '<div class="md-empty">No taxonomy annotations yet. Click Enrich Taxonomy to run LLM classification.</div>';
+    return;
+  }
+
+  // Group by entity
+  const byEntity = {};
+  attrs.forEach(a => {
+    const key = a._entity ? (a._entity.schema_name ? a._entity.schema_name + '.' + a._entity.table_name : a._entity.table_name) : 'Unknown';
+    if (!byEntity[key]) byEntity[key] = [];
+    byEntity[key].push(a);
+  });
+
+  bimTaxonomyList.innerHTML = Object.entries(byEntity).map(([tbl, cols]) => `
+    <div class="bim-tax-entity">
+      <div class="bim-tax-entity-title">${_esc(tbl)}</div>
+      <div class="bim-tax-cols">
+        ${cols.map(a => {
+          const statBg  = _STAT_TYPE_COLOURS[a.statistical_type] || '#475569';
+          const roleBg  = _ROLE_COLOURS[a.semantic_role] || '#475569';
+          const tree    = a.taxonomy_tree || [];
+          const treeHtml = tree.length ? _taxonomyCell(tree) : '';
+          return `<div class="bim-tax-col-row">
+            <span class="bim-tax-col-name">${_esc(a.column_name)}</span>
+            ${a.statistical_type ? `<span class="md-tax-badge" style="background:${statBg}">${_esc(a.statistical_type)}</span>` : ''}
+            ${a.semantic_role    ? `<span class="md-tax-badge" style="background:${roleBg}">${_esc(a.semantic_role.replace(/_/g,' '))}</span>` : ''}
+            ${treeHtml}
+          </div>`;
+        }).join('')}
+      </div>
+    </div>
+  `).join('');
+}
+
+// Enrich button in taxonomy tab
+bimEnrichTaxBtn.addEventListener('click', async () => {
+  const sourceId = bimSourceFilter.value;
+  if (!sourceId) { showToast('Select a source first', 'error'); return; }
+  bimEnrichTaxBtn.disabled = true;
+  bimEnrichTaxBtn.textContent = 'Enriching…';
+  try {
+    await apiMdEnrichTaxonomy(sourceId);
+    showToast('Taxonomy enrichment started — reloading in a moment', 'success');
+    setTimeout(loadBimTaxonomy, 4000);
+  } catch (e) {
+    showToast('Enrich failed: ' + e.message, 'error');
+  } finally {
+    bimEnrichTaxBtn.disabled = false;
+    bimEnrichTaxBtn.textContent = 'Enrich Taxonomy';
+  }
+});
+
+bimTaxSearch.addEventListener('input', _renderBimTaxonomy);
+
+// ── BIM tab switching ─────────────────────────────────────────────────────────
+
+bimPanel.addEventListener('click', async e => {
+  const tab = e.target.closest('.bim-tab');
+  if (!tab) return;
+  _bimActiveTab = tab.dataset.bimTab;
+  bimPanel.querySelectorAll('.bim-tab').forEach(b => b.classList.remove('active'));
+  tab.classList.add('active');
+  document.getElementById('bimTabKpis').style.display      = _bimActiveTab === 'kpis'      ? '' : 'none';
+  document.getElementById('bimTabTaxonomy').style.display  = _bimActiveTab === 'taxonomy'  ? '' : 'none';
+  if (_bimActiveTab === 'taxonomy') await loadBimTaxonomy();
+});
+
+// ── Event listeners ───────────────────────────────────────────────────────────
+
+bimBtn.addEventListener('click', () => {
+  bimPanel.style.display  = 'flex';
+  mdCatalog.style.display = 'none';
+  loadBimPanel();
+});
+bimAddKpiBtn.addEventListener('click', () => openKpiEditor(null));
+bimSourceFilter.addEventListener('change', loadBimPanel);
+bimCategoryFilter.addEventListener('change', loadBimKpis);
+bimStatusFilter.addEventListener('change', loadBimKpis);
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 

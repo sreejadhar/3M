@@ -64,6 +64,12 @@
         </svg>
         Metadata Catalog
       </button>
+      <button class="admin-btn" id="bimBtn" style="display:none">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+        </svg>
+        KPI Manager
+      </button>
       <button class="admin-btn" id="adminBtn">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
           <circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 10-16 0"/>
@@ -281,7 +287,140 @@
       </div>
     </div>
 
+    <!-- ── BI Manager Panel ──────────────────────────────────────────────── -->
+    <div class="bim-panel" id="bimPanel" style="display:none">
+
+      <div class="bim-header">
+        <h2 class="bim-title">KPI Manager</h2>
+        <div class="bim-toolbar">
+          <select class="md-source-filter" id="bimSourceFilter">
+            <option value="">All sources</option>
+          </select>
+          <div class="bim-tab-bar">
+            <button class="bim-tab active" data-bim-tab="kpis">KPI Library</button>
+            <button class="bim-tab" data-bim-tab="taxonomy">Taxonomy Browser</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: KPI Library -->
+      <div id="bimTabKpis" class="bim-tab-pane active">
+        <div class="bim-kpi-toolbar">
+          <button class="btn-primary" id="bimAddKpiBtn">+ New KPI</button>
+          <select class="bim-category-filter" id="bimCategoryFilter">
+            <option value="">All categories</option>
+          </select>
+          <select class="bim-status-filter" id="bimStatusFilter">
+            <option value="">All statuses</option>
+            <option value="draft">Draft</option>
+            <option value="active">Active</option>
+            <option value="deprecated">Deprecated</option>
+          </select>
+        </div>
+        <table class="md-table bim-kpi-table" id="bimKpiTable">
+          <thead>
+            <tr>
+              <th>KPI Name</th>
+              <th>Category</th>
+              <th>Unit</th>
+              <th>Direction</th>
+              <th style="min-width:200px">Natural Language Formula</th>
+              <th style="min-width:200px">SQL Expression</th>
+              <th>Status</th>
+              <th style="width:110px">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="bimKpiBody">
+            <tr><td colspan="8" class="md-empty">No KPIs defined yet. Click + New KPI to get started.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Tab: Taxonomy Browser -->
+      <div id="bimTabTaxonomy" class="bim-tab-pane" style="display:none">
+        <div class="bim-tax-toolbar">
+          <button class="btn-secondary btn-sm" id="bimEnrichTaxBtn">Enrich Taxonomy</button>
+          <input class="md-search" id="bimTaxSearch" type="search" placeholder="Search columns…" style="width:220px" />
+        </div>
+        <div id="bimTaxonomyList" class="bim-taxonomy-list">
+          <div class="md-empty">Select a source to browse taxonomy.</div>
+        </div>
+      </div>
+
+    </div><!-- /bimPanel -->
+
   </div><!-- /main -->
+
+  <!-- ── KPI Editor Modal ──────────────────────────────────────────────────── -->
+  <div class="modal-overlay" id="kpiEditorOverlay" style="display:none">
+    <div class="modal kpi-editor-modal">
+      <div class="modal-header">
+        <h2 class="modal-title" id="kpiEditorTitle">New KPI</h2>
+        <button class="modal-close" id="kpiEditorClose">✕</button>
+      </div>
+      <div class="kpi-editor-body">
+        <input type="hidden" id="kpiEditingId" value="" />
+        <div class="form-row">
+          <div class="form-group" style="flex:2">
+            <label class="form-label">KPI Name *</label>
+            <input class="form-input" id="kpiName" placeholder="e.g. RSV Growth %" />
+          </div>
+          <div class="form-group" style="flex:1">
+            <label class="form-label">Category</label>
+            <input class="form-input" id="kpiCategory" placeholder="e.g. Sales, Finance" />
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Description</label>
+          <textarea class="form-input" id="kpiDescription" rows="2" placeholder="What this KPI measures and why it matters"></textarea>
+        </div>
+        <div class="form-row">
+          <div class="form-group" style="flex:1">
+            <label class="form-label">Unit</label>
+            <input class="form-input" id="kpiUnit" placeholder="%, $, units" />
+          </div>
+          <div class="form-group" style="flex:1">
+            <label class="form-label">Direction</label>
+            <select class="form-input" id="kpiDirection">
+              <option value="up">↑ Up — higher is better</option>
+              <option value="down">↓ Down — lower is better</option>
+            </select>
+          </div>
+          <div class="form-group" style="flex:1">
+            <label class="form-label">Status</label>
+            <select class="form-input" id="kpiStatus">
+              <option value="draft">Draft</option>
+              <option value="active">Active</option>
+              <option value="deprecated">Deprecated</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Natural Language Formula</label>
+          <textarea class="form-input kpi-nl-input" id="kpiNlFormula" rows="3"
+            placeholder="e.g. Revenue in the current period minus revenue in the prior period, divided by revenue in the prior period, multiplied by 100"></textarea>
+          <div class="kpi-formula-hint">Describe the calculation in plain English. Reference column names where possible.</div>
+        </div>
+        <div class="form-group" id="kpiColumnHintsGroup" style="display:none">
+          <label class="form-label">Available Columns <small>(from selected source)</small></label>
+          <div id="kpiColumnHints" class="kpi-column-hints"></div>
+        </div>
+        <div class="kpi-compile-bar">
+          <button class="btn-secondary" id="kpiCompileBtn">Compile to SQL →</button>
+          <span class="kpi-compile-status" id="kpiCompileStatus"></span>
+        </div>
+        <div class="form-group">
+          <label class="form-label">SQL Expression <small>(compiled — editable)</small></label>
+          <textarea class="form-input kpi-sql-input" id="kpiSqlExpression" rows="3"
+            placeholder="SQL expression will appear here after compiling, or type manually…"></textarea>
+        </div>
+      </div>
+      <div class="kpi-editor-footer">
+        <button class="btn-secondary" id="kpiEditorCancel">Cancel</button>
+        <button class="btn-primary" id="kpiEditorSave">Save KPI</button>
+      </div>
+    </div>
+  </div>
 
   <!-- ── Toast notifications ──────────────────────────────────────────────── -->
   <div class="toast-container" id="toastContainer"></div>
@@ -314,6 +453,13 @@
       <div>
         <div class="persona-opt-name">Data Manager</div>
         <div class="persona-opt-desc">Review metadata, tag golden records, edit descriptions</div>
+      </div>
+    </div>
+    <div class="persona-option" data-persona="bi_manager">
+      <span class="persona-opt-icon">📊</span>
+      <div>
+        <div class="persona-opt-name">BI Manager</div>
+        <div class="persona-opt-desc">Define KPIs, manage taxonomy, compile calculation logic</div>
       </div>
     </div>
 

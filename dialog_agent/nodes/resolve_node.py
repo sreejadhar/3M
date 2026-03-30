@@ -154,21 +154,81 @@ If no categorical filters are needed (e.g. purely numeric aggregation), return:
 """
 
 
+_STEM_SUFFIXES = ("ies", "ing", "ness", "ment", "tion", "sion", "er", "est", "ed", "es", "s")
+
+
+def _stem(token: str) -> str:
+    """Strip common English suffixes so 'snacks'/'snack', 'savoury'/'savour' share a root."""
+    for suffix in _STEM_SUFFIXES:
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            return token[: -len(suffix)]
+    return token
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance — fast early-exit when gap > 2."""
+    if abs(len(a) - len(b)) > 2:
+        return 99
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            dp[j] = prev if a[i - 1] == b[j - 1] else 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[n]
+
+
+def _token_matches_text(token: str, text: str) -> bool:
+    """
+    True when token fuzzy-matches anywhere inside text via three strategies:
+    1. Exact substring  (savory  ∈ 'Savory Snacks')
+    2. Stemmed match    (snack   ~ 'Snacks & Foods' after stripping -s)
+    3. Edit distance ≤ 1 for tokens ≥ 5 chars  (savory ≈ savoury)
+    """
+    if token in text:
+        return True
+    stem_t = _stem(token)
+    text_words = re.findall(r'\b\w+\b', text)
+    # Stemmed substring: stem(token) inside text
+    if stem_t != token and stem_t in text:
+        return True
+    # Stem each word in the stored value and compare stems
+    if len(stem_t) >= 3:
+        for word in text_words:
+            if _stem(word) == stem_t:
+                return True
+    # Edit distance for longer tokens (spelling variants: savory/savoury)
+    if len(token) >= 5:
+        for word in text_words:
+            if abs(len(word) - len(token)) <= 2 and _edit_distance(token, word) <= 1:
+                return True
+    return False
+
+
 def _fuzzy_match_candidates(
     natural_query: str,
     categorical_columns: Dict[str, Dict[str, List[str]]],
+    column_hierarchy: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Python-level token-overlap scan between user question words and stored values.
+    Python-level fuzzy scan between user question tokens and stored categorical values.
 
-    Tokenises the query, strips stopwords and short tokens, then for every
-    stored categorical value counts how many significant query tokens appear
-    inside the value string (case-insensitive).
+    Matching strategy (each adds to a token's match score):
+    1. Exact substring      — token appears inside the stored value string
+    2. Stemmed match        — stem(token) matches stem of any word in the stored value
+    3. Edit distance ≤ 1   — handles spelling variants (savory/savoury, colour/color)
 
-    Returns a list of candidate dicts sorted by score descending:
-        [{"table", "column", "stored_value", "overlap_tokens", "score"}, ...]
+    Hierarchy promotion:
+    When a token matches a value in a CHILD column (sub_category) and a parent column
+    exists (category), an additional candidate is added at the PARENT level so the LLM
+    is guided to filter at the correct hierarchy level.
+
+    Returns candidates sorted by score descending:
+        [{"table", "column", "stored_value", "overlap_tokens", "score",
+          "match_type", "promoted_from"}, ...]
     """
-    # Extract significant query tokens
     raw_tokens = re.findall(r'\b[a-zA-Z]\w+\b', natural_query.lower())
     query_tokens = {
         t for t in raw_tokens
@@ -177,30 +237,81 @@ def _fuzzy_match_candidates(
     if not query_tokens:
         return []
 
+    # Build reverse map: child_col → parent_col per table (from hierarchy + naming)
+    child_to_parent: Dict[str, Dict[str, str]] = {}  # tbl → {child_col: parent_col}
+    hier = column_hierarchy or {}
+    for tbl, tbl_hier in hier.items():
+        for parent_col in tbl_hier:
+            child_col = "sub_" + parent_col
+            child_to_parent.setdefault(tbl, {})[child_col] = parent_col
+    # Also derive from naming convention regardless of stored hierarchy
+    for tbl, col_map in categorical_columns.items():
+        for col in col_map:
+            if col.startswith("sub_"):
+                parent_candidate = col[4:]
+                if parent_candidate in col_map:
+                    child_to_parent.setdefault(tbl, {})[col] = parent_candidate
+
     candidates: List[Dict[str, Any]] = []
     seen: set = set()
+    # Track promoted parent candidates separately to avoid duplicates
+    promoted_parents: set = set()
 
     for tbl, col_map in categorical_columns.items():
+        tbl_child_map = child_to_parent.get(tbl, {})
         for col, vals in col_map.items():
+            parent_col = tbl_child_map.get(col)
+            parent_vals = col_map.get(parent_col, []) if parent_col else []
+
             for val in vals:
                 val_lower = val.lower()
-                # Which query tokens appear anywhere inside this stored value?
-                overlap = {t for t in query_tokens if t in val_lower}
-                if not overlap:
+                matched_tokens = {t for t in query_tokens if _token_matches_text(t, val_lower)}
+                if not matched_tokens:
                     continue
-                key = (col, val)
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append({
-                    "table":          tbl,
-                    "column":         col,
-                    "stored_value":   val,
-                    "overlap_tokens": sorted(overlap),
-                    "score":          len(overlap),
-                })
 
-    # Sort: more overlapping tokens first; tie-break by shorter value (more specific)
+                key = (tbl, col, val)
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append({
+                        "table":          tbl,
+                        "column":         col,
+                        "stored_value":   val,
+                        "overlap_tokens": sorted(matched_tokens),
+                        "score":          len(matched_tokens),
+                        "match_type":     "direct",
+                        "promoted_from":  None,
+                    })
+
+                # Hierarchy promotion: child match → add each parent value as candidate
+                # so the LLM filters at the correct (parent) level.
+                if parent_col and parent_vals:
+                    for pval in parent_vals:
+                        pkey = (tbl, parent_col, pval)
+                        if pkey in promoted_parents:
+                            continue
+                        promoted_parents.add(pkey)
+                        # Score the parent candidate by how well the query tokens
+                        # match the parent value itself
+                        pval_lower = pval.lower()
+                        p_matched = {t for t in query_tokens if _token_matches_text(t, pval_lower)}
+                        # Only promote parents with at least some token affinity
+                        # OR where the child match is strong (score >= 1)
+                        if p_matched or len(matched_tokens) >= 1:
+                            # Bonus: +len(matched_tokens) from the child match that drove promotion.
+                            # The parent value that also matches query tokens gets an extra boost,
+                            # so the correct parent ranks above siblings that share no tokens.
+                            parent_bonus = len(matched_tokens) if p_matched else 0
+                            candidates.append({
+                                "table":          tbl,
+                                "column":         parent_col,
+                                "stored_value":   pval,
+                                "overlap_tokens": sorted(matched_tokens | p_matched),
+                                "score":          len(p_matched) + parent_bonus + 1,
+                                "match_type":     "promoted_parent",
+                                "promoted_from":  f"{col}={val!r}",
+                            })
+
+    # Sort: promoted parents first (higher score), then direct matches; tie-break shorter value
     return sorted(candidates, key=lambda x: (-x["score"], len(x["stored_value"])))
 
 
@@ -246,20 +357,25 @@ def _build_categorical_context(
 def _build_hint_section(candidates: List[Dict[str, Any]]) -> str:
     """
     Format fuzzy candidates as a KEYWORD MATCH HINTS block for the LLM prompt.
+    Promoted parent candidates are labelled so the LLM knows to prefer them.
     Limited to the top 25 candidates to avoid bloating the context.
     """
     if not candidates:
         return ""
     lines = [
-        "KEYWORD MATCH HINTS (Python-computed — token overlap between query words and stored values):",
+        "KEYWORD MATCH HINTS (Python-computed — fuzzy token overlap with spelling/stem tolerance):",
         "These are PROVEN matches. You MUST use them unless a better/higher-priority match exists.",
+        "Hints labelled [PARENT LEVEL] mean: filter at the parent column — do NOT use LIKE on a child column.",
         "",
     ]
     for c in candidates[:25]:
         tokens_str = ", ".join(f'"{t}"' for t in c["overlap_tokens"])
+        match_type = c.get("match_type", "direct")
+        label = "  [PARENT LEVEL — via child match]  " if match_type == "promoted_parent" else "  "
+        promoted = f"  (child: {c['promoted_from']})" if c.get("promoted_from") else ""
         lines.append(
-            f"  Query token(s) [{tokens_str}] overlap with "
-            f"table={c['table']!r}  column={c['column']!r}  value={c['stored_value']!r}"
+            f"{label}token(s) [{tokens_str}] → "
+            f"table={c['table']!r}  column={c['column']!r}  value={c['stored_value']!r}{promoted}"
         )
     lines.append("")
     return "\n".join(lines) + "\n"
@@ -335,7 +451,10 @@ def _apply_fuzzy_fallback(
         best_score = 0
         for c in candidates:
             val_lower = c["stored_value"].lower()
-            overlap = sum(1 for t in term_tokens if t in val_lower)
+            overlap = sum(1 for t in term_tokens if _token_matches_text(t, val_lower))
+            # Promoted parent candidates get a bonus so they beat child-level matches
+            if c.get("match_type") == "promoted_parent":
+                overlap += 1
             if overlap > best_score:
                 best_score = overlap
                 best = c
@@ -344,8 +463,6 @@ def _apply_fuzzy_fallback(
             col  = best["column"]
             val  = best["stored_value"]
             tbl  = best["table"]
-            # Prefer filtering at parent column when hierarchy exists
-            hier = column_hierarchy.get(tbl, {})
             frag = f"LOWER({col}) = '{val.lower()}'"
             patched_r = dict(r)
             patched_r["column"]         = col
@@ -390,8 +507,8 @@ def resolve_node(state: DialogState) -> DialogState:
         "DIALOG_LLM_MODEL", "claude-haiku-4-5-20251001"
     )
 
-    # ── Fuzzy pre-match: Python token overlap ─────────────────────────────────
-    fuzzy_candidates = _fuzzy_match_candidates(natural_query, categorical_columns)
+    # ── Fuzzy pre-match: stemmed/edit-distance token overlap + hierarchy promotion ──
+    fuzzy_candidates = _fuzzy_match_candidates(natural_query, categorical_columns, column_hierarchy)
     hint_section = _build_hint_section(fuzzy_candidates)
     if fuzzy_candidates:
         logger.info(

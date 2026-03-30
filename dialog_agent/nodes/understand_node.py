@@ -13,6 +13,7 @@ Key design:
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -166,6 +167,82 @@ def _detect_parent_child_pairs(col_samples: Dict[str, Any]) -> List[tuple]:
                 if p_count <= c_count:          # parent must have ≤ distinct vals
                     pairs.append((parent_candidate, col))
     return pairs
+
+
+def _load_samples_from_catalog(source_id: str) -> tuple:
+    """
+    For non-file sources (PostgreSQL, etc.) load categorical column values and
+    taxonomy hierarchies from the metadata catalog (md_attributes) that was
+    populated during indexing.
+
+    Returns the same (samples, hierarchy) shape as _sample_file_data so the
+    rest of understand_node can treat them identically.
+
+    samples   : { table_name: { col_name: {"values": [...], "categorical": bool} } }
+    hierarchy : { table_name: { parent_col: { parent_val: [child_vals] } } }
+
+    Hierarchy note: without a live DB we cannot build a true cross-tab
+    (which parent values own which child values).  We detect parent-child column
+    pairs by naming convention (sub_X → X) and expose the parent column values
+    in the context so the LLM filters at the correct level.
+    """
+    try:
+        import metadata_catalog as _mc
+
+        entities = _mc.list_entities(source_id)
+        if not entities:
+            return {}, {}
+
+        samples: Dict[str, Dict[str, Any]] = {}
+
+        for ent in entities:
+            full = _mc.get_entity(ent["metadata_id"])
+            if not full:
+                continue
+            tbl = ent["table_name"]
+            for attr in full.get("attributes", []):
+                stat_type = (attr.get("statistical_type") or "").strip()
+                top_vals = attr.get("top_values") or []
+                col = attr["column_name"]
+
+                # Only expose columns that have known categorical/ordinal type
+                # AND have stored sample values from the indexing phase.
+                if stat_type in ("categorical", "ordinal") and top_vals:
+                    samples.setdefault(tbl, {})[col] = {
+                        "values": top_vals,
+                        "categorical": True,
+                    }
+
+        # Detect parent-child pairs by naming convention (sub_X → X).
+        # Without a live DB cross-tab, represent the hierarchy as a flat
+        # {parent_col: {"(all children)": child_vals}} mapping so the LLM
+        # knows to filter at parent level and sees the child value list.
+        hierarchy: Dict[str, Dict[str, Dict[str, List[str]]]] = {}
+        for tbl, col_map in samples.items():
+            pairs = _detect_parent_child_pairs(col_map)
+            if not pairs:
+                continue
+            tbl_hier: Dict[str, Dict[str, List[str]]] = {}
+            for parent_col, child_col in pairs:
+                c_vals = col_map.get(child_col, {}).get("values", [])
+                # Use the child values as a flat group under a descriptive key
+                tbl_hier[parent_col] = {"(all sub-values)": c_vals}
+            if tbl_hier:
+                hierarchy[tbl] = tbl_hier
+
+        if samples:
+            logger.info(
+                "understand_node: loaded catalog samples for %d tables (source %s)",
+                len(samples), source_id[:8],
+            )
+        return samples, hierarchy
+
+    except Exception as exc:
+        logger.warning(
+            "understand_node: _load_samples_from_catalog failed for %s — %s",
+            source_id[:8], exc,
+        )
+        return {}, {}
 
 
 def _build_taxonomy_hierarchy(
@@ -592,10 +669,12 @@ def understand_node(state: DialogState) -> DialogState:
                 "The KG pipeline may not have completed for this source."
             )
 
-    # For file-based sources, inject sample values so the LLM sees actual data
-    # values (e.g. exact company names) and generates accurate WHERE clauses.
+    # Inject sample values so the LLM sees actual data values and generates
+    # accurate WHERE clauses.  File-based sources are sampled live; DB-backed
+    # sources (PostgreSQL etc.) use top_values / taxonomy_tree from the catalog.
     samples:   Optional[Dict[str, Dict[str, List]]] = None
     hierarchy: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None
+    source_id_for_samples = getattr(config, "source_id", "") or ""
     if config.db_type.lower() in _FILE_BASED_TYPES and config.db_file_path:
         samples, hierarchy = _sample_file_data(config)
         if samples:
@@ -603,6 +682,15 @@ def understand_node(state: DialogState) -> DialogState:
         if hierarchy:
             logger.info(
                 "understand_node: taxonomy hierarchy built for %d table(s)", len(hierarchy)
+            )
+    elif source_id_for_samples:
+        # Non-file source: load categorical values and hierarchy from md_attributes
+        # (populated by the indexer via infer_taxonomy / enrich_taxonomy).
+        samples, hierarchy = _load_samples_from_catalog(source_id_for_samples)
+        if hierarchy:
+            logger.info(
+                "understand_node: catalog taxonomy hierarchy loaded for %d table(s)",
+                len(hierarchy),
             )
 
     schema_context = _summarise_graph(nodes, edges, db_schema, samples, hierarchy)
@@ -623,7 +711,7 @@ def understand_node(state: DialogState) -> DialogState:
 
     # Load active KPI definitions for this source (if source_id is set)
     active_kpis: List[Dict] = []
-    source_id = getattr(config, "source_id", "") or ""
+    source_id = source_id_for_samples  # already extracted above
     if source_id:
         try:
             import kpi_store as _kpi_store

@@ -4,8 +4,8 @@
 const API = '/api';
 
 // ── State ──────────────────────────────────────────────────────────────────────
-let _sources      = [];       // [{source_id, name, status, db_type, ...}]
-let _selectedSrc  = null;     // source_id currently selected in pipeline view
+let _sources      = [];       // [{id, name, status, db_type, ...}]
+let _selectedSrc  = null;     // source id currently selected in pipeline view
 let _sseConn      = null;     // EventSource for pipeline events
 let _kgNetwork    = null;     // vis.js network instance
 let _catalogEntities = [];    // md_entities for catalog view
@@ -67,15 +67,25 @@ async function apiFetch(path, opts = {}) {
   return r.json();
 }
 
-function _fmtTime(iso) {
-  if (!iso) return '—';
-  try { return new Date(iso).toLocaleString(); } catch { return iso; }
+// Timestamps: API returns Unix seconds (float). JS Date needs milliseconds.
+function _toMs(val) {
+  if (!val) return null;
+  const n = Number(val);
+  // If it looks like Unix seconds (< year 3000 in seconds), multiply by 1000
+  return n < 9999999999 ? n * 1000 : n;
 }
-function _fmtRelTime(iso) {
-  if (!iso) return '';
-  const s = Math.floor((Date.now() - new Date(iso)) / 1000);
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s/60)}m ago`;
+function _fmtTime(val) {
+  const ms = _toMs(val);
+  if (!ms) return '—';
+  try { return new Date(ms).toLocaleString(); } catch { return String(val); }
+}
+function _fmtRelTime(val) {
+  const ms = _toMs(val);
+  if (!ms) return '';
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 0)     return 'just now';
+  if (s < 60)    return `${s}s ago`;
+  if (s < 3600)  return `${Math.floor(s/60)}m ago`;
   if (s < 86400) return `${Math.floor(s/3600)}h ago`;
   return `${Math.floor(s/86400)}d ago`;
 }
@@ -104,10 +114,11 @@ function renderSourceList() {
     return;
   }
   el.innerHTML = _sources.map(s => {
-    const statusClass = s.status === 'indexed' ? 'indexed' : s.status === 'indexing' ? 'indexing' : s.status === 'error' ? 'error' : 'pending';
+    // API uses "ready" for a fully indexed source
+    const statusClass = s.status === 'ready' ? 'indexed' : s.status === 'indexing' ? 'indexing' : s.status === 'error' ? 'error' : 'pending';
     const dbIcon = _dbIcon(s.db_type);
-    const sel = s.source_id === _selectedSrc ? 'selected' : '';
-    return `<div class="source-card ${sel}" onclick="selectSource('${s.source_id}')">
+    const sel = s.id === _selectedSrc ? 'selected' : '';
+    return `<div class="source-card ${sel}" onclick="selectSource('${_esc(s.id)}')">
       <div class="src-icon">${dbIcon}</div>
       <div style="flex:1;min-width:0;">
         <div class="src-name">${_esc(s.name)}</div>
@@ -130,7 +141,7 @@ function _dbIcon(dbType) {
 }
 
 function populateSourceSelects() {
-  const opts = _sources.map(s => `<option value="${s.source_id}">${_esc(s.name)}</option>`).join('');
+  const opts = _sources.map(s => `<option value="${_esc(s.id)}">${_esc(s.name)}</option>`).join('');
   const placeholder = '<option value="">— select source —</option>';
   ['global-source-select','graph-source-select','ontology-source-select','sql-source-select'].forEach(id => {
     const el = document.getElementById(id);
@@ -149,18 +160,18 @@ async function selectSource(sourceId) {
   // Sync global selector
   document.getElementById('global-source-select').value = sourceId;
 
-  const src = _sources.find(s => s.source_id === sourceId);
+  const src = _sources.find(s => s.id === sourceId);
   if (!src) return;
 
   // Show detail header
   const hdr = document.getElementById('pipeline-detail-header');
   hdr.style.display = 'block';
   document.getElementById('detail-src-name').textContent = src.name;
-  document.getElementById('detail-src-conn').textContent = `${src.db_type}://${src.connection?.host || ''}/${src.connection?.database || ''}`;
+  document.getElementById('detail-src-conn').textContent = `${src.db_type}`;
 
   const stats = [];
   if (src.table_count) stats.push(`<span><b>${src.table_count}</b> tables</span>`);
-  if (src.status) stats.push(`<span>Status: <b style="color:${src.status==='indexed'?'var(--green)':src.status==='indexing'?'var(--accent)':'var(--red)'}">${src.status}</b></span>`);
+  if (src.status) stats.push(`<span>Status: <b style="color:${src.status==='ready'?'var(--green)':src.status==='indexing'?'var(--accent)':'var(--red)'}">${src.status}</b></span>`);
   if (src.indexed_at) stats.push(`<span>Last indexed: <b>${_fmtTime(src.indexed_at)}</b></span>`);
   document.getElementById('detail-src-stats').innerHTML = stats.join('&nbsp;&nbsp;·&nbsp;&nbsp;');
 
@@ -170,7 +181,16 @@ async function selectSource(sourceId) {
 
 function onGlobalSourceChange(sourceId) {
   if (!sourceId) return;
-  selectSource(sourceId);
+  // Sync all view-specific selectors
+  ['graph-source-select','ontology-source-select','sql-source-select'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = sourceId;
+  });
+  if (_currentView === 'pipeline') selectSource(sourceId);
+  else if (_currentView === 'catalog') loadCatalog(sourceId);
+  else if (_currentView === 'graph') loadGraph(sourceId);
+  else if (_currentView === 'ontology') loadOntology(sourceId);
+  else selectSource(sourceId);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -196,7 +216,7 @@ function startSSE(sourceId) {
       const ev = JSON.parse(e.data);
       appendEvent(ev);
       // Refresh source list if status changed
-      if (ev.stage && ev.status) loadSources();
+      if (ev.step && ev.status) loadSources();
     } catch {}
   };
 
@@ -213,12 +233,12 @@ function appendEvent(ev) {
   if (empty) empty.remove();
 
   const stageColors = { extract:'extract', ontology:'ontology', kg:'kg', taxonomy:'taxonomy', error:'error' };
-  const stageClass = stageColors[ev.stage] || 'info';
+  const stageClass = stageColors[ev.step || ev.stage] || 'info';
   const row = document.createElement('div');
   row.className = 'event-row';
   row.innerHTML = `
     <span class="ev-time">${new Date().toLocaleTimeString()}</span>
-    <span class="ev-stage ${stageClass}">${_esc(ev.stage || 'info')}</span>
+    <span class="ev-stage ${stageClass}">${_esc(ev.step || ev.stage || 'info')}</span>
     <span class="ev-msg">${_esc(ev.message || '')}</span>
     ${ev.detail ? `<span class="ev-detail">${_esc(ev.detail)}</span>` : ''}
   `;
@@ -294,6 +314,7 @@ async function testConnection() {
   };
   try {
     const r = await apiFetch('/sources/test-connection', { method: 'POST', body: JSON.stringify(payload) });
+    if (r.ok === false) throw new Error(r.error || 'Connection failed');
     toast(r.message || 'Connection successful', 'success');
   } catch (e) { toast('Connection failed: ' + e.message, 'error'); }
 }
@@ -307,16 +328,31 @@ async function addSource() {
   if (isFile) {
     const file = document.getElementById('src-file').files[0];
     if (!file) { toast('Select a file to upload', 'warn'); return; }
+
+    // Step 1: upload the file to get a stored path
     const fd = new FormData();
     fd.append('file', file);
-    fd.append('source_name', name);
+    let uploadInfo;
     try {
       const r = await fetch(`${API}/sources/upload-file`, { method: 'POST', body: fd });
       if (!r.ok) { const b = await r.json(); throw new Error(b.detail || r.statusText); }
-      toast('File uploaded and indexing started', 'success');
+      uploadInfo = await r.json();
+    } catch (e) { toast('Upload failed: ' + e.message, 'error'); return; }
+
+    // Step 2: register the source with the returned file path
+    const payload = {
+      name,
+      db_type: uploadInfo.db_type || type,
+      connection: { file_path: uploadInfo.path, uploaded: true },
+      auto_index: true,
+    };
+    try {
+      const r = await apiFetch('/sources', { method: 'POST', body: JSON.stringify(payload) });
+      toast(`Source "${name}" registered and indexing started`, 'success');
       closeAddSourceModal();
       await loadSources();
-    } catch (e) { toast('Upload failed: ' + e.message, 'error'); }
+      if (r.id) selectSource(r.id);
+    } catch (e) { toast('Failed to register source: ' + e.message, 'error'); }
     return;
   }
 
@@ -330,14 +366,15 @@ async function addSource() {
       schema: document.getElementById('src-schema').value || '',
       username: document.getElementById('src-user').value,
       password: document.getElementById('src-password').value,
-    }
+    },
+    auto_index: true,
   };
   try {
     const r = await apiFetch('/sources', { method: 'POST', body: JSON.stringify(payload) });
     toast(`Source "${name}" registered and indexing started`, 'success');
     closeAddSourceModal();
     await loadSources();
-    if (r.source_id) selectSource(r.source_id);
+    if (r.id) selectSource(r.id);
   } catch (e) { toast('Failed to add source: ' + e.message, 'error'); }
 }
 
@@ -447,6 +484,7 @@ function showGraphNodeInfo(node) {
       html += `<div style="color:var(--text-2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:0.05em">${_esc(line)}</div>`;
     }
   }
+
   document.getElementById('gip-body').innerHTML = html || '<span style="color:var(--text-2);font-size:12px">No details available</span>';
   panel.classList.add('visible');
 }
@@ -482,7 +520,7 @@ function renderCatalogTableList(entities) {
   }
   el.innerHTML = entities.map(e => {
     const del = e.deleted_from_source ? 'opacity:0.5;' : '';
-    return `<div class="table-list-item" style="${del}" onclick="loadCatalogTable('${e.metadata_id}')">
+    return `<div class="table-list-item" style="${del}" onclick="loadCatalogTable('${_esc(e.metadata_id)}')">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;color:var(--text-2);flex-shrink:0"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
       <div style="min-width:0">
         <div class="tbl-name">${_esc(e.schema_name ? e.schema_name+'.'+e.table_name : e.table_name)}</div>
@@ -507,7 +545,7 @@ async function loadCatalogTable(metadataId) {
 
   // Highlight selected
   document.querySelectorAll('.table-list-item').forEach(el => {
-    el.classList.toggle('selected', el.onclick?.toString().includes(metadataId));
+    el.classList.toggle('selected', el.getAttribute('onclick')?.includes(metadataId));
   });
 
   try {
@@ -593,7 +631,7 @@ function _statColor(s) {
   return m[s] || 'badge-gray';
 }
 function _roleColor(r) {
-  const m = { measure:'badge-blue', time_period:'badge-cyan', time_dimension_key:'badge-cyan', product_category:'badge-amber', product_sub_category:'badge-orange', product_dimension_key:'badge-orange', geography:'badge-green', geography_dimension_key:'badge-green', org_unit:'badge-purple', customer_dimension_key:'badge-red', identifier:'badge-gray', boolean_flag:'badge-purple', other:'badge-gray' };
+  const m = { measure:'badge-blue', time_period:'badge-cyan', time_dimension_key:'badge-cyan', product_category:'badge-amber', product_sub_category:'badge-orange', product_dimension_key:'badge-orange', geography:'badge-green', geography_dimension_key:'badge-green', org_unit:'badge-purple', org_dimension_key:'badge-purple', customer_dimension_key:'badge-red', demographic:'badge-orange', identifier:'badge-gray', boolean_flag:'badge-purple', free_text:'badge-gray', other:'badge-gray' };
   return m[r] || 'badge-gray';
 }
 function _fmtNum(n) { return n == null ? '—' : Number(n).toLocaleString(); }
@@ -660,7 +698,7 @@ async function loadRedundancies() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SQL Console
+// SQL Console  —  uses /sources/{id}/execute-sql (direct connector, no LLM)
 // ─────────────────────────────────────────────────────────────────────────────
 function onViewSQL() {
   const sel = document.getElementById('sql-source-select');
@@ -679,15 +717,14 @@ async function runSQL() {
   status.innerHTML = `<span class="spinner"></span>&nbsp;Running…`;
   results.innerHTML = '';
 
-  const t0 = Date.now();
   try {
-    const data = await apiFetch(`/sources/${sourceId}/graphrag-query`, {
+    const data = await apiFetch(`/sources/${sourceId}/execute-sql`, {
       method: 'POST',
-      body: JSON.stringify({ question: sql, mode: 'sql_direct', sql_override: sql }),
+      body: JSON.stringify({ sql, limit: 500 }),
     });
-    const elapsed = Date.now() - t0;
-    const rows = data.rows || data.results || [];
-    const cols = rows.length ? Object.keys(rows[0]) : [];
+    const rows = data.rows || [];
+    const cols = data.columns || (rows.length ? Object.keys(rows[0]) : []);
+    const elapsed = data.elapsed_ms ?? '—';
     status.innerHTML = `<span class="text-green">${_fmtNum(rows.length)} rows · ${elapsed}ms</span>`;
     if (!rows.length) {
       results.innerHTML = '<div class="empty-state" style="height:120px">Query returned 0 rows</div>';
@@ -695,7 +732,7 @@ async function runSQL() {
     }
     results.innerHTML = `<table class="data-table">
       <thead><tr>${cols.map(c => `<th>${_esc(c)}</th>`).join('')}</tr></thead>
-      <tbody>${rows.slice(0,500).map(row =>
+      <tbody>${rows.slice(0, 500).map(row =>
         `<tr>${cols.map(c => `<td class="mono">${_esc(row[c] ?? '')}</td>`).join('')}</tr>`
       ).join('')}</tbody>
     </table>`;
@@ -711,7 +748,7 @@ function clearSQL() {
   document.getElementById('sql-status').innerHTML = '';
 }
 
-// Ctrl+Enter to run SQL
+// Ctrl+Enter / Cmd+Enter to run SQL
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('sql-input').addEventListener('keydown', e => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); runSQL(); }
@@ -737,11 +774,12 @@ async function loadCDC() {
         const { old: o, new: n } = r.changed_fields.data_type;
         detail = `<span class="mono" style="font-size:10px"><span style="color:var(--red)">${_esc(o)}</span> → <span style="color:var(--green)">${_esc(n)}</span></span>`;
       }
+      const srcId = r.source_id || r.source || '';
       return `<tr>
-        <td class="dim">${_fmtTime(r.detected_at)}</td>
-        <td class="mono dim">${_esc(r.source_id?.slice(0,8) || '—')}</td>
-        <td class="mono" style="font-size:11px">${_esc(r.entity_label || r.entity_id?.slice(0,16) || '—')}</td>
-        <td><span class="mono dim" style="font-size:10px">${_esc(r.entity_type || '')}</span></td>
+        <td class="dim">${_fmtTime(r.detected_at || r.changed_at)}</td>
+        <td class="mono dim">${_esc(srcId.slice(0, 8) || '—')}</td>
+        <td class="mono" style="font-size:11px">${_esc(r.entity_label || r.table_name || r.entity_id?.slice(0,16) || '—')}</td>
+        <td><span class="mono dim" style="font-size:10px">${_esc(r.entity_type || r.change_object || '')}</span></td>
         <td><span class="badge ${cc}">${_esc(r.change_type)}</span></td>
         <td>${detail}</td>
       </tr>`;
@@ -770,32 +808,15 @@ async function loadCDC() {
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Global source selector sync
-// ─────────────────────────────────────────────────────────────────────────────
-function onGlobalSourceChange(sourceId) {
-  if (!sourceId) return;
-  // Sync all view-specific selectors
-  ['graph-source-select','ontology-source-select','sql-source-select'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.value = sourceId;
-  });
-  // If pipeline view is active, select source
-  if (_currentView === 'pipeline') selectSource(sourceId);
-  else if (_currentView === 'catalog') loadCatalog(sourceId);
-  else if (_currentView === 'graph') loadGraph(sourceId);
-  else if (_currentView === 'ontology') loadOntology(sourceId);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Initialise
 // ─────────────────────────────────────────────────────────────────────────────
 async function init() {
   await loadSources();
-  // Auto-select first indexed source
-  const ready = _sources.find(s => s.status === 'indexed');
+  // Auto-select first ready source
+  const ready = _sources.find(s => s.status === 'ready');
   if (ready) {
-    document.getElementById('global-source-select').value = ready.source_id;
-    selectSource(ready.source_id);
+    document.getElementById('global-source-select').value = ready.id;
+    selectSource(ready.id);
   }
   // Poll for source status updates every 10s
   setInterval(loadSources, 10000);

@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from dialog_agent import DialogAgent, DialogConfig
 from dialog_agent.state import ConversationTurn
 from dialog_agent.nodes.execute_node import (
+    _run_sql,
     list_file_dbs,
     purge_all_file_dbs,
     purge_file_db,
@@ -473,6 +474,66 @@ def clear_cache():
 # ── File-DB cache endpoints ────────────────────────────────────────────────────
 # Call DELETE /file-cache when the user navigates away from the Dialog with Data
 # section to release the temp SQLite files that were built for CSV/Excel sources.
+
+# ── Raw SQL execution (tech UI SQL console) ───────────────────────────────────
+
+class ExecuteSQLRequest(BaseModel):
+    sql:                  str
+    db_type:              str = "postgres"
+    db_host:              str = ""
+    db_port:              int = 5432
+    db_name:              str = ""
+    db_schema:            str = "public"
+    db_user:              str = ""
+    db_password:          str = ""
+    db_connection_string: str = ""
+    db_extra:             Dict[str, Any] = {}
+    db_file_path:         Optional[str] = None
+    limit:                int = 500
+
+
+@app.post("/execute-sql")
+def execute_sql_direct(req: ExecuteSQLRequest):
+    """
+    Execute a raw SQL statement against a database and return rows.
+    Used by the tech UI SQL console — no LLM involved.
+    """
+    if not req.sql.strip():
+        raise HTTPException(status_code=400, detail="sql must not be empty")
+
+    _FILE_BASED = {"sqlite", "csv", "excel"}
+    cfg = DialogConfig(
+        db_type              = req.db_type,
+        db_host              = req.db_host,
+        db_port              = req.db_port,
+        db_name              = req.db_name,
+        db_schema            = "" if req.db_type.lower() in _FILE_BASED else req.db_schema,
+        db_user              = req.db_user,
+        db_password          = req.db_password,
+        db_connection_string = req.db_connection_string,
+        db_extra             = req.db_extra,
+        db_file_path         = req.db_file_path or "",
+    )
+
+    import time as _time
+    t0 = _time.time()
+    result = _run_sql(cfg, req.sql)
+    elapsed_ms = int((_time.time() - t0) * 1000)
+
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    columns = result.get("columns") or []
+    raw_rows = (result.get("rows") or [])[:req.limit]
+    rows = [dict(zip(columns, r)) for r in raw_rows]
+
+    return {
+        "columns":    columns,
+        "rows":       rows,
+        "row_count":  len(raw_rows),
+        "elapsed_ms": elapsed_ms,
+    }
+
 
 @app.get("/file-cache")
 def list_file_cache():

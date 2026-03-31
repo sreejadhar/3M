@@ -1777,6 +1777,58 @@ async def source_index_events(source_id: str):
     return StreamingResponse(_gen(), media_type="text/event-stream")
 
 
+class ExecuteSQLRequest(BaseModel):
+    sql:   str
+    limit: int = 500
+
+
+@app.post("/sources/{source_id}/execute-sql")
+async def execute_sql_for_source(source_id: str, req: ExecuteSQLRequest):
+    """
+    Execute a raw SQL statement against a registered source's database.
+    Proxies to the dialog-api /execute-sql endpoint which uses the full
+    connector layer (postgres, redshift, oracle, sqlserver, sqlite, csv…).
+    Used by the tech UI SQL console — no LLM involved.
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    conn = s.get("connection") or {}
+    payload: Dict[str, Any] = {
+        "sql":      req.sql,
+        "limit":    req.limit,
+        "db_type":  s["db_type"],
+    }
+    if s["db_type"].lower() in _FILE_BASED_TYPES:
+        payload["db_file_path"] = conn.get("file_path", "")
+    else:
+        payload.update({
+            "db_host":     conn.get("host", ""),
+            "db_port":     conn.get("port", 5432),
+            "db_name":     conn.get("database", ""),
+            "db_schema":   conn.get("schema_", "") or conn.get("schema", "public"),
+            "db_user":     conn.get("username", ""),
+            "db_password": conn.get("password", ""),
+        })
+        if conn.get("connection_string"):
+            payload["db_connection_string"] = conn["connection_string"]
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.post(f"{DIALOG_API}/execute-sql", json=payload)
+            if r.status_code == 400:
+                raise HTTPException(status_code=400, detail=r.json().get("detail", "SQL error"))
+            r.raise_for_status()
+            return r.json()
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"Dialog API error: {exc.response.text[:200]}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 class GraphRAGQueryRequest(BaseModel):
     query:      str
     top_k:      int = 8

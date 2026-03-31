@@ -205,6 +205,33 @@ services:
     networks:
       - metadata-net
 
+  # ── Tech Workforce UI ────────────────────────────────────────────────────────
+  tech-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.tech
+    image: metadata-tech-ui:latest
+    container_name: metadata-tech-ui
+    restart: unless-stopped
+    ports:
+      - "${TECH_PORT:-8006}:8006"
+    environment:
+      # Proxy target: the orchestrator/chat-ui service hosts all the APIs
+      ORCHESTRATOR_URL: "http://chat-ui:8005"
+      LOG_LEVEL:        "${LOG_LEVEL:-info}"
+    depends_on:
+      chat-ui:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8006/health', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - metadata-net
+
 # ── Named volume so reports persist across container restarts ─────────────────
 volumes:
   reports_data:

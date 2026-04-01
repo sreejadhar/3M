@@ -13,8 +13,9 @@ services:
     volumes:
       - reports_data:/data/reports
     environment:
-      # Anthropic key — set in .env or shell before running
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      # Claude endpoint — set in .env or shell before running
+      CLAUDE_API_KEY:  "${CLAUDE_API_KEY}"
+      CLAUDE_BASE_URL: "${CLAUDE_BASE_URL:-https://api.anthropic.com}"
       DATA_DIR: /data/reports
       # Tune log verbosity: debug | info | warning
       LOG_LEVEL: "${LOG_LEVEL:-info}"
@@ -67,6 +68,8 @@ services:
     ports:
       - "${KG_PORT:-8002}:8002"
     environment:
+      CLAUDE_API_KEY:  "${CLAUDE_API_KEY}"
+      CLAUDE_BASE_URL: "${CLAUDE_BASE_URL:-https://api.anthropic.com}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -91,7 +94,8 @@ services:
     volumes:
       - reports_data:/data/reports
     environment:
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      CLAUDE_API_KEY:  "${CLAUDE_API_KEY}"
+      CLAUDE_BASE_URL: "${CLAUDE_BASE_URL:-https://api.anthropic.com}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     healthcheck:
       # dialog-api imports LangGraph + Anthropic — allow 60s on EC2
@@ -115,7 +119,8 @@ services:
     ports:
       - "${CONFORMITY_PORT:-8004}:8004"
     environment:
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      CLAUDE_API_KEY:  "${CLAUDE_API_KEY}"
+      CLAUDE_BASE_URL: "${CLAUDE_BASE_URL:-https://api.anthropic.com}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -140,7 +145,8 @@ services:
     volumes:
       - metadata_catalog_data:/data
     environment:
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      CLAUDE_API_KEY:  "${CLAUDE_API_KEY}"
+      CLAUDE_BASE_URL: "${CLAUDE_BASE_URL:-https://api.anthropic.com}"
       # Internal Docker DNS — matches service names above
       METADATA_API_URL: "http://agent-api:8000"
       ONTOLOGY_API_URL: "http://ontology-api:8001"

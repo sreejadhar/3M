@@ -470,9 +470,9 @@ async def _llm_validate_candidates(
 
     if not candidates:
         return
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    api_key = os.environ.get("CLAUDE_API_KEY", "")
     if not api_key:
-        logger.debug("ANTHROPIC_API_KEY not set — skipping LLM validation tier")
+        logger.debug("CLAUDE_API_KEY not set — skipping LLM validation tier")
         return
 
     # Batch into groups
@@ -481,7 +481,10 @@ async def _llm_validate_candidates(
 
     try:
         import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(
+            api_key=api_key,
+            base_url=os.environ.get("CLAUDE_BASE_URL", "https://api.anthropic.com"),
+        )
     except ImportError:
         logger.debug("anthropic package unavailable — skipping LLM validation")
         return

@@ -128,7 +128,10 @@ def _call_profile_llm(table_name: str, columns: List[Dict[str, str]], model: str
     user_msg = _PROFILE_USER.format(table_name=table_name, column_list=col_lines)
 
     try:
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        client = anthropic.Anthropic(
+            api_key=os.environ.get("CLAUDE_API_KEY", ""),
+            base_url=os.environ.get("CLAUDE_BASE_URL", "https://api.anthropic.com"),
+        )
         msg = client.messages.create(
             model=model,
             max_tokens=2048,
@@ -210,8 +213,8 @@ def profile_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("profile_node: disabled by config — skipping")
         return state
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        logger.warning("profile_node: ANTHROPIC_API_KEY not set — skipping taxonomy enrichment")
+    if not os.environ.get("CLAUDE_API_KEY"):
+        logger.warning("profile_node: CLAUDE_API_KEY not set — skipping taxonomy enrichment")
         return state
 
     g = state.get("ontology_graph")

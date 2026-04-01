@@ -87,7 +87,11 @@ def recommend_node(state: ConformityState) -> ConformityState:
 
     try:
         import anthropic  # noqa: PLC0415
-        client = anthropic.Anthropic()
+        import os as _os
+        client = anthropic.Anthropic(
+            api_key=_os.environ.get("CLAUDE_API_KEY", ""),
+            base_url=_os.environ.get("CLAUDE_BASE_URL", "https://api.anthropic.com"),
+        )
         response = client.messages.create(
             model=config.llm_model,
             max_tokens=2048,

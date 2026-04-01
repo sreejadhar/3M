@@ -207,7 +207,10 @@ def _llm_fix_sql(
         "Return the corrected SQL only."
     )
     try:
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        client = anthropic.Anthropic(
+            api_key=os.environ.get("CLAUDE_API_KEY", ""),
+            base_url=os.environ.get("CLAUDE_BASE_URL", "https://api.anthropic.com"),
+        )
         msg = client.messages.create(
             model=model,
             max_tokens=2048,

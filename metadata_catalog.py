@@ -1073,10 +1073,7 @@ def _call_enrich_llm(table_name: str, col_specs: List[Dict], model: str) -> List
     user_msg = f"Table: {table_name}\nColumns:\n" + "\n".join(lines) + "\n\nClassify each column."
 
     try:
-        client = anthropic.Anthropic(
-            api_key=os.environ.get("CLAUDE_API_KEY", ""),
-            base_url=os.environ.get("CLAUDE_BASE_URL", "https://api.anthropic.com"),
-        )
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
         msg = client.messages.create(
             model=model, max_tokens=2048, temperature=0.0,
             system=_ENRICH_SYSTEM,

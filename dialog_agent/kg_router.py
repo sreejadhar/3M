@@ -79,10 +79,7 @@ def _llm_confirm(nlq, candidates, model, temperature) -> List[str]:
               "return ONLY a JSON array of kg_id strings for the KGs needed to answer the question.")
     user = f"Question: {nlq}\n\nAvailable Knowledge Graphs:\n{kg_list}\n\nReturn JSON array of kg_id strings."
     try:
-        client = anthropic.Anthropic(
-            api_key=os.environ.get("CLAUDE_API_KEY", ""),
-            base_url=os.environ.get("CLAUDE_BASE_URL", "https://api.anthropic.com"),
-        )
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY",""))
         msg = client.messages.create(model=model, max_tokens=256, temperature=temperature,
                                      system=system, messages=[{"role":"user","content":user}])
         text = (msg.content[0].text if msg.content else "[]").strip()

@@ -6,16 +6,32 @@ The LLM receives:
   - Each executed query (description + SQL + tabular results as markdown)
 
 It returns a narrative insight in plain markdown.
+
+Token management:
+  - Dynamic row limit: reduces rows per result table (20 → 10 → 5) when total
+    result content is large.
+  - History summarization: older turns (beyond MAX_VERBATIM_TURNS) are
+    summarized with a cheap Haiku call to keep the prompt compact.
+  - Token guard: hard cap at 180k input tokens via guard_synth_sections().
 """
 from __future__ import annotations
 
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 from ..state import DialogState, QueryResult
+from ..token_guard import estimate_tokens, guard_synth_sections
 
 logger = logging.getLogger(__name__)
+
+# ── History compression settings ─────────────────────────────────────────────
+# Show this many recent turns verbatim; summarize anything older.
+_MAX_VERBATIM_TURNS = 5
+
+# ── Dynamic row limits (chars of rendered result markdown) ───────────────────
+_RESULTS_LARGE_CHARS  = 80_000   # ~20k tokens  → reduce to 10 rows/query
+_RESULTS_XLARGE_CHARS = 200_000  # ~50k tokens  → reduce to  5 rows/query
 
 _SYSTEM_PROMPT = """\
 You are an expert data analyst.  You have been given the results of one or more
@@ -77,7 +93,47 @@ Instructions:
 """
 
 
-def _result_to_markdown(qr: QueryResult) -> str:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _estimate_result_chars(query_results: List[QueryResult]) -> int:
+    """Quick estimate of total rendered markdown chars without building the strings."""
+    total = 0
+    for qr in query_results:
+        total += len(qr.get("description", "")) + 50  # header overhead
+        if qr.get("error"):
+            total += len(qr.get("error", ""))
+            continue
+        cols = qr.get("columns") or []
+        rows = qr.get("rows") or []
+        col_chars = sum(len(str(c)) for c in cols) + len(cols) * 3
+        total += col_chars * 2  # header + separator
+        for row in rows[:20]:
+            total += sum(len(str(v)) for v in row) + len(row) * 3
+    return total
+
+
+def _dynamic_row_limit(query_results: List[QueryResult]) -> int:
+    """
+    Choose max rows per result table based on estimated total content size.
+    Reduces rows to stay under token thresholds.
+    """
+    estimated = _estimate_result_chars(query_results)
+    if estimated > _RESULTS_XLARGE_CHARS:
+        logger.info(
+            "synthesize_node: large results (~%d chars) — capping at 5 rows/query",
+            estimated,
+        )
+        return 5
+    if estimated > _RESULTS_LARGE_CHARS:
+        logger.info(
+            "synthesize_node: moderate results (~%d chars) — capping at 10 rows/query",
+            estimated,
+        )
+        return 10
+    return 20
+
+
+def _result_to_markdown(qr: QueryResult, max_rows: int = 20) -> str:
     lines = [
         f"### {qr['query_id']}: {qr['description']}",
     ]
@@ -94,18 +150,78 @@ def _result_to_markdown(qr: QueryResult) -> str:
 
     lines.append(f"*Rows returned: {qr['row_count']}*")
 
-    # Markdown table (max 20 rows to keep prompt size manageable)
+    # Markdown table capped at max_rows
     header = "| " + " | ".join(str(c) for c in cols) + " |"
     sep    = "| " + " | ".join("---" for _ in cols) + " |"
     lines += [header, sep]
 
-    for row in rows[:20]:
+    for row in rows[:max_rows]:
         lines.append("| " + " | ".join(str(v) for v in row) + " |")
 
-    if len(rows) > 20:
-        lines.append(f"*... and {len(rows)-20} more rows*")
+    if len(rows) > max_rows:
+        lines.append(f"*... and {len(rows) - max_rows} more rows (truncated)*")
 
     return "\n".join(lines)
+
+
+def _summarize_old_turns(old_turns: list, model: str) -> str:
+    """
+    Summarize older conversation turns into a compact bullet-point paragraph
+    using a cheap Haiku call.  Returns empty string on failure.
+    """
+    lines = [
+        "Summarize these past Q&A exchanges into 3-5 bullet points. "
+        "Be very concise. Focus on key findings, dimensions/filters used, and metrics:\n"
+    ]
+    for turn in old_turns:
+        lines.append(f"Q{turn['turn']}: {turn['question']}")
+        if turn.get("insights"):
+            lines.append(f"A: {turn['insights'][:200]}")
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = client.messages.create(
+            model=model,
+            max_tokens=256,
+            temperature=0.0,
+            system="You summarize data analysis Q&A history into concise bullet points.",
+            messages=[{"role": "user", "content": "\n".join(lines)}],
+        )
+        return msg.content[0].text if msg.content else ""
+    except Exception as exc:
+        logger.warning("synthesize_node: history summarization failed — %s", exc)
+        return ""
+
+
+def _build_history_section(history: list, model: str) -> str:
+    """
+    Build the CONVERSATION HISTORY section for the synthesize prompt.
+    If history is long, older turns are summarized with a Haiku call.
+    """
+    if not history:
+        return ""
+
+    lines = ["CONVERSATION HISTORY (for context on follow-up questions):"]
+
+    if len(history) > _MAX_VERBATIM_TURNS:
+        old_turns = history[:-3]
+        recent    = history[-3:]
+        summary   = _summarize_old_turns(old_turns, model)
+        if summary:
+            lines.append(
+                f"[Summary of {len(old_turns)} earlier turn(s) — use for background context:]"
+            )
+            lines.append(summary)
+            lines.append("")
+    else:
+        recent = history
+
+    for turn in recent:
+        lines.append(f"Q{turn['turn']}: {turn['question']}")
+        if turn.get("insights"):
+            lines.append(f"  Previous answer: {turn['insights'][:400]}")
+
+    return "\n".join(lines) + "\n"
 
 
 def _call_llm(system: str, user: str, model: str, temperature: float) -> str:
@@ -155,30 +271,22 @@ def synthesize_node(state: DialogState) -> DialogState:
         state["phase"] = "synthesize"
         return state
 
-    results_text = "\n\n".join(_result_to_markdown(qr) for qr in query_results)
+    # ── Dynamic row limit ─────────────────────────────────────────────────────
+    max_rows    = _dynamic_row_limit(query_results)
+    results_text = "\n\n".join(_result_to_markdown(qr, max_rows) for qr in query_results)
 
-    # Trim if too long (rough token budget ~4k chars ≈ 1k tokens)
-    if len(results_text) > config.max_insight_rows * 4:
-        results_text = results_text[: config.max_insight_rows * 4] + "\n\n*(truncated)*"
+    # Legacy char-based safety truncation (config.max_insight_rows is in rows,
+    # but the old guard used * 4 as a char budget — keep as a backstop).
+    char_budget = config.max_insight_rows * 4
+    if len(results_text) > char_budget:
+        results_text = results_text[:char_budget] + "\n\n*(truncated)*"
 
-    # Build conversation history context
-    history = state.get("conversation_history") or []
-    if history:
-        lines = ["CONVERSATION HISTORY (for context on follow-up questions):"]
-        for turn in history:
-            lines.append(f"Q{turn['turn']}: {turn['question']}")
-            if turn.get("insights"):
-                lines.append(f"  Previous answer: {turn['insights'][:400]}")
-        history_section = "\n".join(lines) + "\n"
-    else:
-        history_section = ""
+    # ── History section with summarization ───────────────────────────────────
+    history          = state.get("conversation_history") or []
+    haiku_model      = getattr(config, "plan_llm_model", "claude-haiku-4-5-20251001")
+    history_section  = _build_history_section(history, haiku_model)
 
-    user_prompt = _USER_PROMPT.format(
-        question=natural_query,
-        history_section=history_section,
-        results_text=results_text,
-    )
-
+    # ── Token guard ───────────────────────────────────────────────────────────
     # Prepend analyst-role context so the LLM tailors terminology and framing
     analyst_role = getattr(config, "analyst_role", "").strip()
     if analyst_role:
@@ -190,6 +298,19 @@ def synthesize_node(state: DialogState) -> DialogState:
         system = role_prefix + _SYSTEM_PROMPT
     else:
         system = _SYSTEM_PROMPT
+
+    # base_chars: system + static template text + question (everything except
+    # the two variable sections that the guard may trim)
+    base_chars = len(system) + len(natural_query) + len(_USER_PROMPT) + 50
+    results_text, history_section = guard_synth_sections(
+        system, results_text, history_section, base_chars
+    )
+
+    user_prompt = _USER_PROMPT.format(
+        question=natural_query,
+        history_section=history_section,
+        results_text=results_text,
+    )
 
     try:
         insights = _call_llm(

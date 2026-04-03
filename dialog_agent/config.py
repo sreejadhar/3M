@@ -58,7 +58,11 @@ class DialogConfig:
     # Number of seed tables returned by vector search before graph expansion.
     graphrag_top_k: int = 8
     # BFS hops from seed nodes when expanding via FK edges.
-    graphrag_hop_depth: int = 2
+    graphrag_hop_depth: int = 1
+    # Hard cap on tables included in the retrieved subgraph after BFS expansion.
+    # Prevents token bloat when FK chains connect many tables. Top-scored tables
+    # are kept when the cap triggers.
+    graphrag_max_tables: int = 15
     # Only activate retrieval when the schema has more than this many tables.
     # For small schemas the full schema fits easily in the prompt.
     graphrag_min_tables: int = 10

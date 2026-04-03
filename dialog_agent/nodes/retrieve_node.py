@@ -351,6 +351,25 @@ def _neo4j_retrieve(
             e for e in edges
             if e.get("from", "") in subgraph_uris and e.get("to", "") in subgraph_uris
         ]
+
+        # Cap to graphrag_max_tables (seed URIs = highest-scored nodes)
+        max_tables_neo = getattr(config, "graphrag_max_tables", 15)
+        if len(sub_nodes) > max_tables_neo:
+            # Seed URIs are already the highest-similarity nodes; keep those first
+            seed_set = set(seed_uris)
+            seeded   = [n for n in sub_nodes if n.get("id", "") in seed_set]
+            expanded = [n for n in sub_nodes if n.get("id", "") not in seed_set]
+            sub_nodes = (seeded + expanded)[:max_tables_neo]
+            kept_ids = {n.get("id", "") for n in sub_nodes}
+            sub_edges = [
+                e for e in sub_edges
+                if e.get("from", "") in kept_ids and e.get("to", "") in kept_ids
+            ]
+            logger.info(
+                "retrieve_node (Neo4j): capped subgraph from %d → %d tables (max_tables=%d)",
+                len(subgraph_uris), max_tables_neo, max_tables_neo,
+            )
+
         return sub_nodes, sub_edges
 
     except Exception as exc:
@@ -375,8 +394,9 @@ def retrieve_node(state: DialogState) -> DialogState:
     query: str    = state.get("natural_query", "").strip()
 
     top_k       = getattr(config, "graphrag_top_k",       8)
-    hop_depth   = getattr(config, "graphrag_hop_depth",   2)
+    hop_depth   = getattr(config, "graphrag_hop_depth",   1)
     min_tables  = getattr(config, "graphrag_min_tables",  top_k)
+    max_tables  = getattr(config, "graphrag_max_tables",  15)
     enabled     = getattr(config, "graphrag_enabled",     True)
     pref_backend = getattr(config, "graphrag_embedding_backend", "auto")
 
@@ -466,6 +486,23 @@ def retrieve_node(state: DialogState) -> DialogState:
         e for e in edges
         if e.get("from", "") in subgraph_ids and e.get("to", "") in subgraph_ids
     ]
+
+    # ── Cap to graphrag_max_tables to prevent token bloat from deep FK chains ─
+    if len(sub_nodes) > max_tables:
+        node_score = {cache.node_ids[i]: float(scores[i]) for i in range(len(scores))}
+        sub_nodes.sort(
+            key=lambda n: node_score.get(n.get("id", ""), 0.0), reverse=True
+        )
+        sub_nodes = sub_nodes[:max_tables]
+        kept_ids = {n.get("id", "") for n in sub_nodes}
+        sub_edges = [
+            e for e in sub_edges
+            if e.get("from", "") in kept_ids and e.get("to", "") in kept_ids
+        ]
+        logger.info(
+            "retrieve_node: capped subgraph from %d → %d tables (graphrag_max_tables=%d)",
+            len(subgraph_ids), max_tables, max_tables,
+        )
 
     logger.info(
         "retrieve_node: retrieved %d/%d tables, %d/%d edges",

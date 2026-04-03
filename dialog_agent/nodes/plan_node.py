@@ -19,8 +19,85 @@ import re
 from typing import Any, Dict, List
 
 from ..state import DialogState, SQLQuery
+from ..token_guard import guard_plan_prompt
 
 logger = logging.getLogger(__name__)
+
+# Show this many recent turns verbatim; summarize anything older.
+_MAX_VERBATIM_TURNS = 5
+
+
+def _summarize_old_turns_plan(old_turns: list, model: str) -> str:
+    """
+    Summarize older conversation turns into a compact paragraph for the plan
+    prompt, using a cheap Haiku call.  Returns empty string on failure.
+    The summary is optimised for SQL planning context: tables used, filters,
+    metrics, and references that may appear as pronouns in the new question.
+    """
+    lines = [
+        "Summarize these past Q&A exchanges into 3-5 bullet points. "
+        "Be very concise. Focus on: tables/columns queried, filters applied, "
+        "metrics computed, and any entity names that may be referenced later:\n"
+    ]
+    for turn in old_turns:
+        lines.append(f"Q{turn['turn']}: {turn['question']}")
+        if turn.get("tables_queried"):
+            lines.append(f"  Tables: {', '.join(turn['tables_queried'])}")
+        if turn.get("insights"):
+            lines.append(f"  Answer: {turn['insights'][:200]}")
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = client.messages.create(
+            model=model,
+            max_tokens=256,
+            temperature=0.0,
+            system="You summarize SQL analysis Q&A history into concise bullet points.",
+            messages=[{"role": "user", "content": "\n".join(lines)}],
+        )
+        return msg.content[0].text if msg.content else ""
+    except Exception as exc:
+        logger.warning("plan_node: history summarization failed — %s", exc)
+        return ""
+
+
+def _build_history_section_plan(history: list, model: str) -> str:
+    """
+    Build the CONVERSATION HISTORY section for the plan prompt.
+    If history exceeds MAX_VERBATIM_TURNS, older turns are summarized with Haiku.
+    """
+    if not history:
+        return ""
+
+    lines = ["CONVERSATION HISTORY (previous questions in this session — use for context only):"]
+
+    if len(history) > _MAX_VERBATIM_TURNS:
+        old_turns = history[:-3]
+        recent    = history[-3:]
+        summary   = _summarize_old_turns_plan(old_turns, model)
+        if summary:
+            lines.append(
+                f"[Summary of {len(old_turns)} earlier turn(s) — use to resolve pronouns "
+                f"and implied filters:]"
+            )
+            lines.append(summary)
+            lines.append("")
+    else:
+        recent = history
+
+    for turn in recent:
+        lines.append(f"Q{turn['turn']}: {turn['question']}")
+        if turn.get("tables_queried"):
+            lines.append(f"  Tables used: {', '.join(turn['tables_queried'])}")
+        if turn.get("insights"):
+            lines.append(f"  Answer summary: {turn['insights'][:300]}")
+
+    lines.append(
+        "Use this history to resolve pronouns (e.g. 'it', 'that', 'those'), "
+        "implied filters (e.g. 'same service line'), or comparisons to previous results. "
+        "Do NOT reproduce previous SQL — generate fresh SQL for the new question."
+    )
+    return "\n".join(lines) + "\n"
 
 def _build_dialect_rules(db_type: str) -> str:
     """Return database-specific SQL syntax rules injected into the system prompt."""
@@ -954,24 +1031,10 @@ def plan_node(state: DialogState) -> DialogState:
         else "TARGET SCHEMA: (none — use bare table names WITHOUT any schema prefix)"
     )
 
-    # Build conversation history section (last 5 turns, oldest first)
-    history = state.get("conversation_history") or []
-    if history:
-        lines = ["CONVERSATION HISTORY (previous questions in this session — use for context only):"]
-        for turn in history:
-            lines.append(f"Q{turn['turn']}: {turn['question']}")
-            if turn.get("tables_queried"):
-                lines.append(f"  Tables used: {', '.join(turn['tables_queried'])}")
-            if turn.get("insights"):
-                lines.append(f"  Answer summary: {turn['insights'][:300]}")
-        lines.append(
-            "Use this history to resolve pronouns (e.g. 'it', 'that', 'those'), "
-            "implied filters (e.g. 'same service line'), or comparisons to previous results. "
-            "Do NOT reproduce previous SQL — generate fresh SQL for the new question."
-        )
-        history_section = "\n".join(lines) + "\n"
-    else:
-        history_section = ""
+    # Build conversation history section (with summarization for long sessions)
+    history          = state.get("conversation_history") or []
+    haiku_model      = getattr(config, "plan_llm_model", "claude-haiku-4-5-20251001")
+    history_section  = _build_history_section_plan(history, haiku_model)
 
     # Build multi-KG section if applicable
     active_kg_ids = state.get("active_kg_ids") or []
@@ -1059,6 +1122,9 @@ def plan_node(state: DialogState) -> DialogState:
         resolution_section=resolution_section,
         natural_query=natural_query,
     )
+
+    # Token guard: trim schema_context if total prompt exceeds 180k token budget.
+    system, user = guard_plan_prompt(system, user, schema_context)
 
     try:
         raw = _call_llm(system, user, config.plan_llm_model, config.llm_temperature)

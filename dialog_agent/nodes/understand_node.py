@@ -27,10 +27,11 @@ logger = logging.getLogger(__name__)
 _FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
 
 # Max distinct sample values for high-cardinality columns (IDs, free text)
-_SAMPLE_LIMIT = 8
+_SAMPLE_LIMIT = 5
 # Categorical columns (low distinct count) get more samples so the LLM can
 # resolve synonym mismatches between user terminology and data labels.
-_SAMPLE_LIMIT_CATEGORICAL = 20
+# Reduced from 20 → 8 to keep token usage manageable.
+_SAMPLE_LIMIT_CATEGORICAL = 8
 # Threshold: columns with <= this many distinct values are treated as categorical
 _CATEGORICAL_DISTINCT_MAX = 50
 # Only sample columns whose distinct count is <= this (to skip IDs/timestamps)

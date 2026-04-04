@@ -19,6 +19,10 @@ def discovery_node(state: AgentState) -> AgentState:
     config = state["agent_config"]
     connector = state["connector"]
     schema = config.db_config.schema or config.db_config.database or ""
+    cb = getattr(config, "progress_callback", None)
+
+    if cb:
+        cb("discover", "running", f"Querying information_schema for tables in schema '{schema}'…", "")
 
     try:
         all_tables = connector.list_tables(schema)
@@ -34,14 +38,24 @@ def discovery_node(state: AgentState) -> AgentState:
 
         if not all_tables:
             state["errors"].append(f"No tables found in schema '{schema}'.")
+            if cb:
+                cb("discover", "error", f"No tables found in schema '{schema}'", "")
             state["phase"] = "error"
             return state
+
+        table_list = ", ".join(t for _, t in all_tables[:15]) + ("…" if len(all_tables) > 15 else "")
+        if cb:
+            cb("discover", "done",
+               f"Discovered {len(all_tables)} table{'s' if len(all_tables) != 1 else ''} in '{schema}'",
+               table_list)
 
         state["all_tables"] = all_tables
         state["phase"] = "discovered"
     except Exception as exc:
         err = f"Discovery failed: {exc}"
         logger.error(err)
+        if cb:
+            cb("discover", "error", err, "")
         state["errors"].append(err)
         state["phase"] = "error"
 

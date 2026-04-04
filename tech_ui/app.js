@@ -239,28 +239,47 @@ function startSSE(sourceId) {
   };
 }
 
+// Step → display label + colour class
+const _STEP_META = {
+  // coarse orchestrator steps
+  extract:           { label: 'EXTRACT',     cls: 'extract' },
+  ontology:          { label: 'ONTOLOGY',    cls: 'ontology' },
+  kg:                { label: 'KG',          cls: 'kg' },
+  taxonomy:          { label: 'TAXONOMY',    cls: 'taxonomy' },
+  complete:          { label: 'COMPLETE',    cls: 'complete' },
+  // fine-grained pipeline steps
+  discover:          { label: 'DISCOVER',    cls: 'discover' },
+  'extract:table':   { label: '  ↳ table',   cls: 'sub' },
+  fd:                { label: 'FD',          cls: 'fd' },
+  'fd:table':        { label: '  ↳ fd',      cls: 'sub' },
+  ind:               { label: 'IND',         cls: 'ind' },
+  'ind:pair':        { label: '  ↳ ind',     cls: 'sub' },
+  cardinality:       { label: 'CARDINALITY', cls: 'cardinality' },
+  'cardinality:pair':{ label: '  ↳ card',    cls: 'sub' },
+  error:             { label: 'ERROR',       cls: 'error' },
+};
+
 function appendEvent(ev) {
   const log = document.getElementById('event-log');
   const empty = log.querySelector('.empty-state');
   if (empty) empty.remove();
 
-  const stepLabel = ev.step || ev.stage || ev.type || 'info';
-  const stageMap  = { extract:'extract', ontology:'ontology', kg:'kg', taxonomy:'taxonomy',
-                       complete:'complete', error:'error' };
-  const stageClass = stageMap[stepLabel] || 'info';
+  const stepKey  = ev.step || ev.stage || ev.type || 'info';
+  const meta     = _STEP_META[stepKey] || { label: stepKey.toUpperCase(), cls: 'info' };
+  const isSub    = stepKey.includes(':');
 
-  // Status badge: running → spinner, done → ✓, error → ✗, warn → ⚠
+  // Status badge
   const statusIcon = { running:'⟳', done:'✓', error:'✗', warn:'⚠' }[ev.status] || '';
   const statusCls  = { running:'ev-running', done:'ev-done', error:'ev-error', warn:'ev-warn' }[ev.status] || '';
 
   const row = document.createElement('div');
-  row.className = 'event-row';
+  row.className = 'event-row' + (isSub ? ' event-row-sub' : '');
   row.innerHTML = `
     <span class="ev-time">${new Date().toLocaleTimeString()}</span>
-    <span class="ev-stage ${stageClass}">${_esc(stepLabel)}</span>
+    <span class="ev-stage ${meta.cls}">${_esc(meta.label)}</span>
     ${statusIcon ? `<span class="ev-status ${statusCls}">${statusIcon}</span>` : ''}
     <span class="ev-msg">${_esc(ev.message || '')}</span>
-    ${ev.detail ? `<span class="ev-detail">${_esc(ev.detail)}</span>` : ''}
+    ${ev.detail ? `<div class="ev-detail">${_esc(ev.detail)}</div>` : ''}
   `;
   log.appendChild(row);
   log.scrollTop = log.scrollHeight;

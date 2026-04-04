@@ -200,15 +200,26 @@ def _infer_table_description(
 def extraction_node(state: AgentState) -> AgentState:
     config = state["agent_config"]
     connector = state["connector"]
+    cb = getattr(config, "progress_callback", None)
 
     schema_tool = SchemaExtractorTool(connector=connector)
     meta_tool = MetadataCollectorTool(connector=connector)
 
-    for schema_name, table_name in state["all_tables"]:
+    total = len(state["all_tables"])
+    if cb:
+        cb("extract", "running",
+           f"Extracting schema + column statistics for {total} table{'s' if total != 1 else ''}…",
+           "Algorithm: column type inference, cardinality sampling, null-rate scan, top-value frequency")
+
+    for idx, (schema_name, table_name) in enumerate(state["all_tables"], 1):
         if table_name in state["tables_done"]:
             continue
 
         logger.info("Extracting metadata for %s.%s …", schema_name, table_name)
+        if cb:
+            cb("extract:table", "running",
+               f"[{idx}/{total}] {schema_name}.{table_name}",
+               "Fetching columns, PKs, FKs, indexes; sampling row stats")
         try:
             # --- Schema extraction ---
             schema_json = schema_tool._run(schema_name, table_name)
@@ -290,16 +301,28 @@ def extraction_node(state: AgentState) -> AgentState:
 
             state["table_metadata"][table_name] = table_meta
             state["tables_done"].add(table_name)
-            logger.info(
-                "  → %d columns, %s rows",
-                len(col_metas),
-                f"{table_meta.row_count:,}" if table_meta.row_count else "unknown",
-            )
+            row_str = f"{table_meta.row_count:,}" if table_meta.row_count else "?"
+            logger.info("  → %d columns, %s rows", len(col_metas), row_str)
+            if cb:
+                pk_str = f"PK: {', '.join(pks)}" if pks else "no PK"
+                fk_str = f"{len(fks)} FK{'s' if len(fks) != 1 else ''}" if fks else ""
+                detail = f"{len(col_metas)} cols · {row_str} rows · {pk_str}" + (f" · {fk_str}" if fk_str else "")
+                cb("extract:table", "done",
+                   f"[{idx}/{total}] {schema_name}.{table_name}",
+                   detail)
 
         except Exception as exc:
             err = f"Extraction failed for {schema_name}.{table_name}: {exc}"
             logger.error(err)
+            if cb:
+                cb("extract:table", "error", f"[{idx}/{total}] {schema_name}.{table_name}", str(exc))
             state["errors"].append(err)
+
+    done_count = len(state["tables_done"])
+    if cb:
+        cb("extract", "done",
+           f"Schema extraction complete — {done_count} table{'s' if done_count != 1 else ''} profiled",
+           "Domain labels assigned (identifier, monetary, date_time, status_flag, …)")
 
     state["phase"] = "extracted"
     return state

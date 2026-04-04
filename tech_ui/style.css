@@ -284,18 +284,44 @@ body {
 .source-card .src-icon { margin-top: 2px; }
 
 .event-log { font-family: var(--font-mono); font-size: 11px; padding: 12px; overflow-y: auto; flex: 1; }
-.event-row { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; }
-.event-row .ev-time { color: var(--text-2); white-space: nowrap; }
-.event-row .ev-stage { padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 700; text-transform: uppercase; min-width: 72px; text-align: center; }
-.ev-stage.extract  { background: rgba(88,166,255,0.2);  color: var(--blue); }
-.ev-stage.ontology { background: rgba(188,140,255,0.2); color: var(--purple); }
-.ev-stage.kg       { background: rgba(57,197,207,0.2);  color: var(--cyan); }
-.ev-stage.taxonomy { background: rgba(63,185,80,0.2);   color: var(--green); }
-.ev-stage.complete { background: rgba(63,185,80,0.2);   color: var(--green); }
-.ev-stage.error    { background: rgba(248,81,73,0.2);   color: var(--red); }
-.ev-stage.info     { background: rgba(139,148,158,0.2); color: var(--text-1); }
-.event-row .ev-msg    { color: var(--text-0); flex: 1; }
-.event-row .ev-detail { color: var(--text-2); font-size: 10px; }
+.event-row {
+  display: flex; flex-wrap: wrap; gap: 6px 10px;
+  align-items: baseline; margin-bottom: 5px;
+  padding: 3px 0;
+}
+.event-row-sub {
+  margin-left: 16px;
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+  opacity: 0.85;
+}
+.event-row .ev-time { color: var(--text-2); white-space: nowrap; font-size: 10px; }
+.event-row .ev-stage {
+  padding: 1px 6px; border-radius: 3px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.03em;
+  min-width: 82px; text-align: center; white-space: nowrap;
+}
+/* coarse steps */
+.ev-stage.extract    { background: rgba(88,166,255,0.2);  color: var(--blue); }
+.ev-stage.ontology   { background: rgba(188,140,255,0.2); color: var(--purple); }
+.ev-stage.kg         { background: rgba(57,197,207,0.2);  color: var(--cyan); }
+.ev-stage.taxonomy   { background: rgba(63,185,80,0.2);   color: var(--green); }
+.ev-stage.complete   { background: rgba(63,185,80,0.2);   color: var(--green); }
+.ev-stage.error      { background: rgba(248,81,73,0.2);   color: var(--red); }
+.ev-stage.info       { background: rgba(139,148,158,0.2); color: var(--text-1); }
+/* fine-grained steps */
+.ev-stage.discover   { background: rgba(88,166,255,0.15); color: #79c0ff; }
+.ev-stage.fd         { background: rgba(245,158,11,0.2);  color: var(--accent); }
+.ev-stage.ind        { background: rgba(255,166,87,0.2);  color: var(--orange); }
+.ev-stage.cardinality{ background: rgba(57,197,207,0.15); color: var(--cyan); }
+.ev-stage.sub        { background: rgba(139,148,158,0.1); color: var(--text-2); font-weight: 400; }
+/* message + detail */
+.event-row .ev-msg    { color: var(--text-0); flex: 1; min-width: 0; font-size: 12px; }
+.event-row .ev-detail {
+  width: 100%; margin-left: calc(82px + 10px + 14px + 10px + 10px + 48px);
+  color: var(--text-2); font-size: 10px; font-family: var(--font-mono);
+  white-space: pre-wrap; line-height: 1.4;
+}
 .event-row .ev-status { font-size: 11px; font-weight: 700; min-width: 14px; text-align: center; }
 .ev-status.ev-running { color: var(--accent); }
 .ev-status.ev-done    { color: var(--green); }

@@ -899,10 +899,32 @@ async def _index_source(source_id: str) -> None:
         src["extract_job_id"] = extract_job_id
         report = None
         deadline = time.time() + 600
+        _events_seen = 0   # track how many fine-grained events we've forwarded
         async with httpx.AsyncClient(timeout=30.0) as client:
             while time.time() < deadline:
                 pr  = await client.get(f"{METADATA_API}/jobs/{extract_job_id}")
                 job = pr.json()
+
+                # ── Forward any new fine-grained events as SSE ─────────────────
+                try:
+                    er = await client.get(
+                        f"{METADATA_API}/jobs/{extract_job_id}/events",
+                        params={"since": _events_seen},
+                    )
+                    if er.status_code == 200:
+                        payload = er.json()
+                        for ev in payload.get("events", []):
+                            _push_index_event(
+                                source_id,
+                                ev.get("step", "extract"),
+                                ev.get("status", "running"),
+                                ev.get("message", ""),
+                                ev.get("detail", ""),
+                            )
+                        _events_seen += len(payload.get("events", []))
+                except Exception:
+                    pass  # non-fatal — coarse events still flow
+
                 if job.get("status") == "done":
                     rr = await client.get(f"{METADATA_API}/jobs/{extract_job_id}/report")
                     report = rr.json()

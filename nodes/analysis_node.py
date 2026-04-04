@@ -70,6 +70,7 @@ def analysis_node(state: AgentState) -> AgentState:
     config = state["agent_config"]
     connector = state["connector"]
     table_metadata: Dict[str, TableMeta] = state["table_metadata"]
+    cb = getattr(config, "progress_callback", None)
 
     if not table_metadata:
         state["phase"] = "analysed"
@@ -79,12 +80,26 @@ def analysis_node(state: AgentState) -> AgentState:
     id_tool  = InclusionDependencyTool(connector=connector)
     car_tool = CardinalityAnalyzerTool(connector=connector)
 
+    table_names = list(table_metadata.keys())
+    n_tables = len(table_names)
+    n_pairs  = n_tables * (n_tables - 1) // 2
+
     # ------------------------------------------------------------------
     # 1. Functional Dependencies (per table)
     # ------------------------------------------------------------------
     logger.info("=== Functional Dependency Detection ===")
+    if cb:
+        cb("fd", "running",
+           f"Functional Dependency detection — scanning {n_tables} table{'s' if n_tables != 1 else ''}",
+           f"Algorithm: pairwise column-value comparison · threshold={config.fd_threshold:.0%} · cap={config.max_fd_column_pairs} pairs/table")
+
+    total_fds_found = 0
     for table_name, meta in table_metadata.items():
         logger.info("  FD scan: %s", table_name)
+        if cb:
+            cb("fd:table", "running",
+               f"FD scan: {table_name}",
+               f"{len(meta.columns)} columns · testing X→Y for all compatible pairs")
         result_json = fd_tool._run(
             schema_name=meta.schema_name,
             table_name=table_name,
@@ -98,9 +113,13 @@ def analysis_node(state: AgentState) -> AgentState:
         result = json.loads(result_json)
         if "error" in result:
             state["errors"].append(f"FD error [{table_name}]: {result['error']}")
+            if cb:
+                cb("fd:table", "error", f"FD scan: {table_name}", result["error"])
             continue
 
-        for fd in result.get("functional_dependencies", []):
+        fds_this = result.get("functional_dependencies", [])
+        tested   = result.get("candidates_tested", 0)
+        for fd in fds_this:
             state["func_deps"].append(
                 FunctionalDependency(
                     table_name=table_name,
@@ -112,25 +131,45 @@ def analysis_node(state: AgentState) -> AgentState:
                     description=fd.get("description"),
                 )
             )
-        logger.info(
-            "    → %d FDs found (%d pairs tested)",
-            len(result.get("functional_dependencies", [])),
-            result.get("candidates_tested", 0),
-        )
+        total_fds_found += len(fds_this)
+        logger.info("    → %d FDs found (%d pairs tested)", len(fds_this), tested)
+        if cb:
+            if fds_this:
+                fd_examples = "; ".join(
+                    f"({', '.join(f['determinant'])}) → ({', '.join(f['dependent'])}) [{f['confidence']:.0%}]"
+                    for f in fds_this[:3]
+                ) + (" …" if len(fds_this) > 3 else "")
+            else:
+                fd_examples = "no FDs detected"
+            cb("fd:table", "done",
+               f"FD scan: {table_name} — {len(fds_this)} FD{'s' if len(fds_this) != 1 else ''} ({tested} pairs tested)",
+               fd_examples)
+
+    if cb:
+        cb("fd", "done",
+           f"Functional Dependencies complete — {total_fds_found} FD{'s' if total_fds_found != 1 else ''} across {n_tables} tables",
+           "Types: primary_key · candidate_key · partial_key · non_key · transitively_implied")
 
     # ------------------------------------------------------------------
     # 2. Inclusion Dependencies (ordered table pairs)
     # ------------------------------------------------------------------
     logger.info("=== Inclusion Dependency Detection ===")
-    table_names = list(table_metadata.keys())
+    if cb:
+        cb("ind", "running",
+           f"Inclusion Dependency detection — {n_pairs} table pair{'s' if n_pairs != 1 else ''} to scan",
+           f"Algorithm: value-set containment test · threshold={config.id_threshold:.0%} · cap={config.max_id_column_pairs} col-pairs total")
+
     pair_count = 0
     total_col_pairs_tested = 0
 
     for left_name, right_name in itertools.combinations(table_names, 2):
-        # Break when the column-pair budget is exhausted
         if total_col_pairs_tested >= config.max_id_column_pairs:
             logger.info("  IND scan: column-pair budget (%d) reached, stopping.",
                         config.max_id_column_pairs)
+            if cb:
+                cb("ind", "warn",
+                   f"IND budget reached ({config.max_id_column_pairs} col-pairs) — remaining pairs skipped",
+                   "Increase max_id_column_pairs in config to scan more pairs")
             break
         left_meta  = table_metadata[left_name]
         right_meta = table_metadata[right_name]
@@ -140,6 +179,10 @@ def analysis_node(state: AgentState) -> AgentState:
 
         logger.info("  IND scan: %s → %s (budget remaining: %d col pairs)",
                     left_name, right_name, remaining)
+        if cb:
+            cb("ind:pair", "running",
+               f"IND: {left_name} ⊆ {right_name}",
+               f"Testing value-set containment across compatible column pairs")
         result_json = id_tool._run(
             schema_name=left_meta.schema_name,
             left_table=left_name,
@@ -153,15 +196,16 @@ def analysis_node(state: AgentState) -> AgentState:
         result = json.loads(result_json)
         if "error" in result:
             state["errors"].append(f"IND error [{left_name}→{right_name}]: {result['error']}")
-            # Still charge against budget to avoid retrying broken pairs endlessly
+            if cb:
+                cb("ind:pair", "error", f"IND: {left_name} ⊆ {right_name}", result["error"])
             total_col_pairs_tested += max_pairs_this_run
             continue
 
-        # Track seen INDs to avoid duplicates (bidirectional check may produce both directions)
         existing_ind_keys = {
             (d.left_table, tuple(d.left_columns), d.right_table, tuple(d.right_columns))
             for d in state["incl_deps"]
         }
+        new_inds = []
         for ind in result.get("inclusion_dependencies", []):
             lt = ind.get("left_table", left_name)
             rt = ind.get("right_table", right_name)
@@ -183,33 +227,51 @@ def analysis_node(state: AgentState) -> AgentState:
                     description=ind.get("description"),
                 )
             )
+            new_inds.append(ind)
         total_col_pairs_tested += result.get("pairs_tested", max_pairs_this_run)
         pair_count += 1
+        if cb:
+            if new_inds:
+                ind_examples = "; ".join(
+                    f"{i['left_columns']} ⊆ {i['right_columns']} [{i['coverage']:.0%}{'  FK-candidate' if i.get('is_foreign_key_candidate') else ''}]"
+                    for i in new_inds[:3]
+                ) + (" …" if len(new_inds) > 3 else "")
+            else:
+                ind_examples = "no INDs detected"
+            cb("ind:pair", "done",
+               f"IND: {left_name} ⊆ {right_name} — {len(new_inds)} inclusion dep{'s' if len(new_inds) != 1 else ''}",
+               ind_examples)
 
-    logger.info(
-        "Total INDs found: %d (across %d ordered pairs, %d column pairs tested)",
-        len(state["incl_deps"]),
-        pair_count,
-        total_col_pairs_tested,
-    )
+    total_inds = len(state["incl_deps"])
+    logger.info("Total INDs found: %d (across %d ordered pairs, %d column pairs tested)",
+                total_inds, pair_count, total_col_pairs_tested)
+    if cb:
+        fk_count = sum(1 for d in state["incl_deps"] if d.is_foreign_key_candidate)
+        cb("ind", "done",
+           f"Inclusion Dependencies complete — {total_inds} IND{'s' if total_inds != 1 else ''} ({fk_count} FK candidates)",
+           f"Types: exact_foreign_key · strong_fk_candidate · partial_inclusion · value_subset")
 
     # ------------------------------------------------------------------
     # 3. Cardinality Analysis (unordered table pairs, capped)
     # ------------------------------------------------------------------
     logger.info("=== Cardinality Analysis ===")
-    # Cap at max_fd_column_pairs to avoid O(n²) full-table scans on large schemas
     cardinality_cap = min(config.max_fd_column_pairs, 200)
+    if cb:
+        cb("cardinality", "running",
+           f"Cardinality analysis — {n_pairs} table pair{'s' if n_pairs != 1 else ''} (cap {cardinality_cap})",
+           "Algorithm: join-column uniqueness ratio — determines 1:1, 1:N, N:1, M:N relationships")
     cardinality_pair_count = 0
 
     for left_name, right_name in itertools.combinations(table_names, 2):
         if cardinality_pair_count >= cardinality_cap:
             logger.info("  Cardinality: pair cap (%d) reached, stopping.", cardinality_cap)
+            if cb:
+                cb("cardinality", "warn",
+                   f"Cardinality cap ({cardinality_cap} pairs) reached — remaining pairs skipped", "")
             break
 
         left_meta  = table_metadata[left_name]
         right_meta = table_metadata[right_name]
-
-        # Collect all FK hints for both tables
         all_fks = left_meta.foreign_keys + right_meta.foreign_keys
 
         logger.info("  Cardinality: %s ↔ %s", left_name, right_name)
@@ -227,7 +289,8 @@ def analysis_node(state: AgentState) -> AgentState:
             cardinality_pair_count += 1
             continue
 
-        for cr in result.get("cardinality_results", []):
+        new_cards = result.get("cardinality_results", [])
+        for cr in new_cards:
             state["cardinalities"].append(
                 CardinalityRelationship(
                     left_table=left_name,
@@ -238,10 +301,22 @@ def analysis_node(state: AgentState) -> AgentState:
                     right_unique=cr.get("right_unique_values", 0),
                 )
             )
+        if new_cards and cb:
+            rel_str = ", ".join(
+                f"{left_name} {c['relationship_type']} {right_name} on ({', '.join(c['join_columns'])})"
+                for c in new_cards[:2]
+            )
+            cb("cardinality:pair", "done",
+               f"Cardinality: {left_name} ↔ {right_name}",
+               rel_str)
         cardinality_pair_count += 1
 
-    logger.info("Total cardinality relationships: %d (across %d pairs)",
-                len(state["cardinalities"]), cardinality_pair_count)
+    total_cards = len(state["cardinalities"])
+    logger.info("Total cardinality relationships: %d (across %d pairs)", total_cards, cardinality_pair_count)
+    if cb:
+        cb("cardinality", "done",
+           f"Cardinality analysis complete — {total_cards} relationship{'s' if total_cards != 1 else ''} mapped",
+           "Relationship types: 1:1 · 1:N · N:1 · M:N")
 
     state["phase"] = "analysed"
     return state

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 class DBType(str, Enum):
@@ -57,3 +57,5 @@ class AgentConfig:
     llm_model: str = "claude-haiku-4-5-20251001"
     llm_temperature: float = 0.0
     output_path: Optional[str] = None       # where to write JSON report
+    # Optional callback(step, status, message, detail) for fine-grained progress
+    progress_callback: Optional[Callable[[str, str, str, str], None]] = None

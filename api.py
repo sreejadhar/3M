@@ -69,6 +69,9 @@ def _save_history(history: List[Dict]) -> None:
 _jobs: Dict[str, Dict] = {}
 _lock = threading.Lock()
 
+# Fine-grained progress events per job: job_id → list of event dicts
+_job_events: Dict[str, List[Dict]] = {}
+
 PIPELINE_NODES = ["connection", "discovery", "extraction", "analysis", "report"]
 
 
@@ -115,6 +118,16 @@ class AskRequest(BaseModel):
 def _run_extraction(job_id: str, agent_cfg: AgentConfig, db_type: str, db_info: Dict) -> None:
     with _lock:
         _jobs[job_id]["status"] = "running"
+        _job_events[job_id] = []
+
+    # Progress callback — appends fine-grained events to _job_events[job_id]
+    def _progress(step: str, status: str, message: str, detail: str) -> None:
+        event = {"step": step, "status": status, "message": message,
+                 "detail": detail, "ts": time.time()}
+        with _lock:
+            _job_events.setdefault(job_id, []).append(event)
+
+    agent_cfg.progress_callback = _progress
 
     completed: List[str] = []
     try:
@@ -586,6 +599,19 @@ def get_job_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return {k: v for k, v in job.items()}   # no large report body
+
+
+@app.get("/jobs/{job_id}/events")
+def get_job_events(job_id: str, since: int = 0):
+    """
+    Return fine-grained progress events for a running or completed job.
+    Pass `since=N` to fetch only events after index N (for incremental polling).
+    """
+    with _lock:
+        if job_id not in _jobs:
+            raise HTTPException(status_code=404, detail="Job not found")
+        events = list(_job_events.get(job_id, []))
+    return {"events": events[since:], "total": len(events)}
 
 
 @app.get("/jobs/{job_id}/report")

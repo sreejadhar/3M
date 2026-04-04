@@ -20,6 +20,39 @@ def _safe_name(name: str) -> str:
     return name or "sheet"
 
 
+def _detect_header_row(xl, sheet: str, scan_rows: int = 10) -> int:
+    """
+    Find the first row that looks like a real header.
+
+    Many Excel files have a title/subtitle in rows 0-1 before the actual
+    column names.  pandas' default header=0 then names all but the first
+    column 'Unnamed: N'.
+
+    Strategy: read the first `scan_rows` rows without a header, count how
+    many non-null, non-empty cells each row has, and return the index of the
+    first row whose count equals the maximum across all scanned rows.
+    That row is almost always the real header.
+    """
+    import pandas as pd
+    preview = xl.parse(sheet, header=None, nrows=scan_rows)
+    if preview.empty:
+        return 0
+
+    def _nonempty(row):
+        return sum(1 for v in row if str(v).strip() not in ("", "nan", "None"))
+
+    counts = [_nonempty(preview.iloc[i]) for i in range(len(preview))]
+    max_count = max(counts) if counts else 0
+    if max_count == 0:
+        return 0
+
+    # Return the FIRST row that reaches the maximum density
+    for idx, cnt in enumerate(counts):
+        if cnt == max_count:
+            return idx
+    return 0
+
+
 class ExcelConnector(BaseConnector):
     def __init__(self, config: DBConfig):
         self._config = config
@@ -61,7 +94,13 @@ class ExcelConnector(BaseConnector):
                 used_sheets[base] = 1
                 safe = base
             try:
-                df = xl.parse(sheet)
+                header_row = _detect_header_row(xl, sheet)
+                if header_row != 0:
+                    _log.info(
+                        "ExcelConnector: sheet %r — header detected at row %d (skipping title rows)",
+                        sheet, header_row,
+                    )
+                df = xl.parse(sheet, header=header_row)
 
                 # Deduplicate column names after sanitisation
                 # (two columns that map to the same safe name crash df.to_sql)

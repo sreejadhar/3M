@@ -1,14 +1,16 @@
 """
-token_guard — Estimate token counts and enforce budget limits before LLM calls.
+token_guard — Exact token counting and budget enforcement before LLM calls.
 
-Approximation: 1 token ≈ 4 characters (conservative for English/SQL text).
-Hard budget:   180,000 input tokens (20k buffer under Claude's 200k limit).
+Primary:  Anthropic count_tokens API (exact, no LLM cost).
+Fallback: Conservative char-based estimate at 2.5 chars/token (schema/SQL
+          content is denser than prose — the old 4 chars/token was too loose
+          and allowed prompts over 200k through).
+
+Hard budget: 185,000 input tokens (15k buffer under Claude's 200k limit).
 
 Usage:
-    from .token_guard import guard_plan_prompt, guard_synth_prompt, estimate_tokens
-
     # In plan_node:
-    system, user = guard_plan_prompt(system, user, schema_context)
+    system, user = guard_plan_prompt(system, user, schema_context, model)
 
     # In synthesize_node:
     results_text, history_section = guard_synth_sections(
@@ -18,18 +20,49 @@ Usage:
 from __future__ import annotations
 
 import logging
-from typing import Tuple
+import os
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-_CHARS_PER_TOKEN: int = 4
-_MAX_INPUT_TOKENS: int = 180_000
-_MAX_INPUT_CHARS: int = _MAX_INPUT_TOKENS * _CHARS_PER_TOKEN  # 720,000 chars
+# ── Constants ─────────────────────────────────────────────────────────────────
+# Conservative chars-per-token for schema/SQL content (prose is ~4, SQL ~2-3).
+_CHARS_PER_TOKEN: float = 2.5
+
+# Token budget: 15k below the hard 200k limit.
+_MAX_INPUT_TOKENS: int = 185_000
+
+# Char-based threshold (used when count_tokens API is unavailable).
+_MAX_INPUT_CHARS: int = int(_MAX_INPUT_TOKENS * _CHARS_PER_TOKEN)  # ≈ 462,500
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token estimate: 1 token per 4 characters of text."""
-    return max(1, len(text) // _CHARS_PER_TOKEN)
+    """Conservative token estimate: 1 token per 2.5 characters."""
+    return max(1, int(len(text) / _CHARS_PER_TOKEN))
+
+
+def _count_tokens_exact(
+    system: str,
+    user: str,
+    model: str,
+) -> Optional[int]:
+    """
+    Call Anthropic's count_tokens API to get the exact input token count.
+    Returns None on any failure (network error, old SDK version, etc.) so
+    the caller can fall back to the char-based estimate.
+    """
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        resp = client.messages.count_tokens(
+            model=model,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        return resp.input_tokens
+    except Exception as exc:
+        logger.debug("token_guard: count_tokens API unavailable (%s) — using char estimate", exc)
+        return None
 
 
 def _trim_section(text: str, budget_chars: int, label: str) -> str:
@@ -37,10 +70,10 @@ def _trim_section(text: str, budget_chars: int, label: str) -> str:
     if len(text) <= budget_chars:
         return text
     trimmed = text[:budget_chars]
-    saved_tokens = (len(text) - budget_chars) // _CHARS_PER_TOKEN
     logger.warning(
-        "token_guard: %s trimmed %d → %d chars (~%d tokens saved)",
-        label, len(text), budget_chars, saved_tokens,
+        "token_guard: %s trimmed %d → %d chars (~%d tokens removed)",
+        label, len(text), budget_chars,
+        int((len(text) - budget_chars) / _CHARS_PER_TOKEN),
     )
     return trimmed + "\n\n... [content truncated to stay within token budget]"
 
@@ -49,29 +82,61 @@ def guard_plan_prompt(
     system: str,
     user: str,
     schema_context: str,
+    model: str = "claude-haiku-4-5-20251001",
 ) -> Tuple[str, str]:
     """
-    Enforce token budget for plan_node prompts.
+    Enforce the token budget for plan_node prompts.
 
-    If total chars exceed budget, trim schema_context in the user prompt.
-    schema_context must be the exact substring that appears in user (it is
-    formatted in via _USER_PROMPT.format(schema_context=...) so this is safe).
+    Uses count_tokens API for exact counting when available; falls back to
+    conservative char estimate.  Trims schema_context in the user string when
+    the prompt is over budget.
+
+    schema_context must be the exact substring present in user — it is
+    formatted in via _USER_PROMPT.format(schema_context=...) so str.replace
+    finds it unambiguously.
 
     Returns (system, user) with schema trimmed if needed.
     """
-    total = len(system) + len(user)
-    if total <= _MAX_INPUT_CHARS:
+    # ── Exact count (preferred) ───────────────────────────────────────────────
+    actual_tokens = _count_tokens_exact(system, user, model)
+
+    if actual_tokens is not None:
+        if actual_tokens <= _MAX_INPUT_TOKENS:
+            logger.debug("token_guard: plan prompt OK — %d tokens", actual_tokens)
+            return system, user
+
+        # Calculate how many chars to remove from schema_context.
+        # Use the observed chars-per-token ratio for precision.
+        total_chars = len(system) + len(user)
+        observed_cpt = total_chars / actual_tokens          # actual ratio for this prompt
+        excess_tokens = actual_tokens - _MAX_INPUT_TOKENS
+        remove_chars  = int(excess_tokens * observed_cpt * 1.1)   # +10% safety margin
+        new_schema_len = max(len(schema_context) - remove_chars, 10_000)
+
+        trimmed_schema = _trim_section(schema_context, new_schema_len, "schema_context")
+        user = user.replace(schema_context, trimmed_schema, 1)
+
+        logger.warning(
+            "token_guard: plan prompt trimmed — was %d tokens (limit %d), "
+            "schema %d → %d chars",
+            actual_tokens, _MAX_INPUT_TOKENS, len(schema_context), new_schema_len,
+        )
         return system, user
 
-    # Budget left after all other content is preserved
-    other_chars = total - len(schema_context)
+    # ── Char-based fallback ───────────────────────────────────────────────────
+    total_chars = len(system) + len(user)
+    if total_chars <= _MAX_INPUT_CHARS:
+        return system, user
+
+    other_chars   = total_chars - len(schema_context)
     schema_budget = max(_MAX_INPUT_CHARS - other_chars, 10_000)
     trimmed_schema = _trim_section(schema_context, schema_budget, "schema_context")
     user = user.replace(schema_context, trimmed_schema, 1)
 
     logger.warning(
-        "token_guard: plan prompt over budget — was %d chars (~%dk tokens), schema trimmed",
-        total, total // _CHARS_PER_TOKEN // 1000,
+        "token_guard: plan prompt over budget (char fallback) — was %d chars (~%dk tokens), "
+        "schema trimmed",
+        total_chars, int(total_chars / _CHARS_PER_TOKEN / 1000),
     )
     return system, user
 
@@ -83,26 +148,26 @@ def guard_synth_sections(
     base_chars: int,
 ) -> Tuple[str, str]:
     """
-    Enforce token budget for synthesize_node by trimming results_text and
+    Enforce the token budget for synthesize_node by trimming results_text and
     history_section *before* they are formatted into the user prompt.
 
-    base_chars: chars already committed (system + question + static template text).
+    base_chars: chars already committed (system + question + static template).
+    Uses char-based estimate (count_tokens requires the fully assembled prompt).
     Returns (results_text, history_section) possibly trimmed.
     """
     total = base_chars + len(results_text) + len(history_section)
     if total <= _MAX_INPUT_CHARS:
         return results_text, history_section
 
-    # Step 1: trim results first (most content)
+    # Step 1: trim results first (largest section)
     results_budget = max(_MAX_INPUT_CHARS - base_chars - len(history_section), 5_000)
     results_text = _trim_section(results_text, results_budget, "results_text")
 
-    # Re-check
     total = base_chars + len(results_text) + len(history_section)
     if total <= _MAX_INPUT_CHARS:
         logger.warning(
-            "token_guard: synth prompt trimmed results only (~%dk tokens total)",
-            total // _CHARS_PER_TOKEN // 1000,
+            "token_guard: synth prompt trimmed results (~%dk tokens estimated)",
+            int(total / _CHARS_PER_TOKEN / 1000),
         )
         return results_text, history_section
 
@@ -111,7 +176,7 @@ def guard_synth_sections(
     history_section = _trim_section(history_section, history_budget, "history_section")
 
     logger.warning(
-        "token_guard: synth prompt trimmed results + history (~%dk tokens total)",
-        (base_chars + len(results_text) + len(history_section)) // _CHARS_PER_TOKEN // 1000,
+        "token_guard: synth prompt trimmed results + history (~%dk tokens estimated)",
+        int((base_chars + len(results_text) + len(history_section)) / _CHARS_PER_TOKEN / 1000),
     )
     return results_text, history_section

@@ -1124,7 +1124,7 @@ def plan_node(state: DialogState) -> DialogState:
     )
 
     # Token guard: trim schema_context if total prompt exceeds 180k token budget.
-    system, user = guard_plan_prompt(system, user, schema_context)
+    system, user = guard_plan_prompt(system, user, schema_context, model=config.plan_llm_model)
 
     try:
         raw = _call_llm(system, user, config.plan_llm_model, config.llm_temperature)

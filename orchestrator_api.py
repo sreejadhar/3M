@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -2570,3 +2570,43 @@ async def access_check(user_id: str, source_id: Optional[str] = None, action: Op
         result["can_perform"] = _ac.can_perform(user_id, action)
         result["allowed"]     = result.get("allowed", True) and result["can_perform"]
     return result
+
+
+# ── /api/* compatibility shim ─────────────────────────────────────────────────
+# Older versions of tech_ui_server.py forwarded /api/{path} directly to the
+# orchestrator (i.e. GET http://chat-ui:8005/api/sources).  The real routes
+# live at the root (GET /sources, etc.).  This catch-all rewrites the path so
+# both old and new proxy versions work without a container rebuild.
+
+from fastapi.responses import Response as _Response
+
+_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+}
+
+
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def api_compat_shim(request: Request, path: str):
+    """Forward /api/{path}?… → /{path}?… within the same ASGI app."""
+    body = await request.body()
+    qs   = f"?{request.url.query}" if request.url.query else ""
+    fwd_headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in _HOP_HEADERS and k.lower() != "host"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://internal"
+    ) as client:
+        resp = await client.request(
+            method=request.method,
+            url=f"http://internal/{path}{qs}",
+            headers=fwd_headers,
+            content=body,
+        )
+    resp_headers = {k: v for k, v in resp.headers.items()
+                    if k.lower() not in _HOP_HEADERS}
+    return _Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=resp_headers,
+        media_type=resp.headers.get("content-type"),
+    )

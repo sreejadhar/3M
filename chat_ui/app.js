@@ -442,8 +442,9 @@ function renderChart(canvasId, cols, rows) {
 // ── Insight callout post-processing ──────────────────────────────────────────
 
 function processInsightCallouts(html) {
+  // ── 1. Blockquote callout cards ─────────────────────────────────────────
   const KNOWN_ICONS = ['💡','✅','⚠️','🔍','📌','🎯','⚡','🚨','📊','💰','🔑','🏆','📈','📉','🔎'];
-  return html.replace(/<blockquote>\s*<p>([\s\S]*?)<\/p>\s*<\/blockquote>/g, (_, inner) => {
+  html = html.replace(/<blockquote>\s*<p>([\s\S]*?)<\/p>\s*<\/blockquote>/g, (_, inner) => {
     let icon = '';
     let bodyText = inner.trim();
     for (const ic of KNOWN_ICONS) {
@@ -453,11 +454,73 @@ function processInsightCallouts(html) {
         break;
       }
     }
+    // Count-companion banner: "📊 **N total matching rows**..."
+    if (icon === '📊' && /total matching rows/i.test(bodyText)) {
+      return `<div class="md-count-banner"><span class="count-icon">📊</span><span>${bodyText}</span></div>`;
+    }
     const isRec    = /recommendation|action item|next step|should|must|consider/i.test(inner);
     const cls      = isRec ? 'callout-recommendation' : 'callout-insight';
     const iconHtml = icon ? `<div class="callout-icon">${icon}</div>` : '';
     return `<div class="insight-callout ${cls}">${iconHtml}<div class="callout-body"><p>${bodyText}</p></div></div>`;
   });
+
+  // ── 2. Wrap markdown tables in a scrollable container ───────────────────
+  // marked.parse() produces bare <table>…</table>; wrap them so they scroll
+  // horizontally without overflowing the message bubble.
+  html = html.replace(
+    /<table>([\s\S]*?)<\/table>/g,
+    (_, inner) => {
+      // Detect right-aligned columns from GFM alignment markers (---|--:)
+      // and inject data-align="right" on matching th/td cells.
+      const processed = _alignMdTableCells(inner);
+      return `<div class="md-table-wrap"><table class="md-table">${processed}</table></div>`;
+    }
+  );
+
+  return html;
+}
+
+/**
+ * Parse GFM separator row (e.g. | --- | --: | :-- |) and inject
+ * data-align="right" / data-align="left" on every th and td in that column.
+ * Returns the processed innerHTML of the table (everything between <table> tags).
+ */
+function _alignMdTableCells(inner) {
+  // Find the separator row produced by marked: cells contain "---" / "--:" / ":--"
+  const sepMatch = inner.match(/<tr>((?:\s*<th[^>]*>(?:---|:?-+:?)<\/th>\s*)+)<\/tr>/);
+  if (!sepMatch) return inner;
+
+  // Extract alignment per column index
+  const alignments = [];
+  const cellRe = /<th[^>]*>(.*?)<\/th>/g;
+  let m;
+  while ((m = cellRe.exec(sepMatch[1])) !== null) {
+    const cell = m[1].trim();
+    if (cell.endsWith(':') && !cell.startsWith(':')) alignments.push('right');
+    else if (cell.startsWith(':') && cell.endsWith(':')) alignments.push('center');
+    else alignments.push('left');
+  }
+
+  if (!alignments.length) return inner;
+
+  // Remove the separator row entirely (it's a display artefact)
+  let out = inner.replace(sepMatch[0], '');
+
+  // Inject data-align on every th/td in sequence
+  let colIdx = 0;
+  let inRow   = false;
+  out = out.replace(/<(tr|\/tr|th|td)([^>]*)>/g, (tag, el, attrs) => {
+    if (el === 'tr')  { colIdx = 0; inRow = true;  return tag; }
+    if (el === '/tr') { inRow = false; return tag; }
+    if ((el === 'th' || el === 'td') && inRow) {
+      const align = alignments[colIdx] || 'left';
+      colIdx++;
+      return align !== 'left' ? `<${el}${attrs} data-align="${align}">` : tag;
+    }
+    return tag;
+  });
+
+  return out;
 }
 
 function fileIcon(filename) {

@@ -31,7 +31,24 @@ log = logging.getLogger("tech_ui_server")
 app = FastAPI(title="DataNanite Tech UI", docs_url=None, redoc_url=None)
 
 # Serve static assets under /tech/  (CSS, JS, images)
+# html=False keeps the default; we set headers in middleware below
 app.mount("/tech", StaticFiles(directory=str(STATIC_DIR)), name="tech_static")
+
+
+# Disable browser caching for all static assets so CSS/JS changes are instant
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class NoCacheMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path.startswith("/tech/") and (path.endswith(".css") or path.endswith(".js")):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            response.headers["Pragma"]        = "no-cache"
+            response.headers["Expires"]       = "0"
+        return response
+
+app.add_middleware(NoCacheMiddleware)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

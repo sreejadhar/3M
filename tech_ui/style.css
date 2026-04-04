@@ -401,10 +401,15 @@ body {
 #sql-status { font-size: 11px; color: var(--text-1); margin-left: auto; }
 
 /* ── Ontology Editor ──────────────────────────────────────────────────────── */
-#view-ontology { flex-direction: row; overflow: hidden; }
+/* Override .view.active flex-direction:column — ID beats class but be explicit */
+#view-ontology.active,
+#view-ontology       { flex-direction: row !important; overflow: hidden; }
 
 #onto-layout {
-  display: flex; flex-direction: row; width: 100%; height: 100%; overflow: hidden;
+  display: flex; flex-direction: row;
+  flex: 1;            /* fill the parent flex container */
+  min-height: 0;      /* allow shrinking inside flex column parent */
+  overflow: hidden;
 }
 
 /* ── Left explorer ── */

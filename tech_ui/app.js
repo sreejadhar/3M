@@ -467,7 +467,7 @@ async function loadGraph(sourceId) {
         forceAtlas2Based: { gravitationalConstant: -80, centralGravity: 0.01, springLength: 120, springConstant: 0.06 },
         stabilization: { iterations: 150 },
       },
-      interaction: { hover: true, tooltipDelay: 200, navigationButtons: false, keyboard: true },
+      interaction: { hover: true, tooltipDelay: 200, navigationButtons: false, keyboard: false },
       layout: { randomSeed: 42 },
     });
 

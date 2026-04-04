@@ -327,7 +327,7 @@ async function testConnection() {
       host: document.getElementById('src-host').value,
       port: parseInt(document.getElementById('src-port').value) || 5432,
       database: document.getElementById('src-db').value,
-      schema: document.getElementById('src-schema').value || '',
+      schema_: document.getElementById('src-schema').value || 'public',
       username: document.getElementById('src-user').value,
       password: document.getElementById('src-password').value,
     }
@@ -383,7 +383,7 @@ async function addSource() {
       host: document.getElementById('src-host').value,
       port: parseInt(document.getElementById('src-port').value) || 5432,
       database: document.getElementById('src-db').value,
-      schema: document.getElementById('src-schema').value || '',
+      schema_: document.getElementById('src-schema').value || 'public',
       username: document.getElementById('src-user').value,
       password: document.getElementById('src-password').value,
     },

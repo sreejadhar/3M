@@ -279,11 +279,20 @@ class SourceConnection(BaseModel):
     host:              str            = ""
     port:              int            = 0
     database:          str            = ""
-    schema_:           str            = "public"   # 'schema' is reserved in Pydantic
+    schema_:           str            = "public"   # 'schema' is reserved in Pydantic v1; use schema_ or alias
     username:          str            = ""
     password:          str            = ""
     connection_string: str            = ""
     extra:             Dict[str, Any] = {}
+
+    model_config = {"populate_by_name": True}
+
+    @classmethod
+    def model_validate(cls, obj, *args, **kwargs):
+        # Accept plain "schema" key sent by older clients; map it to schema_
+        if isinstance(obj, dict) and "schema" in obj and "schema_" not in obj:
+            obj = {**obj, "schema_": obj.pop("schema")}
+        return super().model_validate(obj, *args, **kwargs)
 
 class CreateSourceRequest(BaseModel):
     name:           str

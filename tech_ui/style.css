@@ -287,14 +287,20 @@ body {
 .event-row { display: flex; gap: 10px; align-items: baseline; margin-bottom: 6px; }
 .event-row .ev-time { color: var(--text-2); white-space: nowrap; }
 .event-row .ev-stage { padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 700; text-transform: uppercase; min-width: 72px; text-align: center; }
-.ev-stage.extract  { background: rgba(88,166,255,0.2); color: var(--blue); }
+.ev-stage.extract  { background: rgba(88,166,255,0.2);  color: var(--blue); }
 .ev-stage.ontology { background: rgba(188,140,255,0.2); color: var(--purple); }
-.ev-stage.kg       { background: rgba(57,197,207,0.2); color: var(--cyan); }
-.ev-stage.taxonomy { background: rgba(63,185,80,0.2); color: var(--green); }
-.ev-stage.error    { background: rgba(248,81,73,0.2); color: var(--red); }
+.ev-stage.kg       { background: rgba(57,197,207,0.2);  color: var(--cyan); }
+.ev-stage.taxonomy { background: rgba(63,185,80,0.2);   color: var(--green); }
+.ev-stage.complete { background: rgba(63,185,80,0.2);   color: var(--green); }
+.ev-stage.error    { background: rgba(248,81,73,0.2);   color: var(--red); }
 .ev-stage.info     { background: rgba(139,148,158,0.2); color: var(--text-1); }
-.event-row .ev-msg { color: var(--text-0); flex: 1; }
+.event-row .ev-msg    { color: var(--text-0); flex: 1; }
 .event-row .ev-detail { color: var(--text-2); font-size: 10px; }
+.event-row .ev-status { font-size: 11px; font-weight: 700; min-width: 14px; text-align: center; }
+.ev-status.ev-running { color: var(--accent); }
+.ev-status.ev-done    { color: var(--green); }
+.ev-status.ev-error   { color: var(--red); }
+.ev-status.ev-warn    { color: #d29922; }
 
 /* ── Graph view ───────────────────────────────────────────────────────────── */
 #view-graph { flex-direction: column; }

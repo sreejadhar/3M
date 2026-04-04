@@ -202,43 +202,63 @@ function startSSE(sourceId) {
 
   const indicator = document.getElementById('sse-indicator');
   indicator.style.background = 'var(--accent)';
-  indicator.style.animation = 'pulse-dot 1s infinite';
+  indicator.title = 'Connecting…';
 
   _sseConn = new EventSource(`/api/sources/${encodeURIComponent(sourceId)}/index-events`);
 
   _sseConn.onopen = () => {
     indicator.style.background = 'var(--green)';
-    indicator.style.animation = '';
+    indicator.title = 'Connected';
   };
 
   _sseConn.onmessage = e => {
     try {
       const ev = JSON.parse(e.data);
+
+      // Skip heartbeats and other non-display events
+      if (ev.type === 'heartbeat' || (!ev.step && !ev.stage && !ev.message)) return;
+
       appendEvent(ev);
-      // Refresh source list if status changed
-      if (ev.step && ev.status) loadSources();
+
+      // Refresh source card when a step completes or errors
+      if (ev.status === 'done' || ev.status === 'error') loadSources();
+
+      // Indexing finished — close so EventSource doesn't reconnect and replay
+      if (ev.step === 'complete') {
+        _sseConn.close();
+        _sseConn = null;
+        indicator.style.background = ev.status === 'error' ? 'var(--red)' : 'var(--green)';
+        indicator.title = ev.status === 'error' ? 'Failed' : 'Done';
+      }
     } catch {}
   };
 
   _sseConn.onerror = () => {
     indicator.style.background = 'var(--text-2)';
-    indicator.style.animation = '';
+    indicator.title = 'Disconnected';
   };
 }
 
 function appendEvent(ev) {
   const log = document.getElementById('event-log');
-  // Remove empty-state placeholder
   const empty = log.querySelector('.empty-state');
   if (empty) empty.remove();
 
-  const stageColors = { extract:'extract', ontology:'ontology', kg:'kg', taxonomy:'taxonomy', error:'error' };
-  const stageClass = stageColors[ev.step || ev.stage] || 'info';
+  const stepLabel = ev.step || ev.stage || ev.type || 'info';
+  const stageMap  = { extract:'extract', ontology:'ontology', kg:'kg', taxonomy:'taxonomy',
+                       complete:'complete', error:'error' };
+  const stageClass = stageMap[stepLabel] || 'info';
+
+  // Status badge: running → spinner, done → ✓, error → ✗, warn → ⚠
+  const statusIcon = { running:'⟳', done:'✓', error:'✗', warn:'⚠' }[ev.status] || '';
+  const statusCls  = { running:'ev-running', done:'ev-done', error:'ev-error', warn:'ev-warn' }[ev.status] || '';
+
   const row = document.createElement('div');
   row.className = 'event-row';
   row.innerHTML = `
     <span class="ev-time">${new Date().toLocaleTimeString()}</span>
-    <span class="ev-stage ${stageClass}">${_esc(ev.step || ev.stage || 'info')}</span>
+    <span class="ev-stage ${stageClass}">${_esc(stepLabel)}</span>
+    ${statusIcon ? `<span class="ev-status ${statusCls}">${statusIcon}</span>` : ''}
     <span class="ev-msg">${_esc(ev.message || '')}</span>
     ${ev.detail ? `<span class="ev-detail">${_esc(ev.detail)}</span>` : ''}
   `;

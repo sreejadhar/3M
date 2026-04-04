@@ -55,7 +55,7 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, Uplo
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 _PROJECT_ROOT = str(Path(__file__).resolve().parent)
 if _PROJECT_ROOT not in sys.path:
@@ -274,25 +274,21 @@ DOMAIN_ICONS: Dict[str, str] = {
 # ── Source models ──────────────────────────────────────────────────────────────
 
 class SourceConnection(BaseModel):
+    # populate_by_name=True lets Python code use field name (schema_) OR alias (schema)
+    model_config = ConfigDict(populate_by_name=True)
+
     file_path:         str            = ""
     uploaded:          bool           = False   # True when file was uploaded via /sources/upload-file
     host:              str            = ""
     port:              int            = 0
     database:          str            = ""
-    schema_:           str            = "public"   # 'schema' is reserved in Pydantic v1; use schema_ or alias
+    # alias="schema" makes FastAPI accept {"schema": "..."} from JSON;
+    # populate_by_name=True also accepts {"schema_": "..."} from Python/internal code
+    schema_:           str            = Field(default="public", alias="schema")
     username:          str            = ""
     password:          str            = ""
     connection_string: str            = ""
     extra:             Dict[str, Any] = {}
-
-    model_config = {"populate_by_name": True}
-
-    @classmethod
-    def model_validate(cls, obj, *args, **kwargs):
-        # Accept plain "schema" key sent by older clients; map it to schema_
-        if isinstance(obj, dict) and "schema" in obj and "schema_" not in obj:
-            obj = {**obj, "schema_": obj.pop("schema")}
-        return super().model_validate(obj, *args, **kwargs)
 
 class CreateSourceRequest(BaseModel):
     name:           str

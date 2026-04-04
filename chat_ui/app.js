@@ -28,6 +28,7 @@ const ANALYST_ROLES = [
 let currentPersona     = localStorage.getItem('datachat_persona') || 'business_user';
 // currentAnalystRole: '' | role key | 'other' (pending) | 'other:Custom text'
 let currentAnalystRole = localStorage.getItem('datachat_analyst_role') || '';
+let currentLlmModel    = localStorage.getItem('datachat_llm_model') || 'claude-sonnet-4-6';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let activeSessionId   = null;
@@ -73,6 +74,7 @@ const fileInput        = document.getElementById('fileInput');
 const fileChips        = document.getElementById('fileChips');
 const msgInput         = document.getElementById('msgInput');
 const sendBtn          = document.getElementById('sendBtn');
+const modelPillGroup   = document.getElementById('modelPillGroup');
 const pipelineStatus   = document.getElementById('pipelineStatus');
 const pipelineBar      = document.getElementById('pipelineBar');
 const pipelineBarInner = document.getElementById('pipelineBarInner');
@@ -809,7 +811,7 @@ async function apiSendChat(sessionId, message) {
   const r = await fetch(`${API}/sessions/${sessionId}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, analyst_role: getAnalystRoleLabel() }),
+    body: JSON.stringify({ message, analyst_role: getAnalystRoleLabel(), llm_model: currentLlmModel }),
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({ detail: r.statusText }));
@@ -2497,6 +2499,22 @@ msgInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 sendBtn.addEventListener('click', sendMessage);
+
+// ── Model pill selector ───────────────────────────────────────────────────────
+function syncModelPills() {
+  modelPillGroup.querySelectorAll('.model-pill').forEach(btn => {
+    const active = btn.dataset.model === currentLlmModel;
+    btn.classList.toggle('model-pill--active', active);
+  });
+}
+modelPillGroup.addEventListener('click', e => {
+  const pill = e.target.closest('.model-pill');
+  if (!pill) return;
+  currentLlmModel = pill.dataset.model;
+  localStorage.setItem('datachat_llm_model', currentLlmModel);
+  syncModelPills();
+});
+syncModelPills();   // restore persisted selection on page load
 
 // Purge file cache on leave
 window.addEventListener('beforeunload', () => {

@@ -1360,6 +1360,7 @@ class ChatRequest(BaseModel):
     message:      str
     skip_cache:   bool = False
     analyst_role: str  = ""   # functional role sent from the UI persona selector
+    llm_model:    str  = ""   # synthesis model override (haiku/sonnet/opus)
 
 
 @app.post("/sessions/{session_id}/chat", status_code=202)
@@ -1397,12 +1398,12 @@ async def send_chat(session_id: str, req: ChatRequest):
     })
 
     # Start background task to run the dialog
-    asyncio.create_task(_run_dialog(session_id, msg_id, req.message, req.skip_cache, req.analyst_role or ""))
+    asyncio.create_task(_run_dialog(session_id, msg_id, req.message, req.skip_cache, req.analyst_role or "", req.llm_model or ""))
 
     return {"msg_id": msg_id, "session_id": session_id}
 
 
-async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bool, analyst_role: str = "") -> None:
+async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bool, analyst_role: str = "", llm_model: str = "") -> None:
     session = _sessions.get(session_id)
     if not session:
         return
@@ -1422,6 +1423,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
         "max_sql_queries": 10,
         "analyst_role":    analyst_role,
         "source_id":       session.get("source_id") or "",
+        **({"llm_model": llm_model} if llm_model else {}),
     }
     if db_type.lower() in _FILE_BASED_TYPES:
         dialog_payload["db_file_path"] = session.get("db_file_path") or ""

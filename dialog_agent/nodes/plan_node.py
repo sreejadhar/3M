@@ -264,6 +264,25 @@ General Rules:
      WRONG:   FROM orders WHERE orders.id = 1         -- unqualified table
      WRONG:   WHERE public.orders.id = 1              -- 3-part names fail in PostgreSQL
    Identifier quoting: follow the rule shown in the DATABASE-SPECIFIC SYNTAX section above.
+9a. AMBIGUOUS COLUMN NAMES IN JOINs — CRITICAL FOR SQLite AND ALL DATABASES:
+    When a query JOINs two or more tables, ANY column that appears in multiple
+    tables MUST be referenced with a table alias in SELECT, WHERE, GROUP BY,
+    and ORDER BY.  An unqualified column reference that exists in both tables
+    will cause an "ambiguous column name" or "no such column" error at runtime.
+
+    RULE: In any query that contains a JOIN, qualify EVERY column reference with
+    its table alias.  Do not rely on the database to resolve which table a column
+    comes from.
+
+    WRONG (Cat_ID exists in both Fact_RGM_KPIs and Dim_Category):
+      SELECT Cat_ID, LOWER(Category_Group) ...
+      FROM Fact_RGM_KPIs JOIN Dim_Category ON Fact_RGM_KPIs.Cat_ID = Dim_Category.Cat_ID
+      GROUP BY Cat_ID                          ← ambiguous, will fail
+
+    CORRECT (use table aliases everywhere):
+      SELECT f.Cat_ID, LOWER(d.Category_Group) ...
+      FROM Fact_RGM_KPIs AS f JOIN Dim_Category AS d ON f.Cat_ID = d.Cat_ID
+      GROUP BY f.Cat_ID                        ← unambiguous, works correctly
 9b. CROSS-TABLE RULES — read carefully:
     a. To JOIN two tables you MUST have a column listed under "POSSIBLE JOIN KEYS"
        in the schema context, or one shown on a "FK:" line.

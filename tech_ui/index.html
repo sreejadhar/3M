@@ -234,24 +234,78 @@
         </div>
       </div>
 
-      <!-- ── ONTOLOGY VIEWER ──────────────────────────────────────────────── -->
+      <!-- ── ONTOLOGY EDITOR ─────────────────────────────────────────────── -->
       <div id="view-ontology" class="view">
-        <div style="padding:8px 14px; background:var(--bg-2); border-bottom:1px solid var(--border); display:flex; gap:8px; align-items:center; flex-shrink:0;">
-          <span style="font-size:12px; color:var(--text-1);">Source:</span>
-          <select id="ontology-source-select" class="search-input" style="padding:5px 8px; width:200px" onchange="loadOntology(this.value)">
-            <option value="">— select —</option>
-          </select>
-          <button class="btn btn-secondary" onclick="loadOntology(document.getElementById('ontology-source-select').value)">Load</button>
-          <div style="margin-left:auto; display:flex; gap:8px;">
-            <button class="btn btn-ghost" onclick="copyOntology()">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-              Copy
-            </button>
+        <div id="onto-layout">
+
+          <!-- Left: Explorer tree -->
+          <div id="onto-explorer">
+            <div class="onto-explorer-hdr">ONTOLOGY EXPLORER</div>
+            <div style="padding:6px 10px; border-bottom:1px solid var(--border);">
+              <select id="ontology-source-select" onchange="loadOntology(this.value)"
+                style="width:100%; background:var(--bg-3); border:1px solid var(--border); color:var(--text-0); padding:5px 8px; border-radius:var(--radius); font-size:12px; outline:none;">
+                <option value="">— select source —</option>
+              </select>
+            </div>
+            <div id="onto-tree">
+              <div class="empty-state" style="height:120px; font-size:11px;">Load a source</div>
+            </div>
           </div>
-        </div>
-        <pre id="ontology-content">
-<span class="text-dim">Select a source to view its OWL/Turtle ontology.</span>
-        </pre>
+
+          <!-- Right: Editor + Visualizer -->
+          <div id="onto-right">
+
+            <!-- Toolbar with tabs -->
+            <div id="onto-toolbar">
+              <div id="onto-tabs">
+                <button class="onto-tab active" id="tab-ttl"    onclick="switchOntoTab('ttl')">ONTOLOGY.TTL</button>
+                <button class="onto-tab"         id="tab-sparql" onclick="switchOntoTab('sparql')">SPARQL</button>
+              </div>
+              <button class="btn btn-ghost" onclick="copyOntology()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                Copy
+              </button>
+              <button class="btn btn-primary" id="onto-save-btn" onclick="saveOntology()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                Save &amp; Rebuild KG
+              </button>
+            </div>
+
+            <!-- Editor panels -->
+            <div id="onto-editor-area">
+              <div id="onto-ttl-wrap">
+                <textarea id="ontology-editor" spellcheck="false"
+                  placeholder="-- OWL/Turtle ontology will appear here after indexing…"
+                  oninput="onOntologyEdit()"></textarea>
+              </div>
+              <div id="onto-sparql-wrap" class="onto-tab-hidden">
+                <textarea id="sparql-editor" spellcheck="false"
+                  placeholder="# SPARQL query&#10;PREFIX owl: <http://www.w3.org/2002/07/owl#>&#10;PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>&#10;&#10;SELECT ?class WHERE {&#10;  ?class a owl:Class .&#10;}"></textarea>
+              </div>
+            </div>
+
+            <!-- Bottom: Ontology class graph -->
+            <div id="onto-viz-panel">
+              <div class="onto-viz-hdr">
+                <span>ONTOLOGY CLASS GRAPH &amp; PROPERTY VISUALIZER</span>
+                <div style="display:flex; gap:14px; align-items:center;">
+                  <span style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text-2)">
+                    <span style="width:10px;height:10px;border-radius:50%;border:2px solid var(--blue);display:inline-block"></span>Semantic Class
+                  </span>
+                  <span style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text-2)">
+                    <span style="width:14px;height:2px;background:var(--accent);display:inline-block"></span>Object Property
+                  </span>
+                  <span style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--text-2)">
+                    <span style="width:14px;height:1px;background:var(--border-hi);border-top:1px dashed var(--border-hi);display:inline-block"></span>SubClassOf
+                  </span>
+                  <button class="btn btn-ghost" style="padding:2px 8px;font-size:10px" onclick="toggleOntoViz(this)">▾</button>
+                </div>
+              </div>
+              <div id="onto-vis"></div>
+            </div>
+
+          </div><!-- /onto-right -->
+        </div><!-- /onto-layout -->
       </div>
 
       <!-- ── REDUNDANCIES ─────────────────────────────────────────────────── -->

@@ -423,7 +423,10 @@ async function addSource() {
 function onViewGraph() {
   const sel = document.getElementById('graph-source-select');
   const global = document.getElementById('global-source-select').value;
-  if (global && sel.value !== global) { sel.value = global; loadGraph(global); }
+  if (!global) return;
+  sel.value = global;
+  // Always load — idempotent; ensures first-visit and source-change both render
+  loadGraph(global);
 }
 
 async function loadGraph(sourceId) {
@@ -676,34 +679,268 @@ function _roleColor(r) {
 function _fmtNum(n) { return n == null ? '—' : Number(n).toLocaleString(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Ontology Viewer
+// Ontology Editor
 // ─────────────────────────────────────────────────────────────────────────────
+let _ontoNetwork = null;
+let _ontoSourceId = null;
+let _ontoDirty = false;
+
 function onViewOntology() {
   const sel = document.getElementById('ontology-source-select');
   const global = document.getElementById('global-source-select').value;
-  if (global && sel.value !== global) { sel.value = global; loadOntology(global); }
+  if (!global) return;
+  sel.value = global;
+  loadOntology(global);
 }
 
 async function loadOntology(sourceId) {
   if (!sourceId) return;
-  const el = document.getElementById('ontology-content');
-  el.innerHTML = '<span class="text-dim">Loading…</span>';
+  _ontoSourceId = sourceId;
+  _ontoDirty = false;
+  _updateSaveBtn();
+
+  const editor = document.getElementById('ontology-editor');
+  editor.value = 'Loading…';
+  _renderOntoTree(null);
+
   try {
     const data = await apiFetch(`/sources/${sourceId}/ontology`);
     const content = data.content || data.ontology_content || '';
     if (!content) {
-      el.innerHTML = '<span class="text-dim">No ontology available for this source. Run indexing to generate one.</span>';
+      editor.value = '';
+      editor.placeholder = 'No ontology available — run indexing to generate one.';
+      _renderOntoTree({ classes: [], objProps: [], dataProps: [] });
+      _renderOntoViz({ classes: [], objProps: [], dataProps: [], subClassOf: [], propDomainRange: [] });
       return;
     }
-    el.textContent = content;
+    editor.value = content;
+    const parsed = _parseOntologyText(content);
+    _renderOntoTree(parsed);
+    _renderOntoViz(parsed);
   } catch (e) {
-    el.innerHTML = `<span style="color:var(--red)">Failed to load ontology: ${_esc(e.message)}</span>`;
+    editor.value = '';
+    toast('Failed to load ontology: ' + e.message, 'error');
+  }
+}
+
+function onOntologyEdit() {
+  _ontoDirty = true;
+  _updateSaveBtn();
+}
+
+function _updateSaveBtn() {
+  const btn = document.getElementById('onto-save-btn');
+  if (!btn) return;
+  btn.textContent = _ontoDirty ? '● Save & Rebuild KG' : 'Save & Rebuild KG';
+  btn.style.opacity = _ontoSourceId ? '1' : '0.4';
+}
+
+async function saveOntology() {
+  if (!_ontoSourceId) { toast('Select a source first', 'warn'); return; }
+  const content = document.getElementById('ontology-editor').value.trim();
+  if (!content) { toast('Ontology is empty', 'warn'); return; }
+  const btn = document.getElementById('onto-save-btn');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    await apiFetch(`/sources/${_ontoSourceId}/ontology`, {
+      method: 'POST',
+      body: JSON.stringify({ content, rebuild_kg: true }),
+    });
+    _ontoDirty = false;
+    const parsed = _parseOntologyText(content);
+    _renderOntoTree(parsed);
+    _renderOntoViz(parsed);
+    toast('Ontology saved — KG rebuild started', 'success');
+  } catch (e) {
+    toast('Save failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    _updateSaveBtn();
   }
 }
 
 function copyOntology() {
-  const content = document.getElementById('ontology-content').textContent;
+  const content = document.getElementById('ontology-editor').value;
+  if (!content) { toast('Nothing to copy', 'warn'); return; }
   navigator.clipboard.writeText(content).then(() => toast('Ontology copied to clipboard', 'success'));
+}
+
+function switchOntoTab(tab) {
+  document.getElementById('tab-ttl').classList.toggle('active', tab === 'ttl');
+  document.getElementById('tab-sparql').classList.toggle('active', tab === 'sparql');
+  document.getElementById('onto-ttl-wrap').classList.toggle('onto-tab-hidden', tab !== 'ttl');
+  document.getElementById('onto-sparql-wrap').classList.toggle('onto-tab-hidden', tab !== 'sparql');
+}
+
+function toggleOntoViz(btn) {
+  const panel = document.getElementById('onto-viz-panel');
+  const collapsed = panel.classList.toggle('collapsed');
+  if (btn) btn.textContent = collapsed ? '▸' : '▾';
+}
+
+// ── Turtle/OWL parser ────────────────────────────────────────────────────────
+function _parseOntologyText(text) {
+  const result = { classes: [], objProps: [], dataProps: [], subClassOf: [], propDomainRange: [] };
+  const seenC = new Set(), seenP = new Set(), seenD = new Set();
+
+  // Classes
+  let m;
+  for (const re of [/(\w+)\s+a\s+owl:Class/gm, /(\w+)\s+a\s+rdfs:Class/gm]) {
+    while ((m = re.exec(text)) !== null) {
+      const n = m[1]; if (!seenC.has(n) && n !== 'owl' && n !== 'rdfs') { result.classes.push(n); seenC.add(n); }
+    }
+  }
+  // Also: ":ClassName" style
+  const colonClass = /:(\w+)\s+a\s+owl:Class/gm;
+  while ((m = colonClass.exec(text)) !== null) {
+    const n = m[1]; if (!seenC.has(n)) { result.classes.push(n); seenC.add(n); }
+  }
+
+  // Object Properties
+  for (const re of [/(\w+)\s+a\s+owl:ObjectProperty/gm, /:(\w+)\s+a\s+owl:ObjectProperty/gm]) {
+    while ((m = re.exec(text)) !== null) {
+      const n = m[1]; if (!seenP.has(n)) { result.objProps.push(n); seenP.add(n); }
+    }
+  }
+
+  // Data Properties
+  for (const re of [/(\w+)\s+a\s+owl:DatatypeProperty/gm, /:(\w+)\s+a\s+owl:DatatypeProperty/gm]) {
+    while ((m = re.exec(text)) !== null) {
+      const n = m[1]; if (!seenD.has(n)) { result.dataProps.push(n); seenD.add(n); }
+    }
+  }
+
+  // SubClassOf
+  const scRe = /:?(\w+)\s+rdfs:subClassOf\s+:?(\w+)/gm;
+  while ((m = scRe.exec(text)) !== null) result.subClassOf.push({ child: m[1], parent: m[2] });
+
+  // Domain / Range (collect per property)
+  const domMap = {};
+  const domRe = /:?(\w+)\s+rdfs:domain\s+:?(\w+)/gm;
+  while ((m = domRe.exec(text)) !== null) { domMap[m[1]] = domMap[m[1]] || {}; domMap[m[1]].domain = m[2]; }
+  const rangeRe = /:?(\w+)\s+rdfs:range\s+:?(\w+)/gm;
+  while ((m = rangeRe.exec(text)) !== null) { domMap[m[1]] = domMap[m[1]] || {}; domMap[m[1]].range = m[2]; }
+  for (const [prop, dr] of Object.entries(domMap)) result.propDomainRange.push({ prop, ...dr });
+
+  return result;
+}
+
+// ── Ontology Tree ────────────────────────────────────────────────────────────
+function _renderOntoTree(parsed) {
+  const tree = document.getElementById('onto-tree');
+  if (!parsed) { tree.innerHTML = '<div class="empty-state" style="height:120px;font-size:11px;">Loading…</div>'; return; }
+  if (!parsed.classes.length && !parsed.objProps.length && !parsed.dataProps.length) {
+    tree.innerHTML = '<div class="empty-state" style="height:120px;font-size:11px;">No classes or properties found</div>';
+    return;
+  }
+
+  const section = (label, icon, items, dotClass, clickFn) => {
+    if (!items.length) return '';
+    const rows = items.map(n =>
+      `<div class="onto-item" onclick="${clickFn ? `${clickFn}('${_esc(n)}', this)` : ''}">
+        <span class="onto-dot ${dotClass}"></span><span class="onto-item-label">${_esc(n)}</span>
+      </div>`
+    ).join('');
+    return `<div class="onto-section">
+      <div class="onto-section-hdr" onclick="this.nextElementSibling.classList.toggle('collapsed')">
+        <span class="onto-section-toggle">▾</span>${icon}<span>${label}</span>
+        <span class="badge" style="margin-left:auto">${items.length}</span>
+      </div>
+      <div class="onto-section-body">${rows}</div>
+    </div>`;
+  };
+
+  // Virtual Graphs = sources with status "ready"
+  const readySources = _sources.filter(s => s.status === 'ready');
+  const vgRows = readySources.map(s =>
+    `<div class="onto-item" onclick="document.getElementById('ontology-source-select').value='${_esc(s.id)}'; loadOntology('${_esc(s.id)}')">
+      <span class="onto-dot vg-dot"></span><span class="onto-item-label">${_esc(s.name)}</span>
+    </div>`
+  ).join('');
+  const vgSection = readySources.length ? `<div class="onto-section">
+    <div class="onto-section-hdr" onclick="this.nextElementSibling.classList.toggle('collapsed')">
+      <span class="onto-section-toggle">▾</span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>
+      <span>Virtual Graphs</span>
+      <span class="badge" style="margin-left:auto">${readySources.length}</span>
+    </div>
+    <div class="onto-section-body">${vgRows}</div>
+  </div>` : '';
+
+  const classIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px"><circle cx="12" cy="12" r="8"/></svg>`;
+  const propIcon  = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>`;
+  const dataIcon  = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>`;
+
+  tree.innerHTML =
+    section('Classes', classIcon, parsed.classes, 'class-dot', 'ontoItemClick') +
+    section('Object Properties', propIcon, parsed.objProps, 'prop-dot', null) +
+    section('Data Properties', dataIcon, parsed.dataProps, 'data-dot', null) +
+    vgSection;
+}
+
+function ontoItemClick(className, el) {
+  // Scroll editor to first occurrence of the class name
+  const editor = document.getElementById('ontology-editor');
+  const text = editor.value;
+  const idx = text.indexOf(className);
+  if (idx >= 0) {
+    editor.focus();
+    editor.setSelectionRange(idx, idx + className.length);
+    const lines = text.substring(0, idx).split('\n').length;
+    editor.scrollTop = Math.max(0, (lines - 5) * 22);
+  }
+  // Highlight in tree
+  document.querySelectorAll('.onto-item').forEach(e => e.classList.remove('active'));
+  if (el) el.classList.add('active');
+}
+
+// ── Ontology class graph ─────────────────────────────────────────────────────
+function _renderOntoViz(parsed) {
+  const container = document.getElementById('onto-vis');
+  if (_ontoNetwork) { _ontoNetwork.destroy(); _ontoNetwork = null; }
+
+  const classSet = new Set(parsed.classes);
+  if (!classSet.size) return;
+
+  const visNodes = parsed.classes.map(c => ({
+    id: c, label: c,
+    color: { background: '#111827', border: '#58a6ff',
+             highlight: { background: '#1c2230', border: '#79c0ff' },
+             hover: { background: '#1c2230', border: '#93c5fd' } },
+    font: { color: '#e6edf3', size: 11, face: 'JetBrains Mono, Consolas, monospace' },
+    shape: 'ellipse', size: 24, borderWidth: 2,
+    shadow: { enabled: true, color: 'rgba(88,166,255,0.15)', size: 8 },
+  }));
+
+  const visEdges = [];
+  // SubClassOf (dashed)
+  parsed.subClassOf.forEach(sc => {
+    if (classSet.has(sc.child) && classSet.has(sc.parent))
+      visEdges.push({ from: sc.child, to: sc.parent, label: 'subClassOf',
+        color: { color: '#3a4a6a', highlight: '#8b949e' },
+        font: { color: '#8b949e', size: 9 }, dashes: true,
+        arrows: { to: { enabled: true, scaleFactor: 0.6 } }, smooth: { type: 'curvedCW', roundness: 0.2 } });
+  });
+  // Object properties (solid amber)
+  parsed.propDomainRange.forEach(p => {
+    if (p.domain && p.range && classSet.has(p.domain) && classSet.has(p.range))
+      visEdges.push({ from: p.domain, to: p.range, label: p.prop,
+        color: { color: '#f59e0b88', highlight: '#f59e0b' },
+        font: { color: '#f59e0b', size: 9, strokeWidth: 2, strokeColor: '#0d1117' },
+        arrows: { to: { enabled: true, scaleFactor: 0.7 } }, smooth: { type: 'curvedCW', roundness: 0.25 } });
+  });
+
+  _ontoNetwork = new vis.Network(container,
+    { nodes: visNodes, edges: visEdges },
+    {
+      physics: { enabled: true, solver: 'forceAtlas2Based',
+        forceAtlas2Based: { gravitationalConstant: -60, centralGravity: 0.005, springLength: 140, springConstant: 0.05 },
+        stabilization: { iterations: 120 } },
+      interaction: { hover: true, tooltipDelay: 150, navigationButtons: false, keyboard: false },
+      layout: { randomSeed: 42 },
+    }
+  );
+  _ontoNetwork.on('stabilizationIterationsDone', () => _ontoNetwork.setOptions({ physics: { enabled: false } }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -220,6 +220,10 @@ services:
     restart: unless-stopped
     ports:
       - "${TECH_PORT:-8006}:8006"
+    volumes:
+      # Mount static assets live so CSS/JS changes take effect without rebuild
+      - ./tech_ui:/app/tech_ui:ro
+      - ./tech_ui_server.py:/app/tech_ui_server.py:ro
     environment:
       # Proxy target: the orchestrator/chat-ui service hosts all the APIs
       ORCHESTRATOR_URL: "http://chat-ui:8005"

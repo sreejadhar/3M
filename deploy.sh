@@ -38,6 +38,7 @@ ONTOLOGY_IMAGE="metadata-ontology-api:latest"
 KG_IMAGE="metadata-kg-api:latest"
 DIALOG_IMAGE="metadata-dialog-api:latest"
 CHAT_IMAGE="metadata-chat-ui:latest"
+TECH_IMAGE="metadata-tech-ui:latest"
 UI_IMAGE="metadata-agent-ui:latest"
 
 AGENT_PORT="${AGENT_PORT:-8000}"
@@ -155,6 +156,13 @@ cmd_build() {
         --tag  "${CHAT_IMAGE}" \
         "${SCRIPT_DIR}"
     success "Built ${CHAT_IMAGE}"
+
+    info "Building tech-ui image…"
+    docker build \
+        --file "${SCRIPT_DIR}/Dockerfile.tech" \
+        --tag  "${TECH_IMAGE}" \
+        "${SCRIPT_DIR}"
+    success "Built ${TECH_IMAGE}"
 
     info "Building ui image…"
     docker build \

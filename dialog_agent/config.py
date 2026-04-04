@@ -57,7 +57,7 @@ class DialogConfig:
     llm_temperature: float = 0.0
 
     # ── Query behaviour ───────────────────────────────────────────────────────
-    max_sql_queries: int = 10          # max SQL queries the planner may emit
+    max_sql_queries: int = 5           # max SQL queries the planner may emit
     row_limit: int = 500               # LIMIT applied to each query
     max_insight_rows: int = 2000       # rows passed to the synthesizer LLM
     # For raw-row queries (no GROUP BY / aggregation), automatically inject a
@@ -86,7 +86,7 @@ class DialogConfig:
     # Hard cap on tables included in the retrieved subgraph after BFS expansion.
     # Prevents token bloat when FK chains connect many tables. Top-scored tables
     # are kept when the cap triggers.
-    graphrag_max_tables: int = 15
+    graphrag_max_tables: int = 8
     # Only activate retrieval when the schema has more than this many tables.
     # For small schemas the full schema fits easily in the prompt.
     graphrag_min_tables: int = 10

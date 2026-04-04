@@ -1273,33 +1273,32 @@ body {
 
 .input-footer { font-size:11px; color:var(--clr-text-mute); text-align:center; margin-top:8px; }
 
-/* ── Model selector pill group ───────────────────────────────────────────────── */
-.model-selector-row {
-  display:flex; align-items:center; gap:8px; margin-bottom:6px;
+/* ── Model selector dropdown (inside input-row) ──────────────────────────────── */
+.model-select {
+  flex-shrink: 0;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--clr-text-sec);
+  background: var(--clr-bg);
+  border: 1.5px solid var(--clr-border);
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+  height: 32px;
+  cursor: pointer;
+  outline: none;
+  transition: border-color var(--transition), color var(--transition);
+  appearance: none;
+  -webkit-appearance: none;
+  /* custom caret */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%239aa0a6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  padding-right: 22px;
 }
-.model-selector-label {
-  font-size:11px; font-weight:600; color:var(--clr-text-mute);
-  text-transform:uppercase; letter-spacing:.5px; white-space:nowrap;
-}
-.model-pill-group {
-  display:flex; gap:4px;
-}
-.model-pill {
-  font-size:12px; font-weight:500; padding:4px 12px;
-  border-radius:20px; border:1.5px solid var(--clr-border);
-  background:var(--clr-surface); color:var(--clr-text-sec);
-  cursor:pointer; transition:all var(--transition);
-  white-space:nowrap;
-}
-.model-pill:hover:not(.model-pill--active) {
-  border-color:var(--clr-primary); color:var(--clr-primary);
-  background:rgba(66,133,244,.06);
-}
-.model-pill--active {
-  border-color:var(--clr-primary); background:var(--clr-primary);
-  color:#fff; cursor:default;
-}
-.model-pill:disabled { opacity:.45; cursor:not-allowed; }
+.model-select:hover   { border-color: var(--clr-primary); color: var(--clr-primary); }
+.model-select:focus   { border-color: var(--clr-primary); }
+.model-select:disabled { opacity: .45; cursor: not-allowed; }
 
 /* ── Toast notifications ─────────────────────────────────────────────────────── */
 .toast-container {

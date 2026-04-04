@@ -74,7 +74,7 @@ const fileInput        = document.getElementById('fileInput');
 const fileChips        = document.getElementById('fileChips');
 const msgInput         = document.getElementById('msgInput');
 const sendBtn          = document.getElementById('sendBtn');
-const modelPillGroup   = document.getElementById('modelPillGroup');
+const modelSelect      = document.getElementById('modelSelect');
 const pipelineStatus   = document.getElementById('pipelineStatus');
 const pipelineBar      = document.getElementById('pipelineBar');
 const pipelineBarInner = document.getElementById('pipelineBarInner');
@@ -2500,21 +2500,12 @@ msgInput.addEventListener('keydown', (e) => {
 });
 sendBtn.addEventListener('click', sendMessage);
 
-// ── Model pill selector ───────────────────────────────────────────────────────
-function syncModelPills() {
-  modelPillGroup.querySelectorAll('.model-pill').forEach(btn => {
-    const active = btn.dataset.model === currentLlmModel;
-    btn.classList.toggle('model-pill--active', active);
-  });
-}
-modelPillGroup.addEventListener('click', e => {
-  const pill = e.target.closest('.model-pill');
-  if (!pill) return;
-  currentLlmModel = pill.dataset.model;
+// ── Model dropdown selector ───────────────────────────────────────────────────
+modelSelect.value = currentLlmModel;   // restore persisted selection on page load
+modelSelect.addEventListener('change', () => {
+  currentLlmModel = modelSelect.value;
   localStorage.setItem('datachat_llm_model', currentLlmModel);
-  syncModelPills();
 });
-syncModelPills();   // restore persisted selection on page load
 
 // Purge file cache on leave
 window.addEventListener('beforeunload', () => {

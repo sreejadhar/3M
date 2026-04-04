@@ -52,8 +52,8 @@ logger = logging.getLogger(__name__)
 _MAX_VERBATIM_TURNS = 5
 
 # ── Dynamic row limits (chars of rendered result markdown) ───────────────────
-_RESULTS_LARGE_CHARS  = 80_000   # ~20k tokens  → reduce to 10 rows/query
-_RESULTS_XLARGE_CHARS = 200_000  # ~50k tokens  → reduce to  5 rows/query
+_RESULTS_LARGE_CHARS  = 20_000   # ~5k tokens   → reduce to 10 rows/query
+_RESULTS_XLARGE_CHARS = 60_000   # ~15k tokens  → reduce to  5 rows/query
 
 # ── Max rows in the programmatic ## Data section appended to output ───────────
 _DATA_SECTION_MAX_ROWS = 50

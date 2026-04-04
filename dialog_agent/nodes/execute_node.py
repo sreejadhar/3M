@@ -47,20 +47,22 @@ _FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
 
 def purge_file_db(fpath: str) -> bool:
     """
-    Delete the cached SQLite temp file for *fpath* and remove it from cache.
-    Returns True if an entry was found and removed, False otherwise.
+    Delete all cached SQLite temp files for *fpath* and remove them from cache.
+    Returns True if at least one entry was found and removed, False otherwise.
     Safe to call even if the entry does not exist.
     """
     with _FILE_DB_LOCK:
-        tmp = _FILE_DB_CACHE.pop(fpath, None)
-    if tmp:
+        keys = [k for k in _FILE_DB_CACHE if k == fpath or k.startswith(f"{fpath}::")]
+        entries = {k: _FILE_DB_CACHE.pop(k) for k in keys}
+    if not entries:
+        return False
+    for k, tmp in entries.items():
         try:
             os.unlink(tmp)
             logger.info("file_db_cache: purged %s → %s", fpath, tmp)
         except Exception as exc:
             logger.warning("file_db_cache: could not delete %s — %s", tmp, exc)
-        return True
-    return False
+    return True
 
 
 def purge_all_file_dbs() -> int:
@@ -123,6 +125,7 @@ _RETRYABLE_RE = re.compile(
     r"|invalid cast"
     r"|cannot be cast"
     r"|ambiguous column"                        # qualify with table name
+    r"|no such column"                          # may be ambiguous — LLM can qualify
     r"|syntax error"                            # generic / PostgreSQL / SQLite
     r"|incorrect syntax"                        # SQL Server: "Incorrect syntax near ..."
     r"|no such function"                        # wrong function for this DB
@@ -145,7 +148,6 @@ _NOT_RETRYABLE_RE = re.compile(
     r"|relation .{0,80} does not exist"
     r"|table .{0,80} doesn't exist"
     r"|invalid object name"                     # SQL Server: table not found
-    r"|no such column"
     r"|column .{0,80} does not exist"
     r"|unknown column"
     r"|invalid column name"                     # SQL Server: column not found
@@ -314,6 +316,35 @@ def _exec_on_conn_with_retry(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _detect_excel_header_row(xl, sheet: str, scan_rows: int = 10) -> int:
+    """
+    Find the actual header row in an Excel sheet.
+
+    Many Excel files have a title/subtitle in rows 0-1 before the real column
+    names.  pandas' default header=0 would then name every column after the
+    first 'Unnamed: N'.
+
+    Reads the first `scan_rows` rows without a header, counts non-empty cells
+    per row, and returns the index of the first row with the maximum density —
+    that row is reliably the real column header.
+    """
+    import pandas as pd
+    preview = xl.parse(sheet, header=None, nrows=scan_rows)
+    if preview.empty:
+        return 0
+    counts = [
+        sum(1 for v in preview.iloc[i] if str(v).strip() not in ("", "nan", "None"))
+        for i in range(len(preview))
+    ]
+    max_count = max(counts) if counts else 0
+    if max_count == 0:
+        return 0
+    for idx, cnt in enumerate(counts):
+        if cnt == max_count:
+            return idx
+    return 0
+
+
 def _safe_col(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9_]", "_", str(name))
     return ("col_" + s if s and s[0].isdigit() else s) or "col"
@@ -373,7 +404,10 @@ def _load_file_to_db(db_type: str, fpath: str, tmp_path: str) -> None:
                     used_sheets[base] = 1
                     safe = base
                 try:
-                    df = xl.parse(sheet)
+                    header_row = _detect_excel_header_row(xl, sheet)
+                    if header_row != 0:
+                        logger.info("file_db: sheet %r — header at row %d", sheet, header_row)
+                    df = xl.parse(sheet, header=header_row)
                     _dedup_cols(df)
                     df.to_sql(safe, conn, if_exists="replace", index=False)
                     logger.info("file_db: loaded sheet %r → %r (%d rows, %d cols)",
@@ -395,19 +429,36 @@ def _get_cached_file_db(cfg: DialogConfig) -> str:
     """
     Return the path of the pre-loaded temp SQLite DB for *cfg.db_file_path*.
     Builds and caches on first call; returns instantly on subsequent calls.
+    Cache key includes file mtime so a re-uploaded file is re-parsed automatically.
     """
     fpath = cfg.db_file_path
     db    = cfg.db_type.lower()
 
+    # Include mtime in the cache key so stale DBs (built before the header-
+    # detection fix, or from an older file upload) are automatically invalidated.
+    try:
+        mtime = os.path.getmtime(fpath)
+    except Exception:
+        mtime = 0
+    cache_key = f"{fpath}::{mtime}"
+
     with _FILE_DB_LOCK:
-        if fpath in _FILE_DB_CACHE:
-            tmp = _FILE_DB_CACHE[fpath]
+        if cache_key in _FILE_DB_CACHE:
+            tmp = _FILE_DB_CACHE[cache_key]
             if os.path.exists(tmp):
                 logger.info("file_db_cache: HIT %s → %s", fpath, tmp)
                 return tmp
-            # Stale entry (file was deleted externally) — rebuild
             logger.warning("file_db_cache: stale entry for %s, rebuilding", fpath)
-            _FILE_DB_CACHE.pop(fpath, None)
+            _FILE_DB_CACHE.pop(cache_key, None)
+        # Also evict any old entries for the same path (different mtime)
+        stale = [k for k in _FILE_DB_CACHE if k.startswith(f"{fpath}::")]
+        for k in stale:
+            old_tmp = _FILE_DB_CACHE.pop(k, None)
+            if old_tmp:
+                try:
+                    os.unlink(old_tmp)
+                except Exception:
+                    pass
 
         # Build the temp DB (lock held so only one thread loads it)
         tmp_f = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -425,7 +476,7 @@ def _get_cached_file_db(cfg: DialogConfig) -> str:
         raise
 
     with _FILE_DB_LOCK:
-        _FILE_DB_CACHE[fpath] = tmp_path
+        _FILE_DB_CACHE[cache_key] = tmp_path
 
     return tmp_path
 

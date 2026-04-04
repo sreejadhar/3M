@@ -501,7 +501,10 @@ async function loadGraph(sourceId) {
       showGraphNodeInfo(node);
     });
 
-    _kgNetwork.on('stabilizationIterationsDone', () => _kgNetwork.setOptions({ physics: { enabled: false } }));
+    _kgNetwork.on('stabilizationIterationsDone', () => {
+      _kgNetwork.setOptions({ physics: { enabled: false } });
+      _kgNetwork.fit();
+    });
 
   } catch (e) {
     toast('Failed to load graph: ' + e.message, 'error');

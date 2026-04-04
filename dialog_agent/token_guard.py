@@ -85,11 +85,12 @@ def guard_plan_prompt(
     model: str = "claude-haiku-4-5-20251001",
 ) -> Tuple[str, str]:
     """
-    Enforce the token budget for plan_node prompts.
+    Enforce the token budget for plan_node prompts using char-based estimation.
 
-    Uses count_tokens API for exact counting when available; falls back to
-    conservative char estimate.  Trims schema_context in the user string when
-    the prompt is over budget.
+    We intentionally avoid the count_tokens API here: calling it sends the full
+    schema prompt to Anthropic just to measure it, effectively doubling the
+    billed input tokens for every plan_node call.  The conservative char estimate
+    (2.5 chars/token for schema/SQL content) is accurate enough and costs nothing.
 
     schema_context must be the exact substring present in user — it is
     formatted in via _USER_PROMPT.format(schema_context=...) so str.replace
@@ -97,35 +98,12 @@ def guard_plan_prompt(
 
     Returns (system, user) with schema trimmed if needed.
     """
-    # ── Exact count (preferred) ───────────────────────────────────────────────
-    actual_tokens = _count_tokens_exact(system, user, model)
-
-    if actual_tokens is not None:
-        if actual_tokens <= _MAX_INPUT_TOKENS:
-            logger.debug("token_guard: plan prompt OK — %d tokens", actual_tokens)
-            return system, user
-
-        # Calculate how many chars to remove from schema_context.
-        # Use the observed chars-per-token ratio for precision.
-        total_chars = len(system) + len(user)
-        observed_cpt = total_chars / actual_tokens          # actual ratio for this prompt
-        excess_tokens = actual_tokens - _MAX_INPUT_TOKENS
-        remove_chars  = int(excess_tokens * observed_cpt * 1.1)   # +10% safety margin
-        new_schema_len = max(len(schema_context) - remove_chars, 10_000)
-
-        trimmed_schema = _trim_section(schema_context, new_schema_len, "schema_context")
-        user = user.replace(schema_context, trimmed_schema, 1)
-
-        logger.warning(
-            "token_guard: plan prompt trimmed — was %d tokens (limit %d), "
-            "schema %d → %d chars",
-            actual_tokens, _MAX_INPUT_TOKENS, len(schema_context), new_schema_len,
-        )
-        return system, user
-
-    # ── Char-based fallback ───────────────────────────────────────────────────
     total_chars = len(system) + len(user)
     if total_chars <= _MAX_INPUT_CHARS:
+        logger.debug(
+            "token_guard: plan prompt OK — ~%d tokens (char estimate)",
+            int(total_chars / _CHARS_PER_TOKEN),
+        )
         return system, user
 
     other_chars   = total_chars - len(schema_context)
@@ -134,9 +112,8 @@ def guard_plan_prompt(
     user = user.replace(schema_context, trimmed_schema, 1)
 
     logger.warning(
-        "token_guard: plan prompt over budget (char fallback) — was %d chars (~%dk tokens), "
-        "schema trimmed",
-        total_chars, int(total_chars / _CHARS_PER_TOKEN / 1000),
+        "token_guard: plan prompt over budget — was ~%dk tokens, schema trimmed %d → %d chars",
+        int(total_chars / _CHARS_PER_TOKEN / 1000), len(schema_context), schema_budget,
     )
     return system, user
 

@@ -356,16 +356,34 @@ def _build_history_section(history: list, model: str) -> str:
 
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
+_COST_PER_M = {
+    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    "claude-sonnet-4-6":         (3.00, 15.00),
+    "claude-opus-4-6":           (15.00, 75.00),
+}
+
+
+def _log_cost(node: str, model: str, usage) -> None:
+    inp, out = usage.input_tokens, usage.output_tokens
+    in_price, out_price = _COST_PER_M.get(model, (3.00, 15.00))
+    cost = (inp * in_price + out * out_price) / 1_000_000
+    logger.info(
+        "COST %s [%s] in=%d out=%d  $%.5f",
+        node, model, inp, out, cost,
+    )
+
+
 def _call_llm(system: str, user: str, model: str, temperature: float) -> str:
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
     msg = client.messages.create(
         model=model,
-        max_tokens=2048,
+        max_tokens=1024,
         temperature=temperature,
         system=system,
         messages=[{"role": "user", "content": user}],
     )
+    _log_cost("synthesize_node", model, msg.usage)
     return msg.content[0].text if msg.content else ""
 
 

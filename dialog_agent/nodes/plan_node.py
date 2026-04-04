@@ -411,6 +411,23 @@ Return the JSON array of SQL queries now.
 """
 
 
+_COST_PER_M = {
+    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    "claude-sonnet-4-6":         (3.00, 15.00),
+    "claude-opus-4-6":           (15.00, 75.00),
+}
+
+
+def _log_cost(node: str, model: str, usage) -> None:
+    inp, out = usage.input_tokens, usage.output_tokens
+    in_price, out_price = _COST_PER_M.get(model, (0.80, 4.00))
+    cost = (inp * in_price + out * out_price) / 1_000_000
+    logger.info(
+        "COST %s [%s] in=%d out=%d  $%.5f",
+        node, model, inp, out, cost,
+    )
+
+
 def _call_llm(
     system: str,
     user: str,
@@ -427,6 +444,7 @@ def _call_llm(
         system=system,
         messages=[{"role": "user", "content": user}],
     )
+    _log_cost("plan_node", model, msg.usage)
     return msg.content[0].text if msg.content else ""
 
 

@@ -40,6 +40,10 @@ class DialogConfig:
     max_sql_queries: int = 10          # max SQL queries the planner may emit
     row_limit: int = 500               # LIMIT applied to each query
     max_insight_rows: int = 2000       # rows passed to the synthesizer LLM
+    # For raw-row queries (no GROUP BY / aggregation), automatically inject a
+    # companion COUNT(*) query so the user sees the total matching row count,
+    # not just the size of the sampled page.
+    raw_row_count_companion: bool = True
 
     # ── User context ──────────────────────────────────────────────────────────
     analyst_role: str = ""             # e.g. "Financial Analyst" — personalises insights

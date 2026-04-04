@@ -951,6 +951,61 @@ def _enforce_sql_limits(sql: str, row_limit: int, db_type: str = "") -> str:
             return patched
 
 
+def _is_raw_row_query(sql: str) -> bool:
+    """Return True when the SQL has no aggregation (GROUP BY / COUNT / SUM …)."""
+    return not bool(_AGG_PATTERN.search(sql))
+
+
+def _strip_row_limit(sql: str) -> str:
+    """
+    Remove any LIMIT / TOP N / FETCH FIRST … ROWS ONLY / ROWNUM clause so the
+    SQL can be wrapped in a COUNT subquery that reflects the *total* matching
+    rows, not just the sampled page.
+    """
+    cleaned = _LIMIT_PATTERN.sub("", sql)
+    cleaned = re.sub(
+        r'(\bSELECT\b\s+)TOP\s+\d+\s+', r'\1', cleaned, flags=re.IGNORECASE
+    )
+    cleaned = _FETCH_FIRST_PATTERN.sub("", cleaned)
+    cleaned = _ROWNUM_PATTERN.sub("1=1", cleaned)
+    return cleaned.strip().rstrip(";").strip()
+
+
+def _build_count_companion(
+    raw_sql: str,
+    original_query_id: str,
+    table_refs: list,
+    db_type: str,
+) -> dict:
+    """
+    Wrap a raw-row SQL query in a COUNT subquery so the user learns the total
+    number of matching rows (not just the size of the sampled page).
+
+    Returns a plain dict ready to become a SQLQuery.
+
+    Works across all supported dialects:
+      PostgreSQL / SQLite / Redshift / BigQuery: SELECT COUNT(*) FROM (...) AS _c
+      SQL Server  : same (subquery alias required)
+      Oracle      : SELECT COUNT(*) FROM (...) _c   (no AS keyword for aliases)
+    """
+    base_sql = _strip_row_limit(raw_sql)
+    alias    = "_total_count"
+
+    if db_type.lower() == "oracle":
+        # Oracle does not use AS for table aliases in FROM
+        count_sql = f"SELECT COUNT(*) AS total_matching_rows FROM (\n  {base_sql}\n) {alias}"
+    else:
+        count_sql = f"SELECT COUNT(*) AS total_matching_rows FROM (\n  {base_sql}\n) AS {alias}"
+
+    return {
+        "query_id":    f"{original_query_id}_count",
+        "description": f"Total number of rows matching the query (full dataset, no row limit)",
+        "sql":         count_sql,
+        "table_refs":  table_refs,
+        "kg_id":       "",
+    }
+
+
 def plan_node(state: DialogState) -> DialogState:
     """Decompose the NQL into SQL queries via LLM."""
     logger.info("=== plan_node ===")
@@ -1317,6 +1372,41 @@ def plan_node(state: DialogState) -> DialogState:
         logger.warning("plan_node: 0 SQL queries produced from LLM plan of %d item(s)", len(plan))
     else:
         logger.info("plan_node: %d SQL queries planned", len(sql_queries))
+
+    # ── Inject COUNT companions for raw-row queries ───────────────────────────
+    # For every sampled raw-row query (no aggregation), prepend a companion
+    # COUNT(*) query so the user and the synthesizer know the total matching
+    # row count, not just the size of the page returned.
+    if sql_queries and getattr(config, "raw_row_count_companion", True):
+        enriched: List[SQLQuery] = []
+        companions_added = 0
+        for q in sql_queries:
+            if _is_raw_row_query(q["sql"]):
+                companion_dict = _build_count_companion(
+                    q["sql"], q["query_id"], list(q.get("table_refs") or []), config.db_type
+                )
+                companion = SQLQuery(
+                    query_id    = companion_dict["query_id"],
+                    description = companion_dict["description"],
+                    sql         = companion_dict["sql"],
+                    table_refs  = companion_dict["table_refs"],
+                    kg_id       = companion_dict["kg_id"],
+                )
+                enriched.append(companion)
+                companions_added += 1
+                logger.info(
+                    "plan_node: injected COUNT companion %s for raw-row query %s",
+                    companion["query_id"], q["query_id"],
+                )
+            enriched.append(q)
+
+        if companions_added:
+            sql_queries = enriched
+            logger.info(
+                "plan_node: %d COUNT companion(s) injected → %d total queries",
+                companions_added, len(sql_queries),
+            )
+
     state["sql_queries"] = sql_queries
     state["phase"] = "plan"
     return state

@@ -73,6 +73,11 @@ CRITICAL ACCURACY RULES — follow without exception
 3. Do NOT use domain knowledge to fill in or adjust numbers.
 4. If a query returned zero rows, say so explicitly — do not substitute estimates.
 5. If any queries failed, acknowledge the gap; do not invent replacement figures.
+6. SAMPLED DATA — when a query_id ends in "_count", it shows the TOTAL matching
+   rows in the full dataset.  Its companion query (same id without "_count") is a
+   sampled page of those rows.  Always state both numbers:
+     "Showing 20 of 12,483 matching rows (full dataset count from <id>_count)."
+   Never imply the sample is the complete result set.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ANALYTICAL DEPTH — mandatory
@@ -164,8 +169,25 @@ def _fmt_value(v: object) -> str:
 def _result_to_data_table(qr: QueryResult, max_rows: int = _DATA_SECTION_MAX_ROWS) -> str:
     """
     Render one QueryResult as a clean markdown block for the ## Data section.
+    COUNT companion queries (query_id ending in _count) get a callout banner.
     """
-    lines = [f"### {qr['query_id']}: {qr['description']}"]
+    is_count_companion = qr["query_id"].endswith("_count")
+    title = (
+        f"### {qr['query_id']}: {qr['description']}"
+        if not is_count_companion
+        else f"### {qr['query_id']}: Total rows in full dataset (no row limit)"
+    )
+    lines = [title]
+
+    if is_count_companion and not qr.get("error"):
+        rows = qr.get("rows") or []
+        if rows and rows[0]:
+            total = rows[0][0]
+            lines.append(f"> 📊 **{_fmt_value(total)} total matching rows** in the full dataset.")
+            lines.append(
+                f"> The sample query shows up to {_DATA_SECTION_MAX_ROWS} rows from this result."
+            )
+            return "\n".join(lines)
 
     if qr.get("error"):
         lines.append(f"> ⚠️ **Query failed:** {qr['error']}")

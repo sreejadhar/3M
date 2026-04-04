@@ -898,40 +898,62 @@ async def _index_source(source_id: str) -> None:
 
         src["extract_job_id"] = extract_job_id
         report = None
-        deadline = time.time() + 600
-        _events_seen = 0   # track how many fine-grained events we've forwarded
+
+        # ── Stream fine-grained events in real-time from agent-api SSE ────────
+        extraction_error: Optional[str] = None
+        _sse_timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=5.0)
+        try:
+            async with httpx.AsyncClient(timeout=_sse_timeout) as client:
+                async with client.stream(
+                    "GET", f"{METADATA_API}/jobs/{extract_job_id}/stream"
+                ) as r:
+                    async for raw_line in r.aiter_lines():
+                        if not raw_line.startswith("data:"):
+                            continue
+                        try:
+                            ev = json.loads(raw_line[5:].strip())
+                        except Exception:
+                            continue
+
+                        ev_type = ev.get("type", "")
+                        if ev_type == "heartbeat":
+                            continue
+                        if ev_type == "done":
+                            if ev.get("status") == "error":
+                                extraction_error = ev.get("error", "Extraction failed")
+                            break
+
+                        # Forward every fine-grained event straight to the browser SSE
+                        _push_index_event(
+                            source_id,
+                            ev.get("step", "extract"),
+                            ev.get("status", "running"),
+                            ev.get("message", ""),
+                            ev.get("detail", ""),
+                        )
+        except Exception as _stream_exc:
+            logger.warning("SSE stream from agent-api failed (%s) — falling back to polling",
+                           _stream_exc)
+            # Fallback: poll until done
+            deadline = time.time() + 600
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                while time.time() < deadline:
+                    pr  = await client.get(f"{METADATA_API}/jobs/{extract_job_id}")
+                    job = pr.json()
+                    if job.get("status") == "done":
+                        break
+                    if job.get("status") == "error":
+                        extraction_error = job.get("error", "Extraction failed")
+                        break
+                    await asyncio.sleep(2.0)
+
+        if extraction_error:
+            raise RuntimeError(extraction_error)
+
+        # Fetch the completed report
         async with httpx.AsyncClient(timeout=30.0) as client:
-            while time.time() < deadline:
-                pr  = await client.get(f"{METADATA_API}/jobs/{extract_job_id}")
-                job = pr.json()
-
-                # ── Forward any new fine-grained events as SSE ─────────────────
-                try:
-                    er = await client.get(
-                        f"{METADATA_API}/jobs/{extract_job_id}/events",
-                        params={"since": _events_seen},
-                    )
-                    if er.status_code == 200:
-                        payload = er.json()
-                        for ev in payload.get("events", []):
-                            _push_index_event(
-                                source_id,
-                                ev.get("step", "extract"),
-                                ev.get("status", "running"),
-                                ev.get("message", ""),
-                                ev.get("detail", ""),
-                            )
-                        _events_seen += len(payload.get("events", []))
-                except Exception:
-                    pass  # non-fatal — coarse events still flow
-
-                if job.get("status") == "done":
-                    rr = await client.get(f"{METADATA_API}/jobs/{extract_job_id}/report")
-                    report = rr.json()
-                    break
-                if job.get("status") == "error":
-                    raise RuntimeError(job.get("error", "Extraction failed"))
-                await asyncio.sleep(2.0)
+            rr = await client.get(f"{METADATA_API}/jobs/{extract_job_id}/report")
+            report = rr.json()
 
         if not report:
             raise RuntimeError("Extraction timed out")

@@ -23,7 +23,9 @@ GET  /ontology/list               list all generated ontologies
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
+import queue as _queue
 import shutil
 import sys
 import threading
@@ -33,8 +35,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # ── package on PYTHONPATH (set via ENV in Docker; fallback for local dev) ─────
@@ -69,8 +72,10 @@ def _save_history(history: List[Dict]) -> None:
 _jobs: Dict[str, Dict] = {}
 _lock = threading.Lock()
 
-# Fine-grained progress events per job: job_id → list of event dicts
+# Fine-grained progress events per job: job_id → list of event dicts (replay buffer)
 _job_events: Dict[str, List[Dict]] = {}
+# Live streaming queues: job_id → thread-safe Queue (None sentinel = stream ended)
+_job_stream_queues: Dict[str, _queue.Queue] = {}
 
 PIPELINE_NODES = ["connection", "discovery", "extraction", "analysis", "report"]
 
@@ -116,16 +121,19 @@ class AskRequest(BaseModel):
 
 # ── Background extraction runner ───────────────────────────────────────────────
 def _run_extraction(job_id: str, agent_cfg: AgentConfig, db_type: str, db_info: Dict) -> None:
+    stream_q: _queue.Queue = _queue.Queue()
     with _lock:
         _jobs[job_id]["status"] = "running"
         _job_events[job_id] = []
+        _job_stream_queues[job_id] = stream_q
 
-    # Progress callback — appends fine-grained events to _job_events[job_id]
+    # Progress callback — stores event in replay buffer AND pushes to live stream queue
     def _progress(step: str, status: str, message: str, detail: str) -> None:
         event = {"step": step, "status": status, "message": message,
                  "detail": detail, "ts": time.time()}
         with _lock:
             _job_events.setdefault(job_id, []).append(event)
+        stream_q.put(event)
 
     agent_cfg.progress_callback = _progress
 
@@ -198,6 +206,9 @@ def _run_extraction(job_id: str, agent_cfg: AgentConfig, db_type: str, db_info: 
         with _lock:
             _jobs[job_id]["status"] = "error"
             _jobs[job_id]["error"]  = str(exc)
+    finally:
+        # Signal the SSE stream that this job is finished (None = sentinel)
+        stream_q.put(None)
 
 
 # ── Helper: load report from disk ──────────────────────────────────────────────
@@ -612,6 +623,65 @@ def get_job_events(job_id: str, since: int = 0):
             raise HTTPException(status_code=404, detail="Job not found")
         events = list(_job_events.get(job_id, []))
     return {"events": events[since:], "total": len(events)}
+
+
+@app.get("/jobs/{job_id}/stream")
+async def stream_job_events(job_id: str, request: Request):
+    """
+    SSE stream of fine-grained progress events for a job.
+    Events are pushed in real-time as the extraction pipeline executes.
+    Replays any buffered events first, then streams new ones live.
+    Ends with a 'done' or 'error' sentinel event.
+    """
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        replay = list(_job_events.get(job_id, []))
+        stream_q = _job_stream_queues.get(job_id)
+        already_done = job.get("status") in ("done", "error")
+
+    async def _generate():
+        loop = asyncio.get_event_loop()
+
+        # 1. Replay already-buffered events (for late-connecting clients)
+        for ev in replay:
+            yield f"data: {json.dumps(ev)}\n\n"
+
+        # 2. If job already finished before we connected, send terminal event and stop
+        if already_done or stream_q is None:
+            with _lock:
+                j = _jobs.get(job_id, {})
+            terminal = {"type": "done", "status": j.get("status", "done"),
+                        "error": j.get("error", "")}
+            yield f"data: {json.dumps(terminal)}\n\n"
+            return
+
+        # 3. Stream live events from the thread-safe queue
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                ev = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.3))
+            except _queue.Empty:
+                yield "data: {\"type\":\"heartbeat\"}\n\n"
+                continue
+
+            if ev is None:  # sentinel — job finished
+                with _lock:
+                    j = _jobs.get(job_id, {})
+                terminal = {"type": "done", "status": j.get("status", "done"),
+                            "error": j.get("error", "")}
+                yield f"data: {json.dumps(terminal)}\n\n"
+                break
+
+            yield f"data: {json.dumps(ev)}\n\n"
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/jobs/{job_id}/report")

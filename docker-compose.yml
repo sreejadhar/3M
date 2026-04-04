@@ -93,6 +93,10 @@ services:
     environment:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # Controls which LLM synthesize_node uses for insight generation:
+      #   development → claude-haiku (cheap, fast iteration)
+      #   production  → claude-sonnet (quality, default)
+      DIALOG_ENV: "${DIALOG_ENV:-production}"
     healthcheck:
       # dialog-api imports LangGraph + Anthropic — allow 60s on EC2
       test: ["CMD", "python", "-c",

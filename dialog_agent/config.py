@@ -1,10 +1,31 @@
 """
 Configuration for the Dialog with Data Agent.
+
+LLM model selection is driven by the DIALOG_ENV environment variable:
+
+    DIALOG_ENV=production   → synthesize uses claude-sonnet-4-6  (default)
+    DIALOG_ENV=development  → synthesize uses claude-haiku-4-5-20251001 (cheap)
+
+SQL planning (plan_node) always uses Haiku regardless of environment.
+Set DIALOG_ENV in docker-compose.yml or your .env file.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Dict, Any, List
+
+# ---------------------------------------------------------------------------
+# Environment-aware model defaults
+# ---------------------------------------------------------------------------
+_ENV = os.environ.get("DIALOG_ENV", "production").strip().lower()
+_IS_DEV = _ENV in ("development", "dev", "local")
+
+_DEFAULT_SYNTH_MODEL = (
+    "claude-haiku-4-5-20251001"   # cheap — fast iteration in dev
+    if _IS_DEV else
+    "claude-sonnet-4-6"           # quality — what business users read
+)
 
 
 @dataclass
@@ -27,13 +48,12 @@ class DialogConfig:
     db_file_path: str = ""             # for SQLite / CSV / Excel sources
 
     # ── LLM settings ──────────────────────────────────────────────────────────
-    # plan_llm_model: used by plan_node to generate SQL.
-    #   Haiku is ~10-15× cheaper than Sonnet and fully capable of structured
-    #   JSON output for SQL generation — the biggest per-question cost driver.
+    # plan_llm_model: SQL generation — always Haiku (structured JSON output,
+    #   10-15× cheaper than Sonnet, no quality difference for SQL tasks).
     plan_llm_model: str = "claude-haiku-4-5-20251001"
-    # llm_model: used by synthesize_node to write the final user-facing insight.
-    #   Kept at Sonnet — this is what the business user reads.
-    llm_model: str = "claude-sonnet-4-6"
+    # llm_model: insight synthesis — Sonnet in production, Haiku in dev.
+    #   Driven by DIALOG_ENV env var; can also be overridden per-request via API.
+    llm_model: str = field(default_factory=lambda: _DEFAULT_SYNTH_MODEL)
     llm_temperature: float = 0.0
 
     # ── Query behaviour ───────────────────────────────────────────────────────

@@ -141,7 +141,7 @@ class QueryRequest(BaseModel):
     # Behaviour
     max_sql_queries: int = 10
     row_limit:       int = 500
-    llm_model:       str = "claude-sonnet-4-6"        # synthesize node (insight quality)
+    llm_model:       str = ""                          # synthesize node — empty = use DialogConfig env default
     plan_llm_model:  str = "claude-haiku-4-5-20251001" # plan node (SQL generation — cheaper)
 
     # User context — used to personalise insight framing
@@ -321,7 +321,9 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
         db_extra             = req.db_extra,
         db_file_path         = req.db_file_path or "",
         source_id            = req.source_id or "",
-        llm_model            = req.llm_model,
+        # Only override llm_model when the caller explicitly picks one;
+        # otherwise DialogConfig uses its env-driven default (DIALOG_ENV).
+        **({"llm_model": req.llm_model} if req.llm_model else {}),
         plan_llm_model       = req.plan_llm_model,
         max_sql_queries      = req.max_sql_queries,
         row_limit            = req.row_limit,

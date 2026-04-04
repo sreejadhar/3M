@@ -404,26 +404,23 @@ async def _startup() -> None:
     except Exception as exc:
         logger.warning("access_control bootstrap failed (non-fatal): %s", exc)
 
-    if os.environ.get("APP_ENV", "").strip().lower() == "production":
-        try:
-            restored = _kg_store.load_all()
-            for src in restored:
-                if src["id"] not in _sources:
-                    _sources[src["id"]] = src
-            logger.info("kg_store: restored %d sources from persistent store", len(restored))
-            # Back-fill taxonomy annotations for all restored sources whose
-            # md_attributes have not yet been annotated.
-            for src in restored:
-                try:
-                    n = _sync_taxonomy_from_kg_nodes(src["id"], src.get("kg_nodes") or [])
-                    if n:
-                        logger.info("Startup taxonomy sync: %d columns for %s", n, src["id"][:8])
-                except Exception as _ts_exc:
-                    logger.warning("Startup taxonomy sync failed for %s: %s", src["id"][:8], _ts_exc)
-        except Exception as exc:
-            logger.warning("kg_store restore failed (non-fatal): %s", exc)
-    else:
-        logger.info("kg_store: dev/test mode — skipping KG snapshot restore")
+    try:
+        restored = _kg_store.load_all()
+        for src in restored:
+            if src["id"] not in _sources:
+                _sources[src["id"]] = src
+        logger.info("kg_store: restored %d sources from persistent store", len(restored))
+        # Back-fill taxonomy annotations for all restored sources whose
+        # md_attributes have not yet been annotated.
+        for src in restored:
+            try:
+                n = _sync_taxonomy_from_kg_nodes(src["id"], src.get("kg_nodes") or [])
+                if n:
+                    logger.info("Startup taxonomy sync: %d columns for %s", n, src["id"][:8])
+            except Exception as _ts_exc:
+                logger.warning("Startup taxonomy sync failed for %s: %s", src["id"][:8], _ts_exc)
+    except Exception as exc:
+        logger.warning("kg_store restore failed (non-fatal): %s", exc)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

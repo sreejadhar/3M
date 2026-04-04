@@ -152,6 +152,7 @@ services:
       DIALOG_API_URL:   "http://dialog-api:8003"
       LOG_LEVEL:        "${LOG_LEVEL:-info}"
       METADATA_DB:      "/data/metadata.db"
+      KG_STORE_DB:      "/data/kg_store.db"
     depends_on:
       agent-api:
         condition: service_healthy

@@ -189,6 +189,8 @@ def analysis_node(state: AgentState) -> AgentState:
             right_table=right_name,
             left_columns=_col_dicts(left_meta),
             right_columns=_col_dicts(right_meta),
+            left_col_stats=_col_stats(left_meta),
+            right_col_stats=_col_stats(right_meta),
             sample_size=config.sample_size,
             threshold=config.id_threshold,
             max_pairs=max_pairs_this_run,

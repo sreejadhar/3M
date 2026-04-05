@@ -37,12 +37,28 @@ class IDDetectorInput(BaseModel):
     right_columns: List[Dict[str, str]] = Field(
         description="Columns of right table: [{name, data_type}, ...]"
     )
+    left_col_stats: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Per-column stats for left table: {col_name: {uniqueness_ratio, ...}}"
+    )
+    right_col_stats: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Per-column stats for right table: {col_name: {uniqueness_ratio, ...}}"
+    )
     sample_size: int = Field(default=10_000)
     threshold: float = Field(default=0.95, description="Min coverage fraction")
     max_pairs: int = Field(default=100)
     check_bidirectional: bool = Field(
         default=True,
         description="Also test right→left inclusion for each candidate pair"
+    )
+    fk_uniqueness_threshold: float = Field(
+        default=0.95,
+        description=(
+            "Min uniqueness_ratio required on the right-side column before an IND "
+            "can be promoted to a FK candidate. Prevents fact→fact spurious FKs "
+            "where both sides carry non-unique ID columns."
+        ),
     )
 
 
@@ -246,6 +262,32 @@ class InclusionDependencyTool(BaseTool):
         return intersection / union if union else 0.0
 
     # ------------------------------------------------------------------
+    # Right-side uniqueness gate
+    # ------------------------------------------------------------------
+
+    def _right_col_is_unique(
+        self,
+        col_name: str,
+        col_stats: Optional[Dict[str, Any]],
+        threshold: float,
+    ) -> bool:
+        """
+        Return True if the right-side column is unique enough to be a valid FK target.
+
+        If no stats are provided we optimistically allow it (backwards-compatible).
+        If uniqueness_ratio is None (e.g. row_count=0) we also allow it.
+        """
+        if col_stats is None:
+            return True
+        stats = col_stats.get(col_name)
+        if stats is None:
+            return True
+        ratio = stats.get("uniqueness_ratio")
+        if ratio is None:
+            return True
+        return ratio >= threshold
+
+    # ------------------------------------------------------------------
     # Candidate generation
     # ------------------------------------------------------------------
 
@@ -338,10 +380,13 @@ class InclusionDependencyTool(BaseTool):
         right_table: str,
         left_columns: List[Dict[str, str]],
         right_columns: List[Dict[str, str]],
+        left_col_stats: Optional[Dict[str, Any]] = None,
+        right_col_stats: Optional[Dict[str, Any]] = None,
         sample_size: int = 10_000,
         threshold: float = 0.95,
         max_pairs: int = 100,
         check_bidirectional: bool = True,
+        fk_uniqueness_threshold: float = 0.95,
     ) -> str:
         try:
             pairs_with_sim = self._generate_column_pairs(
@@ -363,6 +408,13 @@ class InclusionDependencyTool(BaseTool):
 
                 if coverage_lr >= threshold:
                     ind_type = _classify_ind(coverage_lr, sim)
+                    # Right-side uniqueness gate: only promote to FK candidate
+                    # if right_col is unique/near-unique (i.e. a valid PK/UK target).
+                    # This prevents spurious fact→fact or table→table FK inferences
+                    # where both sides share a non-unique key column.
+                    right_is_unique = self._right_col_is_unique(
+                        right_col, right_col_stats, fk_uniqueness_threshold
+                    )
                     found_inds.append({
                         "left_table": left_table,
                         "left_columns": [left_col],
@@ -370,8 +422,8 @@ class InclusionDependencyTool(BaseTool):
                         "right_columns": [right_col],
                         "coverage": round(coverage_lr, 4),
                         "name_similarity": round(sim, 4),
-                        "is_foreign_key_candidate": coverage_lr >= 0.99,
-                        "ind_type": ind_type,
+                        "is_foreign_key_candidate": coverage_lr >= 0.99 and right_is_unique,
+                        "ind_type": ind_type if right_is_unique else "value_subset",
                         "is_composite": False,
                         "description": _describe_ind(
                             left_table, left_col, right_table, right_col,
@@ -391,6 +443,10 @@ class InclusionDependencyTool(BaseTool):
 
                     if coverage_rl >= threshold:
                         ind_type = _classify_ind(coverage_rl, sim)
+                        # For the reverse direction the "right" side is left_col
+                        left_is_unique = self._right_col_is_unique(
+                            left_col, left_col_stats, fk_uniqueness_threshold
+                        )
                         found_inds.append({
                             "left_table": right_table,
                             "left_columns": [right_col],
@@ -398,8 +454,8 @@ class InclusionDependencyTool(BaseTool):
                             "right_columns": [left_col],
                             "coverage": round(coverage_rl, 4),
                             "name_similarity": round(sim, 4),
-                            "is_foreign_key_candidate": coverage_rl >= 0.99,
-                            "ind_type": ind_type,
+                            "is_foreign_key_candidate": coverage_rl >= 0.99 and left_is_unique,
+                            "ind_type": ind_type if left_is_unique else "value_subset",
                             "is_composite": False,
                             "description": _describe_ind(
                                 right_table, right_col, left_table, left_col,
@@ -420,7 +476,12 @@ class InclusionDependencyTool(BaseTool):
                 )
                 tested += 1
                 if cov >= threshold:
-                    ind_type = _classify_ind(cov, 0.9)  # composite implies structural similarity
+                    ind_type = _classify_ind(cov, 0.9)
+                    # For composite FKs all right-side columns must be unique
+                    all_right_unique = all(
+                        self._right_col_is_unique(rc, right_col_stats, fk_uniqueness_threshold)
+                        for rc in right_cols
+                    )
                     found_inds.append({
                         "left_table": left_table,
                         "left_columns": left_cols,
@@ -428,8 +489,8 @@ class InclusionDependencyTool(BaseTool):
                         "right_columns": right_cols,
                         "coverage": round(cov, 4),
                         "name_similarity": None,
-                        "is_foreign_key_candidate": cov >= 0.99,
-                        "ind_type": ind_type,
+                        "is_foreign_key_candidate": cov >= 0.99 and all_right_unique,
+                        "ind_type": ind_type if all_right_unique else "value_subset",
                         "is_composite": True,
                         "description": _describe_ind(
                             left_table,

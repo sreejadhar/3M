@@ -950,7 +950,10 @@ function _renderOntoViz(parsed) {
       layout: { randomSeed: 42 },
     }
   );
-  _ontoNetwork.on('stabilizationIterationsDone', () => _ontoNetwork.setOptions({ physics: { enabled: false } }));
+  _ontoNetwork.on('stabilizationIterationsDone', () => {
+    _ontoNetwork.setOptions({ physics: { enabled: false } });
+    _ontoNetwork.fit();
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

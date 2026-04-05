@@ -526,6 +526,14 @@ def _run_sql(cfg: DialogConfig, sql: str, state: Optional[Dict] = None, kg_id: s
             return _run_teradata(cfg, sql)
         elif db in ("delta_lake", "databricks"):
             return _run_databricks(cfg, sql)
+        elif db in ("sqlite", "csv", "excel"):
+            conn = _open_file_conn(cfg)
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                return _cursor_to_result(cur)
+            finally:
+                conn.close()
         else:
             return {"columns": [], "rows": [], "error": f"Unsupported db_type: {db}"}
     except Exception as exc:

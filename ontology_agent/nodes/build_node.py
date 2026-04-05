@@ -428,8 +428,11 @@ def build_node(state: OntologyState) -> OntologyState:
         fd_type = fd.get("fd_type", "non_key")
         fd_desc = fd.get("description")
 
-        # Build a structured FD annotation
-        fd_parts = []
+        # Build a structured FD annotation.
+        # The sentinel prefix "FD-ANNOTATION:" is used by understand_node to
+        # strip these comments from the SQL planning schema context, preventing
+        # the LLM from treating determinant/dependent column names as real columns.
+        fd_parts = [f"FD-ANNOTATION:"]
         if fd_desc:
             fd_parts.append(fd_desc)
         fd_parts.append(

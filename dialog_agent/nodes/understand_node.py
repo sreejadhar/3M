@@ -315,16 +315,21 @@ def _extract_columns_from_title(title: str, table_label: str) -> List[str]:
 def _extract_comments_from_title(title: str) -> List[str]:
     """
     Return the rdfs:comment lines from the node title (row_count, table description etc.)
-    Skips the first 'Class: X' line, the 'Properties:' block, and FD annotation lines.
+    Skips the first 'Class: X' line, the 'Properties:' block, and ALL FD annotation lines.
 
     FD annotations are excluded because they reference column names from the
-    determinant/dependent sets (e.g. "[Segment_ID] → [Segment_Flag]") which the
-    LLM misreads as valid SELECT-able column names, causing "column does not exist"
-    errors at runtime.  FD information is structural metadata — it does not need to
-    appear in the SQL planning prompt.
+    determinant/dependent sets (e.g. "'Segment_ID' determines 'Segment_Flag'") which
+    the LLM misreads as valid SELECT-able columns, causing "column does not exist"
+    errors at runtime.
+
+    build_node marks each FD comment block with a leading "FD-ANNOTATION:" sentinel line
+    and a trailing "FD type: ... | confidence=N" line.  We use a stateful flag to skip
+    the ENTIRE block including the description line between them, which also contains
+    column names and would otherwise leak through.
     """
     comments: List[str] = []
-    in_props = False
+    in_props    = False
+    in_fd_block = False
     for line in title.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -336,13 +341,22 @@ def _extract_comments_from_title(title: str) -> List[str]:
             continue
         if in_props:
             break
-        # Skip FD annotation blocks entirely.
-        # build_node prefixes every FD comment with "FD-ANNOTATION:" and the
-        # block also contains "FD type:" / "| confidence=" lines.  All of these
-        # reference determinant/dependent column names that the LLM would
-        # misread as queryable SELECT-able columns, causing runtime errors.
-        if stripped.startswith("FD-ANNOTATION:") or "FD type:" in stripped or "| confidence=" in stripped:
+
+        # Detect the start of an FD annotation block (sentinel from build_node)
+        if stripped.startswith("FD-ANNOTATION:"):
+            in_fd_block = True
             continue
+
+        # Detect the closing line of an FD block and exit the block
+        if "FD type:" in stripped or "| confidence=" in stripped:
+            in_fd_block = False   # reset — next line is a new comment
+            continue
+
+        # While inside an FD block, drop every line (the plain-English description
+        # also contains column names like "'Segment_ID' determines 'Segment_Flag'")
+        if in_fd_block:
+            continue
+
         comments.append(stripped)
     return comments
 

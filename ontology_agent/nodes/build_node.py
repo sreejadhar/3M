@@ -342,7 +342,11 @@ def build_node(state: OntologyState) -> OntologyState:
         added_obj_props.add(prop_uri)
 
     # ------------------------------------------------------------------
-    # 4. ObjectProperties + cardinality from cardinality relationships
+    # 4. Cardinality annotations — enrich existing FK edges; only create a
+    #    new edge when no FK-derived edge exists for this table pair.
+    #
+    #    This prevents duplicate edges (one from IND→FK, one from cardinality)
+    #    which caused the cluttered bidirectional ↔ labels in the graph UI.
     # ------------------------------------------------------------------
     for cr in report.get("cardinality_relationships") or []:
         left_t    = cr.get("left_table",  "")
@@ -353,15 +357,36 @@ def build_node(state: OntologyState) -> OntologyState:
         right_uniq= cr.get("right_unique_values", 0)
         if left_t not in class_map or right_t not in class_map:
             continue
-        prop_uri = ns[f"{_safe(left_t)}_relates_{_safe(right_t)}"]
-        if prop_uri not in added_obj_props:
-            g.add((prop_uri, RDF.type,    OWL.ObjectProperty))
-            g.add((prop_uri, RDFS.label,  Literal(f"{left_t} ↔ {right_t} ({rel_type})")))
-            g.add((prop_uri, RDFS.domain, class_map[left_t]))
-            g.add((prop_uri, RDFS.range,  class_map[right_t]))
-            added_obj_props.add(prop_uri)
 
-        # Rich cardinality description
+        # Prefer annotating the existing IND-derived or explicit FK edge for
+        # this pair rather than creating a separate cardinality edge.
+        fk_uri    = ns[f"{_safe(left_t)}_fk_{_safe(right_t)}"]
+        ref_uri   = ns[f"{_safe(left_t)}_references_{_safe(right_t)}"]
+        rel_uri   = ns[f"{_safe(left_t)}_relates_{_safe(right_t)}"]
+
+        if fk_uri in added_obj_props:
+            prop_uri = fk_uri
+        elif ref_uri in added_obj_props:
+            prop_uri = ref_uri
+        else:
+            # No FK edge exists — create a new directed edge (not bidirectional)
+            prop_uri = rel_uri
+            if prop_uri not in added_obj_props:
+                g.add((prop_uri, RDF.type,    OWL.ObjectProperty))
+                # Clean directed label — cardinality goes in comments/OWL only
+                g.add((prop_uri, RDFS.label,  Literal(f"{left_t} → {right_t}")))
+                g.add((prop_uri, RDFS.domain, class_map[left_t]))
+                g.add((prop_uri, RDFS.range,  class_map[right_t]))
+                added_obj_props.add(prop_uri)
+
+        # OWL cardinality semantics on whichever edge we resolved
+        if rel_type == "1:1":
+            g.add((prop_uri, RDF.type, OWL.FunctionalProperty))
+            g.add((prop_uri, RDF.type, OWL.InverseFunctionalProperty))
+        elif rel_type in ("1:N", "N:1"):
+            g.add((prop_uri, RDF.type, OWL.FunctionalProperty))
+
+        # Rich cardinality description (appended as additional rdfs:comment)
         card_desc_parts = [
             f"Cardinality: {rel_type} relationship between '{left_t}' and '{right_t}'",
         ]
@@ -389,12 +414,6 @@ def build_node(state: OntologyState) -> OntologyState:
                 f"Many-to-many relationship between '{left_t}' and '{right_t}'."
             )
         g.add((prop_uri, RDFS.comment, Literal("\n".join(card_desc_parts))))
-
-        if rel_type == "1:1":
-            g.add((prop_uri, RDF.type, OWL.FunctionalProperty))
-            g.add((prop_uri, RDF.type, OWL.InverseFunctionalProperty))
-        elif rel_type in ("1:N", "N:1"):
-            g.add((prop_uri, RDF.type, OWL.FunctionalProperty))
 
     # ------------------------------------------------------------------
     # 5. Annotate classes with FD summaries (rich descriptions)

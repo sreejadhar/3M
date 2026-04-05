@@ -353,10 +353,14 @@ def _build_graph_data(classes: Dict, obj_props: List) -> Dict:
                 join_columns.append([m2.group(1), m2.group(2)])
 
         comments = "; ".join(op["comments"])
+
+        # Edge label: short cardinality only (e.g. "1:N") so the graph stays
+        # readable. Full property name + cardinality + comments go in the
+        # tooltip (title) so engineers can inspect details on hover.
         edges.append({
             "from":         op["domain"],
             "to":           op["range"],
-            "label":        op["name"],
+            "label":        cardinality,
             "title":        f"{op['name']} ({cardinality})" + (f"\n{comments}" if comments else ""),
             "join_columns": join_columns,   # [[src_col, tgt_col], ...]
         })

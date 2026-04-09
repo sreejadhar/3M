@@ -283,6 +283,66 @@ def _generate_gremlin(classes: Dict, obj_props: List, config: Any) -> List[str]:
     return queries
 
 
+# ── Semantic edge-label derivation ───────────────────────────────────────────
+
+_STRIP_SUFFIX_RE = re.compile(
+    r'(_id|_key|_code|_no|_num|_nr|_nbr|_cd|_sk|_nk|_fk|_ref|_uuid|_guid)$',
+    re.IGNORECASE,
+)
+_CAMEL_SPLIT_RE = re.compile(r'(?<=[a-z0-9])(?=[A-Z])')
+
+
+def _entity_name_from(raw: str) -> str:
+    """
+    Turn a raw column or table token into a short Title-Cased entity name.
+    e.g. "customer_id" → "Customer", "productSKU" → "Product SKU"
+    """
+    s = _STRIP_SUFFIX_RE.sub("", raw.strip())
+    s = _CAMEL_SPLIT_RE.sub(" ", s)
+    s = re.sub(r'[_\s]+', ' ', s).strip()
+    return s.title() if s else raw.title()
+
+
+def _semantic_edge_label(prop_name: str, join_columns: List[List[str]], cardinality: str) -> str:
+    """
+    Derive a short human-readable edge label from an OWL ObjectProperty name
+    and its join column pair(s).  Falls back gracefully when signals are thin.
+
+    Examples
+    --------
+    prop_name="orders references customers", join=[["customer_id","id"]]
+        → "has Customer (1:N)"
+    prop_name="order_items → products (explicit FK)", join=[["product_id","id"]]
+        → "has Product (1:N)"
+    prop_name="sales_fact → region", join=[]
+        → "relates Region (M:N)"
+    """
+    # ── 1. Try to derive entity name from the FK column on the left side ──────
+    #   "customer_id" → "Customer",  "product_sku" → "Product"
+    if join_columns:
+        src_col = join_columns[0][0]  # first join pair, left column
+        entity = _entity_name_from(src_col)
+        # Sanity-check: entity should be shorter than full prop_name
+        if entity and len(entity) <= 30:
+            return f"has {entity} ({cardinality})"
+
+    # ── 2. Extract range table name from the property name ────────────────────
+    #   "orders references customers"  → "customers"
+    #   "order_items → products (explicit FK)"  → "products"
+    #   "sales_fact → region (inferred FK)"     → "region"
+    range_token = ""
+    # Try "→ <target>" or "references <target>" patterns
+    m = re.search(r'(?:→|references?)\s+([A-Za-z0-9_]+)', prop_name, re.IGNORECASE)
+    if m:
+        range_token = m.group(1)
+    if range_token:
+        entity = _entity_name_from(range_token)
+        return f"has {entity} ({cardinality})"
+
+    # ── 3. Generic fallback ───────────────────────────────────────────────────
+    return f"relates ({cardinality})"
+
+
 # ── Graph data for UI visualisation ──────────────────────────────────────────
 
 def _build_graph_data(classes: Dict, obj_props: List) -> Dict:
@@ -362,13 +422,14 @@ def _build_graph_data(classes: Dict, obj_props: List) -> Dict:
 
         comments = "; ".join(op["comments"])
 
-        # Edge label: short cardinality only (e.g. "1:N") so the graph stays
-        # readable. Full property name + cardinality + comments go in the
-        # tooltip (title) so engineers can inspect details on hover.
+        # Edge label: semantic verb derived from the property name / join column,
+        # with cardinality appended in parens.  Full details go in the tooltip.
+        edge_label = _semantic_edge_label(op["name"], join_columns, cardinality)
+
         edges.append({
             "from":         op["domain"],
             "to":           op["range"],
-            "label":        cardinality,
+            "label":        edge_label,
             "title":        f"{op['name']} ({cardinality})" + (f"\n{comments}" if comments else ""),
             "join_columns": join_columns,   # [[src_col, tgt_col], ...]
         })

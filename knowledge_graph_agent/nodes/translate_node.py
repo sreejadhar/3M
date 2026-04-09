@@ -329,6 +329,14 @@ def _build_graph_data(classes: Dict, obj_props: List) -> Dict:
             "title": title,
             "color": "#63b3ed",
             "size":  20 + min(len(cls["datatype_props"]) * 2, 20),
+            # Structured property list consumed by the bridge inference engine
+            # (_profiles_from_nodes in kg_inference_engine.py). Without this,
+            # the engine sees node.get("properties") == None and produces empty
+            # column profiles, so no cross-KG bridges are ever inferred.
+            "properties": [
+                {"name": p["name"], "type": p["range"]}
+                for p in cls["datatype_props"]
+            ],
         })
 
     for op in obj_props:

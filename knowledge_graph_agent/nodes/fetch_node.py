@@ -60,12 +60,21 @@ def _fetch_neo4j(config: Any) -> Tuple[Dict, int, int]:
                     if dt_lines:
                         title += "\n\nProperties:\n" + "\n".join(dt_lines)
 
+                # Structured column list for bridge inference engine.
+                # Non-internal props are the datatype-property columns stored
+                # by translate_node as "ON CREATE SET n.col_name = 'xsd:type'".
+                col_props = [
+                    {"name": k, "type": v}
+                    for k, v in props.items()
+                    if k not in _INTERNAL
+                ]
                 nodes.append({
-                    "id":    uri,
-                    "label": name,
-                    "title": title,
-                    "color": "#63b3ed",
-                    "size":  20 + min(len(dt_lines) * 2, 20),
+                    "id":         uri,
+                    "label":      name,
+                    "title":      title,
+                    "color":      "#63b3ed",
+                    "size":       20 + min(len(dt_lines) * 2, 20),
+                    "properties": col_props,
                 })
 
             # Fetch relationships scoped to this KG only
@@ -144,12 +153,20 @@ def _fetch_gremlin(config: Any) -> Tuple[Dict, int, int]:
                 if dt_lines:
                     title += "\n\nProperties:\n" + "\n".join(dt_lines)
 
+            # Structured column list for bridge inference engine.
+            # Gremlin stores column types as "{col}_xsd_type" vertex properties.
+            col_props = [
+                {"name": str(k)[:-len("_xsd_type")], "type": vals[0]}
+                for k, vals in v.items()
+                if str(k).endswith("_xsd_type") and isinstance(vals, list) and vals
+            ]
             nodes.append({
-                "id":    uri,
-                "label": name,
-                "title": title,
-                "color": "#63b3ed",
-                "size":  20 + min(len(dt_lines) * 2, 20),
+                "id":         uri,
+                "label":      name,
+                "title":      title,
+                "color":      "#63b3ed",
+                "size":       20 + min(len(dt_lines) * 2, 20),
+                "properties": col_props,
             })
 
         # Fetch edges scoped to this KG

@@ -1,16 +1,9 @@
 # ── Stage 1: dependency builder ────────────────────────────────────────────────
+# No apt-get needed: every package in requirements.agent.txt ships a
+# prebuilt binary wheel (psycopg2-binary, pyodbc>=5.0 manylinux wheels).
 FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /build
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
-    && apt-get clean \
-    && apt-get update --fix-missing -o Acquire::Retries=5 -o Acquire::http::Timeout=30 \
-    && apt-get install -y --no-install-recommends --fix-missing \
-        gcc g++ libpq-dev unixodbc-dev \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 COPY requirements.agent.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.agent.txt

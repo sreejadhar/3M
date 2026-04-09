@@ -5,6 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.agent
+      network: host   # lets apt-get use the host's DNS during build
     image: metadata-agent-api:latest
     container_name: metadata-agent-api
     restart: unless-stopped

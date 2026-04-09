@@ -347,7 +347,22 @@ def build_node(state: OntologyState) -> OntologyState:
     #
     #    This prevents duplicate edges (one from IND→FK, one from cardinality)
     #    which caused the cluttered bidirectional ↔ labels in the graph UI.
+    #
+    #    Fact-table detection: match the same naming conventions used by
+    #    extraction_node so that fact↔fact cardinality relationships (which
+    #    share ID columns but have no meaningful FK relationship) are not
+    #    rendered as graph edges.
     # ------------------------------------------------------------------
+    _FACT_NAME_RE = re.compile(r'\b(fact|fct|measure|metric|kpi)\b', re.IGNORECASE)
+
+    def _is_fact_table(name: str) -> bool:
+        """Return True if the table is a fact/measure table."""
+        if _FACT_NAME_RE.search(name):
+            return True
+        # Also check the stored description in case the table was labelled by extraction_node
+        desc = (tables.get(name) or {}).get("description") or ""
+        return "fact/measure table" in desc
+
     for cr in report.get("cardinality_relationships") or []:
         left_t    = cr.get("left_table",  "")
         right_t   = cr.get("right_table", "")
@@ -369,7 +384,14 @@ def build_node(state: OntologyState) -> OntologyState:
         elif ref_uri in added_obj_props:
             prop_uri = ref_uri
         else:
-            # No FK edge exists — create a new directed edge (not bidirectional)
+            # No FK edge exists — skip creating a spurious edge between two
+            # fact tables (they share ID columns but are not meaningfully joined).
+            if _is_fact_table(left_t) and _is_fact_table(right_t):
+                logger.debug(
+                    "Skipping fact↔fact cardinality edge: %s ↔ %s", left_t, right_t
+                )
+                continue
+            # Create a new directed edge (not bidirectional)
             prop_uri = rel_uri
             if prop_uri not in added_obj_props:
                 g.add((prop_uri, RDF.type,    OWL.ObjectProperty))

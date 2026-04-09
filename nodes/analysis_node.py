@@ -14,6 +14,7 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import re
 from typing import Any, Dict, List
 
 from ..state import (
@@ -264,6 +265,11 @@ def analysis_node(state: AgentState) -> AgentState:
            "Algorithm: join-column uniqueness ratio — determines 1:1, 1:N, N:1, M:N relationships")
     cardinality_pair_count = 0
 
+    _FACT_RE = re.compile(r'\b(fact|fct|measure|metric|kpi)\b', re.IGNORECASE)
+
+    def _is_fact(name: str) -> bool:
+        return bool(_FACT_RE.search(name))
+
     for left_name, right_name in itertools.combinations(table_names, 2):
         if cardinality_pair_count >= cardinality_cap:
             logger.info("  Cardinality: pair cap (%d) reached, stopping.", cardinality_cap)
@@ -271,6 +277,13 @@ def analysis_node(state: AgentState) -> AgentState:
                 cb("cardinality", "warn",
                    f"Cardinality cap ({cardinality_cap} pairs) reached — remaining pairs skipped", "")
             break
+
+        # Fact↔fact pairs share ID columns but have no meaningful join path;
+        # skip them to avoid spurious cardinality edges in the KG.
+        if _is_fact(left_name) and _is_fact(right_name):
+            logger.debug("  Cardinality: skipping fact↔fact pair %s ↔ %s", left_name, right_name)
+            cardinality_pair_count += 1
+            continue
 
         left_meta  = table_metadata[left_name]
         right_meta = table_metadata[right_name]

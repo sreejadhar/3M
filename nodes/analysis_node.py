@@ -85,6 +85,11 @@ def analysis_node(state: AgentState) -> AgentState:
     n_tables = len(table_names)
     n_pairs  = n_tables * (n_tables - 1) // 2
 
+    _FACT_RE = re.compile(r'\b(fact|fct|measure|metric|kpi)\b', re.IGNORECASE)
+
+    def _is_fact(name: str) -> bool:
+        return bool(_FACT_RE.search(name))
+
     # ------------------------------------------------------------------
     # 1. Functional Dependencies (per table)
     # ------------------------------------------------------------------
@@ -272,11 +277,6 @@ def analysis_node(state: AgentState) -> AgentState:
            f"Cardinality analysis — {n_pairs} table pair{'s' if n_pairs != 1 else ''} (cap {cardinality_cap})",
            "Algorithm: join-column uniqueness ratio — determines 1:1, 1:N, N:1, M:N relationships")
     cardinality_pair_count = 0
-
-    _FACT_RE = re.compile(r'\b(fact|fct|measure|metric|kpi)\b', re.IGNORECASE)
-
-    def _is_fact(name: str) -> bool:
-        return bool(_FACT_RE.search(name))
 
     for left_name, right_name in itertools.combinations(table_names, 2):
         if cardinality_pair_count >= cardinality_cap:

@@ -1180,76 +1180,218 @@ const _msgStore = {};   // msg_id → { content, results, sql }
 const _DL_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
 const _EMAIL_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2 4 12 13 22 4"/></svg>`;
 
+// ── Content-type detection ─────────────────────────────────────────────────────
+
+function _isComparativeQuery(content, results) {
+  const text = (content || '') + (results || []).map(r => r.description || '').join(' ');
+  return /compar|vs\.?\s|versus|benchmark|scorecard|rank|rating|evaluat|assess|side.by.side|performance.against|gap.analys/i.test(text);
+}
+
+function _isScheduleQuery(content, results) {
+  const text = (content || '') + (results || []).map(r => r.description || '').join(' ');
+  return /schedule|roster|shift|rota|timetable|calendar|planner|agenda|assign|allocation|on.call|duty|weekly.plan|staffing.plan/i.test(text);
+}
+
+// ── Harvey Ball renderer ───────────────────────────────────────────────────────
+// Maps numeric values to 0–4 fill levels and renders SVG circles.
+
+function _harveyScore(v, min, max) {
+  if (max === min) return 2;
+  const t = (v - min) / (max - min);
+  return Math.round(t * 4);   // 0 = empty … 4 = full
+}
+
+function _harveySVG(level) {
+  // level: 0 empty, 1 quarter, 2 half, 3 three-quarter, 4 full
+  const r = 10, cx = 12, cy = 12, stroke = '#4285F4', fill = '#4285F4', bg = '#e8edf8';
+  const circle = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${bg}" stroke="${stroke}" stroke-width="1.5"/>`;
+  let pie = '';
+  if (level === 0) {
+    pie = '';
+  } else if (level === 4) {
+    pie = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${fill}"/>`;
+  } else {
+    const angles = [0, 90, 180, 270];
+    const endAngle = angles[level];
+    const rad = a => (a - 90) * Math.PI / 180;
+    const x1 = cx + r * Math.cos(rad(0));
+    const y1 = cy + r * Math.sin(rad(0));
+    const x2 = cx + r * Math.cos(rad(endAngle));
+    const y2 = cy + r * Math.sin(rad(endAngle));
+    const large = endAngle > 180 ? 1 : 0;
+    pie = `<path d="M${cx},${cy} L${x1},${y1} A${r},${r} 0 ${large},1 ${x2},${y2} Z" fill="${fill}"/>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">${circle}${pie}</svg>`;
+}
+
+function _harveyLabel(level) {
+  return ['None','Low','Medium','High','Full'][level];
+}
+
+function buildHarveyTable(cols, rows, desc) {
+  const numCols  = cols.filter(c => rows.slice(0,5).every(r => isNumeric(r[c])));
+  const lblCols  = cols.filter(c => !numCols.includes(c));
+  if (!numCols.length || !lblCols.length) return null;
+
+  // Compute min/max per numeric column for normalisation
+  const ranges = {};
+  numCols.forEach(c => {
+    const vals = rows.map(r => Number(r[c])).filter(v => !isNaN(v));
+    ranges[c] = { min: Math.min(...vals), max: Math.max(...vals) };
+  });
+
+  const thead = '<tr>'
+    + lblCols.map(c => `<th class="hb-th">${escHtml(c)}</th>`).join('')
+    + numCols.map(c => `<th class="hb-th hb-metric">${escHtml(c)}</th>`).join('')
+    + '</tr>';
+
+  const tbody = rows.map(row => {
+    const labelCells = lblCols.map(c => `<td class="hb-label">${escHtml(String(row[c] ?? ''))}</td>`).join('');
+    const metricCells = numCols.map(c => {
+      const v = Number(row[c]);
+      if (isNaN(v)) return `<td class="hb-cell">—</td>`;
+      const { min, max } = ranges[c];
+      const lvl  = _harveyScore(v, min, max);
+      return `<td class="hb-cell" title="${c}: ${formatNumber(v)} (${_harveyLabel(lvl)})">${_harveySVG(lvl)}<span class="hb-val">${formatNumber(v)}</span></td>`;
+    }).join('');
+    return `<tr>${labelCells}${metricCells}</tr>`;
+  }).join('');
+
+  const legend = [0,1,2,3,4].map(l =>
+    `<span class="hb-leg-item">${_harveySVG(l)}<span>${_harveyLabel(l)}</span></span>`
+  ).join('');
+
+  return `<div class="result-block harvey-block">
+    <div class="result-block-header">
+      <span class="result-block-icon">🎯</span>
+      <span class="result-block-title">${escHtml(desc || 'Comparative Analysis')}</span>
+      <span class="result-row-badge">${rows.length} rows</span>
+    </div>
+    <div class="harvey-legend">${legend}</div>
+    <div class="result-table-wrap">
+      <table class="result-table harvey-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table>
+    </div>
+  </div>`;
+}
+
+// ── Schedule / Roster renderer ─────────────────────────────────────────────────
+
+function buildScheduleTable(cols, rows, desc) {
+  // Detect person/role col (first non-date/time text col) and time cols
+  const timeCols = cols.filter(c => /date|day|week|shift|time|slot|period|from|to|start|end|month/i.test(c));
+  const entityCol = cols.find(c => !timeCols.includes(c) &&
+    /name|person|employee|staff|resource|role|team|user|agent|analyst/i.test(c)) || cols[0];
+
+  const displayCols = [entityCol, ...cols.filter(c => c !== entityCol)];
+
+  // Colour palette for distinct values in the entity column
+  const palette = ['#4285F4','#34A853','#FBBC04','#EA4335','#9C27B0','#00BCD4','#FF9800','#8BC34A'];
+  const entityVals = [...new Set(rows.map(r => r[entityCol]))];
+  const colourMap = Object.fromEntries(entityVals.map((v, i) => [v, palette[i % palette.length]]));
+
+  const thead = '<tr>' + displayCols.map(c => `<th class="sched-th">${escHtml(c)}</th>`).join('') + '</tr>';
+  const tbody = rows.map(row => {
+    const colour = colourMap[row[entityCol]] || '#4285F4';
+    const cells = displayCols.map((c, i) => {
+      const v = escHtml(String(row[c] ?? '—'));
+      if (i === 0) return `<td class="sched-entity" style="border-left:3px solid ${colour}">${v}</td>`;
+      const isTimeCol = timeCols.includes(c);
+      return `<td class="${isTimeCol ? 'sched-time' : 'sched-cell'}">${v}</td>`;
+    }).join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+
+  return `<div class="result-block schedule-block">
+    <div class="result-block-header">
+      <span class="result-block-icon">📅</span>
+      <span class="result-block-title">${escHtml(desc || 'Schedule / Roster')}</span>
+      <span class="result-row-badge">${rows.length} entries</span>
+    </div>
+    <div class="result-table-wrap">
+      <table class="result-table sched-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table>
+    </div>
+  </div>`;
+}
+
+// ── Action bar ─────────────────────────────────────────────────────────────────
+
 function buildInsightActionBar(msgId) {
   return `<div class="insight-action-bar">
     <span class="insight-action-label">Export:</span>
-    <button class="insight-action-btn" onclick="downloadInsight('${msgId}','csv')" title="Download as CSV">${_DL_ICON} CSV</button>
-    <button class="insight-action-btn" onclick="downloadInsight('${msgId}','md')" title="Download as Markdown">${_DL_ICON} Markdown</button>
-    <button class="insight-action-btn" onclick="downloadInsight('${msgId}','json')" title="Download as JSON">${_DL_ICON} JSON</button>
+    <button class="insight-action-btn" onclick="downloadInsightPDF('${msgId}')" title="Download as PDF">${_DL_ICON} PDF</button>
     <button class="insight-action-btn" onclick="emailInsight('${msgId}')" title="Share via email">${_EMAIL_ICON} Email</button>
   </div>`;
 }
 
-function downloadInsight(msgId, fmt) {
+// ── PDF export via print iframe ────────────────────────────────────────────────
+
+function downloadInsightPDF(msgId) {
   const m = _msgStore[msgId];
   if (!m) return;
-  const ts   = new Date().toISOString().slice(0, 19).replace('T', ' ');
-  const sql  = (m.sql || []).join('\n\n');
-  let content, mime, ext;
 
-  if (fmt === 'csv') {
-    const lines = [];
-    (m.results || []).forEach((r, i) => {
-      const { cols, rows } = normalizeRows(r);
-      if (!cols.length) return;
-      if (i > 0) lines.push('');
-      if (r.description) lines.push(`# ${r.description}`);
-      const esc = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
-      lines.push(cols.map(esc).join(','));
-      rows.forEach(row => lines.push(cols.map(c => esc(row[c] ?? '')).join(',')));
-    });
-    if (!lines.length) lines.push('# No tabular data');
-    lines.push('');
-    lines.push(`# Insight: ${(m.content || '').replace(/\n/g, ' ').slice(0, 300)}`);
-    if (sql) lines.push(`# SQL: ${sql.replace(/\n/g, ' ')}`);
-    content = lines.join('\n');
-    mime = 'text/csv'; ext = 'csv';
+  const ts  = new Date().toLocaleString();
+  const sql = (m.sql || []).join('\n\n');
 
-  } else if (fmt === 'md') {
-    const parts = [`# Insight Report\n\n**Generated:** ${ts}\n`];
-    parts.push(`## Summary\n\n${m.content || ''}\n`);
-    (m.results || []).forEach(r => {
-      const { cols, rows } = normalizeRows(r);
-      if (!cols.length) return;
-      if (r.description) parts.push(`## ${r.description}\n`);
-      const sep = cols.map(() => '---').join(' | ');
-      parts.push(`| ${cols.join(' | ')} |\n| ${sep} |`);
-      rows.slice(0, 200).forEach(row => parts.push(`| ${cols.map(c => String(row[c] ?? '')).join(' | ')} |`));
-      parts.push('');
-    });
-    if (sql) parts.push(`## Generated SQL\n\n\`\`\`sql\n${sql}\n\`\`\`\n`);
-    content = parts.join('\n');
-    mime = 'text/markdown'; ext = 'md';
+  // Build table HTML for each result set
+  const tablesHtml = (m.results || []).map(r => {
+    const { cols, rows } = normalizeRows(r);
+    if (!cols.length || !rows.length) return '';
+    const esc = v => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const thead = '<tr>' + cols.map(c => `<th>${esc(c)}</th>`).join('') + '</tr>';
+    const tbody = rows.map(row => '<tr>' + cols.map(c => `<td>${esc(formatNumber(row[c]))}</td>`).join('') + '</tr>').join('');
+    return `${r.description ? `<h3>${esc(r.description)}</h3>` : ''}<table>${thead}<tbody>${tbody}</tbody></table>`;
+  }).join('<br>');
 
-  } else {
-    content = JSON.stringify({
-      generated_at: ts,
-      insight: m.content || '',
-      results: (m.results || []).map(r => {
-        const { cols, rows } = normalizeRows(r);
-        return { description: r.description || '', columns: cols, rows };
-      }),
-      sql: m.sql || [],
-    }, null, 2);
-    mime = 'application/json'; ext = 'json';
-  }
+  // Markdown → basic HTML for the insight text
+  const insightHtml = (typeof marked !== 'undefined')
+    ? marked.parse(m.content || '')
+    : `<p>${(m.content || '').replace(/\n/g,'<br>')}</p>`;
 
-  const blob = new Blob([content], { type: mime + ';charset=utf-8' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href = url; a.download = `insight_${msgId}.${ext}`;
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a); URL.revokeObjectURL(url);
+  const sqlBlock = sql
+    ? `<h3>Generated SQL</h3><pre>${sql.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`
+    : '';
+
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+  <title>Insight Report</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+      font-size:13px;color:#1f1f1f;margin:0;padding:32px 40px}
+    h1{font-size:18px;color:#1a56c4;margin:0 0 4px}
+    .meta{font-size:11px;color:#9aa0a6;margin-bottom:20px}
+    h3{font-size:13px;font-weight:700;margin:20px 0 8px;color:#5f6368}
+    .insight{background:#f0f4ff;border-left:4px solid #4285F4;
+      border-radius:4px;padding:12px 16px;margin-bottom:20px;line-height:1.6}
+    table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:16px}
+    th{background:#f8f9fa;text-align:left;padding:7px 10px;
+      border:1px solid #e3e8f0;font-size:11px;font-weight:700;
+      text-transform:uppercase;letter-spacing:.04em;color:#5f6368}
+    td{padding:6px 10px;border:1px solid #e3e8f0;vertical-align:top}
+    tr:nth-child(even) td{background:#fafbff}
+    pre{background:#f8f9fa;border:1px solid #e3e8f0;border-radius:4px;
+      padding:12px;font-size:11px;white-space:pre-wrap;word-break:break-all}
+    @page{margin:1.5cm}
+    @media print{body{padding:0}}
+  </style>
+  </head><body>
+  <h1>Insight Report</h1>
+  <div class="meta">Generated: ${ts}</div>
+  <div class="insight">${insightHtml}</div>
+  ${tablesHtml}
+  ${sqlBlock}
+  </body></html>`;
+
+  // Open in hidden iframe and trigger print-to-PDF
+  const iframe = document.createElement('iframe');
+  iframe.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;border:none';
+  document.body.appendChild(iframe);
+  iframe.contentDocument.open();
+  iframe.contentDocument.write(html);
+  iframe.contentDocument.close();
+  iframe.contentWindow.focus();
+  setTimeout(() => {
+    iframe.contentWindow.print();
+    setTimeout(() => document.body.removeChild(iframe), 2000);
+  }, 400);
 }
 
 function emailInsight(msgId) {
@@ -1258,7 +1400,7 @@ function emailInsight(msgId) {
   const subject = encodeURIComponent('Data Insight');
   const body    = encodeURIComponent(
     (m.content || '').slice(0, 1800) +
-    (m.results && m.results.length ? `\n\n[${m.results.length} result set(s) — download the full report for data tables]` : '')
+    (m.results && m.results.length ? `\n\n[${m.results.length} result set(s) — download the PDF report for data tables]` : '')
   );
   window.location.href = `mailto:?subject=${subject}&body=${body}`;
 }
@@ -1273,7 +1415,7 @@ function renderAIMessage(ev) {
   _msgStore[ev.msg_id] = { content: ev.content || '', results: ev.results || [], sql: ev.sql || [] };
 
   const mdHtml      = renderMarkdown(ev.content || '');
-  const resultsHtml = buildResultBlocks(ev.results || [], ev.msg_id);
+  const resultsHtml = buildResultBlocks(ev.results || [], ev.msg_id, ev.content || '');
   const sqlHtml     = buildSQLDisclosure(ev.sql || [], ev.msg_id, p.showSQL);
   const errHtml     = buildErrorNotes(ev.errors || []);
   const cacheNote   = ev.cache_hit
@@ -1311,8 +1453,13 @@ function renderAIError(msgId, message) {
   scrollToBottom();
 }
 
-function buildResultBlocks(results, msgId) {
+function buildResultBlocks(results, msgId, content) {
   if (!results || !results.length) return '';
+
+  // Detect special rendering modes once, across all result blocks
+  const isHarvey   = _isComparativeQuery(content, results);
+  const isSchedule = !isHarvey && _isScheduleQuery(content, results);
+
   return results.map((r, i) => {
     const { cols, rows } = normalizeRows(r);
     if (!rows.length) return '';
@@ -1322,6 +1469,18 @@ function buildResultBlocks(results, msgId) {
     const chartable = detectChartConfig(cols, rows);
     const desc      = r.description || '';
     const rowCount  = r.row_count ?? rows.length;
+
+    // ── Harvey ball (comparative study) ──────────────────────────────────────
+    if (isHarvey) {
+      const harveyHtml = buildHarveyTable(cols, rows, desc);
+      if (harveyHtml) return harveyHtml;
+      // Fall through to default rendering if data isn't suitable
+    }
+
+    // ── Schedule / roster ────────────────────────────────────────────────────
+    if (isSchedule) {
+      return buildScheduleTable(cols, rows, desc);
+    }
 
     // Data table (up to 50 rows in the block; full data is in query results)
     const displayRows = rows.slice(0, 50);

@@ -218,6 +218,14 @@ def analysis_node(state: AgentState) -> AgentState:
             if dedup_key in existing_ind_keys:
                 continue
             existing_ind_keys.add(dedup_key)
+            # Fact↔fact INDs share ID columns but represent no meaningful FK
+            # relationship — demote them so build_node never creates an edge.
+            is_fk_cand = ind["is_foreign_key_candidate"]
+            ind_type   = ind.get("ind_type", "value_subset")
+            if is_fk_cand and _is_fact(lt) and _is_fact(rt):
+                is_fk_cand = False
+                ind_type   = "value_subset"
+                logger.debug("IND: demoted fact↔fact FK candidate %s → %s to value_subset", lt, rt)
             state["incl_deps"].append(
                 InclusionDependency(
                     left_table=lt,
@@ -225,8 +233,8 @@ def analysis_node(state: AgentState) -> AgentState:
                     right_table=rt,
                     right_columns=rc,
                     coverage=ind["coverage"],
-                    is_foreign_key_candidate=ind["is_foreign_key_candidate"],
-                    ind_type=ind.get("ind_type", "value_subset"),
+                    is_foreign_key_candidate=is_fk_cand,
+                    ind_type=ind_type,
                     description=ind.get("description"),
                 )
             )

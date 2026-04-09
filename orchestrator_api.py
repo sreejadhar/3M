@@ -1097,6 +1097,12 @@ async def _index_source(source_id: str) -> None:
                 if other.kg_id == entry.kg_id:
                     continue
                 other_src = _sources.get(other.source_id)
+                if not other_src:
+                    logger.warning(
+                        "KG bridge inference skipped: registry has KG %s but "
+                        "source %s is not loaded — re-index that source to enable bridges",
+                        other.kg_id[:8], other.source_id[:8],
+                    )
                 if other_src:
                     saved = _infer_bridges(
                         entry.kg_id,  src.get("kg_nodes", []),
@@ -1642,6 +1648,15 @@ async def delete_source(source_id: str):
         _kg_store.delete(source_id)
     except Exception as exc:
         logger.warning("kg_store.delete failed (non-fatal): %s", exc)
+    # Remove from KG federation registry so stale entries don't block bridge
+    # inference — without this, _reg_list() keeps returning the deleted source
+    # and _sources.get(other.source_id) silently returns None, causing all
+    # bridge inference calls for that KG pair to be skipped forever.
+    try:
+        from dialog_agent.kg_registry import delete as _reg_delete
+        _reg_delete(source_id)
+    except Exception as exc:
+        logger.warning("kg_registry.delete failed (non-fatal): %s", exc)
     logger.info("Source deleted: %s (%s)", source_id[:8], s["name"])
     return {"deleted": source_id}
 

@@ -810,6 +810,46 @@ body {
 .msg-bubble pre code { background:none; border:none; color:#e6edf3; font-size:13px; padding:0; }
 .msg-bubble strong { font-weight:600; }
 
+/* ── Insight action bar (download / email) ───────────────────────────────── */
+.insight-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--clr-border);
+  flex-wrap: wrap;
+}
+.insight-action-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: var(--clr-text-mute);
+  margin-right: 2px;
+}
+.insight-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--clr-surface);
+  border: 1px solid var(--clr-border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--clr-text-mute);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background .15s, border-color .15s, color .15s;
+}
+.insight-action-btn:hover {
+  background: var(--clr-primary-subtle, #eff6ff);
+  border-color: var(--clr-primary);
+  color: var(--clr-primary);
+}
+.insight-action-btn svg { flex-shrink: 0; }
+
 /* Raw blockquotes (fallback — processed ones become .insight-callout) */
 .msg-bubble blockquote {
   border-left: 3px solid var(--clr-primary);

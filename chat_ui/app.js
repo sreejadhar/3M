@@ -1173,11 +1173,104 @@ function hideTypingIndicator(msgId) {
   if (el) el.remove();
 }
 
+// ── Per-message store for download / email ────────────────────────────────────
+const _msgStore = {};   // msg_id → { content, results, sql }
+
+// ── Download icon SVG (inline, no external dep) ───────────────────────────────
+const _DL_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
+const _EMAIL_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><polyline points="2 4 12 13 22 4"/></svg>`;
+
+function buildInsightActionBar(msgId) {
+  return `<div class="insight-action-bar">
+    <span class="insight-action-label">Export:</span>
+    <button class="insight-action-btn" onclick="downloadInsight('${msgId}','csv')" title="Download as CSV">${_DL_ICON} CSV</button>
+    <button class="insight-action-btn" onclick="downloadInsight('${msgId}','md')" title="Download as Markdown">${_DL_ICON} Markdown</button>
+    <button class="insight-action-btn" onclick="downloadInsight('${msgId}','json')" title="Download as JSON">${_DL_ICON} JSON</button>
+    <button class="insight-action-btn" onclick="emailInsight('${msgId}')" title="Share via email">${_EMAIL_ICON} Email</button>
+  </div>`;
+}
+
+function downloadInsight(msgId, fmt) {
+  const m = _msgStore[msgId];
+  if (!m) return;
+  const ts   = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const sql  = (m.sql || []).join('\n\n');
+  let content, mime, ext;
+
+  if (fmt === 'csv') {
+    const lines = [];
+    (m.results || []).forEach((r, i) => {
+      const { cols, rows } = normalizeRows(r);
+      if (!cols.length) return;
+      if (i > 0) lines.push('');
+      if (r.description) lines.push(`# ${r.description}`);
+      const esc = v => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
+      lines.push(cols.map(esc).join(','));
+      rows.forEach(row => lines.push(cols.map(c => esc(row[c] ?? '')).join(',')));
+    });
+    if (!lines.length) lines.push('# No tabular data');
+    lines.push('');
+    lines.push(`# Insight: ${(m.content || '').replace(/\n/g, ' ').slice(0, 300)}`);
+    if (sql) lines.push(`# SQL: ${sql.replace(/\n/g, ' ')}`);
+    content = lines.join('\n');
+    mime = 'text/csv'; ext = 'csv';
+
+  } else if (fmt === 'md') {
+    const parts = [`# Insight Report\n\n**Generated:** ${ts}\n`];
+    parts.push(`## Summary\n\n${m.content || ''}\n`);
+    (m.results || []).forEach(r => {
+      const { cols, rows } = normalizeRows(r);
+      if (!cols.length) return;
+      if (r.description) parts.push(`## ${r.description}\n`);
+      const sep = cols.map(() => '---').join(' | ');
+      parts.push(`| ${cols.join(' | ')} |\n| ${sep} |`);
+      rows.slice(0, 200).forEach(row => parts.push(`| ${cols.map(c => String(row[c] ?? '')).join(' | ')} |`));
+      parts.push('');
+    });
+    if (sql) parts.push(`## Generated SQL\n\n\`\`\`sql\n${sql}\n\`\`\`\n`);
+    content = parts.join('\n');
+    mime = 'text/markdown'; ext = 'md';
+
+  } else {
+    content = JSON.stringify({
+      generated_at: ts,
+      insight: m.content || '',
+      results: (m.results || []).map(r => {
+        const { cols, rows } = normalizeRows(r);
+        return { description: r.description || '', columns: cols, rows };
+      }),
+      sql: m.sql || [],
+    }, null, 2);
+    mime = 'application/json'; ext = 'json';
+  }
+
+  const blob = new Blob([content], { type: mime + ';charset=utf-8' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = `insight_${msgId}.${ext}`;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+}
+
+function emailInsight(msgId) {
+  const m = _msgStore[msgId];
+  if (!m) return;
+  const subject = encodeURIComponent('Data Insight');
+  const body    = encodeURIComponent(
+    (m.content || '').slice(0, 1800) +
+    (m.results && m.results.length ? `\n\n[${m.results.length} result set(s) — download the full report for data tables]` : '')
+  );
+  window.location.href = `mailto:?subject=${subject}&body=${body}`;
+}
+
 function renderAIMessage(ev) {
   const p          = PERSONAS[currentPersona] || PERSONAS.business_user;
   const row        = document.createElement('div');
   row.className    = 'msg-row assistant';
   row.id           = 'ai-msg-' + ev.msg_id;
+
+  // Store message data for download/email actions
+  _msgStore[ev.msg_id] = { content: ev.content || '', results: ev.results || [], sql: ev.sql || [] };
 
   const mdHtml      = renderMarkdown(ev.content || '');
   const resultsHtml = buildResultBlocks(ev.results || [], ev.msg_id);
@@ -1186,11 +1279,14 @@ function renderAIMessage(ev) {
   const cacheNote   = ev.cache_hit
     ? '<div style="font-size:11px;color:var(--clr-text-mute);margin-top:8px">⚡ From cache</div>' : '';
 
+  const actionBar = buildInsightActionBar(ev.msg_id);
+
   row.innerHTML = `
     <div class="msg-avatar">⬡</div>
     <div class="msg-bubble">
       <div class="md-content">${mdHtml}</div>
       ${resultsHtml}${errHtml}${sqlHtml}${cacheNote}
+      ${actionBar}
     </div>`;
   messages.appendChild(row);
 

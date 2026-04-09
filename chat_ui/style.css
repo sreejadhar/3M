@@ -170,8 +170,17 @@ body {
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
   z-index: 500;
-  overflow: hidden;
+  /* Scrollable so the full panel is reachable on short/Windows screens */
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* Thin custom scrollbar so it doesn't eat into the 256px width */
+  scrollbar-width: thin;
+  scrollbar-color: var(--clr-border) transparent;
 }
+.persona-dropdown::-webkit-scrollbar { width: 4px; }
+.persona-dropdown::-webkit-scrollbar-track { background: transparent; }
+.persona-dropdown::-webkit-scrollbar-thumb { background: var(--clr-border); border-radius: 4px; }
 
 .persona-option {
   display: flex;

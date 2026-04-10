@@ -1209,7 +1209,20 @@ def infer_taxonomy(source_id: str) -> int:
                         break
 
                 if not stat_type:
-                    # 2. Data type wins for clear date / numeric types
+                    # 2. Remaining column-name rules (time, geography, product, etc.)
+                    #    checked BEFORE dtype rules so that period columns stored as
+                    #    integers (e.g. year_month INTEGER = 202412) are correctly
+                    #    classified as "ordinal/time_period" rather than
+                    #    "continuous/measure", ensuring their top_values are surfaced
+                    #    as sample hints in the planning prompt.
+                    for pattern, st, sr in _NAME_RULES[2:]:
+                        if pattern.search(col):
+                            stat_type = st
+                            sem_role  = sr
+                            break
+
+                if not stat_type:
+                    # 3. Data type fallback for columns whose name gives no signal
                     if _DATE_TYPES.search(dtype):
                         stat_type = "date"
                         sem_role  = "time_dimension_key"
@@ -1217,21 +1230,13 @@ def infer_taxonomy(source_id: str) -> int:
                         stat_type = "continuous"
                         sem_role  = "measure"
                     else:
-                        # 3. Remaining column-name rules (skip first two already checked)
-                        for pattern, st, sr in _NAME_RULES[2:]:
-                            if pattern.search(col):
-                                stat_type = st
-                                sem_role  = sr
-                                break
-
-                        # 4. Fallback: text column with few distinct values → categorical
-                        if not stat_type:
-                            is_text = _TEXT_TYPES.search(dtype) or not dtype
-                            few_vals = (unique is not None and unique <= _CATEGORICAL_MAX_UNIQUE) \
-                                       or (unique is None and len(top_vals) <= _CATEGORICAL_MAX_UNIQUE)
-                            if is_text and few_vals:
-                                stat_type = "categorical"
-                                sem_role  = "other"
+                        # 4. Text column with few distinct values → categorical
+                        is_text = _TEXT_TYPES.search(dtype) or not dtype
+                        few_vals = (unique is not None and unique <= _CATEGORICAL_MAX_UNIQUE) \
+                                   or (unique is None and len(top_vals) <= _CATEGORICAL_MAX_UNIQUE)
+                        if is_text and few_vals:
+                            stat_type = "categorical"
+                            sem_role  = "other"
 
                 if not stat_type:
                     continue

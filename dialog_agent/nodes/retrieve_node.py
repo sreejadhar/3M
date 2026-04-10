@@ -487,9 +487,33 @@ def retrieve_node(state: DialogState) -> DialogState:
         if e.get("from", "") in subgraph_ids and e.get("to", "") in subgraph_ids
     ]
 
+    # ── Drop BFS-expanded nodes that are below the relevance floor ────────────
+    # Seed nodes (top-K by similarity) are always kept.  Nodes that were pulled
+    # in purely via FK expansion and score below the floor are dropped so the
+    # LLM does not see unrelated tables and join them unnecessarily.
+    expand_score_floor = getattr(config, "graphrag_expand_score_floor", 0.10)
+    seed_id_set  = set(seed_ids)
+    node_score   = {cache.node_ids[i]: float(scores[i]) for i in range(len(scores))}
+    before_floor = len(sub_nodes)
+    sub_nodes = [
+        n for n in sub_nodes
+        if n.get("id", "") in seed_id_set
+        or node_score.get(n.get("id", ""), 0.0) >= expand_score_floor
+    ]
+    if len(sub_nodes) < before_floor:
+        pruned_ids = {n.get("id", "") for n in sub_nodes}
+        sub_edges  = [
+            e for e in sub_edges
+            if e.get("from", "") in pruned_ids and e.get("to", "") in pruned_ids
+        ]
+        logger.info(
+            "retrieve_node: pruned %d low-relevance BFS-expanded nodes "
+            "(score < %.2f) — %d tables remain",
+            before_floor - len(sub_nodes), expand_score_floor, len(sub_nodes),
+        )
+
     # ── Cap to graphrag_max_tables to prevent token bloat from deep FK chains ─
     if len(sub_nodes) > max_tables:
-        node_score = {cache.node_ids[i]: float(scores[i]) for i in range(len(scores))}
         sub_nodes.sort(
             key=lambda n: node_score.get(n.get("id", ""), 0.0), reverse=True
         )

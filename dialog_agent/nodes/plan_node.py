@@ -255,7 +255,19 @@ General Rules:
    b. Explicit top-N questions ONLY ("top 10 products", "bottom 5 regions"):
       use ORDER BY <metric> DESC then the appropriate limit syntax for this database.
    c. Do NOT add LIMIT {row_limit} to any query — the system applies row limits automatically.
-6. Prefer simple queries; only join when necessary.
+6. JOIN only when strictly required — CRITICAL:
+   a. Only JOIN a table if at least one column from that table is needed in
+      SELECT, WHERE, GROUP BY, or ORDER BY to answer the question.
+   b. If the question can be answered from a single table, use ONLY that table.
+      Do NOT join dimension tables "just in case" or for context enrichment.
+   c. Ask yourself for EACH table in your query: "Does answering this question
+      require a column from this table?"  If the answer is NO — remove the JOIN.
+   d. Common mistakes to avoid:
+      • Joining a channel/region/org table when the question asks only for totals
+        from a fact table (e.g. "sales trends" needs the sales fact, not the
+        channel dimension unless the question specifically asks to break down by channel).
+      • Joining a date dimension when the fact table already has the period column.
+      • Joining lookup tables to "enrich" the output with extra labels not asked for.
 7. If the question cannot be answered from the available schema, return [].
 8. Maximum {max_queries} queries total.
 9. Schema-qualified FROM/JOIN clauses: always write FROM schema.table.

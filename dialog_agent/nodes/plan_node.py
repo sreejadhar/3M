@@ -268,15 +268,29 @@ General Rules:
         channel dimension unless the question specifically asks to break down by channel).
       • Joining a date dimension when the fact table already has the period column.
       • Joining lookup tables to "enrich" the output with extra labels not asked for.
-7. If the question cannot be answered from the available schema, return [].
-8. Maximum {max_queries} queries total.
-9. Schema-qualified FROM/JOIN clauses: always write FROM schema.table.
+7. Sibling table disambiguation — when several tables share the same columns
+   (e.g. the same schema has a "by_channel" table, a "by_category" table, and
+   a "combined" table with maker+category+channel):
+   a. If the question asks for a specific dimension breakdown (e.g. "by channel",
+      "by category", "per bottler") use the table whose name matches that dimension.
+   b. If the question asks for overall totals or trends WITHOUT specifying a
+      dimension (e.g. "what are Coca Cola sales trends?"), prefer the most
+      COMPREHENSIVE/COMBINED table (the one whose name contains "combined",
+      "total", or encodes multiple dimensions like maker_category_channel).
+      Do NOT pick a dimension-specific table (channel-only, category-only) when
+      the user hasn't asked to break down by that dimension.
+   c. When unsure, prefer the table with more rows / more distinct time periods —
+      this is usually indicated by higher unique_count on the year_month column in
+      the schema context.
+8. If the question cannot be answered from the available schema, return [].
+9. Maximum {max_queries} queries total.
+10. Schema-qualified FROM/JOIN clauses: always write FROM schema.table.
    Use short aliases for column references so you avoid unsupported 3-part names:
      CORRECT: FROM public.orders AS o  WHERE o.id = 1  SELECT o.col1
      WRONG:   FROM orders WHERE orders.id = 1         -- unqualified table
      WRONG:   WHERE public.orders.id = 1              -- 3-part names fail in PostgreSQL
    Identifier quoting: follow the rule shown in the DATABASE-SPECIFIC SYNTAX section above.
-9a. AMBIGUOUS COLUMN NAMES IN JOINs — CRITICAL FOR SQLite AND ALL DATABASES:
+10a. AMBIGUOUS COLUMN NAMES IN JOINs — CRITICAL FOR SQLite AND ALL DATABASES:
     When a query JOINs two or more tables, ANY column that appears in multiple
     tables MUST be referenced with a table alias in SELECT, WHERE, GROUP BY,
     and ORDER BY.  An unqualified column reference that exists in both tables
@@ -295,7 +309,7 @@ General Rules:
       SELECT f.Cat_ID, LOWER(d.Category_Group) ...
       FROM Fact_RGM_KPIs AS f JOIN Dim_Category AS d ON f.Cat_ID = d.Cat_ID
       GROUP BY f.Cat_ID                        ← unambiguous, works correctly
-9b. CROSS-TABLE RULES — read carefully:
+10b. CROSS-TABLE RULES — read carefully:
     a. To JOIN two tables you MUST have a column listed under "POSSIBLE JOIN KEYS"
        in the schema context, or one shown on a "FK:" line.
        NEVER invent or guess a join key (e.g. Check_PC, CP_ID, PC_ID, Center_ID).
@@ -319,7 +333,7 @@ General Rules:
     d. If a column you need (e.g. SBU1) is only in Table A, write a query for
        Table A that retrieves it.  Write a second query for Table B with its
        own columns.  Do NOT try to bridge them without a valid join key.
-10. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
+11. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
     The user's terminology will often DIFFER from the values stored in the database.
     You MUST resolve this mismatch before writing any WHERE clause.
 
@@ -346,7 +360,7 @@ General Rules:
     d. Always use case-insensitive matching (LOWER/ILIKE) — never raw equality on text.
     e. When using LIKE, anchor to the most distinctive part of the term to avoid
        false positives (e.g. LIKE '%snack%' not LIKE '%and%').
-11. Date/period filters — always check the [sample values] for the period column before
+12. Date/period filters — always check the [sample values] for the period column before
     writing a year filter.  Period columns often store values with a prefix or suffix:
       WRONG : WHERE fiscal_year = '2024'       ← if samples show 'FY2024'
       CORRECT: WHERE LOWER(fiscal_year) = 'fy2024'
@@ -355,7 +369,7 @@ General Rules:
     If the PRE-RESOLVED CATEGORY MAPPINGS section provides a fiscal_year sql_fragment,
     use it verbatim — do not rewrite the year value.
     For true date columns use the date extraction functions shown above.
-12. COUNT vs SUM — choose the correct aggregate:
+13. COUNT vs SUM — choose the correct aggregate:
     a. Use COUNT(*) or COUNT(column) when the question asks for:
          headcount, number of people, how many employees/records/rows,
          total count, number of [entities].
@@ -371,7 +385,7 @@ General Rules:
        use SUM(Headcount) — not COUNT(*).  Otherwise use COUNT(*).
     e. When asked for breakdown by category (e.g. onshore vs offshore headcount),
        GROUP BY the category column and apply the correct aggregate per group.
-13. Percentage calculations — when the question asks for %, share, proportion,
+14. Percentage calculations — when the question asks for %, share, proportion,
     or percentage of a total:
     a. Always compute the percentage IN SQL — do not leave it to the reader.
     b. Use the PERCENTAGE CALC syntax shown in the DATABASE-SPECIFIC SYNTAX section above.
@@ -385,7 +399,7 @@ General Rules:
            COUNT(*) AS denominator,
            ROUND(SUM(CASE WHEN condition THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS Pct
          FROM table_name
-14. Multi-KG federation — when ACTIVE KG IDS contains multiple entries:
+15. Multi-KG federation — when ACTIVE KG IDS contains multiple entries:
     a. Each query in your JSON array MUST include a "kg_id" field set to one of
        the active KG ids listed in ACTIVE KG IDS.
     b. Use the bridge keys listed under CROSS-KG BRIDGES to plan which queries
@@ -393,7 +407,7 @@ General Rules:
     c. When a question requires data from multiple KGs, emit one query per KG
        and use the bridge column names so the synthesizer can merge them.
     d. If no bridges are listed, treat each KG independently.
-15. Pre-defined KPI formulas — when DEFINED KPIs section is present:
+16. Pre-defined KPI formulas — when DEFINED KPIs section is present:
     a. If the user's question references a KPI by name (e.g. "RSV Growth", "Market Share"),
        check the DEFINED KPIs section for a matching KPI with a sql_expression.
     b. When a match is found AND sql_expression is non-empty, use that expression

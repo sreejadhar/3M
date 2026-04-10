@@ -47,8 +47,10 @@ from ..state import DialogState
 logger = logging.getLogger(__name__)
 
 # ── Module-level embedding cache ──────────────────────────────────────────────
-# Keyed by (schema_hash, backend) so cache is invalidated when schema changes.
+# Keyed by (schema_hash, backend, _NODE_TEXT_VERSION) so cache is invalidated
+# when the schema changes OR when _node_text() logic is updated.
 _EMBED_CACHE: Dict[str, "_Cache"] = {}
+_NODE_TEXT_VERSION = "2"   # bump when _node_text() or _expand_table_name() changes
 
 
 class _Cache:
@@ -112,16 +114,59 @@ def _schema_hash(nodes: List[Dict]) -> str:
     return hashlib.md5(fingerprint.encode()).hexdigest()
 
 
+def _expand_table_name(label: str) -> str:
+    """
+    Expand a table name into a richer phrase for embedding by splitting on
+    underscores/camelCase and appending a granularity hint when the name
+    encodes a specific dimension (channel, category, maker, etc.).
+
+    Examples:
+      JSR_bottler_channel         → "JSR bottler channel channel-level breakdown"
+      JSR_bottler_category        → "JSR bottler category category-level breakdown"
+      JSR_maker_category_channel  → "JSR maker category channel combined breakdown"
+      vw_fact_month_combined_m    → "vw fact month combined m monthly fact sales"
+      retail_All_data             → "retail All data sales retail"
+    """
+    # Split on underscores and camelCase transitions
+    parts = re.sub(r'([a-z])([A-Z])', r'\1 \2', label)
+    parts = re.sub(r'[_]+', ' ', parts).strip()
+
+    lower = label.lower()
+
+    hints = []
+    if re.search(r'\bfact\b', lower):
+        hints.append("fact table sales measures")
+    if re.search(r'\bchannel\b', lower) and not re.search(r'\bcategory\b', lower):
+        hints.append("channel-level breakdown distribution channel")
+    if re.search(r'\bcategory\b', lower) and not re.search(r'\bchannel\b', lower):
+        hints.append("category-level breakdown product category")
+    if re.search(r'\bcategory\b', lower) and re.search(r'\bchannel\b', lower):
+        hints.append("combined breakdown maker category channel granular")
+    if re.search(r'\bretail\b', lower):
+        hints.append("retail sales")
+    if re.search(r'\bpromotion\b|\bpromo\b', lower):
+        hints.append("promotion promotional activity")
+
+    if hints:
+        return f"{parts} {' '.join(hints)}"
+    return parts
+
+
 def _node_text(node: Dict) -> str:
     """
     Build a rich text representation of a KG node for embedding.
-    Uses label (table name) + full title (columns, comments, sample values).
+    Uses expanded label (with granularity hints) + full title (columns,
+    comments, sample values).  The expansion ensures that sibling tables
+    with identical column sets but different dimensional granularities
+    (e.g. JSR_bottler_channel vs JSR_maker_category_channel) score
+    differently for queries that don't ask for a specific dimension.
     """
     label = node.get("label", "")
     title = node.get("title", "")
-    # Strip "Class: X" prefix — redundant with label
+    expanded = _expand_table_name(label)
+    # Strip "Class: X" prefix — redundant with expanded label
     title_body = re.sub(r'^Class:\s*\S+\s*', '', title, flags=re.IGNORECASE).strip()
-    return f"{label} {title_body}".strip()
+    return f"{expanded} {title_body}".strip()
 
 
 # ── Embedding backends ────────────────────────────────────────────────────────
@@ -432,7 +477,7 @@ def retrieve_node(state: DialogState) -> DialogState:
     # ── Get or build in-memory embedding cache ────────────────────────────────
     s_hash  = _schema_hash(nodes)
     backend = _detect_backend(pref_backend)
-    key     = f"{s_hash}:{backend}"
+    key     = f"{s_hash}:{backend}:v{_NODE_TEXT_VERSION}"
 
     if key not in _EMBED_CACHE:
         logger.info(

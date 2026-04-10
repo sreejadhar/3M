@@ -37,110 +37,277 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Name-based fallback: table name contains one of these words → likely a fact table
-_FACT_NAME_RE = re.compile(r'\b(fact|fct|measure|metric|kpi)\b', re.IGNORECASE)
+# ── Fact table name keywords ──────────────────────────────────────────────
+# Strong prior: table name contains one of these → likely a fact or aggregate
+_FACT_NAME_RE = re.compile(
+    r'\b(fact|fct|measure|metric|kpi)\b', re.IGNORECASE
+)
+# Weaker prior: aggregate / periodic summary table names
+_AGG_NAME_RE = re.compile(
+    r'\b(agg|aggregat|summary|summ|snapshot|trans|event|'
+    r'daily|weekly|monthly|hourly|annual|yearly)\b',
+    re.IGNORECASE,
+)
 
-# Column name patterns that indicate a numeric measure (additive fact column)
+# ── Measure column name keywords ──────────────────────────────────────────
+# Named measures: keyword in column name + numeric dtype → clear additive measure
 _MEASURE_COL_RE = re.compile(
-    r'\b(sales|revenue|qty|quantity|amount|volume|price|cost|count|total|'
-    r'value|profit|margin|units|spend|budget|forecast|actuals?|transactions?)\b',
+    r'\b(sales|revenue|qty|quantity|amount|volume|price|cost|'
+    r'count|total|value|profit|margin|units|spend|budget|forecast|'
+    r'actual|transaction|order|balance|inventory|stock|weight|'
+    r'rate|ratio|score|index|pct|percent|share|growth|diff|variance|'
+    r'dist|distribution|avg|average|sum|fee|charge|tax|discount|'
+    r'return|conversion|impression|click|session|visit|call|event|'
+    r'duration|supply|demand)\b',
     re.IGNORECASE,
 )
 
-# Column name patterns that indicate a FK / dimension reference
+# ── FK / dimension-reference column suffixes ──────────────────────────────
 _FK_COL_RE = re.compile(
-    r'(_id|_key|_sk|_fk|_code|_ref)\s*$',
+    r'(_id|_key|_sk|_nk|_bk|_fk|_wid|_code|_ref|_num)\s*$',
     re.IGNORECASE,
 )
 
-# Column name patterns that indicate a time grain column
+# ── Time / grain column name keywords ─────────────────────────────────────
 _TIME_COL_RE = re.compile(
     r'\b(date|month|year|week|quarter|period|fiscal|timestamp|time)\b',
     re.IGNORECASE,
 )
 
-# Numeric dtypes that can store measures
+# ── SCD2 effective / expiry date column patterns ──────────────────────────
+# Presence of BOTH an effective-date col AND an expiry/end-date col is a
+# strong signal that this is a slowly-changing dimension, not a fact table.
+#
+# NOTE: do NOT use \b word boundaries here — underscores are word-chars in
+# Python regex, so \beffective\b fails to match "effective_date".
+# Plain substring matching is intentional and sufficient.
+_SCD_EFF_RE = re.compile(
+    r'effective|eff_|valid_from|start_date|start_dt|active_from|row_start',
+    re.IGNORECASE,
+)
+_SCD_EXP_RE = re.compile(
+    r'expir|valid_to|end_date|end_dt|active_to|row_end|close_date',
+    re.IGNORECASE,
+)
+# is_current / current_flag is an unambiguous SCD2 marker on its own.
+_SCD_CURRENT_RE = re.compile(
+    r'is_current|current_flag|current_ind|current_row|is_active_row',
+    re.IGNORECASE,
+)
+
+# ── Numeric dtypes ────────────────────────────────────────────────────────
 _NUMERIC_DTYPE_RE = re.compile(
     r'\b(int|integer|bigint|smallint|tinyint|number|numeric|decimal|'
     r'float|double|real|money)\b',
     re.IGNORECASE,
 )
 
+# ── Text / string dtypes ──────────────────────────────────────────────────
+_TEXT_DTYPE_RE = re.compile(
+    r'\b(varchar|nvarchar|char|nchar|text|ntext|string|clob|character)\b',
+    re.IGNORECASE,
+)
 
-def _score_fact_table(table_meta: TableMeta) -> int:
+# ── Boolean / flag column patterns ───────────────────────────────────────
+_BOOL_DTYPE_RE = re.compile(r'\b(bool|boolean|bit)\b', re.IGNORECASE)
+_BOOL_COL_RE   = re.compile(
+    r'^(is_|has_|flag_|ind_|can_)|\b(flag|active|enabled|deleted|'
+    r'current|latest|archived|is_current)\b',
+    re.IGNORECASE,
+)
+
+
+def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
     """
-    Score a table against heuristics derived from its sampled column metadata.
-    Returns an integer score; tables scoring >= 2 are treated as fact tables.
+    Score a table using column-level sampled metadata to determine whether it
+    is a fact table (any Kimball variant) or a dimension/lookup.
 
-    Scoring rubric (each signal +1, up to its cap):
-      +2  name matches _FACT_NAME_RE  (strong prior)
-      +1  has ≥1 column matching _MEASURE_COL_RE with a numeric dtype
-      +1  has ≥2 columns matching _FK_COL_RE or is_foreign_key=True (dimension references)
-      +1  has ≥1 column matching _TIME_COL_RE (time grain)
-      +1  no single column is a unique natural key (uniqueness_ratio ≈ 1.0) →
-          table has composite grain, typical of facts  [requires row_count > 0]
-      +1  factless fact signal: ≥3 FK columns AND zero measure columns →
-          event/coverage/bridge table; fires even when sampling data is absent
-      -1  has exactly 1 column or is clearly a lookup/dim (unique col count ≤ 3)
+    Returns an integer; tables scoring >= 2 are treated as fact tables.
+
+    ── POSITIVE signals (fact indicators) ───────────────────────────────────
+    +2  table name matches _FACT_NAME_RE  (fact/fct/measure/metric/kpi)
+    +1  table name matches _AGG_NAME_RE   (aggregate/snapshot/event name)
+    +1  ≥1 NAMED measure column  (_MEASURE_COL_RE keyword + numeric dtype)
+    +1  ≥2 NAMED measure columns (strongly additive, clearly a fact)
+    +1  ≥2 generic inferred measure columns (numeric, not FK, not time, not
+        boolean, uniqueness_ratio < 0.95 when available — catches domain-
+        specific abbreviations like `orders`, `9l_vol`, `net_rev`)
+    +1  ≥2 FK / dimension-reference columns (_id/_key/_sk/… or is_foreign_key)
+    +1  ≥1 time grain column (_TIME_COL_RE)
+    +1  ≥3 time/date columns → accumulating snapshot (milestone dates)
+    +1  no single non-FK column with uniqueness_ratio ≥ 0.95 → composite
+        grain, typical of facts  [only fires when row_count > 0]
+    +1  factless / bridge signal: ≥2 FK cols AND zero named measures AND
+        zero generic measures → event/coverage/bridge table; fires even
+        when sampling data is absent
+
+    ── NEGATIVE signals (dimension / lookup indicators) ─────────────────────
+    -1  ≤3 total columns (tiny lookup table)
+    -1  text-heavy: >55% of columns have a text/string dtype (dimension attr)
+    -1  SCD2 pattern: table has BOTH an effective-date col AND an expiry-date
+        col by name (slowly-changing dimension, not a fact)
+    -2  strong dimension: table has exactly one declared PK column
+        (len(primary_keys) == 1) AND text-heavy (text_ratio > 0.40) AND
+        fewer than 2 named measure columns → very likely a standard dimension
     """
     score = 0
     name = table_meta.table_name
 
-    # Name heuristic
+    # ── Name priors ───────────────────────────────────────────────────────
     if _FACT_NAME_RE.search(name):
         score += 2
+    elif _AGG_NAME_RE.search(name):
+        score += 1
 
     cols = table_meta.columns
     if not cols:
         return score
 
+    n_cols    = len(cols)
     row_count = table_meta.row_count or 0
 
-    measure_cols = 0
-    fk_cols = 0
-    time_cols = 0
-    has_unique_natural_key = False
+    named_measure_cols   = 0
+    generic_measure_cols = 0
+    fk_cols              = 0
+    time_cols            = 0
+    text_cols            = 0
+    scd_eff_found        = False
+    scd_exp_found        = False
+    scd_current_found    = False
+    has_unique_col       = False   # any non-FK col with uniqueness_ratio ≥ 0.95
+    # Count how many distinct FK-named columns reference different entity types.
+    # Surrogate+natural key pairs for the SAME entity both end in _sk/_nk or
+    # _key/_id — we detect this to avoid the factless signal firing on SCD dims.
+    fk_root_names: set = set()
 
     for c in cols:
-        # Measure column: name matches measure pattern AND numeric dtype
-        if _MEASURE_COL_RE.search(c.name) and _NUMERIC_DTYPE_RE.search(c.data_type):
-            measure_cols += 1
+        col   = c.name
+        dtype = c.data_type
+        is_fk_named  = bool(_FK_COL_RE.search(col))
+        is_numeric   = bool(_NUMERIC_DTYPE_RE.search(dtype))
+        is_text      = bool(_TEXT_DTYPE_RE.search(dtype))
+        is_time_col  = bool(_TIME_COL_RE.search(col))
+        is_bool      = bool(_BOOL_DTYPE_RE.search(dtype)) or bool(_BOOL_COL_RE.search(col))
 
-        # FK / dimension reference column
-        if _FK_COL_RE.search(c.name) or c.is_foreign_key:
+        # Named measure: keyword match + numeric dtype
+        if _MEASURE_COL_RE.search(col) and is_numeric:
+            named_measure_cols += 1
+
+        # FK / dimension reference
+        if is_fk_named or c.is_foreign_key:
             fk_cols += 1
+            # Strip trailing suffix to get the entity root name
+            # e.g. customer_sk → customer, customer_nk → customer (same root)
+            root = _FK_COL_RE.sub('', col).rstrip('_').lower()
+            fk_root_names.add(root)
 
-        # Time grain column
-        if _TIME_COL_RE.search(c.name):
+        # Time grain
+        if is_time_col:
             time_cols += 1
 
-        # Natural-key detection: single column with uniqueness_ratio near 1.0
+        # Text column ratio
+        if is_text:
+            text_cols += 1
+
+        # SCD2 signals — checked on all columns (not just time/bool)
+        # because column names like "effective_date" and "expiry_date"
+        # match both time AND SCD patterns simultaneously.
+        if _SCD_EFF_RE.search(col):
+            scd_eff_found = True
+        if _SCD_EXP_RE.search(col):
+            scd_exp_found = True
+        if _SCD_CURRENT_RE.search(col):
+            scd_current_found = True
+
+        # Generic inferred measure: numeric, not FK, not time, not bool,
+        # and (when available) uniqueness_ratio < 0.95 (it varies per row)
         if (
-            c.unique_count is not None
+            is_numeric
+            and not is_fk_named
+            and not c.is_foreign_key
+            and not c.is_primary_key
+            and not is_time_col
+            and not is_bool
+        ):
+            u_ratio = (
+                c.unique_count / row_count
+                if c.unique_count is not None and row_count > 0
+                else None
+            )
+            # Exclude columns that look like a numeric surrogate/natural key
+            # (very high uniqueness with no FK suffix → e.g. a numeric PK in a dim)
+            if u_ratio is None or u_ratio < 0.95:
+                generic_measure_cols += 1
+
+        # Natural-key detection (for composite-grain signal below):
+        # A column has uniqueness ≈ 1.0 and is NOT an FK-named column →
+        # this table may have a natural unique key, typical of a dimension.
+        # We deliberately include PK-flagged columns here so that a dim's
+        # surrogate key (e.g. customer_key, which also ends in _key matching
+        # _FK_COL_RE) does NOT blindly suppress this signal.
+        if (
+            c.is_primary_key
+            and c.unique_count is not None
             and row_count > 0
             and c.unique_count / row_count >= 0.95
-            and not _FK_COL_RE.search(c.name)
         ):
-            has_unique_natural_key = True
+            has_unique_col = True
+        elif (
+            not is_fk_named
+            and not c.is_primary_key
+            and c.unique_count is not None
+            and row_count > 0
+            and c.unique_count / row_count >= 0.95
+        ):
+            has_unique_col = True
 
-    if measure_cols >= 1:
+    text_ratio = text_cols / n_cols if n_cols else 0.0
+
+    # ── Positive signals ──────────────────────────────────────────────────
+    if named_measure_cols >= 1:
+        score += 1
+    if named_measure_cols >= 2:
+        score += 1   # double-signal: clearly measure-heavy
+    if generic_measure_cols >= 2:
         score += 1
     if fk_cols >= 2:
         score += 1
     if time_cols >= 1:
         score += 1
-    if not has_unique_natural_key and row_count > 0:
+    if time_cols >= 3:
+        score += 1   # accumulating snapshot (multiple milestone dates)
+    if not has_unique_col and row_count > 0:
+        score += 1   # composite grain — no single unique identifier
+
+    # Factless / bridge fact: ≥2 FK cols referencing ≥2 DISTINCT entity roots,
+    # zero measures of any kind → event / coverage / bridge table.
+    # Requiring ≥2 distinct roots prevents SCD dims (customer_sk + customer_nk
+    # → same root "customer") from triggering this signal.
+    # Does not require row_count.
+    distinct_fk_roots = len(fk_root_names)
+    if fk_cols >= 2 and distinct_fk_roots >= 2 and named_measure_cols == 0 and generic_measure_cols == 0:
         score += 1
 
-    # Factless fact signal: ≥3 FK/dimension-reference columns and zero measure
-    # columns → almost certainly a factless fact (event or coverage table).
-    # Does not require row_count so works even when sampling data is absent.
-    if fk_cols >= 3 and measure_cols == 0:
-        score += 1
-
-    # Penalty: tiny column count suggests a lookup/dim table
-    if len(cols) <= 3:
+    # ── Negative signals ──────────────────────────────────────────────────
+    if n_cols <= 3:
         score -= 1
+    if text_ratio > 0.55:
+        score -= 1
+
+    # SCD2 slowly-changing dimension:
+    # -1 for effective+expiry date pair; -1 more if is_current flag also present
+    # (belt-and-suspenders: even one of these alongside a single PK is enough).
+    is_scd2 = scd_eff_found and scd_exp_found
+    if is_scd2:
+        score -= 1
+    if scd_current_found:
+        score -= 1   # is_current / current_flag is an unambiguous SCD2 marker
+
+    # Strong dimension penalty: single declared PK + text-heavy + few measures
+    # → almost certainly a standard or conformed dimension.
+    single_pk = len(table_meta.primary_keys) == 1
+    if single_pk and text_ratio > 0.40 and named_measure_cols < 2:
+        score -= 2
 
     return score
 

@@ -95,6 +95,30 @@ _SCD_CURRENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── SCD Type 3 column patterns ────────────────────────────────────────────
+# SCD3 stores limited history via "current_X" / "previous_X" column pairs.
+# Detecting ≥1 "previous/prior/old/original" value column is a strong dim
+# indicator — facts never carry prior-state columns.
+# NOTE: plain substring match, no \b, to handle underscores correctly.
+_SCD3_PREV_RE = re.compile(
+    r'(^|_)(prev(ious)?|prior|old|original|last|former|historic)_',
+    re.IGNORECASE,
+)
+# "current_X" alongside a prev-style column confirms SCD3.
+# We detect this separately so we only penalise when BOTH patterns co-exist.
+_SCD3_CURR_RE = re.compile(
+    r'(^|_)current_(?!flag|ind|row)',   # current_segment, current_tier, etc.
+    re.IGNORECASE,                       # but NOT current_flag (that is SCD2)
+)
+
+# ── SCD Type 4 history-table name patterns ────────────────────────────────
+# The history / audit table in a Type-4 design carries _hist/_history/_audit
+# in the name and should be treated as a dimension, not a fact.
+_SCD4_HIST_NAME_RE = re.compile(
+    r'(_hist|_history|_archive|_audit|_log|_shadow)\s*$',
+    re.IGNORECASE,
+)
+
 # ── Numeric dtypes ────────────────────────────────────────────────────────
 _NUMERIC_DTYPE_RE = re.compile(
     r'\b(int|integer|bigint|smallint|tinyint|number|numeric|decimal|'
@@ -144,11 +168,14 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
     ── NEGATIVE signals (dimension / lookup indicators) ─────────────────────
     -1  ≤3 total columns (tiny lookup table)
     -1  text-heavy: >55% of columns have a text/string dtype (dimension attr)
-    -1  SCD2 pattern: table has BOTH an effective-date col AND an expiry-date
-        col by name (slowly-changing dimension, not a fact)
-    -2  strong dimension: table has exactly one declared PK column
-        (len(primary_keys) == 1) AND text-heavy (text_ratio > 0.40) AND
-        fewer than 2 named measure columns → very likely a standard dimension
+    -1  SCD2: table has BOTH an effective-date col AND an expiry-date col
+    -1  SCD2: is_current / current_flag present (unambiguous SCD2 marker)
+    -1  SCD3: ≥1 column with previous_*/prior_*/old_*/former_* prefix
+        (prior-value column — facts never store prior attribute states)
+    -1  SCD3: confirmed current_<attr> + previous_<attr> pair present
+    -2  SCD4: table name ends with _hist/_history/_archive/_audit/_log
+        (history side-table — always a dimension, never a fact)
+    -2  strong dimension: single declared PK + text-heavy (>40%) + few measures
     """
     score = 0
     name = table_meta.table_name
@@ -174,6 +201,8 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
     scd_eff_found        = False
     scd_exp_found        = False
     scd_current_found    = False
+    scd3_prev_count      = 0     # columns with previous_/prior_/old_ prefix
+    scd3_curr_count      = 0     # columns with current_<attr> prefix (not flags)
     has_unique_col       = False   # any non-FK col with uniqueness_ratio ≥ 0.95
     # Count how many distinct FK-named columns reference different entity types.
     # Surrogate+natural key pairs for the SAME entity both end in _sk/_nk or
@@ -219,8 +248,18 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
         if _SCD_CURRENT_RE.search(col):
             scd_current_found = True
 
+        # SCD3 signals: previous_*/prior_*/old_* column prefix (prior-value col)
+        # and current_<attr> prefix (current-value col).  Facts never carry
+        # prior-state columns, so even one is a strong dimension indicator.
+        if _SCD3_PREV_RE.search(col):
+            scd3_prev_count += 1
+        if _SCD3_CURR_RE.search(col):
+            scd3_curr_count += 1
+
         # Generic inferred measure: numeric, not FK, not time, not bool,
+        # not an SCD3 prior/current attribute column,
         # and (when available) uniqueness_ratio < 0.95 (it varies per row)
+        is_scd3_col = bool(_SCD3_PREV_RE.search(col)) or bool(_SCD3_CURR_RE.search(col))
         if (
             is_numeric
             and not is_fk_named
@@ -228,6 +267,7 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
             and not c.is_primary_key
             and not is_time_col
             and not is_bool
+            and not is_scd3_col
         ):
             u_ratio = (
                 c.unique_count / row_count
@@ -302,6 +342,21 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
         score -= 1
     if scd_current_found:
         score -= 1   # is_current / current_flag is an unambiguous SCD2 marker
+
+    # SCD3 slowly-changing dimension (prior-value columns):
+    # Any "previous_*/prior_*/old_*" column is a dead giveaway — facts never
+    # store prior attribute values.
+    # -1 for ≥1 prior-value column; -1 more if current_<attr> columns also
+    # present (confirming the current/previous pair pattern).
+    if scd3_prev_count >= 1:
+        score -= 1
+    if scd3_prev_count >= 1 and scd3_curr_count >= 1:
+        score -= 1   # confirmed current+previous pair → SCD3
+
+    # SCD4 history table: the history/audit side-table carries _hist/_history/
+    # _archive/_audit in its name. Treat as dimension regardless of columns.
+    if _SCD4_HIST_NAME_RE.search(table_meta.table_name):
+        score -= 2
 
     # Strong dimension penalty: single declared PK + text-heavy + few measures
     # → almost certainly a standard or conformed dimension.

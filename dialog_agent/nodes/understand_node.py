@@ -205,13 +205,25 @@ def _load_samples_from_catalog(source_id: str) -> tuple:
                 top_vals = attr.get("top_values") or []
                 col = attr["column_name"]
 
-                # Only expose columns that have known categorical/ordinal type
-                # AND have stored sample values from the indexing phase.
-                if stat_type in ("categorical", "ordinal") and top_vals:
-                    samples.setdefault(tbl, {})[col] = {
-                        "values": top_vals,
-                        "categorical": True,
-                    }
+                unique_count = attr.get("unique_count")
+
+                # Expose columns that have known categorical/ordinal type.
+                # - If top_values are stored: show them as sample values.
+                # - If top_values are empty but unique_count is low (≤ 50):
+                #   still mark the column as categorical so the LLM knows to
+                #   use LIKE rather than exact equality — even without samples.
+                if stat_type in ("categorical", "ordinal"):
+                    if top_vals:
+                        samples.setdefault(tbl, {})[col] = {
+                            "values": top_vals,
+                            "categorical": True,
+                        }
+                    elif unique_count is not None and unique_count <= 50:
+                        samples.setdefault(tbl, {})[col] = {
+                            "values": [],
+                            "categorical": True,
+                            "values_unknown": True,
+                        }
 
         # Detect parent-child pairs by naming convention (sub_X → X).
         # Without a live DB cross-tab, represent the hierarchy as a flat
@@ -513,11 +525,17 @@ def _summarise_graph(
                 col_info = tbl_samples.get(sql_col)
                 display  = f"{sql_col}{col_type}" if samples is not None else col
                 if col_info:
-                    # col_info is {"values": [...], "categorical": bool}
-                    vals        = col_info.get("values", []) if isinstance(col_info, dict) else col_info
-                    categorical = col_info.get("categorical", False) if isinstance(col_info, dict) else False
-                    sample_str  = ", ".join(repr(v) for v in vals)
-                    if categorical:
+                    # col_info is {"values": [...], "categorical": bool, "values_unknown"?: bool}
+                    vals           = col_info.get("values", []) if isinstance(col_info, dict) else col_info
+                    categorical    = col_info.get("categorical", False) if isinstance(col_info, dict) else False
+                    values_unknown = col_info.get("values_unknown", False) if isinstance(col_info, dict) else False
+                    sample_str     = ", ".join(repr(v) for v in vals)
+                    if categorical and values_unknown:
+                        lines.append(
+                            f"    {display}  [categorical — stored values not sampled;"
+                            f" use LIKE '%keyword%' filter, NOT exact equality]"
+                        )
+                    elif categorical:
                         lines.append(
                             f"    {display}  [categorical — ALL stored values: {sample_str}]"
                             f"  ← your filter term may differ from these labels"

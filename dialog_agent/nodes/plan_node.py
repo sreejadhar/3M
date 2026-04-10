@@ -357,9 +357,17 @@ General Rules:
 
     c. If a column is marked [categorical] in the schema context, you MUST follow this
        rule — do not use exact equality unless the term appears verbatim in the samples.
-    d. Always use case-insensitive matching (LOWER/ILIKE) — never raw equality on text.
-    e. When using LIKE, anchor to the most distinctive part of the term to avoid
-       false positives (e.g. LIKE '%snack%' not LIKE '%and%').
+    d. If a column is marked [categorical — stored values not sampled] you MUST use
+       LIKE with the most distinctive keyword from the user's term:
+         WRONG : LOWER(maker) = 'coca cola'        ← exact equality when values unknown
+         CORRECT: LOWER(maker) LIKE '%coca%'        ← LIKE with distinctive keyword
+       Never use exact equality on a categorical column whose actual stored values are
+       not shown in the schema. The stored values may be abbreviated, trademarked, or
+       formatted differently from what the user typed (e.g. "Coca-Cola HBC", "CCEP",
+       "The Coca-Cola Company").
+    e. Always use case-insensitive matching (LOWER/ILIKE) — never raw equality on text.
+    f. When using LIKE, anchor to the most distinctive part of the term to avoid
+       false positives (e.g. LIKE '%coca%' not LIKE '%cola%' which would match Pepsi Cola).
 12. Date/period filters — always check the [sample values] for the period column before
     writing a year filter.  Period columns often store values with a prefix or suffix:
       WRONG : WHERE fiscal_year = '2024'       ← if samples show 'FY2024'

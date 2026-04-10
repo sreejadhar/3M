@@ -37,6 +37,123 @@ logger = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Name-based fallback: table name contains one of these words → likely a fact table
+_FACT_NAME_RE = re.compile(r'\b(fact|fct|measure|metric|kpi)\b', re.IGNORECASE)
+
+# Column name patterns that indicate a numeric measure (additive fact column)
+_MEASURE_COL_RE = re.compile(
+    r'\b(sales|revenue|qty|quantity|amount|volume|price|cost|count|total|'
+    r'value|profit|margin|units|spend|budget|forecast|actuals?|transactions?)\b',
+    re.IGNORECASE,
+)
+
+# Column name patterns that indicate a FK / dimension reference
+_FK_COL_RE = re.compile(
+    r'(_id|_key|_sk|_fk|_code|_ref)\s*$',
+    re.IGNORECASE,
+)
+
+# Column name patterns that indicate a time grain column
+_TIME_COL_RE = re.compile(
+    r'\b(date|month|year|week|quarter|period|fiscal|timestamp|time)\b',
+    re.IGNORECASE,
+)
+
+# Numeric dtypes that can store measures
+_NUMERIC_DTYPE_RE = re.compile(
+    r'\b(int|integer|bigint|smallint|tinyint|number|numeric|decimal|'
+    r'float|double|real|money)\b',
+    re.IGNORECASE,
+)
+
+
+def _score_fact_table(table_meta: TableMeta) -> int:
+    """
+    Score a table against heuristics derived from its sampled column metadata.
+    Returns an integer score; tables scoring >= 2 are treated as fact tables.
+
+    Scoring rubric (each signal +1, up to its cap):
+      +2  name matches _FACT_NAME_RE  (strong prior)
+      +1  has ≥1 column matching _MEASURE_COL_RE with a numeric dtype
+      +1  has ≥2 columns matching _FK_COL_RE or is_foreign_key=True (dimension references)
+      +1  has ≥1 column matching _TIME_COL_RE (time grain)
+      +1  no single column is a unique natural key (uniqueness_ratio ≈ 1.0) →
+          table has composite grain, typical of facts
+      -1  has exactly 1 column or is clearly a lookup/dim (unique col count ≤ 3)
+    """
+    score = 0
+    name = table_meta.table_name
+
+    # Name heuristic
+    if _FACT_NAME_RE.search(name):
+        score += 2
+
+    cols = table_meta.columns
+    if not cols:
+        return score
+
+    row_count = table_meta.row_count or 0
+
+    measure_cols = 0
+    fk_cols = 0
+    time_cols = 0
+    has_unique_natural_key = False
+
+    for c in cols:
+        # Measure column: name matches measure pattern AND numeric dtype
+        if _MEASURE_COL_RE.search(c.name) and _NUMERIC_DTYPE_RE.search(c.data_type):
+            measure_cols += 1
+
+        # FK / dimension reference column
+        if _FK_COL_RE.search(c.name) or c.is_foreign_key:
+            fk_cols += 1
+
+        # Time grain column
+        if _TIME_COL_RE.search(c.name):
+            time_cols += 1
+
+        # Natural-key detection: single column with uniqueness_ratio near 1.0
+        if (
+            c.unique_count is not None
+            and row_count > 0
+            and c.unique_count / row_count >= 0.95
+            and not _FK_COL_RE.search(c.name)
+        ):
+            has_unique_natural_key = True
+
+    if measure_cols >= 1:
+        score += 1
+    if fk_cols >= 2:
+        score += 1
+    if time_cols >= 1:
+        score += 1
+    if not has_unique_natural_key and row_count > 0:
+        score += 1
+
+    # Penalty: tiny column count suggests a lookup/dim table
+    if len(cols) <= 3:
+        score -= 1
+
+    return score
+
+
+def _infer_fact_tables(table_metadata: Dict[str, TableMeta]) -> Dict[str, bool]:
+    """
+    Return a mapping of table_name → is_fact for every table in table_metadata.
+    Tables are classified as fact if their score >= 2 (see _score_fact_table).
+    Logs the score for each table at DEBUG level for transparency.
+    """
+    result: Dict[str, bool] = {}
+    for name, meta in table_metadata.items():
+        score = _score_fact_table(meta)
+        is_fact = score >= 2
+        result[name] = is_fact
+        logger.debug(
+            "fact-inference: %s → score=%d is_fact=%s", name, score, is_fact
+        )
+    return result
+
+
 def _col_dicts(table_meta: TableMeta) -> List[Dict[str, str]]:
     return [{"name": c.name, "data_type": c.data_type} for c in table_meta.columns]
 
@@ -85,10 +202,12 @@ def analysis_node(state: AgentState) -> AgentState:
     n_tables = len(table_names)
     n_pairs  = n_tables * (n_tables - 1) // 2
 
-    _FACT_RE = re.compile(r'\b(fact|fct|measure|metric|kpi)\b', re.IGNORECASE)
+    # Infer fact tables from sampled column metadata (falls back to name heuristic
+    # when no sampling data is available).
+    _fact_map = _infer_fact_tables(table_metadata)
 
     def _is_fact(name: str) -> bool:
-        return bool(_FACT_RE.search(name))
+        return _fact_map.get(name, False)
 
     # ------------------------------------------------------------------
     # 1. Functional Dependencies (per table)

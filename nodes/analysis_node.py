@@ -38,27 +38,42 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # ── Fact table name keywords ──────────────────────────────────────────────
-# Strong prior: table name contains one of these → likely a fact or aggregate
+# Strong prior: table name contains one of these → likely a fact or aggregate.
+# NOTE: plain anchor match — underscores are word-chars so \bfact\b fails on
+# "vw_fact_sales" (no \b between '_' and 'f').
 _FACT_NAME_RE = re.compile(
-    r'\b(fact|fct|measure|metric|kpi)\b', re.IGNORECASE
+    r'(^|_)(fact|fct|measure|metric|kpi)($|_)', re.IGNORECASE
 )
-# Weaker prior: aggregate / periodic summary table names
+# Weaker prior: aggregate / periodic summary / OLTP transaction event names
+# NOTE: plain substring match (no \b) — underscores are word-chars so \bticker\b
+# would fail on "support_tickets".
 _AGG_NAME_RE = re.compile(
-    r'\b(agg|aggregat|summary|summ|snapshot|trans|event|'
-    r'daily|weekly|monthly|hourly|annual|yearly)\b',
+    r'(^|_)(agg|aggregat|summary|summ|snapshot|trans|event|'
+    r'daily|weekly|monthly|hourly|annual|yearly|'
+    r'tickets?|cases?|incidents?|sessions?|'
+    r'claims?|requests?|complaints?|issues?|'
+    r'alerts?|bookings?|reservations?)($|_)',
     re.IGNORECASE,
 )
+# Explicit dimension name: table starts with dim_ or contains _dim_
+# → strong prior it is a dimension, not a fact.
+# NOTE: plain anchor match for same \b reason.
+_DIM_NAME_RE = re.compile(r'(^|_)dim(ension)?(_|$)', re.IGNORECASE)
 
 # ── Measure column name keywords ──────────────────────────────────────────
 # Named measures: keyword in column name + numeric dtype → clear additive measure
+#
+# NOTE: do NOT use \b word boundaries — underscores are word-chars so \btotal\b
+# FAILS on "total_amount" (no boundary between 'l' and '_').
+# Pattern: keyword appears at start, end, or between underscores.
 _MEASURE_COL_RE = re.compile(
-    r'\b(sales|revenue|qty|quantity|amount|volume|price|cost|'
+    r'(^|_)(sales|revenue|qty|quantity|amount|volume|price|cost|'
     r'count|total|value|profit|margin|units|spend|budget|forecast|'
     r'actual|transaction|order|balance|inventory|stock|weight|'
     r'rate|ratio|score|index|pct|percent|share|growth|diff|variance|'
     r'dist|distribution|avg|average|sum|fee|charge|tax|discount|'
     r'return|conversion|impression|click|session|visit|call|event|'
-    r'duration|supply|demand)\b',
+    r'duration|supply|demand)($|_)',
     re.IGNORECASE,
 )
 
@@ -69,8 +84,24 @@ _FK_COL_RE = re.compile(
 )
 
 # ── Time / grain column name keywords ─────────────────────────────────────
+# NOTE: do NOT use \b word boundaries — underscores are word-chars in Python
+# regex, so \bdate\b FAILS to match "order_date" (the _ before date is a word
+# char, so there is no word boundary before 'd').  Use explicit anchor patterns.
+#
+# Patterns covered:
+#   (^|_)keyword($|_)  — keyword at start, end, or between underscores
+#   (_at|_ts|_dt)$     — created_at, updated_ts, modified_dt suffix
 _TIME_COL_RE = re.compile(
-    r'\b(date|month|year|week|quarter|period|fiscal|timestamp|time)\b',
+    r'(^|_)(date|month|year|week|quarter|period|fiscal|timestamp|datetime|time)($|_)'
+    r'|(_at|_ts|_dt)$',
+    re.IGNORECASE,
+)
+
+# ── Time / grain data-type keywords ──────────────────────────────────────
+# Catches columns whose NAME doesn't signal time but whose DTYPE does:
+# e.g. col named "created" with dtype "datetime", or "ts" with dtype "timestamp"
+_TIME_DTYPE_RE = re.compile(
+    r'\b(date|datetime|timestamp|time)\b',
     re.IGNORECASE,
 )
 
@@ -114,8 +145,9 @@ _SCD3_CURR_RE = re.compile(
 # ── SCD Type 4 history-table name patterns ────────────────────────────────
 # The history / audit table in a Type-4 design carries _hist/_history/_audit
 # in the name and should be treated as a dimension, not a fact.
+# Using end-of-string anchor ($) — the prefix underscore is already literal.
 _SCD4_HIST_NAME_RE = re.compile(
-    r'(_hist|_history|_archive|_audit|_log|_shadow)\s*$',
+    r'(_hist|_history|_archive|_audit|_log|_shadow)$',
     re.IGNORECASE,
 )
 
@@ -141,7 +173,7 @@ _BOOL_COL_RE   = re.compile(
 )
 
 
-def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
+def _score_fact_table(table_meta: TableMeta) -> tuple:  # noqa: C901  → (score: int, has_unique_col: bool)
     """
     Score a table using column-level sampled metadata to determine whether it
     is a fact table (any Kimball variant) or a dimension/lookup.
@@ -176,6 +208,14 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
     -2  SCD4: table name ends with _hist/_history/_archive/_audit/_log
         (history side-table — always a dimension, never a fact)
     -2  strong dimension: single declared PK + text-heavy (>40%) + few measures
+    -1  OLTP entity/master table: single PK + unique natural key + <2 external
+        FK references + table name does not contain fact/fct → intrinsic entity
+        attributes are not measurements of events (catches compact product/
+        employee/account tables with numeric attrs like price, weight, salary)
+
+    Returns (score, has_unique_col) — callers use has_unique_col to determine
+    whether this table has composite grain (OLAP fact) vs a natural PK key
+    (OLTP transaction header), which changes the fact↔fact suppression logic.
     """
     score = 0
     name = table_meta.table_name
@@ -185,17 +225,21 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
         score += 2
     elif _AGG_NAME_RE.search(name):
         score += 1
+    # Explicit dim_ prefix/infix is a strong dimension indicator regardless of
+    # what the columns look like (e.g. dim_date has many time-related columns).
+    if _DIM_NAME_RE.search(name):
+        score -= 2
 
     cols = table_meta.columns
     if not cols:
-        return score
+        return score, False  # no column data — cannot determine grain
 
     n_cols    = len(cols)
     row_count = table_meta.row_count or 0
 
     named_measure_cols   = 0
     generic_measure_cols = 0
-    fk_cols              = 0
+    fk_cols              = 0   # external FK references only — PK excluded
     time_cols            = 0
     text_cols            = 0
     scd_eff_found        = False
@@ -203,10 +247,11 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
     scd_current_found    = False
     scd3_prev_count      = 0     # columns with previous_/prior_/old_ prefix
     scd3_curr_count      = 0     # columns with current_<attr> prefix (not flags)
-    has_unique_col       = False   # any non-FK col with uniqueness_ratio ≥ 0.95
-    # Count how many distinct FK-named columns reference different entity types.
-    # Surrogate+natural key pairs for the SAME entity both end in _sk/_nk or
-    # _key/_id — we detect this to avoid the factless signal firing on SCD dims.
+    has_unique_col       = False   # any single col with uniqueness_ratio ≥ 0.95
+    # Distinct FK root names for factless-fact detection.
+    # Only counts non-PK FK columns so that surrogate+natural key pairs for the
+    # same entity (customer_sk + customer_nk → root "customer") don't masquerade
+    # as two separate entity references.
     fk_root_names: set = set()
 
     for c in cols:
@@ -222,16 +267,20 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
         if _MEASURE_COL_RE.search(col) and is_numeric:
             named_measure_cols += 1
 
-        # FK / dimension reference
-        if is_fk_named or c.is_foreign_key:
+        # FK / dimension reference — deliberately exclude PK columns.
+        # A PK column that happens to end in _id/_key (e.g. product_id as PK)
+        # is the entity's own identifier, not a reference to another table.
+        # Counting it inflates fk_cols for entity/master tables and confuses
+        # the factless-fact distinct-root logic.
+        if (is_fk_named or c.is_foreign_key) and not c.is_primary_key:
             fk_cols += 1
-            # Strip trailing suffix to get the entity root name
-            # e.g. customer_sk → customer, customer_nk → customer (same root)
             root = _FK_COL_RE.sub('', col).rstrip('_').lower()
             fk_root_names.add(root)
 
-        # Time grain
-        if is_time_col:
+        # Time grain — name pattern OR dtype, but only when the dtype is not plain
+        # text (varchar/nvarchar/char). Text columns named "month_name", "year_name",
+        # "quarter_desc" are descriptive dimension attributes, not grain columns.
+        if (is_time_col and not is_text) or bool(_TIME_DTYPE_RE.search(dtype)):
             time_cols += 1
 
         # Text column ratio
@@ -279,29 +328,26 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
             if u_ratio is None or u_ratio < 0.95:
                 generic_measure_cols += 1
 
-        # Natural-key detection (for composite-grain signal below):
-        # A column has uniqueness ≈ 1.0 and is NOT an FK-named column →
-        # this table may have a natural unique key, typical of a dimension.
-        # We deliberately include PK-flagged columns here so that a dim's
-        # surrogate key (e.g. customer_key, which also ends in _key matching
-        # _FK_COL_RE) does NOT blindly suppress this signal.
-        if (
-            c.is_primary_key
-            and c.unique_count is not None
-            and row_count > 0
-            and c.unique_count / row_count >= 0.95
-        ):
-            has_unique_col = True
-        elif (
-            not is_fk_named
-            and not c.is_primary_key
-            and c.unique_count is not None
-            and row_count > 0
-            and c.unique_count / row_count >= 0.95
-        ):
-            has_unique_col = True
+        # Natural-key / unique-identifier detection.
+        # Signals that this table has a single-column identifier (dim or OLTP
+        # transaction header), not a purely composite grain (OLAP fact).
+        # Fires on:
+        #   • Any declared PK column with uniqueness_ratio ≥ 0.95, OR
+        #   • Any non-FK, non-PK column with uniqueness_ratio ≥ 0.95
+        #     (natural business keys like customer_no, order_number)
+        if c.unique_count is not None and row_count > 0:
+            u_ratio = c.unique_count / row_count
+            if u_ratio >= 0.95 and (c.is_primary_key or (not is_fk_named and not c.is_foreign_key)):
+                has_unique_col = True
 
     text_ratio = text_cols / n_cols if n_cols else 0.0
+
+    # Self-referencing / hierarchical table: any FK points back to this table.
+    # These are entity tables (categories, org_chart, bill_of_materials) — never facts.
+    is_self_referencing = any(
+        (fk.get("references_table", "") or "").lower() == name.lower()
+        for fk in table_meta.foreign_keys
+    )
 
     # ── Positive signals ──────────────────────────────────────────────────
     if named_measure_cols >= 1:
@@ -358,28 +404,59 @@ def _score_fact_table(table_meta: TableMeta) -> int:  # noqa: C901
     if _SCD4_HIST_NAME_RE.search(table_meta.table_name):
         score -= 2
 
+    # Self-referencing / hierarchical entity table (categories, org chart, BOM).
+    # A table that has a FK back to itself is always an entity, never a fact.
+    if is_self_referencing:
+        score -= 2
+
     # Strong dimension penalty: single declared PK + text-heavy + few measures
     # → almost certainly a standard or conformed dimension.
     single_pk = len(table_meta.primary_keys) == 1
     if single_pk and text_ratio > 0.40 and named_measure_cols < 2:
         score -= 2
 
-    return score
+    # OLTP entity / master table penalty.
+    # Key insight: transaction tables ALWAYS have at least one event date/time
+    # column (order_date, payment_date, created_at).  Pure entity/attribute
+    # tables (products, departments, config) do not.
+    # Fires when:
+    #   • single unique identifier (has_unique_col) — entity or txn header
+    #   • fewer than 2 external FK references — not a junction/resolution table
+    #   • NO time/date column (time_cols == 0) — no event timestamp → entity
+    #   • not an explicit fact/aggregate name
+    # Penalty is -2 (not -1) so it overcomes entity tables that happen to carry
+    # two numeric attribute columns (e.g. products.unit_price + products.weight).
+    if (
+        has_unique_col
+        and fk_cols < 2
+        and time_cols == 0
+        and not _FACT_NAME_RE.search(name)
+        and not _AGG_NAME_RE.search(name)
+    ):
+        score -= 2
+
+    return score, has_unique_col
 
 
-def _infer_fact_tables(table_metadata: Dict[str, TableMeta]) -> Dict[str, bool]:
+def _infer_fact_tables(table_metadata: Dict[str, TableMeta]) -> Dict[str, Dict]:
     """
-    Return a mapping of table_name → is_fact for every table in table_metadata.
-    Tables are classified as fact if their score >= 2 (see _score_fact_table).
-    Logs the score for each table at DEBUG level for transparency.
+    Return a mapping of table_name → {"is_fact": bool, "has_unique_col": bool}
+    for every table in table_metadata.
+
+    is_fact         — True if score >= 2 (any Kimball fact variant)
+    has_unique_col  — True if the table has a single-column unique identifier.
+                      Used by analysis_node to distinguish OLAP composite-grain
+                      facts (where fact↔fact edges are suppressed) from OLTP
+                      transaction headers (where header→line FK edges are valid).
     """
-    result: Dict[str, bool] = {}
+    result: Dict[str, Dict] = {}
     for name, meta in table_metadata.items():
-        score = _score_fact_table(meta)
+        score, has_unique_col = _score_fact_table(meta)
         is_fact = score >= 2
-        result[name] = is_fact
+        result[name] = {"is_fact": is_fact, "has_unique_col": has_unique_col}
         logger.debug(
-            "fact-inference: %s → score=%d is_fact=%s", name, score, is_fact
+            "fact-inference: %s → score=%d is_fact=%s has_unique_col=%s",
+            name, score, is_fact, has_unique_col,
         )
     return result
 
@@ -436,8 +513,14 @@ def analysis_node(state: AgentState) -> AgentState:
     # when no sampling data is available).
     _fact_map = _infer_fact_tables(table_metadata)
 
-    def _is_fact(name: str) -> bool:
-        return _fact_map.get(name, False)
+    def _is_composite_grain_fact(name: str) -> bool:
+        """True only for OLAP-style facts with no single unique identifier.
+        OLTP transaction headers also score as facts but have has_unique_col=True
+        (the order_id / invoice_id PK), so fact↔fact suppression should NOT fire
+        for header→line relationships — only for pure composite-grain OLAP facts.
+        """
+        info = _fact_map.get(name, {})
+        return info.get("is_fact", False) and not info.get("has_unique_col", False)
 
     # ------------------------------------------------------------------
     # 1. Functional Dependencies (per table)
@@ -572,11 +655,13 @@ def analysis_node(state: AgentState) -> AgentState:
             if dedup_key in existing_ind_keys:
                 continue
             existing_ind_keys.add(dedup_key)
-            # Fact↔fact INDs share ID columns but represent no meaningful FK
-            # relationship — demote them so build_node never creates an edge.
+            # Suppress spurious FK edges between two OLAP composite-grain facts
+            # (e.g. fact_sales ↔ fact_budget sharing date_id).  Do NOT suppress
+            # when either table is an OLTP transaction header (has_unique_col=True)
+            # because header→line relationships (orders → order_items) are valid.
             is_fk_cand = ind["is_foreign_key_candidate"]
             ind_type   = ind.get("ind_type", "value_subset")
-            if is_fk_cand and _is_fact(lt) and _is_fact(rt):
+            if is_fk_cand and _is_composite_grain_fact(lt) and _is_composite_grain_fact(rt):
                 is_fk_cand = False
                 ind_type   = "value_subset"
                 logger.debug("IND: demoted fact↔fact FK candidate %s → %s to value_subset", lt, rt)
@@ -635,9 +720,12 @@ def analysis_node(state: AgentState) -> AgentState:
                    f"Cardinality cap ({cardinality_cap} pairs) reached — remaining pairs skipped", "")
             break
 
-        # Fact↔fact pairs share ID columns but have no meaningful join path;
-        # skip them to avoid spurious cardinality edges in the KG.
-        if _is_fact(left_name) and _is_fact(right_name):
+        # Skip cardinality analysis for two OLAP composite-grain facts — they
+        # share dimension keys but have no meaningful direct join path.
+        # OLTP header↔line pairs (both scored as fact but has_unique_col=True)
+        # are NOT skipped because their cardinality relationship is real and
+        # needed for query generation (e.g. orders 1:N order_items).
+        if _is_composite_grain_fact(left_name) and _is_composite_grain_fact(right_name):
             logger.debug("  Cardinality: skipping fact↔fact pair %s ↔ %s", left_name, right_name)
             cardinality_pair_count += 1
             continue

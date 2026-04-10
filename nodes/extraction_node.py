@@ -155,18 +155,45 @@ def _infer_table_description(
     """
     name_lower = table_name.lower()
 
-    # Determine likely entity type from common table-name patterns
+    # Determine likely entity type from common table-name patterns.
+    # Checked in priority order — first match wins.
     entity_hint = ""
     if re.search(r'\b(fact|fct|measure|metric|kpi)\b', name_lower):
         entity_hint = "fact/measure table"
-    elif re.search(r'\b(dim|dimension|lookup|ref|reference|master|mst)\b', name_lower):
-        entity_hint = "dimension/reference table"
-    elif re.search(r'\b(bridge|xref|cross|mapping|map|link|assoc)\b', name_lower):
+    elif re.search(r'\b(dim|dimension)\b', name_lower):
+        entity_hint = "dimension table"
+    elif re.search(r'\b(lookup|ref|reference|master|mst|code_table|codelist)\b', name_lower):
+        entity_hint = "lookup/reference table"
+    elif re.search(r'\b(bridge|xref|cross_ref|mapping|map|link|assoc|junction|rel)\b', name_lower):
         entity_hint = "bridge/mapping table"
-    elif re.search(r'\b(log|audit|history|hist|event|trail)\b', name_lower):
+    # ── OLTP-specific patterns ────────────────────────────────────────────
+    elif re.search(r'\b(order|invoice|transaction|payment|shipment|receipt|'
+                   r'booking|reservation|claim|ticket|request|case|incident)\b', name_lower):
+        entity_hint = "OLTP transaction table"
+    elif re.search(r'\b(order_item|invoice_line|line_item|detail|position|entry|'
+                   r'component|item|row)\b', name_lower):
+        entity_hint = "OLTP transaction line/detail table"
+    elif re.search(r'\b(customer|client|account|party|person|employee|emp|staff|'
+                   r'vendor|supplier|partner|contact|user|member)\b', name_lower):
+        entity_hint = "OLTP entity/master table"
+    elif re.search(r'\b(product|item|sku|article|service|catalogue|catalog|'
+                   r'asset|equipment|device)\b', name_lower):
+        entity_hint = "OLTP product/item master table"
+    elif re.search(r'\b(address|location|site|warehouse|store|branch|outlet|'
+                   r'territory|region)\b', name_lower):
+        entity_hint = "OLTP location/address table"
+    elif re.search(r'\b(category|type|subtype|class|group|segment|tier|'
+                   r'hierarchy|level)\b', name_lower):
+        entity_hint = "OLTP classification/hierarchy table"
+    elif re.search(r'\b(status|state|workflow|stage|phase|queue)\b', name_lower):
+        entity_hint = "OLTP workflow/status table"
+    # ── Structural patterns ───────────────────────────────────────────────
+    elif re.search(r'\b(log|audit|history|hist|event|trail|changelog|change_log)\b', name_lower):
         entity_hint = "audit/history table"
-    elif re.search(r'\b(staging|stg|stage|temp|tmp|raw)\b', name_lower):
+    elif re.search(r'\b(staging|stg|stage|temp|tmp|raw|landing|inbound)\b', name_lower):
         entity_hint = "staging/temporary table"
+    elif re.search(r'\b(agg|aggregat|summary|summ|rollup|snapshot)\b', name_lower):
+        entity_hint = "aggregate/summary table"
 
     col_count = len(columns)
     pk_str = f"PK: ({', '.join(primary_keys)})" if primary_keys else "no defined primary key"

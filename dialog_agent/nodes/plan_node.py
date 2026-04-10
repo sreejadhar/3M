@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..state import DialogState, SQLQuery
 from ..token_guard import guard_plan_prompt
@@ -666,6 +666,97 @@ def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
         return sql.strip()
     except Exception:
         return sql
+
+
+def _strip_invalid_join(sql: str, invalid_join_descriptions: List[str]) -> Optional[str]:
+    """
+    Attempt to salvage a query that contains an invalid JOIN by removing the
+    entire JOIN clause and any SELECT columns / WHERE conditions that reference
+    the joined table's alias.
+
+    Strategy:
+      1. Parse the first table alias from FROM ... AS alias.
+      2. Find each JOIN ... ON block that contains one of the invalid pairs.
+      3. Remove those JOIN blocks from the SQL.
+      4. Remove any SELECT columns, WHERE conditions, GROUP BY or ORDER BY
+         references that use the removed table's alias.
+
+    Returns the salvaged SQL string, or None if the query cannot be salvaged
+    (e.g. all SELECT columns came from the removed table).
+    """
+    try:
+        # Extract aliases from JOIN clauses — "JOIN tbl AS alias" or "JOIN tbl alias"
+        join_aliases = re.findall(
+            r'\bJOIN\b\s+\S+\s+(?:AS\s+)?(\w+)\b',
+            sql, re.IGNORECASE,
+        )
+        if not join_aliases:
+            return None
+
+        # Determine which aliases are involved in the invalid join conditions
+        bad_aliases: set = set()
+        for desc in invalid_join_descriptions:
+            # desc looks like "alias1.col = alias2.col"
+            for m in re.finditer(r'\b(\w+)\.\w+', desc):
+                bad_aliases.add(m.group(1).lower())
+
+        # Only keep aliases that appear in actual JOIN clauses (not the primary table)
+        bad_aliases = {a for a in bad_aliases if a.lower() in [j.lower() for j in join_aliases]}
+        if not bad_aliases:
+            return None
+
+        # Remove each JOIN ... ON block for bad aliases
+        salvaged = sql
+        for alias in bad_aliases:
+            ae = re.escape(alias)
+            # Remove the JOIN block: JOIN ... ON condition (stop at next JOIN/WHERE/GROUP/ORDER)
+            salvaged = re.sub(
+                r'(?i)\b(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|FULL\s+)?JOIN\s+\S+\s+'
+                r'(?:AS\s+)?' + ae +
+                r'\b\s+ON\s+.+?(?=\b(?:LEFT|RIGHT|INNER|OUTER|FULL|JOIN|WHERE|GROUP|ORDER|HAVING|LIMIT)\b|$)',
+                ' ',
+                salvaged,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            # Remove SELECT columns referencing the removed alias: "alias.col [AS name],"
+            salvaged = re.sub(
+                r'(?i),?\s*' + ae + r'\.\w+(?:\s+AS\s+\w+)?(?=\s*[,\n]|\s*FROM)',
+                '',
+                salvaged,
+            )
+            # Remove WHERE / AND conditions referencing the removed alias
+            val = r"""(?:'[^']*'|\([^)]*\)|[^\s,)]+)"""
+            op  = r"(?:=|!=|<>|>=|<=|>|<|(?:NOT\s+)?LIKE|(?:NOT\s+)?IN|IS(?:\s+NOT)?)"
+            salvaged = re.sub(
+                r'(?i)\s+(?:AND|OR)\s+' + ae + r'\.\w+\s+' + op + r'\s*' + val, '', salvaged
+            )
+            salvaged = re.sub(
+                r'(?i)\bWHERE\s+' + ae + r'\.\w+\s+' + op + r'\s*' + val + r'\s+AND\s+',
+                'WHERE ', salvaged,
+            )
+            salvaged = re.sub(
+                r'(?i)\s+WHERE\s+' + ae + r'\.\w+\s+' + op + r'\s*' + val
+                + r'(?=\s*(?:GROUP\b|ORDER\b|HAVING\b|LIMIT\b|$))',
+                '', salvaged,
+            )
+            # Remove GROUP BY / ORDER BY references to the removed alias
+            salvaged = re.sub(r'(?i),\s*' + ae + r'\.\w+', '', salvaged)
+
+        # Collapse multiple spaces/commas left behind
+        salvaged = re.sub(r',\s*,', ',', salvaged)
+        salvaged = re.sub(r'SELECT\s*,', 'SELECT ', salvaged, flags=re.IGNORECASE)
+        salvaged = re.sub(r',\s*(FROM\b)', r' \1', salvaged, flags=re.IGNORECASE)
+        salvaged = salvaged.strip()
+
+        # Sanity check: must still have a FROM clause and at least one SELECT column
+        if not re.search(r'\bFROM\b', salvaged, re.IGNORECASE):
+            return None
+        if not re.search(r'\bSELECT\b.+\bFROM\b', salvaged, re.IGNORECASE | re.DOTALL):
+            return None
+
+        return salvaged
+    except Exception:
+        return None
 
 
 def _has_hallucinated_join(sql: str, bad_cols: List[str]) -> bool:
@@ -1381,21 +1472,29 @@ def plan_node(state: DialogState) -> DialogState:
             if valid_join_pairs:
                 invalid_joins = _find_invalid_join_conditions(sql, valid_join_pairs)
                 if invalid_joins:
-                    logger.warning(
-                        "plan_node: dropping query %s — invalid JOIN pair(s): %s",
-                        item.get("query_id", "?"), invalid_joins,
-                    )
-                    state["errors"].append(
-                        f"plan_node: query {item.get('query_id','?')} skipped — "
-                        f"invalid JOIN column pair(s) not in schema join keys: {invalid_joins}"
-                    )
-                    reasons.append(
-                        f"Query {item.get('query_id','?')} used JOIN ON condition(s) "
-                        f"{invalid_joins} — these column pairs are NOT valid join keys "
-                        "in the schema. Check POSSIBLE JOIN KEYS; do not join tables via "
-                        "unrelated FK columns from different dimension tables."
-                    )
-                    continue
+                    salvaged_sql = _strip_invalid_join(sql, invalid_joins)
+                    if salvaged_sql:
+                        logger.info(
+                            "plan_node: salvaged query %s by stripping invalid JOIN(s): %s",
+                            item.get("query_id", "?"), invalid_joins,
+                        )
+                        sql = salvaged_sql
+                    else:
+                        logger.warning(
+                            "plan_node: dropping query %s — invalid JOIN pair(s) not salvageable: %s",
+                            item.get("query_id", "?"), invalid_joins,
+                        )
+                        state["errors"].append(
+                            f"plan_node: query {item.get('query_id','?')} skipped — "
+                            f"invalid JOIN column pair(s) not in schema join keys: {invalid_joins}"
+                        )
+                        reasons.append(
+                            f"Query {item.get('query_id','?')} used JOIN ON condition(s) "
+                            f"{invalid_joins} — these column pairs are NOT valid join keys "
+                            "in the schema. Check POSSIBLE JOIN KEYS; do not join tables via "
+                            "unrelated FK columns from different dimension tables."
+                        )
+                        continue
 
             valid.append(
                 SQLQuery(

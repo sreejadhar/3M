@@ -78,7 +78,9 @@ def _score_fact_table(table_meta: TableMeta) -> int:
       +1  has ≥2 columns matching _FK_COL_RE or is_foreign_key=True (dimension references)
       +1  has ≥1 column matching _TIME_COL_RE (time grain)
       +1  no single column is a unique natural key (uniqueness_ratio ≈ 1.0) →
-          table has composite grain, typical of facts
+          table has composite grain, typical of facts  [requires row_count > 0]
+      +1  factless fact signal: ≥3 FK columns AND zero measure columns →
+          event/coverage/bridge table; fires even when sampling data is absent
       -1  has exactly 1 column or is clearly a lookup/dim (unique col count ≤ 3)
     """
     score = 0
@@ -128,6 +130,12 @@ def _score_fact_table(table_meta: TableMeta) -> int:
     if time_cols >= 1:
         score += 1
     if not has_unique_natural_key and row_count > 0:
+        score += 1
+
+    # Factless fact signal: ≥3 FK/dimension-reference columns and zero measure
+    # columns → almost certainly a factless fact (event or coverage table).
+    # Does not require row_count so works even when sampling data is absent.
+    if fk_cols >= 3 and measure_cols == 0:
         score += 1
 
     # Penalty: tiny column count suggests a lookup/dim table

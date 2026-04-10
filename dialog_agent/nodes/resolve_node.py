@@ -129,9 +129,14 @@ MATCHING RULES — try in order, stop at the first rule that gives a match
 
 6. LAST RESORT — NO MATCH: ONLY use this when rules 1-5 all fail AND there are
    no KEYWORD MATCH HINTS for this term.
-   Set matched_values to [] and sql_fragment to null.
+   Set matched_values to [], sql_fragment to null, and no_match to true.
    ⚠ If KEYWORD MATCH HINTS shows overlap for a user term, you MUST NOT use
      NO MATCH for that term — the hint is Python-computed proof of overlap.
+   ⚠ NO MATCH is the CORRECT answer when the user's term genuinely does not
+     appear in any stored column value. For example: if the user says "Coca Cola"
+     but the [categorical] column only stores manufacturer codes like "CCEP",
+     "Suntory", "Asahi" — then NO MATCH is correct. The SQL planner will then
+     know NOT to add a filter for this term instead of fabricating a wrong one.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -142,13 +147,15 @@ OUTPUT FORMAT (return exactly this JSON, no other text):
       "user_term": "<the term from the question>",
       "column": "<column name>",
       "table": "<table name>",
-      "reasoning": "<one sentence explaining the match>",
+      "reasoning": "<one sentence explaining the match or why no match was found>",
       "matched_values": ["<stored value 1>", "<stored value 2>"],
-      "sql_fragment": "<LOWER(column) = 'stored value' or LOWER(column) IN (...) or LOWER(column) LIKE '%...'>"
+      "sql_fragment": "<LOWER(column) = 'stored value' or LOWER(column) IN (...) or LOWER(column) LIKE '%...'  — null if NO MATCH>",
+      "no_match": false
     }
   ]
 }
 
+For NO MATCH cases set: matched_values=[], sql_fragment=null, no_match=true.
 If no categorical filters are needed (e.g. purely numeric aggregation), return:
 {"resolved_filters": []}
 """

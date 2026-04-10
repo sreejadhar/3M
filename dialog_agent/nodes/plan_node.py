@@ -441,6 +441,10 @@ TARGET DATABASE TYPE: {db_type}
 CRITICAL REMINDERS:
 - Use ONLY column names that appear in the DETAILED SCHEMA above. Do NOT invent column names.
 - Use ONLY table names from the AVAILABLE TABLES list above.
+- ⛔ NO MATCH TERMS: If PRE-RESOLVED CATEGORY MAPPINGS shows a "⛔ NO MATCH" entry for a
+  user term, do NOT add any WHERE clause filter for that term. The term does not exist in
+  the data. Instead retrieve all rows (no filter) so the user can see what values are available.
+  NEVER fabricate a filter like LOWER(col) = 'term' or LOWER(col) LIKE '%term%' for a NO MATCH term.
 - CROSS-TABLE: If no POSSIBLE JOIN KEYS exist between two tables, query them SEPARATELY.
   Do NOT use subqueries, IN (...), EXISTS, correlated queries, or any trick to combine
   data from two tables that have no valid join key. One query = one table (or validly joined tables).
@@ -1220,7 +1224,20 @@ def plan_node(state: DialogState) -> DialogState:
             matched        = r.get("matched_values") or []
             sql_frag       = r.get("sql_fragment") or ""
             reasoning      = r.get("reasoning", "")
-            if sql_frag:
+            no_match       = r.get("no_match", False) or not sql_frag
+            if no_match:
+                res_lines.append(
+                    f'  ⛔ NO MATCH: User said "{user_term}" — this term does NOT exist'
+                    f' in any categorical column in the schema.'
+                )
+                if reasoning:
+                    res_lines.append(f"    Reason: {reasoning}")
+                res_lines.append(
+                    f"    ⚡ DO NOT add a WHERE filter for \"{user_term}\"."
+                    f" Retrieve all data and let the user see what values exist."
+                )
+                res_lines.append("")
+            elif sql_frag:
                 res_lines.append(
                     f'  User said "{user_term}"  →  column "{column}"'
                 )

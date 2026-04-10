@@ -207,22 +207,37 @@ def _load_samples_from_catalog(source_id: str) -> tuple:
 
                 unique_count = attr.get("unique_count")
 
-                # Expose columns that have known categorical/ordinal type.
-                # - If top_values are stored: show them as sample values.
-                # - If top_values are empty but unique_count is low (≤ 50):
-                #   still mark the column as categorical so the LLM knows to
-                #   use LIKE rather than exact equality — even without samples.
-                if stat_type in ("categorical", "ordinal"):
-                    if top_vals:
-                        samples.setdefault(tbl, {})[col] = {
-                            "values": top_vals,
-                            "categorical": True,
-                        }
-                    elif unique_count is not None and unique_count <= 50:
+                # Expose columns as categorical samples using a three-tier strategy:
+                #
+                # Tier 1 — stat_type is categorical/ordinal AND top_values present:
+                #   Show all stored values with exact-match annotation.
+                #
+                # Tier 2 — top_values present AND unique_count ≤ 50 (regardless of
+                #   stat_type being wrong/empty due to stale catalog classification):
+                #   Show stored values so the LLM sees what is actually in the column.
+                #   This catches columns like 'maker' (7 unique values, wrongly typed
+                #   as "continuous") where top_values ARE stored but gated out.
+                #
+                # Tier 3 — stat_type is categorical/ordinal but top_values empty AND
+                #   unique_count ≤ 50: mark as categorical so LLM uses LIKE not =.
+                description  = (attr.get("description") or "").strip()
+
+                if top_vals and (
+                    stat_type in ("categorical", "ordinal")
+                    or (unique_count is not None and unique_count <= 50)
+                ):
+                    samples.setdefault(tbl, {})[col] = {
+                        "values": top_vals,
+                        "categorical": True,
+                        "description": description,
+                    }
+                elif stat_type in ("categorical", "ordinal") and not top_vals:
+                    if unique_count is not None and unique_count <= 50:
                         samples.setdefault(tbl, {})[col] = {
                             "values": [],
                             "categorical": True,
                             "values_unknown": True,
+                            "description": description,
                         }
 
         # Detect parent-child pairs by naming convention (sub_X → X).
@@ -525,19 +540,21 @@ def _summarise_graph(
                 col_info = tbl_samples.get(sql_col)
                 display  = f"{sql_col}{col_type}" if samples is not None else col
                 if col_info:
-                    # col_info is {"values": [...], "categorical": bool, "values_unknown"?: bool}
+                    # col_info is {"values": [...], "categorical": bool, "values_unknown"?: bool, "description"?: str}
                     vals           = col_info.get("values", []) if isinstance(col_info, dict) else col_info
                     categorical    = col_info.get("categorical", False) if isinstance(col_info, dict) else False
                     values_unknown = col_info.get("values_unknown", False) if isinstance(col_info, dict) else False
+                    col_desc       = col_info.get("description", "") if isinstance(col_info, dict) else ""
                     sample_str     = ", ".join(repr(v) for v in vals)
+                    desc_suffix    = f"  — {col_desc}" if col_desc else ""
                     if categorical and values_unknown:
                         lines.append(
                             f"    {display}  [categorical — stored values not sampled;"
-                            f" use LIKE '%keyword%' filter, NOT exact equality]"
+                            f" use LIKE '%keyword%' filter, NOT exact equality{desc_suffix}]"
                         )
                     elif categorical:
                         lines.append(
-                            f"    {display}  [categorical — ALL stored values: {sample_str}]"
+                            f"    {display}  [categorical — ALL stored values: {sample_str}{desc_suffix}]"
                             f"  ← your filter term may differ from these labels"
                         )
                         # Show taxonomy hierarchy when this column is a parent

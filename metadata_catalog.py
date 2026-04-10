@@ -1024,7 +1024,9 @@ def _coerce_change(row: Dict) -> Dict:
 
 _ENRICH_SYSTEM = """\
 You are a data modelling expert. Given a database table with column names, types, and sample values,
-classify each column and infer its taxonomy.
+classify each column, infer its taxonomy, and write a concise description of what the column
+actually stores.  The description is critical — it is used by an AI SQL planner to choose the
+correct filter column for natural-language questions.
 
 Return ONLY a JSON object — no prose, no markdown fences.
 
@@ -1038,6 +1040,13 @@ statistical_type (pick one):
   free_text   — high-cardinality unstructured text
   date        — actual date/datetime/timestamp column
 
+IMPORTANT classification rules:
+  • A column named "maker", "manufacturer", "vendor", "brand", "supplier" is ALWAYS
+    categorical — even if the dtype is varchar/nvarchar.  Never classify it as continuous.
+  • A column named "year", "month", "quarter", "period", "year_month", "fiscal_year" is
+    ALWAYS ordinal — even if the dtype is integer (e.g. year_month=202412).
+  • Only use "continuous" for pure numeric measures like revenue, volume, price, quantity.
+
 semantic_role (pick the best match):
   measure | time_period | time_dimension_key | product_category | product_sub_category |
   product_dimension_key | geography | geography_dimension_key | org_unit | org_dimension_key |
@@ -1046,6 +1055,17 @@ semantic_role (pick the best match):
 taxonomy_values: for categorical/ordinal columns list all distinct values shown in sample_values.
   For other types return [].
 
+description: A one-sentence plain-English description of what this column stores.
+  Be specific about WHAT the values represent, not just the data type.
+  Good examples:
+    maker      → "Bottler or manufacturer company name (e.g. CCEP, Suntory, Asahi)"
+    channel    → "Sales distribution channel (e.g. CVS, Supermarket, Vending)"
+    year_month → "Year-month period key in YYYYMM integer format (e.g. 202401 = January 2024)"
+    metric     → "Metric type stored in this row: either 'Value' (monetary) or 'Volume' (units)"
+  Bad examples (too vague):
+    maker      → "descriptive text column"
+    year_month → "numeric measure column"
+
 OUTPUT FORMAT:
 {
   "columns": [
@@ -1053,7 +1073,8 @@ OUTPUT FORMAT:
       "name": "<column_name>",
       "statistical_type": "<type>",
       "semantic_role": "<role>",
-      "taxonomy_values": ["<val1>", "<val2>"]
+      "taxonomy_values": ["<val1>", "<val2>"],
+      "description": "<one sentence describing what this column stores>"
     }
   ]
 }
@@ -1332,19 +1353,36 @@ def enrich_taxonomy(source_id: str, model: Optional[str] = None) -> int:
                 if not attr_id:
                     continue
 
-                stat_type = ann.get("statistical_type") or ""
-                sem_role = ann.get("semantic_role") or ""
-                tax_vals = ann.get("taxonomy_values") or []
+                stat_type   = ann.get("statistical_type") or ""
+                sem_role    = ann.get("semantic_role") or ""
+                tax_vals    = ann.get("taxonomy_values") or []
+                description = ann.get("description") or ""
 
                 # If this is a parent col with a child col, taxonomy_tree stays as flat list
                 # for now; the hierarchy enrichment requires live DB access which is in understand_node
                 taxonomy_json = json.dumps(tax_vals if isinstance(tax_vals, list) else [])
 
-                cur.execute(
-                    "UPDATE md_attributes SET statistical_type=?, semantic_role=?, "
-                    "taxonomy_tree=?, updated_at=? WHERE attr_id=?",
-                    (stat_type, sem_role, taxonomy_json, now, attr_id),
-                )
+                # Write description only if the column doesn't already have one —
+                # preserves manual golden-record descriptions.
+                if description:
+                    cur.execute(
+                        "UPDATE md_attributes SET statistical_type=?, semantic_role=?, "
+                        "taxonomy_tree=?, description=?, updated_at=? WHERE attr_id=? "
+                        "AND (description IS NULL OR description='')",
+                        (stat_type, sem_role, taxonomy_json, description, now, attr_id),
+                    )
+                    # Also update stat/role/taxonomy even if description already exists
+                    cur.execute(
+                        "UPDATE md_attributes SET statistical_type=?, semantic_role=?, "
+                        "taxonomy_tree=?, updated_at=? WHERE attr_id=?",
+                        (stat_type, sem_role, taxonomy_json, now, attr_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE md_attributes SET statistical_type=?, semantic_role=?, "
+                        "taxonomy_tree=?, updated_at=? WHERE attr_id=?",
+                        (stat_type, sem_role, taxonomy_json, now, attr_id),
+                    )
                 updated += 1
 
             logger.debug("enrich_taxonomy: table=%r annotated %d columns", table_name, len(ann_by_name))

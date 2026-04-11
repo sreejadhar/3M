@@ -781,11 +781,12 @@ function applyPersona() {
   renderAnalystRoleSection();
   updateRoleBadge();
 
-  // Admin / Data Manager / BI Manager button visibility
+  // Sidebar bottom: show for admin / data_manager / bi_manager
   sidebarBottom.style.display = (p.isAdmin || p.isDataManager || p.isBiManager) ? '' : 'none';
-  adminBtn.style.display      = p.isAdmin       ? '' : 'none';
-  dmCatalogBtn.style.display  = p.isDataManager ? '' : 'none';
-  bimBtn.style.display        = p.isBiManager   ? '' : 'none';
+  // Admin sees all three tool buttons; DM and BIM each see their own + catalog/KPI cross-access
+  adminBtn.style.display     = p.isAdmin                            ? '' : 'none';
+  dmCatalogBtn.style.display = (p.isDataManager || p.isAdmin)       ? '' : 'none';
+  bimBtn.style.display       = (p.isBiManager   || p.isAdmin)       ? '' : 'none';
 
   // Upload button: admins only
   uploadBtn.style.display = p.isAdmin ? '' : 'none';
@@ -793,19 +794,11 @@ function applyPersona() {
   // SQL disclosure: show by default for analysts/admins
   document.documentElement.dataset.showSql = p.showSQL ? 'true' : 'false';
 
-  // Data manager sees the metadata catalog instead of chat/landing
+  // Default view per persona
   if (p.isDataManager) {
-    landing.style.display   = 'none';
-    chatView.style.display  = 'none';
-    bimPanel.style.display  = 'none';
-    mdCatalog.style.display = 'flex';
-    loadMdCatalog();
+    showMdCatalog();
   } else if (p.isBiManager) {
-    landing.style.display   = 'none';
-    chatView.style.display  = 'none';
-    mdCatalog.style.display = 'none';
-    bimPanel.style.display  = 'flex';
-    loadBimPanel();
+    showBimPanel();
   } else {
     mdCatalog.style.display = 'none';
     bimPanel.style.display  = 'none';
@@ -899,16 +892,38 @@ window.selectAnalystRole = function(key) {
 // ── View management ───────────────────────────────────────────────────────────
 
 function showLanding() {
-  landing.style.display = 'flex';
-  chatView.style.display = 'none';
+  landing.style.display    = 'flex';
+  chatView.style.display   = 'none';
+  mdCatalog.style.display  = 'none';
+  bimPanel.style.display   = 'none';
   topbarSourceName.textContent = '';
   pipelineStatus.classList.remove('visible');
 }
 
 function showChatView(sourceNameOrTitle) {
-  landing.style.display = 'none';
-  chatView.style.display = '';   // use CSS flex
+  landing.style.display    = 'none';
+  chatView.style.display   = '';   // use CSS flex
+  mdCatalog.style.display  = 'none';
+  bimPanel.style.display   = 'none';
   topbarSourceName.textContent = sourceNameOrTitle || '';
+}
+
+function showMdCatalog() {
+  landing.style.display    = 'none';
+  chatView.style.display   = 'none';
+  bimPanel.style.display   = 'none';
+  mdCatalog.style.display  = 'flex';
+  topbarSourceName.textContent = '';
+  loadMdCatalog();
+}
+
+function showBimPanel() {
+  landing.style.display    = 'none';
+  chatView.style.display   = 'none';
+  mdCatalog.style.display  = 'none';
+  bimPanel.style.display   = 'flex';
+  topbarSourceName.textContent = '';
+  loadBimPanel();
 }
 
 // ── Source API calls ──────────────────────────────────────────────────────────
@@ -3731,6 +3746,7 @@ function renderMdSourcesTable(rows) {
       <td>${src.active_entity_count ?? 0}</td>
       <td>${src.redundancy_count ?? 0}</td>
       <td class="md-source-desc">${_esc(src.description || '')}</td>
+      <td><button class="admin-action-btn md-view-kg-btn" data-kg-source="${_esc(src.source_id)}" title="View knowledge graph">View KG</button></td>
     </tr>`;
   }).join('');
 
@@ -3766,10 +3782,15 @@ function renderMdSourcesTable(rows) {
       }
     });
   });
+
+  // View KG button — opens knowledge graph explorer (read-only for non-admins)
+  mdSourcesBody.querySelectorAll('.md-view-kg-btn').forEach(btn => {
+    btn.addEventListener('click', () => openKGExplorer(btn.dataset.kgSource));
+  });
 }
 
 // Event listeners for metadata catalog
-dmCatalogBtn.addEventListener('click', loadMdCatalog);
+dmCatalogBtn.addEventListener('click', showMdCatalog);
 mdRefreshBtn.addEventListener('click', loadMdCatalog);
 mdSourceFilter.addEventListener('change', loadMdCatalog);
 mdSearch.addEventListener('input', renderMdEntityTable);
@@ -4201,15 +4222,23 @@ bimPanel.addEventListener('click', async e => {
 
 // ── Event listeners ───────────────────────────────────────────────────────────
 
-bimBtn.addEventListener('click', () => {
-  bimPanel.style.display  = 'flex';
-  mdCatalog.style.display = 'none';
+bimBtn.addEventListener('click', showBimPanel);
+bimAddKpiBtn.addEventListener('click', () => openKpiEditor(null));
+bimSourceFilter.addEventListener('change', () => {
+  const srcId = bimSourceFilter.value;
+  const kgBtn = document.getElementById('bimViewKgBtn');
+  if (kgBtn) kgBtn.style.display = srcId ? '' : 'none';
   loadBimPanel();
 });
-bimAddKpiBtn.addEventListener('click', () => openKpiEditor(null));
-bimSourceFilter.addEventListener('change', loadBimPanel);
 bimCategoryFilter.addEventListener('change', loadBimKpis);
 bimStatusFilter.addEventListener('change', loadBimKpis);
+
+// "View KG" button in BI Manager panel — opens KG explorer for selected source
+document.getElementById('bimViewKgBtn')?.addEventListener('click', () => {
+  const srcId = bimSourceFilter.value;
+  if (!srcId) { showToast('Select a source first', 'error'); return; }
+  openKGExplorer(srcId);
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 

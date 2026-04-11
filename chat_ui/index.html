@@ -286,6 +286,7 @@
             <th>Entities</th>
             <th>Redundancies</th>
             <th>Description</th>
+            <th style="width:90px"></th>
           </tr></thead>
           <tbody id="mdSourcesBody"></tbody>
         </table>
@@ -301,6 +302,7 @@
           <select class="md-source-filter" id="bimSourceFilter">
             <option value="">All sources</option>
           </select>
+          <button class="btn-secondary btn-sm" id="bimViewKgBtn" title="View knowledge graph for selected source" style="display:none">View KG</button>
           <div class="bim-tab-bar">
             <button class="bim-tab active" data-bim-tab="kpis">KPI Library</button>
             <button class="bim-tab" data-bim-tab="taxonomy">Taxonomy Browser</button>
@@ -892,6 +894,6 @@
     </div>
   </div>
 
-  <script src="/ui/app.js?v=12"></script>
+  <script src="/ui/app.js?v=13"></script>
 </body>
 </html>

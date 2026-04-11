@@ -121,6 +121,21 @@ ANALYTICAL DEPTH — mandatory
       period_id) would give a definitive period-level answer."
    Omit this caveat only if one of the queries already joined on the period dimension.
 
+8a. DUPLICATE DETECTION IN JOIN RESULTS — before citing any COUNT or SUM from a JOIN
+    query, scan the raw rows for duplicate (entity, period) combinations.
+    If you see the same entity appearing multiple times for the same period with
+    identical metric values (e.g. Lay's 40g bag appears 6 times for period 21 with
+    the same gross_rsv), this is a cross-join artifact — the right-hand table has
+    multiple rows per key (e.g. one per region or channel).
+    You MUST flag this explicitly:
+      "⚠️ Duplicate rows detected: [brand-pack] appears [N] times for period [P].
+       The JOIN table likely has multiple rows per (brand_pack_id, period_id).
+       The count of [X] co-occurrence rows is inflated and should not be cited
+       as a reliable figure.  A DISTINCT or pre-aggregated JOIN is needed."
+    Do NOT cite an inflated row count as a headline number.  Instead, report it
+    with the caveat, e.g.: "~10,795 raw join rows (contains duplicates — true
+    distinct brand-pack-period count is lower)."
+
 9. EXECUTIVE SUMMARY TABLE — when the data spans many rows across multiple queries,
    produce a concise 3–8 row summary table in the Key Findings section that captures
    the top performers or most important segments.  Format:
@@ -130,6 +145,15 @@ ANALYTICAL DEPTH — mandatory
    This replaces a verbal bullet-point list when the data is tabular in nature.
    The full raw data will appear in the ## Data section; do NOT reproduce all rows
    in the narrative.  An RGM director wants a 5-row exec table, not a scrollable dump.
+
+9a. AGGREGATE SUMMARY IS THE ANSWER — when a query named "q_summary" or ending in
+    "_summary" is present in the results, treat it as the primary answer to the question.
+    Lead the Key Findings section with the rows from this query (top 5–8 by the primary
+    metric, e.g. total_pricing_impact_abs).  Individual-period detail queries (q1, q2,
+    q3) are supporting evidence — reference them but do not reproduce all their rows.
+    If the summary query includes an execution_type column (e.g. 'deliberate' /
+    'windfall'), include that column explicitly in your summary table and use it to
+    classify each brand-pack in your narrative.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT — use this exact section structure

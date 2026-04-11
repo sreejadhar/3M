@@ -356,6 +356,67 @@ General Rules:
     If no valid join key exists between the tables and you must use separate queries,
     add a note in the description field: "Note: period-level co-occurrence cannot be
     proven from separate queries — results should be merged in analysis."
+
+10c-i. JOIN DEDUPLICATION — CRITICAL: when the right-hand table in a co-occurrence
+    JOIN has MULTIPLE ROWS per (entity_key, period_key) — e.g. one row per region,
+    channel, or retailer — a straight JOIN will MULTIPLY fact rows and produce:
+      • duplicate entity+period rows in the result
+      • inflated COUNT(*) / SUM() values (each fact row counted N times)
+    You MUST detect this situation and prevent it.
+
+    How to detect: look at the description and column list of the right-hand table.
+    If it contains dimension columns like region, channel, store, customer, retailer,
+    or any column that would make (entity_key, period_key) non-unique, treat it as
+    a "many-rows-per-key" table.
+
+    Fix — use a pre-aggregated subquery or CTE on the right-hand table before
+    joining, so you guarantee at most one row per (entity_key, period_key):
+
+      WITH price_agg AS (
+        SELECT brand_pack_id, period_id,
+               AVG(price_index)         AS avg_price_index,
+               AVG(price_index_vs_yago) AS avg_price_index_vs_yago
+        FROM   price_index_table
+        GROUP BY brand_pack_id, period_id
+      )
+      SELECT f.brand_pack_id, f.period_id,
+             f.pricing_impact_abs, f.gross_rsv,
+             p.avg_price_index, p.avg_price_index_vs_yago
+      FROM   fact_table AS f
+      JOIN   price_agg  AS p
+        ON   f.brand_pack_id = p.brand_pack_id
+        AND  f.period_id     = p.period_id
+
+    NEVER write: FROM fact JOIN price_index ON (brand_pack_id, period_id)
+    without first confirming price_index has exactly one row per key.
+    When in doubt — always pre-aggregate.
+
+10c-ii. FINAL SUMMARY AGGREGATE — when a multi-step analytical question produces
+    a co-occurrence or filtered dataset (e.g. "brand-packs with both high pricing
+    impact AND elevated price index"), ALWAYS emit a final summary query that
+    aggregates the co-occurrence result to the entity level:
+
+      SELECT brand_pack_id, brand_name, pack_size,
+             COUNT(DISTINCT period_id)         AS qualifying_periods,
+             SUM(pricing_impact_abs)           AS total_pricing_impact_abs,
+             SUM(gross_rsv)                    AS total_gross_rsv,
+             AVG(avg_price_index)              AS avg_price_index,
+             AVG(avg_price_index_vs_yago)      AS avg_yoy_movement,
+             CASE WHEN AVG(avg_price_index_vs_yago) > 0
+                  THEN 'deliberate' ELSE 'windfall' END AS execution_type
+      FROM   <co-occurrence CTE>
+      GROUP BY brand_pack_id, brand_name, pack_size
+      ORDER BY total_pricing_impact_abs DESC
+
+    This final aggregate is the board-ready answer — it replaces thousands of
+    raw co-occurrence rows with a concise per-entity summary.  Without it, the
+    analysis forces the reader to draw their own conclusions from raw data.
+
+    Pattern: whenever you emit a JOIN / co-occurrence query (rule 10c), ALWAYS
+    follow it with one additional query_id (e.g. "q_summary") that wraps the join
+    result in an aggregation to entity level.  Use a CTE or subquery to avoid
+    repeating the full JOIN logic.
+
 10d. YEAR-OVER-YEAR vs ABSOLUTE INDEX — when the question asks about DELIBERATE
     price changes, price-up execution, or windfall vs intentional pricing, ALWAYS
     prefer year-over-year / vs-prior-year columns over absolute index columns.

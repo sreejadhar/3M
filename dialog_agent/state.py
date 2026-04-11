@@ -24,12 +24,24 @@ class QueryResult(TypedDict):
     error: Optional[str]
 
 
-class ConversationTurn(TypedDict):
+class ConversationTurn(TypedDict, total=False):
     """One completed Q&A exchange stored in the session history."""
     turn: int           # 1-based turn number
     question: str       # the user's original question
     insights: str       # synthesized answer (first 600 chars to keep prompt size manageable)
     tables_queried: List[str]   # table names referenced in the SQL queries
+
+    # ── Execution diagnostics (populated from query_results + errors) ─────
+    # Used by plan_node on the NEXT turn to avoid repeating failed approaches.
+    query_diagnostics: List[Dict[str, Any]]
+    # Each entry: {
+    #   "query_id":   str,
+    #   "sql":        str,          # exact SQL that was run
+    #   "row_count":  int,          # rows returned (0 if error)
+    #   "columns":    List[str],    # column names returned
+    #   "error":      str | None,   # DB error message if failed
+    #   "preflight_gaps": List[str] # pre-flight check gaps (empty = none)
+    # }
 
 
 class DialogState(TypedDict, total=False):

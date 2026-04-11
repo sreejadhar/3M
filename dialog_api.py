@@ -248,11 +248,34 @@ def _run_dialog(
             for q in sql_queries
             for ref in (q.get("table_refs") or [])
         })
+
+        # Build per-query diagnostics so the planner can learn from failures
+        # on the NEXT turn rather than starting fresh.
+        query_results_list = result.get("query_results") or []
+        results_by_id = {qr["query_id"]: qr for qr in query_results_list}
+        preflight_errors = [
+            e for e in (result.get("errors") or [])
+            if "pre-flight" in e.lower()
+        ]
+        query_diagnostics = []
+        for q in sql_queries:
+            qid = q.get("query_id", "")
+            qr  = results_by_id.get(qid, {})
+            query_diagnostics.append({
+                "query_id":  qid,
+                "sql":       q.get("sql", "")[:800],   # cap to keep history compact
+                "row_count": qr.get("row_count", 0),
+                "columns":   qr.get("columns") or [],
+                "error":     qr.get("error"),
+                "preflight_gaps": preflight_errors if qid == sql_queries[0].get("query_id") else [],
+            })
+
         new_turn: ConversationTurn = {
             "turn": turn_number,
             "question": natural_query,
             "insights": insights[:600],   # keep prompt size manageable
             "tables_queried": tables_queried,
+            "query_diagnostics": query_diagnostics,
         }
         with _sessions_lock:
             turns = _sessions.setdefault(session_id, [])

@@ -64,12 +64,14 @@ def _summarize_old_turns_plan(old_turns: list, model: str) -> str:
 def _build_history_section_plan(history: list, model: str) -> str:
     """
     Build the CONVERSATION HISTORY section for the plan prompt.
+    Includes per-query diagnostics (SQL used, row counts, columns returned,
+    errors, pre-flight gaps) so the planner can avoid repeating failed approaches.
     If history exceeds MAX_VERBATIM_TURNS, older turns are summarized with Haiku.
     """
     if not history:
         return ""
 
-    lines = ["CONVERSATION HISTORY (previous questions in this session — use for context only):"]
+    lines = ["CONVERSATION HISTORY (previous questions in this session):"]
 
     if len(history) > _MAX_VERBATIM_TURNS:
         old_turns = history[:-3]
@@ -92,10 +94,35 @@ def _build_history_section_plan(history: list, model: str) -> str:
         if turn.get("insights"):
             lines.append(f"  Answer summary: {turn['insights'][:300]}")
 
+        # ── Per-query execution diagnostics ──────────────────────────────
+        diags = turn.get("query_diagnostics") or []
+        if diags:
+            lines.append("  PRIOR QUERY ATTEMPTS (what was run and what it returned):")
+            for d in diags:
+                qid      = d.get("query_id", "?")
+                rows     = d.get("row_count", 0)
+                cols     = d.get("columns") or []
+                err      = d.get("error")
+                gaps     = d.get("preflight_gaps") or []
+                sql_snip = (d.get("sql") or "")[:300]
+
+                lines.append(f"    [{qid}] rows_returned={rows}  columns={cols}")
+                if sql_snip:
+                    lines.append(f"      SQL: {sql_snip}")
+                if err:
+                    lines.append(f"      ❌ ERROR: {err}")
+                if gaps:
+                    for g in gaps:
+                        lines.append(f"      ⚠️  GAP: {g}")
+            lines.append(
+                "  INSTRUCTION: Study the prior attempts above. Do NOT repeat the same "
+                "SQL patterns that returned 0 rows, produced errors, or had analytical "
+                "gaps flagged above. Build on what worked and fix what didn't."
+            )
+
     lines.append(
         "Use this history to resolve pronouns (e.g. 'it', 'that', 'those'), "
-        "implied filters (e.g. 'same service line'), or comparisons to previous results. "
-        "Do NOT reproduce previous SQL — generate fresh SQL for the new question."
+        "implied filters (e.g. 'same service line'), or comparisons to previous results."
     )
     return "\n".join(lines) + "\n"
 

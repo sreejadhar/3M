@@ -1398,20 +1398,32 @@ const _EMAIL_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="
 // ── Content-type detection ─────────────────────────────────────────────────────
 
 function _isComparativeQuery(content, results) {
-  // First: keyword gate — must sound like a comparison/scorecard query
+  // Harvey balls are ONLY appropriate for explicit multi-entity × multi-metric
+  // scorecards.  Words like "evaluate", "assess", "compare trends", "rank" appear
+  // in almost every analytical response and must NOT trigger Harvey balls.
+  //
+  // Trigger words: scorecard, "X vs Y", versus, benchmark, side-by-side,
+  //               "performance against", gap analysis.
+  // Explicitly excluded: evaluate, assess, rank, rating, compare (too broad —
+  //   "comparing monthly trends" is a line chart, not a scorecard).
   const text = (content || '') + (results || []).map(r => r.description || '').join(' ');
-  const keywordMatch = /compar|vs\.?\s|versus|benchmark|scorecard|evaluat|assess|side.by.side|performance.against|gap.analys/i.test(text);
+  const keywordMatch = /\bscorecard\b|\bvs\.?\s|\bversus\b|\bbenchmark\b|side[- ]by[- ]side|performance\s+against|gap\s+analys/i.test(text);
   if (!keywordMatch) return false;
 
-  // Second: data structure gate — Harvey balls only make sense when there are
-  // multiple entities (rows) AND multiple numeric metrics (cols) to compare.
-  // A trend query or single-metric ranking should get a line/bar chart instead.
+  // Data structure gate: true scorecard needs ≥2 entity rows AND ≥2 numeric metric cols.
   return (results || []).some(r => {
     const { cols, rows } = normalizeRows(r);
     if (rows.length < 2) return false;
     const sample = rows.slice(0, 5);
     const numCols = cols.filter(c => sample.every(row => isNumeric(row[c])));
-    return numCols.length >= 2;
+    if (numCols.length < 2) return false;
+    // Exclude time-series — Harvey balls are meaningless for trend data
+    const labelCols = cols.filter(c => !numCols.includes(c));
+    if (labelCols.length > 0) {
+      const lc = labelCols[0].toLowerCase();
+      if (/date|month|year|week|day|quarter|period|time|fiscal|yr|qtr|wk/.test(lc)) return false;
+    }
+    return true;
   });
 }
 

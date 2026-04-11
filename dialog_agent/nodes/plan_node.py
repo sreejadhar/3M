@@ -716,6 +716,180 @@ Return the JSON array of SQL queries now.
 """
 
 
+# ── YoY / change column name patterns ────────────────────────────────────────
+_YOY_PATTERNS = (
+    "vs_yago", "vs_py", "_yoy", "year_over_year", "prior_year",
+    "vs_last_year", "_growth", "_change", "_delta", "_improvement",
+    "_vs_prior", "_variance",
+)
+
+# Keywords in the natural question that signal change/driver intent
+_CHANGE_INTENT_WORDS = (
+    "deliberate", "intentional", "windfall", "why", "driver", "cause",
+    "grew", "increased", "improved", "declined", "fell", "change",
+    "movement", "shift", "execution", "vs prior", "year over year",
+    "classify", "classification", "performance", "driven",
+)
+
+
+def _preflight_check_plan(
+    plan_items: List[Dict],
+    known_columns: set,
+    natural_query: str,
+) -> List[str]:
+    """
+    Pre-execution completeness checks on the raw LLM plan (list of dicts).
+
+    Returns a list of gap descriptions (strings).  Empty list = plan passes.
+    These gaps drive a targeted correction retry — unlike _validate_plan_items
+    which fires when queries are outright invalid, pre-flight fires when the
+    plan is structurally valid but analytically incomplete.
+
+    Checks
+    ------
+    1. JOIN without WITH (pre-aggregation CTEs): any query that joins tables
+       but has no CTE pre-aggregating to (entity_key, period_key) level.
+    2. CTE with no aggregate functions: a WITH block whose SELECT list contains
+       no SUM / AVG / COUNT / MIN / MAX — indicates a key-only CTE that carries
+       no metrics into the outer query.
+    3. Missing q_summary: a JOIN query exists but no query_id ends in "summary".
+    4. YoY column in schema + change-intent question but no YoY column in any
+       query SQL.
+    """
+    gaps: List[str] = []
+    sql_items = [it for it in plan_items if it.get("sql")]
+    if not sql_items:
+        return gaps
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _has_join(sql: str) -> bool:
+        return bool(re.search(r'\b(?:INNER\s+|LEFT\s+|RIGHT\s+|FULL\s+)?JOIN\b', sql, re.IGNORECASE))
+
+    def _has_cte(sql: str) -> bool:
+        return bool(re.search(r'^\s*WITH\b', sql, re.IGNORECASE))
+
+    def _is_dimension_join_only(sql: str) -> bool:
+        """
+        Heuristic: if every JOIN clause joins ON a single column equality that
+        looks like a surrogate key (ends in _id, _key, _code, _num) and the
+        joined table name contains 'dim' or 'dimension', treat it as a
+        pure dimension lookup — pre-aggregation not required.
+        """
+        join_tables = re.findall(r'\bJOIN\s+\S+\s+AS\s+(\w+)', sql, re.IGNORECASE)
+        if not join_tables:
+            join_tables = re.findall(r'\bJOIN\s+(\w+)\b', sql, re.IGNORECASE)
+        for tbl in join_tables:
+            # resolve alias back to table label
+            alias_match = re.search(
+                r'\b(\S+)\s+(?:AS\s+)?' + re.escape(tbl) + r'\b', sql, re.IGNORECASE
+            )
+            tbl_name = alias_match.group(1).lower() if alias_match else tbl.lower()
+            if 'dim' not in tbl_name and 'lookup' not in tbl_name and 'master' not in tbl_name:
+                return False
+        return bool(join_tables)
+
+    def _cte_bodies(sql: str) -> List[str]:
+        """
+        Extract the full body of each CTE using paren-depth tracking.
+        Returns list of body strings (content between the outer parens).
+        """
+        results = []
+        for m in re.finditer(r'\b\w+\s+AS\s*\(', sql, re.IGNORECASE):
+            start = m.end()
+            depth = 1
+            pos = start
+            while pos < len(sql) and depth > 0:
+                if sql[pos] == '(':
+                    depth += 1
+                elif sql[pos] == ')':
+                    depth -= 1
+                pos += 1
+            results.append(sql[start: pos - 1])
+        return results
+
+    def _has_aggregates(col_list_text: str) -> bool:
+        return bool(re.search(
+            r'\b(SUM|AVG|COUNT|MIN|MAX|PERCENTILE|STRING_AGG|LISTAGG)\s*\(',
+            col_list_text, re.IGNORECASE,
+        ))
+
+    # ── Check 1 + 2: JOIN queries ─────────────────────────────────────────────
+    for item in sql_items:
+        sql = item["sql"]
+        qid = item.get("query_id", "?")
+
+        if not _has_join(sql):
+            continue
+        if _is_dimension_join_only(sql):
+            continue  # pure dim lookup — pre-aggregation not needed
+
+        # Check 1: JOIN without any CTE
+        if not _has_cte(sql):
+            gaps.append(
+                f"Query {qid!r} has a JOIN between metric/fact tables but no pre-aggregation "
+                f"CTEs (WITH clause). Both tables must be wrapped in CTEs that GROUP BY "
+                f"(entity_key, period_key) before joining to prevent row multiplication. "
+                f"See rule 10c-i."
+            )
+        else:
+            # Check 2: CTEs that GROUP BY but contain no aggregate functions
+            # (pass-through / join CTEs with no GROUP BY are intentional and OK)
+            bad_cte_indices = []
+            for i, body in enumerate(_cte_bodies(sql), 1):
+                has_group_by = bool(re.search(r'\bGROUP\s+BY\b', body, re.IGNORECASE))
+                if has_group_by and not _has_aggregates(body):
+                    bad_cte_indices.append(i)
+            if bad_cte_indices:
+                gaps.append(
+                    f"Query {qid!r}: CTE(s) {bad_cte_indices} use GROUP BY but contain "
+                    f"no aggregate functions (SUM/AVG/COUNT) — they select only key "
+                    f"columns and carry no metrics into the outer query. Each "
+                    f"pre-aggregation CTE must include metric columns. See rule 10c-i."
+                )
+
+    # ── Check 3: JOIN exists but no q_summary ─────────────────────────────────
+    has_fact_join = any(
+        _has_join(it["sql"]) and not _is_dimension_join_only(it["sql"])
+        for it in sql_items
+    )
+    has_summary = any(
+        (it.get("query_id") or "").lower().endswith("summary")
+        for it in sql_items
+    )
+    if has_fact_join and not has_summary:
+        gaps.append(
+            "The plan has a JOIN query but no 'q_summary'. Every fact-table JOIN "
+            "MUST be followed by a self-contained q_summary query that re-runs the "
+            "same CTEs + JOIN and then GROUP BY entity to produce one row per entity "
+            "with all metrics aggregated. q_summary cannot reference another query_id "
+            "— it must be fully self-contained. See rule 10c-ii."
+        )
+
+    # ── Check 4: YoY column in schema + change intent but not in any query ────
+    yoy_cols_in_schema = [
+        col for col in known_columns
+        if any(pat in col for pat in _YOY_PATTERNS)
+    ]
+    if yoy_cols_in_schema:
+        q_lower = natural_query.lower()
+        has_change_intent = any(w in q_lower for w in _CHANGE_INTENT_WORDS)
+        if has_change_intent:
+            all_sql_lower = " ".join(it["sql"] for it in sql_items).lower()
+            referenced = any(col in all_sql_lower for col in yoy_cols_in_schema)
+            if not referenced:
+                sample = yoy_cols_in_schema[:3]
+                gaps.append(
+                    f"The question has change/classification intent but none of the "
+                    f"YoY/change columns in the schema ({sample}…) appear in any query. "
+                    f"At least one must be included — in a standalone query or in "
+                    f"q_summary — to answer the 'deliberate vs windfall' / direction "
+                    f"part of the question. See rules 10d and 10e."
+                )
+
+    return gaps
+
+
 _COST_PER_M = {
     "claude-haiku-4-5-20251001": (0.80, 4.00),
     "claude-sonnet-4-6":         (3.00, 15.00),
@@ -1910,6 +2084,63 @@ def plan_node(state: DialogState) -> DialogState:
         if prose:
             state["plan_explanation"] = prose
             logger.info("plan_node: LLM returned [] with explanation (%d chars)", len(prose))
+
+    # ── Pre-flight completeness check ─────────────────────────────────────────
+    # Runs on the raw plan (before SQL validation / execution) to catch analytical
+    # gaps: missing CTEs, key-only CTEs, absent q_summary, missing YoY columns.
+    # If gaps are found we do ONE targeted correction call before the normal
+    # validation pass.  This is separate from the existing retry (which fires
+    # only when ALL queries are structurally rejected).
+    if plan:
+        preflight_gaps = _preflight_check_plan(plan, known_columns, natural_query)
+        if preflight_gaps:
+            gap_text = "\n".join(f"  • {g}" for g in preflight_gaps)
+            logger.warning(
+                "plan_node: pre-flight check found %d gap(s):\n%s",
+                len(preflight_gaps), gap_text,
+            )
+            state.setdefault("errors", []).append(
+                f"plan_node: pre-flight gaps detected — triggering correction: "
+                + "; ".join(preflight_gaps)
+            )
+            preflight_user = (
+                "ANALYTICAL COMPLETENESS CORRECTION REQUIRED\n"
+                "=" * 60 + "\n"
+                "Your query plan has the following analytical gaps that MUST be "
+                "fixed before the plan can be accepted:\n\n"
+                f"{gap_text}\n\n"
+                "Produce a corrected plan that addresses EVERY gap listed above.\n"
+                "Rules:\n"
+                "  1. Every fact/metric JOIN query must use pre-aggregation CTEs "
+                "     (WITH left_agg AS (...), right_agg AS (...)) that GROUP BY "
+                "     (entity_key, period_key) and SELECT all needed metric columns.\n"
+                "  2. Every JOIN plan must include a q_summary query that is fully "
+                "     self-contained (its own CTEs + JOIN + GROUP BY entity).\n"
+                "  3. If the schema has YoY/change columns relevant to the question, "
+                "     they must appear in at least one query (preferably q_summary).\n"
+                "  4. All other rules from your original instructions still apply.\n"
+                "=" * 60 + "\n\n"
+                + user
+            )
+            try:
+                pf_raw  = _call_llm(system, preflight_user, config.plan_llm_model, config.llm_temperature)
+                pf_plan = _extract_json(pf_raw)
+                if pf_plan:
+                    # Re-check: if the corrected plan also has gaps, log and proceed
+                    # with it anyway (better than the original) rather than looping.
+                    remaining = _preflight_check_plan(pf_plan, known_columns, natural_query)
+                    if remaining:
+                        logger.warning(
+                            "plan_node: corrected plan still has %d gap(s) — proceeding: %s",
+                            len(remaining), remaining,
+                        )
+                    else:
+                        logger.info("plan_node: pre-flight correction resolved all gaps")
+                    plan = pf_plan
+                else:
+                    logger.warning("plan_node: pre-flight correction returned empty plan — keeping original")
+            except Exception as pf_exc:
+                logger.warning("plan_node: pre-flight correction call failed — %s", pf_exc)
 
     # Build valid join pair whitelist from schema context (used in join validation below)
     valid_join_pairs = _extract_valid_join_pairs(schema_context)

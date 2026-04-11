@@ -240,6 +240,12 @@ def _run_dialog(
                 "query_results":   result.get("query_results") or [],
                 "errors":          result.get("errors") or [],
                 "session_id":      session_id,
+                # Debug fields — available via /jobs/{job_id}/debug
+                "_schema_context": result.get("schema_context", ""),
+                "_preflight_gaps": [
+                    e for e in (result.get("errors") or [])
+                    if "pre-flight" in e.lower()
+                ],
             })
 
         # Append this completed turn to the session history (capped at MAX_HISTORY_TURNS)
@@ -449,6 +455,51 @@ def get_results(job_id: str):
         "query_results":  job["query_results"],
         "errors":         job["errors"],
         "cache_hit":      job.get("cache_hit", False),
+    }
+
+
+@app.get("/jobs/{job_id}/debug")
+def get_debug(job_id: str):
+    """
+    Return diagnostic information about a completed job:
+    - The full schema_context the LLM received (after grain annotation)
+    - The SQL queries that were generated
+    - Row counts and column lists from each query result
+    - All errors and pre-flight gaps
+    Use this to diagnose why generated SQL is not returning expected data.
+    """
+    with _lock:
+        job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "done":
+        raise HTTPException(status_code=202, detail="Job not yet complete")
+
+    sql_queries   = job.get("sql_queries") or []
+    query_results = job.get("query_results") or []
+    results_by_id = {qr["query_id"]: qr for qr in query_results}
+
+    query_debug = []
+    for q in sql_queries:
+        qid = q.get("query_id", "?")
+        qr  = results_by_id.get(qid, {})
+        query_debug.append({
+            "query_id":    qid,
+            "description": q.get("description", ""),
+            "sql":         q.get("sql", ""),
+            "row_count":   qr.get("row_count", 0),
+            "columns":     qr.get("columns") or [],
+            "sample_rows": (qr.get("rows") or [])[:3],
+            "error":       qr.get("error"),
+        })
+
+    return {
+        "job_id":          job_id,
+        "natural_query":   job.get("natural_query", ""),
+        "schema_context":  job.get("_schema_context", ""),
+        "preflight_gaps":  job.get("_preflight_gaps", []),
+        "errors":          job.get("errors") or [],
+        "query_debug":     query_debug,
     }
 
 

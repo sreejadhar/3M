@@ -226,52 +226,163 @@ function formatAxisValue(n) {
   return Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2);
 }
 
+// ── Chart-type detection ────────────────────────────────────────────────────
+//
+// Chart types and when each is used:
+//
+//  line       — time-series: label column is a time/date/period dimension
+//               or query explicitly asks for a trend
+//  histogram  — distribution: label column looks like a numeric bin/bucket/range
+//               (e.g. "age_band", "score_bucket", "price_range") with many rows
+//  waterfall  — bridge/variance: columns contain words like "variance", "delta",
+//               "bridge", "impact", "prior", "current", "change" — shows
+//               cumulative contribution of each item
+//  scatter    — correlation: exactly 2 numeric columns, no text label col,
+//               or label is an identifier with 2 measures
+//  grouped    — multi-metric comparison across categories where metrics are
+//               INDEPENDENT (not parts of a whole) — e.g. revenue vs volume
+//  stacked    — part-of-whole breakdown: multiple metrics that SUM to a total,
+//               or a label like "channel", "region", "segment" breakdown
+//  doughnut   — share/composition: ≤8 categories, single metric, label is
+//               a meaningful category (not time, not a range/bin)
+//  hbar       — ranking / many categories: single metric, 9–80 rows, good
+//               for long category names
+//  vbar       — few categories (≤8), single metric, categories are ordinal
+//               but NOT a share/composition (e.g. monthly totals by department)
+//  kpi        — single-row summary with multiple metrics (scorecard tiles)
+
 function detectChartConfig(cols, rows) {
   if (!rows.length || cols.length < 2) return null;
-  const numCols = cols.filter(c => rows.slice(0, 5).every(r => r[c] !== null && r[c] !== undefined && isNumeric(r[c])));
+
+  const sample = rows.slice(0, 8);
+  const numCols = cols.filter(c =>
+    sample.every(r => r[c] !== null && r[c] !== undefined && isNumeric(r[c]))
+  );
   const lblCols = cols.filter(c => !numCols.includes(c));
-  if (!lblCols.length || !numCols.length) return null;
-  const labelCol = lblCols[0];
+  const labelCol = lblCols[0] || null;
 
-  // Suppress charts when the label column is an identifier/key — not a meaningful category.
-  // Identifiers: column name contains id/key/sku/code/uuid/hash/no/num/ref/pk suffixes.
-  const isIdCol = /(\b|_)(id|key|sku|code|uuid|guid|hash|no|num|nr|ref|pk)(\b|_|$)/i.test(labelCol);
-  if (isIdCol) return null;
+  // ── Suppress charts for unaggregated detail data ───────────────────────────
+  // Identifiers as label: id/key/sku/code/uuid/hash/no/num/ref/pk
+  if (labelCol) {
+    const isIdCol = /(_id|_key|_sk|_sku|_code|_uuid|_guid|_hash|_no|_num|_ref|_pk)$/i.test(labelCol)
+                 || /^(id|key|pk)$/i.test(labelCol);
+    if (isIdCol) return null;
+    // Duplicate label values = unaggregated detail rows — no meaningful chart
+    const labelVals = rows.map(r => String(r[labelCol] ?? ''));
+    if (labelVals.length !== new Set(labelVals).size) return null;
+  }
 
-  // Suppress charts when label values are not unique (duplicate rows = unaggregated detail data).
-  const labelVals = rows.map(r => r[labelCol]);
-  const hasDuplicates = labelVals.length !== new Set(labelVals).size;
-  if (hasDuplicates) return null;
+  // ── Scatter: correlation between exactly 2 numeric columns ────────────────
+  // Fires when there's no useful text label (only IDs or no label at all)
+  // and exactly 2 numeric measures — shows data points as x,y pairs.
+  if (numCols.length === 2 && (!labelCol || lblCols.length === 0) && rows.length >= 10) {
+    return { type: 'scatter', xCol: numCols[0], yCol: numCols[1], numCols };
+  }
 
-  const isTime = /date|month|year|week|day|quarter|period|time|fiscal/i.test(labelCol);
-  if (isTime)                                             return { type: 'line',    labelCol, numCols: numCols.slice(0, 5) };
-  // KPI tiles: few rows with multiple metrics — each row becomes a card
-  if (rows.length <= 5 && numCols.length === 1)           return { type: 'doughnut', labelCol, numCols };
-  if (rows.length <= 5 && numCols.length >= 2)            return { type: 'kpi',     labelCol, numCols: numCols.slice(0, 5) };
-  // Stacked bar: multi-series breakdown
-  if (numCols.length >= 2 && rows.length <= 25)           return { type: 'stacked', labelCol, numCols: numCols.slice(0, 6) };
-  // Single-series fallbacks
-  if (rows.length <= 8)                                   return { type: 'doughnut', labelCol, numCols: numCols.slice(0, 1) };
-  if (rows.length <= 60)                                  return { type: 'hbar',    labelCol, numCols: numCols.slice(0, 1) };
+  if (!labelCol || !numCols.length) return null;
+
+  const labelLower = labelCol.toLowerCase();
+
+  // ── Single-row KPI summary ─────────────────────────────────────────────────
+  // One row + multiple metrics = summary scorecard tiles.
+  if (rows.length === 1 && numCols.length >= 2) {
+    return { type: 'kpi', labelCol, numCols: numCols.slice(0, 8) };
+  }
+
+  // ── Trend / time-series → line chart ──────────────────────────────────────
+  // Label is a time dimension OR the result contains ordered time periods.
+  const isTime = /date|month|year|week|day|quarter|period|time|fiscal|yr|qtr|wk/i.test(labelLower);
+  if (isTime) {
+    return { type: 'line', labelCol, numCols: numCols.slice(0, 5) };
+  }
+
+  // ── Distribution → histogram-style vertical bar ────────────────────────────
+  // Label column is a numeric bucket / range / band / bin / bracket.
+  // Displayed as vertical bars with no gap (histogram aesthetic).
+  const isBin = /(bucket|bin|band|range|bracket|tier|group|cohort|decile|quartile|percentile)/i.test(labelLower)
+             || /^\d/.test(String(rows[0]?.[labelCol] ?? ''))   // labels start with digits → likely "0-10", "10-20"
+             || /\d+\s*[-–]\s*\d+/.test(String(rows[0]?.[labelCol] ?? '')); // "0-10" pattern
+  if (isBin && numCols.length === 1) {
+    return { type: 'histogram', labelCol, numCols };
+  }
+
+  // ── Waterfall / bridge chart → variance decomposition ─────────────────────
+  // Detects: column names contain variance/delta/bridge/impact/change/prior/
+  // contribution. Used for budget-vs-actual bridge, P&L waterfall, etc.
+  const allColNames = cols.join(' ').toLowerCase();
+  const isWaterfall = /(variance|delta|bridge|impact|contrib|change|prior|current|opening|closing|movement)/i
+                        .test(allColNames)
+                   && numCols.length >= 1
+                   && rows.length <= 20;
+  if (isWaterfall) {
+    return { type: 'waterfall', labelCol, numCols: numCols.slice(0, 1) };
+  }
+
+  // ── Multi-metric: stacked vs grouped bar ──────────────────────────────────
+  // Stacked = metrics are parts of a whole (they should sum to something meaningful):
+  //   • label is share/composition dimension: channel, segment, region, category, brand
+  //   • OR all metric values are positive and same order of magnitude
+  // Grouped = independent metrics (revenue vs volume vs margin — different scales)
+  if (numCols.length >= 2 && rows.length <= 30) {
+    const isCompositionDim = /(channel|segment|region|category|brand|product|division|dept|territory|country|market)/i
+                               .test(labelLower);
+    // Check if metrics are same order of magnitude (within 10x of each other)
+    const metricMeans = numCols.map(c =>
+      rows.reduce((s, r) => s + (Number(r[c]) || 0), 0) / rows.length
+    );
+    const maxMean = Math.max(...metricMeans);
+    const minMean = Math.min(...metricMeans.filter(m => m > 0));
+    const sameScale = minMean > 0 && maxMean / minMean <= 10;
+
+    if (isCompositionDim || sameScale) {
+      return { type: 'stacked', labelCol, numCols: numCols.slice(0, 6) };
+    }
+    // Different scales (e.g. revenue in millions, units in thousands) → grouped
+    return { type: 'grouped', labelCol, numCols: numCols.slice(0, 4) };
+  }
+
+  // ── Single-metric charts ───────────────────────────────────────────────────
+  // Share/composition: ≤8 categories → doughnut
+  const isShareDim = /(channel|segment|region|category|brand|type|division)/i.test(labelLower);
+  if (isShareDim && rows.length <= 8 && numCols.length === 1) {
+    return { type: 'doughnut', labelCol, numCols };
+  }
+
+  // Few categories (≤8), not share → vertical bar (cleaner than doughnut for ranking)
+  if (rows.length <= 8 && numCols.length === 1) {
+    return { type: 'vbar', labelCol, numCols };
+  }
+
+  // Many categories → horizontal bar (easier to read long names)
+  if (rows.length <= 80 && numCols.length === 1) {
+    return { type: 'hbar', labelCol, numCols };
+  }
+
+  // Few rows, multiple metrics, no time → KPI tiles
+  if (rows.length <= 5 && numCols.length >= 2) {
+    return { type: 'kpi', labelCol, numCols: numCols.slice(0, 6) };
+  }
+
   return null;
 }
 
 function renderChart(canvasId, cols, rows) {
   if (typeof Chart === 'undefined') return;
   const cfg = detectChartConfig(cols, rows);
-  if (!cfg || cfg.type === 'kpi') return;  // kpi is HTML-only
+  if (!cfg || cfg.type === 'kpi') return;  // kpi is HTML-only, not canvas
 
   const wrap = document.getElementById(canvasId)?.parentElement;
   if (!wrap) return;
 
-  // Dynamic height for horizontal bars
+  // ── Canvas height ──────────────────────────────────────────────────────────
   if (cfg.type === 'hbar') {
-    const rowH = cfg.numCols.length > 1 ? 28 : 34;
-    wrap.style.height = Math.max(220, rows.length * rowH + 90) + 'px';
-  }
-  // Taller canvas for stacked bars with many groups
-  if (cfg.type === 'stacked') {
+    wrap.style.height = Math.max(220, rows.length * 34 + 90) + 'px';
+  } else if (cfg.type === 'stacked' || cfg.type === 'grouped') {
     wrap.style.height = Math.max(280, rows.length * 32 + 100) + 'px';
+  } else if (cfg.type === 'histogram') {
+    wrap.style.height = '260px';
+  } else if (cfg.type === 'waterfall') {
+    wrap.style.height = Math.max(260, rows.length * 36 + 100) + 'px';
   }
 
   const canvas = document.getElementById(canvasId);
@@ -282,28 +393,68 @@ function renderChart(canvasId, cols, rows) {
   const gridClr = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)';
   const tickClr = isDark ? '#9aa0ac' : '#6b7280';
   const lblClr  = isDark ? '#c9d1d9' : '#374151';
-  const labels  = rows.map(r => String(r[cfg.labelCol] ?? ''));
+  const posClr  = '#34a853';   // waterfall positive
+  const negClr  = '#ea4335';   // waterfall negative
+  const totClr  = '#4285F4';   // waterfall total/base
+  const labels  = cfg.type === 'scatter'
+    ? rows.map((_, i) => i)
+    : rows.map(r => String(r[cfg.labelCol] ?? ''));
   const ctx     = canvas.getContext('2d');
 
-  const datasets = cfg.numCols.map((col, i) => {
-    const color = CHART_PALETTE[i % CHART_PALETTE.length];
+  // ── Dataset builders ────────────────────────────────────────────────────────
+  let datasets = [];
+  const t = cfg.type;
 
-    if (cfg.type === 'doughnut') {
-      return {
-        label: col,
-        data: rows.map(r => Number(r[col]) || 0),
-        backgroundColor: CHART_PALETTE.slice(0, rows.length).map(c => c + 'dd'),
-        borderWidth: 3,
-        borderColor: isDark ? '#1e2432' : '#ffffff',
-        hoverBorderWidth: 4,
-        hoverOffset: 8,
-      };
-    }
-
-    if (cfg.type === 'line') {
+  if (t === 'scatter') {
+    // Scatter: plot (xCol, yCol) pairs
+    datasets = [{
+      label: `${cfg.xCol} vs ${cfg.yCol}`,
+      data: rows.map(r => ({ x: Number(r[cfg.xCol]) || 0, y: Number(r[cfg.yCol]) || 0 })),
+      backgroundColor: CHART_PALETTE[0] + 'aa',
+      borderColor: CHART_PALETTE[0],
+      pointRadius: 5,
+      pointHoverRadius: 7,
+    }];
+  } else if (t === 'waterfall') {
+    // Waterfall: compute running base for floating bars; colour by sign
+    const col = cfg.numCols[0];
+    const values = rows.map(r => Number(r[col]) || 0);
+    // Detect if last row is a total (base resets to 0)
+    let running = 0;
+    const bases = [];
+    const colours = [];
+    values.forEach((v, i) => {
+      const isLast = i === values.length - 1;
+      // If last row resets to a total we float it from 0
+      if (isLast && Math.abs(v) >= Math.abs(running) * 0.9) {
+        bases.push(0);
+        colours.push(totClr + 'dd');
+      } else {
+        bases.push(v >= 0 ? running : running + v);
+        colours.push(v >= 0 ? posClr + 'dd' : negClr + 'dd');
+        running += v;
+      }
+    });
+    // Chart.js floating bar: data = [base, base+value]
+    datasets = [{
+      label: col,
+      data: values.map((v, i) => {
+        const isLast = i === values.length - 1;
+        if (isLast && Math.abs(v) >= Math.abs(running + v) * 0.9) return [0, v];
+        return [bases[i], bases[i] + (values[i] >= 0 ? values[i] : -values[i])];
+      }),
+      backgroundColor: colours,
+      borderColor: colours.map(c => c.slice(0, 7)),
+      borderWidth: 1,
+      borderRadius: 3,
+      borderSkipped: false,
+    }];
+  } else if (t === 'line') {
+    datasets = cfg.numCols.map((col, i) => {
+      const color = CHART_PALETTE[i % CHART_PALETTE.length];
       const h = wrap.clientHeight || 300;
       const grad = ctx.createLinearGradient(0, 0, 0, h);
-      grad.addColorStop(0, color + '55');
+      grad.addColorStop(0, color + '44');
       grad.addColorStop(1, color + '00');
       return {
         label: col,
@@ -311,7 +462,7 @@ function renderChart(canvasId, cols, rows) {
         backgroundColor: grad,
         borderColor: color,
         borderWidth: 2.5,
-        fill: true,
+        fill: cfg.numCols.length === 1,   // fill only for single series
         tension: 0.4,
         pointRadius: rows.length < 25 ? 4 : 2,
         pointHoverRadius: 6,
@@ -319,10 +470,34 @@ function renderChart(canvasId, cols, rows) {
         pointBorderColor: isDark ? '#1e2432' : '#fff',
         pointBorderWidth: 2,
       };
-    }
-
-    // Stacked vertical bar
-    if (cfg.type === 'stacked') {
+    });
+  } else if (t === 'doughnut') {
+    datasets = [{
+      label: cfg.numCols[0],
+      data: rows.map(r => Number(r[cfg.numCols[0]]) || 0),
+      backgroundColor: CHART_PALETTE.slice(0, rows.length).map(c => c + 'dd'),
+      borderWidth: 3,
+      borderColor: isDark ? '#1e2432' : '#ffffff',
+      hoverBorderWidth: 4,
+      hoverOffset: 8,
+    }];
+  } else if (t === 'histogram') {
+    // Histogram: vertical bars with no gap between them (barPercentage 1, categoryPercentage 1)
+    const color = CHART_PALETTE[0];
+    datasets = [{
+      label: cfg.numCols[0],
+      data: rows.map(r => Number(r[cfg.numCols[0]]) || 0),
+      backgroundColor: color + 'cc',
+      hoverBackgroundColor: color,
+      borderColor: color,
+      borderWidth: 1,
+      borderRadius: 0,
+      barPercentage: 1.0,
+      categoryPercentage: 1.0,
+    }];
+  } else if (t === 'stacked') {
+    datasets = cfg.numCols.map((col, i) => {
+      const color = CHART_PALETTE[i % CHART_PALETTE.length];
       return {
         label: col,
         data: rows.map(r => Number(r[col]) || 0),
@@ -330,84 +505,114 @@ function renderChart(canvasId, cols, rows) {
         hoverBackgroundColor: color,
         borderRadius: i === cfg.numCols.length - 1 ? [4, 4, 0, 0] : 0,
         borderSkipped: false,
+        stack: 'stack0',
       };
-    }
+    });
+  } else if (t === 'grouped') {
+    // Grouped bars: independent metrics side-by-side, each on its own y-axis if scales differ
+    datasets = cfg.numCols.map((col, i) => {
+      const color = CHART_PALETTE[i % CHART_PALETTE.length];
+      return {
+        label: col,
+        data: rows.map(r => Number(r[col]) || 0),
+        backgroundColor: color + 'cc',
+        hoverBackgroundColor: color,
+        borderRadius: 4,
+        borderSkipped: false,
+        yAxisID: i === 0 ? 'y' : 'y2',   // dual axis for different-scale metrics
+      };
+    });
+  } else {
+    // vbar / hbar: single-series bar
+    datasets = cfg.numCols.map((col, i) => {
+      const color = CHART_PALETTE[i % CHART_PALETTE.length];
+      return {
+        label: col,
+        data: rows.map(r => Number(r[col]) || 0),
+        backgroundColor: color + 'cc',
+        hoverBackgroundColor: color,
+        borderRadius: 5,
+        borderSkipped: false,
+      };
+    });
+  }
 
-    // Horizontal bar
-    return {
-      label: col,
-      data: rows.map(r => Number(r[col]) || 0),
-      backgroundColor: color + 'cc',
-      hoverBackgroundColor: color,
-      borderRadius: 5,
-      borderSkipped: false,
-    };
-  });
-
-  // Datalabels: values on bars + percentages on doughnut slices
-  const datalabelsPlugin = (typeof ChartDataLabels !== 'undefined');
-  const datalabelsCfg = datalabelsPlugin ? {
-    anchor:    cfg.type === 'doughnut' ? 'center' : 'end',
-    align:     cfg.type === 'doughnut' ? 'center' : 'end',
-    offset:    cfg.type === 'doughnut' ? 0 : 5,
-    color:     cfg.type === 'doughnut' ? '#fff' : lblClr,
-    font:      { size: 11, weight: '600' },
-    formatter: (v, context) => {
-      if (cfg.type === 'doughnut') {
-        const total = context.dataset.data.reduce((a, b) => a + b, 0);
-        return total > 0 ? (v / total * 100).toFixed(1) + '%' : '';
+  // ── Data labels ─────────────────────────────────────────────────────────────
+  const dlPlugin = (typeof ChartDataLabels !== 'undefined');
+  if (dlPlugin) Chart.register(ChartDataLabels);
+  const dlCfg = dlPlugin ? {
+    anchor: t === 'doughnut' ? 'center' : 'end',
+    align:  t === 'doughnut' ? 'center' : 'end',
+    offset: t === 'doughnut' ? 0 : 4,
+    color:  t === 'doughnut' ? '#fff' : lblClr,
+    font:   { size: 11, weight: '600' },
+    formatter: (v, ctx2) => {
+      if (t === 'doughnut') {
+        const tot = ctx2.dataset.data.reduce((a, b) => a + b, 0);
+        return tot > 0 ? (v / tot * 100).toFixed(1) + '%' : '';
       }
-      return formatAxisValue(v);
+      return formatAxisValue(Array.isArray(v) ? v[1] - v[0] : v);
     },
-    display: (context) => {
-      if (cfg.type === 'doughnut') return context.dataset.data[context.dataIndex] > 0;
-      if (cfg.type === 'line') return false;
-      const max = Math.max(...context.dataset.data);
-      return max > 0 ? context.dataset.data[context.dataIndex] / max > 0.06 : false;
+    display: (ctx2) => {
+      if (t === 'doughnut') return ctx2.dataset.data[ctx2.dataIndex] > 0;
+      if (t === 'line' || t === 'scatter' || t === 'histogram') return false;
+      const vals = ctx2.dataset.data.map(d => Array.isArray(d) ? Math.abs(d[1] - d[0]) : Math.abs(Number(d) || 0));
+      const max = Math.max(...vals);
+      return max > 0 ? vals[ctx2.dataIndex] / max > 0.07 : false;
     },
   } : false;
 
-  const isHbar    = cfg.type === 'hbar';
-  const isStacked = cfg.type === 'stacked';
-  const chartType = (isHbar || isStacked) ? 'bar' : cfg.type;
+  // ── Scales ──────────────────────────────────────────────────────────────────
+  const isHbar = t === 'hbar';
+  let scaleOpts = {};
 
-  const scaleOpts = cfg.type === 'doughnut' ? {} : {
-    [isHbar ? 'x' : 'y']: {
-      stacked: isStacked,
-      beginAtZero: true,
-      grid: { color: gridClr },
-      ticks: { color: tickClr, callback: formatAxisValue, maxTicksLimit: 6 },
-    },
-    [isHbar ? 'y' : 'x']: {
-      stacked: isStacked,
-      grid: { display: false },
-      ticks: {
-        color: tickClr,
-        maxRotation: isHbar ? 0 : 35,
-        callback: (_v, i) => {
-          const lbl = labels[i] || '';
-          return lbl.length > 26 ? lbl.slice(0, 24) + '…' : lbl;
+  if (t === 'doughnut' || t === 'scatter') {
+    scaleOpts = t === 'scatter' ? {
+      x: { title: { display: true, text: cfg.xCol, color: tickClr }, grid: { color: gridClr }, ticks: { color: tickClr } },
+      y: { title: { display: true, text: cfg.yCol, color: tickClr }, grid: { color: gridClr }, ticks: { color: tickClr } },
+    } : {};
+  } else if (t === 'grouped' && cfg.numCols.length > 1) {
+    // Dual y-axis for independent metrics with different scales
+    scaleOpts = {
+      x: { grid: { display: false }, ticks: { color: tickClr, maxRotation: 35 } },
+      y:  { position: 'left',  beginAtZero: true, grid: { color: gridClr }, ticks: { color: CHART_PALETTE[0], callback: formatAxisValue, maxTicksLimit: 6 } },
+      y2: { position: 'right', beginAtZero: true, grid: { drawOnChartArea: false }, ticks: { color: CHART_PALETTE[1], callback: formatAxisValue, maxTicksLimit: 6 } },
+    };
+  } else {
+    scaleOpts = {
+      [isHbar ? 'x' : 'y']: {
+        stacked: t === 'stacked',
+        beginAtZero: true,
+        grid: { color: gridClr },
+        ticks: { color: tickClr, callback: formatAxisValue, maxTicksLimit: 6 },
+      },
+      [isHbar ? 'y' : 'x']: {
+        stacked: t === 'stacked',
+        grid: { display: false },
+        ticks: {
+          color: tickClr,
+          maxRotation: isHbar ? 0 : (rows.length > 8 ? 35 : 0),
+          callback: (_v, idx) => {
+            const lbl = labels[idx] || '';
+            return lbl.length > 26 ? lbl.slice(0, 24) + '…' : lbl;
+          },
         },
       },
-    },
-  };
+    };
+  }
 
+  // ── Legend & tooltip ────────────────────────────────────────────────────────
+  const showLegend = cfg.numCols.length > 1 || t === 'doughnut' || t === 'stacked' || t === 'grouped';
   const plugins = {
     title: { display: false },
     legend: {
-      display: cfg.numCols.length > 1 || cfg.type === 'doughnut' || isStacked,
-      position: cfg.type === 'doughnut' ? 'right' : 'bottom',
-      labels: {
-        color: tickClr,
-        boxWidth: 12,
-        padding: 16,
-        font: { size: 12 },
-        usePointStyle: cfg.type === 'line',
-      },
+      display: showLegend,
+      position: t === 'doughnut' ? 'right' : 'bottom',
+      labels: { color: tickClr, boxWidth: 12, padding: 16, font: { size: 12 }, usePointStyle: t === 'line' },
     },
     tooltip: {
-      mode: cfg.type === 'doughnut' ? 'nearest' : 'index',
-      intersect: false,
+      mode: (t === 'doughnut' || t === 'scatter') ? 'nearest' : 'index',
+      intersect: t === 'scatter',
       backgroundColor: isDark ? '#2d3347' : '#ffffff',
       titleColor: lblClr,
       bodyColor: tickClr,
@@ -416,27 +621,37 @@ function renderChart(canvasId, cols, rows) {
       padding: 10,
       callbacks: {
         label: (context) => {
+          if (t === 'scatter') return ` (${formatAxisValue(context.parsed.x)}, ${formatAxisValue(context.parsed.y)})`;
+          if (t === 'waterfall') {
+            const raw = context.dataset.data[context.dataIndex];
+            const val = Array.isArray(raw) ? raw[1] - raw[0] : raw;
+            return ` ${context.dataset.label}: ${formatAxisValue(val)}`;
+          }
           const v = isHbar ? context.parsed.x : (context.parsed.y ?? context.parsed);
           return ` ${context.dataset.label}: ${formatAxisValue(v)}`;
         },
       },
     },
-    ...(datalabelsPlugin ? { datalabels: datalabelsCfg } : {}),
+    ...(dlPlugin ? { datalabels: dlCfg } : {}),
   };
 
-  if (datalabelsPlugin) Chart.register(ChartDataLabels);
+  // ── Chart.js type mapping ────────────────────────────────────────────────────
+  const CJ_TYPE = {
+    line: 'line', doughnut: 'doughnut',
+    hbar: 'bar', vbar: 'bar', stacked: 'bar', grouped: 'bar',
+    histogram: 'bar', waterfall: 'bar', scatter: 'scatter',
+  };
 
   _charts[canvasId] = new Chart(canvas, {
-    type: chartType,
+    type: CJ_TYPE[t] || 'bar',
     data: { labels, datasets },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       indexAxis: isHbar ? 'y' : 'x',
-      // stacked bars always use vertical orientation (indexAxis stays 'x')
       plugins,
       scales: scaleOpts,
-      animation: { duration: 450, easing: 'easeInOutQuart' },
+      animation: { duration: 400, easing: 'easeInOutQuart' },
     },
   });
 }
@@ -1183,8 +1398,21 @@ const _EMAIL_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="
 // ── Content-type detection ─────────────────────────────────────────────────────
 
 function _isComparativeQuery(content, results) {
+  // First: keyword gate — must sound like a comparison/scorecard query
   const text = (content || '') + (results || []).map(r => r.description || '').join(' ');
-  return /compar|vs\.?\s|versus|benchmark|scorecard|rank|rating|evaluat|assess|side.by.side|performance.against|gap.analys/i.test(text);
+  const keywordMatch = /compar|vs\.?\s|versus|benchmark|scorecard|evaluat|assess|side.by.side|performance.against|gap.analys/i.test(text);
+  if (!keywordMatch) return false;
+
+  // Second: data structure gate — Harvey balls only make sense when there are
+  // multiple entities (rows) AND multiple numeric metrics (cols) to compare.
+  // A trend query or single-metric ranking should get a line/bar chart instead.
+  return (results || []).some(r => {
+    const { cols, rows } = normalizeRows(r);
+    if (rows.length < 2) return false;
+    const sample = rows.slice(0, 5);
+    const numCols = cols.filter(c => sample.every(row => isNumeric(row[c])));
+    return numCols.length >= 2;
+  });
 }
 
 function _isScheduleQuery(content, results) {

@@ -192,6 +192,24 @@
             <button class="btn btn-ghost" style="width:100%;margin-top:10px;font-size:11px" onclick="document.getElementById('graph-info-panel').classList.remove('visible')">Dismiss</button>
           </div>
         </div>
+
+        <!-- ── KG Bridges strip ─────────────────────────────────────────── -->
+        <div id="graph-bridges">
+          <div id="graph-bridges-header">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;opacity:0.7"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+            CROSS-SOURCE BRIDGES
+            <span id="graph-bridges-count"></span>
+            <div id="graph-bridges-legend">
+              <span class="bridges-legend-item bridges-legend-declared">declared</span>
+              <span class="bridges-legend-item bridges-legend-inferred">inferred</span>
+              <span class="bridges-legend-item bridges-legend-disabled">disabled</span>
+            </div>
+          </div>
+          <div id="graph-bridges-body">
+            <canvas id="graph-bridges-canvas" style="display:none"></canvas>
+            <div id="graph-bridges-empty">No cross-source bridges for this source.</div>
+          </div>
+        </div>
       </div>
 
       <!-- ── SCHEMA CATALOG ───────────────────────────────────────────────── -->
@@ -484,6 +502,6 @@
 
 <!-- vis.js network -->
 <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
-<script src="/tech/app.js?v=6"></script>
+<script src="/tech/app.js?v=7"></script>
 </body>
 </html>

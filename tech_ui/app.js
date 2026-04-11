@@ -517,6 +517,179 @@ async function loadGraph(sourceId) {
     toast('Failed to load graph: ' + e.message, 'error');
     document.getElementById('graph-empty').style.display = 'flex';
   }
+
+  // Render bridges diagram below the graph (non-blocking)
+  loadAndRenderGraphBridges(sourceId);
+}
+
+// ── KG Bridges diagram ─────────────────────────────────────────────────────────
+
+async function loadAndRenderGraphBridges(sourceId) {
+  const canvas  = document.getElementById('graph-bridges-canvas');
+  const emptyEl = document.getElementById('graph-bridges-empty');
+  const countEl = document.getElementById('graph-bridges-count');
+  if (!canvas) return;
+
+  let bridges = [];
+  try { bridges = await apiFetch('/kg-bridges'); } catch (_) { bridges = []; }
+
+  // Find the source name to match against KG names
+  const srcEl   = document.getElementById('graph-source-select');
+  const srcName = srcEl?.options[srcEl.selectedIndex]?.text || sourceId;
+  const re      = new RegExp(_escRe(srcName) + '|' + _escRe(sourceId), 'i');
+  const relevant = bridges.filter(b =>
+    re.test(b.from_kg) || re.test(b.to_kg) ||
+    b.from_source_id === sourceId || b.to_source_id === sourceId
+  );
+  const drawBridges = relevant.length ? relevant : bridges;
+
+  if (!drawBridges.length) {
+    canvas.style.display  = 'none';
+    emptyEl.style.display = 'flex';
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+  canvas.style.display  = 'block';
+  if (countEl) countEl.textContent = drawBridges.length;
+
+  _drawBridgesCanvas(canvas, drawBridges);
+}
+
+function _escRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function _drawBridgesCanvas(canvas, bridges) {
+  const kgNames = [...new Set(bridges.flatMap(b => [b.from_kg, b.to_kg]))];
+  const N       = kgNames.length;
+
+  const H          = 180;
+  const NODE_W     = 150;
+  const NODE_H     = 40;
+  const MIN_COL_W  = NODE_W + 60;
+  const totalW     = Math.max(760, N * MIN_COL_W + 60);
+
+  canvas.width  = totalW;
+  canvas.height = H;
+  canvas.style.height = H + 'px';
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, totalW, H);
+
+  // Background
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg-1').trim() || '#0f1117';
+  ctx.fillRect(0, 0, totalW, H);
+
+  const GREEN   = '#3fb950';
+  const BLUE    = '#58a6ff';
+  const GREY    = '#4b5563';
+  const LABEL_C = '#8b949e';
+  const NODE_BG = getComputedStyle(document.documentElement).getPropertyValue('--bg-3').trim() || '#1c2230';
+  const NODE_BD = '#f59e0b';
+  const TEXT_C  = getComputedStyle(document.documentElement).getPropertyValue('--text-0').trim() || '#e6edf3';
+
+  const nodeY = 48;
+  const pos = {};
+  kgNames.forEach((name, i) => {
+    pos[name] = { x: Math.round((totalW / (N + 1)) * (i + 1)), y: nodeY };
+  });
+
+  // Draw edges
+  bridges.forEach(b => {
+    const from = pos[b.from_kg];
+    const to   = pos[b.to_kg];
+    if (!from || !to) return;
+
+    const disabled   = b.enabled === false;
+    const isInferred = b.source === 'inferred';
+    const color = disabled ? GREY : isInferred ? BLUE : GREEN;
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = disabled ? 1 : 2;
+    ctx.globalAlpha = disabled ? 0.4 : 1;
+    if (disabled) ctx.setLineDash([5, 4]);
+
+    const x1 = from.x, y1 = from.y + NODE_H;
+    const x2 = to.x,   y2 = to.y + NODE_H;
+    const mx = (x1 + x2) / 2;
+    const cy = y1 + 56 + Math.abs(x2 - x1) * 0.07;
+
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.quadraticCurveTo(mx, cy, x2, y2);
+    ctx.stroke();
+
+    // Arrowhead
+    const ang = Math.atan2(y2 - cy, x2 - mx);
+    ctx.save();
+    ctx.translate(x2, y2);
+    ctx.rotate(ang);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(-9, -4);
+    ctx.lineTo(-9,  4);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.restore();
+
+    if (!disabled) {
+      const confPct   = Math.round((b.confidence || 0) * 100);
+      const edgeLbl   = `${b.from_entity ? b.from_entity + '.' : ''}${b.from_column} → ${b.to_entity ? b.to_entity + '.' : ''}${b.to_column}`;
+      const subLbl    = `${b.join_type || 'FK'} · ${confPct}%`;
+
+      ctx.globalAlpha = 1;
+      ctx.textAlign   = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font        = 'bold 11px system-ui,sans-serif';
+      ctx.fillStyle   = color;
+      ctx.fillText(edgeLbl, mx, cy + 14);
+      ctx.font        = '10px system-ui,sans-serif';
+      ctx.fillStyle   = LABEL_C;
+      ctx.fillText(subLbl, mx, cy + 27);
+    }
+
+    ctx.restore();
+  });
+
+  // Draw nodes (on top of edges)
+  kgNames.forEach(name => {
+    const { x, y } = pos[name];
+    const nx = x - NODE_W / 2;
+    const ny = y - NODE_H / 2;
+    const r  = 7;
+
+    ctx.beginPath();
+    ctx.moveTo(nx + r, ny);
+    ctx.lineTo(nx + NODE_W - r, ny);
+    ctx.arcTo(nx + NODE_W, ny, nx + NODE_W, ny + r, r);
+    ctx.lineTo(nx + NODE_W, ny + NODE_H - r);
+    ctx.arcTo(nx + NODE_W, ny + NODE_H, nx + NODE_W - r, ny + NODE_H, r);
+    ctx.lineTo(nx + r, ny + NODE_H);
+    ctx.arcTo(nx, ny + NODE_H, nx, ny + NODE_H - r, r);
+    ctx.lineTo(nx, ny + r);
+    ctx.arcTo(nx, ny, nx + r, ny, r);
+    ctx.closePath();
+    ctx.fillStyle   = NODE_BG;
+    ctx.fill();
+    ctx.strokeStyle = NODE_BD;
+    ctx.lineWidth   = 1.5;
+    ctx.stroke();
+
+    ctx.font         = 'bold 12px system-ui,sans-serif';
+    ctx.fillStyle    = TEXT_C;
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    let label = name;
+    while (label.length > 4 && ctx.measureText(label + '…').width > NODE_W - 16) {
+      label = label.slice(0, -1);
+    }
+    if (label !== name) label += '…';
+    ctx.fillText(label, x, y);
+  });
 }
 
 function showGraphNodeInfo(node) {

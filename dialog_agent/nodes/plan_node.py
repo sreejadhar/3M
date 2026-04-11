@@ -734,6 +734,58 @@ General Rules:
     If a standard role metric cannot be computed from available columns, note
     "column not available in schema" in the query description — do not skip silently.
 
+    ── STEP 7: TEMPORAL / PERIOD-OVER-PERIOD DERIVATIONS ─────────────────────
+    When the question or the schema implies a prior-period comparison
+    (e.g. "prior_net_realized_value", "previous period", "vs last year") and
+    there is NO pre-existing [yoy/change] column in the schema, compute the
+    prior period value using one of these patterns (pick the first that applies):
+
+    Pattern A — Pre-existing prior column (preferred):
+      If the schema has a column named with _prior, _previous, _last_year,
+      _lag1, or similar: use it directly as SUM(prior_col) AS prior_metric.
+
+    Pattern B — LAG() window function (when a period/date column exists):
+      SELECT entity_key, period_col,
+             metric_col,
+             LAG(metric_col) OVER (
+               PARTITION BY entity_key ORDER BY period_col
+             ) AS prior_metric,
+             metric_col - LAG(metric_col) OVER (
+               PARTITION BY entity_key ORDER BY period_col
+             ) AS metric_change
+      FROM fact_table
+
+      Then aggregate the window result in an outer CTE:
+      WITH windowed AS (
+        SELECT entity_key,
+               SUM(metric_col)  AS total_metric,
+               AVG(LAG(metric_col) OVER (PARTITION BY entity_key ORDER BY period_col))
+                               AS avg_prior_metric
+        FROM fact_table GROUP BY entity_key
+      )
+      → Only use LAG() if the schema has a [date/period] column to ORDER BY.
+
+    Pattern C — Self-join on prior period (fallback):
+      WITH current_period AS (
+        SELECT entity_key, SUM(metric_col) AS current_metric
+        FROM fact_table WHERE period_col = <current>
+        GROUP BY entity_key
+      ),
+      prior_period AS (
+        SELECT entity_key, SUM(metric_col) AS prior_metric
+        FROM fact_table WHERE period_col = <prior>
+        GROUP BY entity_key
+      )
+      SELECT c.entity_key, c.current_metric, p.prior_metric,
+             ROUND((c.current_metric - p.prior_metric)
+                   / NULLIF(p.prior_metric, 0) * 100, 2) AS change_pct
+      FROM current_period AS c JOIN prior_period AS p USING (entity_key)
+
+      → Only use Pattern C when the user specifies or the schema makes the
+        period values clear (e.g. categorical sample values show '2024', '2023').
+      → If neither the current nor prior period is determinable from the schema
+        or the question, default to Pattern B (LAG) or note the limitation.
+
 11. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
     The user's terminology will often DIFFER from the values stored in the database.
     You MUST resolve this mismatch before writing any WHERE clause.
@@ -1292,6 +1344,21 @@ _SQL_KEYWORDS = {
     "upper", "trim", "substr", "length", "round", "abs", "ifnull",
     "strftime", "date", "datetime", "asc", "desc", "over", "partition",
     "row_number", "rank", "iif", "replace", "typeof",
+    # Window functions — never column names
+    "lag", "lead", "first_value", "last_value", "nth_value",
+    "dense_rank", "percent_rank", "cume_dist", "ntile",
+    "nullif", "greatest", "least", "extract", "floor", "ceil", "ceiling",
+    "current_date", "current_timestamp", "now", "concat",
+    "left", "right", "ltrim", "rtrim", "lpad", "rpad", "split_part",
+    "to_char", "to_date", "to_timestamp", "date_trunc", "date_part",
+    "format_date", "parse_date", "timestamp_diff", "timestamp_add",
+    "interval", "epoch", "unbounded", "preceding", "following", "rows",
+    "range", "groups", "current", "exclude",
+    "approx_count_distinct", "approx_quantiles", "percentile_cont", "percentile_disc",
+    "safe_divide", "safe_cast", "ifnull", "zeroifnull", "nanvl",
+    "regexp_extract", "regexp_replace", "regexp_contains",
+    "array_agg", "string_agg", "listagg", "group_concat",
+    "json_extract", "json_value", "json_query",
 }
 
 

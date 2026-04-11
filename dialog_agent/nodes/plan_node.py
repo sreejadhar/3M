@@ -1354,90 +1354,122 @@ def _fix_subquery_order_by(sql: str, db_type: str) -> str:
     return result
 
 
+def _split_select_list(text: str) -> List[str]:
+    """
+    Split a SQL SELECT-list string on top-level commas only (depth 0).
+    Handles nested parentheses from functions like COALESCE(a, b),
+    ROUND(x, 2), CASE WHEN ... END, window functions, etc.
+    """
+    parts: List[str] = []
+    depth = 0
+    buf: List[str] = []
+    for ch in text:
+        if ch == '(':
+            depth += 1
+            buf.append(ch)
+        elif ch == ')':
+            depth -= 1
+            buf.append(ch)
+        elif ch == ',' and depth == 0:
+            parts.append(''.join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append(''.join(buf).strip())
+    return [p for p in parts if p]
+
+
+def _split_order_by_terms(text: str) -> List[str]:
+    """
+    Split ORDER BY clause on top-level commas and strip direction keywords
+    (ASC / DESC / NULLS FIRST / NULLS LAST) from each term.
+    Handles expressions like COALESCE(a, b) DESC without splitting on the
+    inner comma.
+    """
+    raw_terms = _split_select_list(text)  # reuse paren-aware splitter
+    cleaned: List[str] = []
+    for term in raw_terms:
+        t = re.sub(
+            r'\s*\b(NULLS\s+(?:FIRST|LAST)|ASC|DESC)\b\s*$', '',
+            term, flags=re.IGNORECASE,
+        ).rstrip(';').strip()
+        if t:
+            cleaned.append(t)
+    return cleaned
+
+
 def _fix_distinct_order_by(sql: str) -> str:
     """
     Fix: "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
 
-    When SELECT DISTINCT is used, every column referenced in ORDER BY must also
-    appear in the SELECT list.  The LLM sometimes adds ORDER BY f.col when that
-    col is not selected.
+    Universal SQL rule (PostgreSQL, SQLite, SQL Server, Oracle, BigQuery):
+    when SELECT DISTINCT is used every column in ORDER BY must also appear in
+    the SELECT list.
 
-    Strategy: detect the pattern and either
-      (a) add the missing ORDER BY column(s) to the SELECT list, or
-      (b) if DISTINCT is combined with ORDER BY on a non-selected expression,
-          drop DISTINCT (safer when the intent is just de-dup on selected cols).
+    The LLM sometimes generates ORDER BY on a column it did not select.
+    This function detects that and adds the missing columns to the SELECT list.
 
-    We apply (a) — add the columns — because dropping DISTINCT could change
-    result semantics in ways the LLM didn't intend.
+    The SELECT list is parsed with a paren-aware splitter so expressions like
+    COALESCE(a, b), ROUND(x, 2), CASE WHEN ... END do not confuse the comma
+    split.
     """
-    # Only act on SELECT DISTINCT queries
     if not re.search(r'\bSELECT\s+DISTINCT\b', sql, re.IGNORECASE):
         return sql
 
-    # Extract ORDER BY clause (everything after the last ORDER BY at depth 0)
+    # ── locate outermost ORDER BY ─────────────────────────────────────────
     ob_match = None
     for m in re.finditer(r'\bORDER\s+BY\b', sql, re.IGNORECASE):
         prefix = sql[:m.start()]
-        depth = prefix.count('(') - prefix.count(')')
-        if depth == 0:
-            ob_match = m  # keep last outer ORDER BY
+        if prefix.count('(') - prefix.count(')') == 0:
+            ob_match = m
     if not ob_match:
         return sql
 
     order_clause = sql[ob_match.end():]
-
-    # Parse individual ORDER BY terms (strip ASC/DESC/NULLS FIRST/LAST)
-    order_terms = []
-    for term in order_clause.split(','):
-        t = re.sub(r'\b(ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b', '', term, flags=re.IGNORECASE).strip()
-        # strip trailing semicolons / trailing whitespace
-        t = t.rstrip(';').strip()
-        if t:
-            order_terms.append(t)
-
+    order_terms = _split_order_by_terms(order_clause)
     if not order_terms:
         return sql
 
-    # Extract SELECT list (between SELECT DISTINCT and FROM at depth 0)
+    # ── locate SELECT list (between SELECT DISTINCT and first outer FROM) ─
     sel_match = re.search(r'\bSELECT\s+DISTINCT\b', sql, re.IGNORECASE)
     from_match = None
     for m in re.finditer(r'\bFROM\b', sql, re.IGNORECASE):
         prefix = sql[:m.start()]
-        depth = prefix.count('(') - prefix.count(')')
-        if depth == 0 and m.start() > sel_match.end():
+        if prefix.count('(') - prefix.count(')') == 0 and m.start() > sel_match.end():
             from_match = m
             break
     if not from_match:
         return sql
 
     select_list_text = sql[sel_match.end():from_match.start()]
+    select_items = _split_select_list(select_list_text)
 
-    # Build a normalised set of selected expressions (alias + raw)
+    # Build normalised set: aliases, bare column names, full expressions
     selected_exprs: set = set()
-    for col_expr in select_list_text.split(','):
-        col_expr = col_expr.strip()
-        # grab alias if present: "expr AS alias" or "tbl.col alias"
-        alias_m = re.search(r'\bAS\s+(\w+)\s*$', col_expr, re.IGNORECASE)
+    for item in select_items:
+        # alias: "expr AS alias"
+        alias_m = re.search(r'\bAS\s+(\w+)\s*$', item, re.IGNORECASE)
         if alias_m:
             selected_exprs.add(alias_m.group(1).lower())
-        # also store the bare expression (strip table prefix)
-        bare = re.sub(r'^\w+\.', '', col_expr.strip()).lower()
+        # bare column (strip table qualifier)
+        bare = re.sub(r'^\w+\.', '', item.strip()).lower()
         selected_exprs.add(bare)
-        # and fully-qualified form
-        selected_exprs.add(col_expr.strip().lower())
+        # full expression as-is
+        selected_exprs.add(item.strip().lower())
 
-    # Identify ORDER BY terms not covered by the SELECT list
+    # ── find ORDER BY terms absent from SELECT list ───────────────────────
     missing = []
     for term in order_terms:
-        term_lower = term.lower()
-        bare_term = re.sub(r'^\w+\.', '', term_lower)
-        if term_lower not in selected_exprs and bare_term not in selected_exprs:
+        t_lower = term.lower()
+        bare_t = re.sub(r'^\w+\.', '', t_lower)
+        if t_lower not in selected_exprs and bare_t not in selected_exprs:
             missing.append(term)
 
     if not missing:
         return sql
 
-    # Add missing terms to the SELECT list
+    # ── patch: insert missing columns just before FROM ────────────────────
     insert_pos = from_match.start()
     additions = ', '.join(missing)
     patched = sql[:insert_pos] + ', ' + additions + ' ' + sql[insert_pos:]

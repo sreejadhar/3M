@@ -297,6 +297,32 @@ General Rules:
      WRONG:   FROM orders WHERE orders.id = 1         -- unqualified table
      WRONG:   WHERE public.orders.id = 1              -- 3-part names fail in PostgreSQL
    Identifier quoting: follow the rule shown in the DATABASE-SPECIFIC SYNTAX section above.
+10a-0. SELECT DISTINCT + ORDER BY — UNIVERSAL SQL RULE:
+    When you use SELECT DISTINCT, EVERY column in the ORDER BY clause MUST also
+    appear in the SELECT list.  Ordering by a column that is not selected is a
+    syntax error in PostgreSQL, SQLite, and most other databases.
+
+    WRONG:  SELECT DISTINCT brand_name, period_id
+            FROM fact_metrics AS f
+            WHERE f.pricing_impact_pct > 0
+            ORDER BY f.pricing_impact_pct       ← NOT in SELECT list → ERROR
+
+    CORRECT option A — add the ORDER BY column to the SELECT list:
+            SELECT DISTINCT brand_name, period_id, f.pricing_impact_pct
+            FROM fact_metrics AS f
+            WHERE f.pricing_impact_pct > 0
+            ORDER BY f.pricing_impact_pct
+
+    CORRECT option B — remove DISTINCT and use GROUP BY instead:
+            SELECT brand_name, period_id, MAX(f.pricing_impact_pct) AS max_impact
+            FROM fact_metrics AS f
+            WHERE f.pricing_impact_pct > 0
+            GROUP BY brand_name, period_id
+            ORDER BY max_impact DESC
+
+    Prefer option A for simple de-duplication; prefer option B when you need an
+    aggregated metric for ordering.
+
 10a. AMBIGUOUS COLUMN NAMES IN JOINs — CRITICAL FOR SQLite AND ALL DATABASES:
     When a query JOINs two or more tables, ANY column that appears in multiple
     tables MUST be referenced with a table alias in SELECT, WHERE, GROUP BY,
@@ -1328,6 +1354,100 @@ def _fix_subquery_order_by(sql: str, db_type: str) -> str:
     return result
 
 
+def _fix_distinct_order_by(sql: str) -> str:
+    """
+    Fix: "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
+
+    When SELECT DISTINCT is used, every column referenced in ORDER BY must also
+    appear in the SELECT list.  The LLM sometimes adds ORDER BY f.col when that
+    col is not selected.
+
+    Strategy: detect the pattern and either
+      (a) add the missing ORDER BY column(s) to the SELECT list, or
+      (b) if DISTINCT is combined with ORDER BY on a non-selected expression,
+          drop DISTINCT (safer when the intent is just de-dup on selected cols).
+
+    We apply (a) — add the columns — because dropping DISTINCT could change
+    result semantics in ways the LLM didn't intend.
+    """
+    # Only act on SELECT DISTINCT queries
+    if not re.search(r'\bSELECT\s+DISTINCT\b', sql, re.IGNORECASE):
+        return sql
+
+    # Extract ORDER BY clause (everything after the last ORDER BY at depth 0)
+    ob_match = None
+    for m in re.finditer(r'\bORDER\s+BY\b', sql, re.IGNORECASE):
+        prefix = sql[:m.start()]
+        depth = prefix.count('(') - prefix.count(')')
+        if depth == 0:
+            ob_match = m  # keep last outer ORDER BY
+    if not ob_match:
+        return sql
+
+    order_clause = sql[ob_match.end():]
+
+    # Parse individual ORDER BY terms (strip ASC/DESC/NULLS FIRST/LAST)
+    order_terms = []
+    for term in order_clause.split(','):
+        t = re.sub(r'\b(ASC|DESC|NULLS\s+FIRST|NULLS\s+LAST)\b', '', term, flags=re.IGNORECASE).strip()
+        # strip trailing semicolons / trailing whitespace
+        t = t.rstrip(';').strip()
+        if t:
+            order_terms.append(t)
+
+    if not order_terms:
+        return sql
+
+    # Extract SELECT list (between SELECT DISTINCT and FROM at depth 0)
+    sel_match = re.search(r'\bSELECT\s+DISTINCT\b', sql, re.IGNORECASE)
+    from_match = None
+    for m in re.finditer(r'\bFROM\b', sql, re.IGNORECASE):
+        prefix = sql[:m.start()]
+        depth = prefix.count('(') - prefix.count(')')
+        if depth == 0 and m.start() > sel_match.end():
+            from_match = m
+            break
+    if not from_match:
+        return sql
+
+    select_list_text = sql[sel_match.end():from_match.start()]
+
+    # Build a normalised set of selected expressions (alias + raw)
+    selected_exprs: set = set()
+    for col_expr in select_list_text.split(','):
+        col_expr = col_expr.strip()
+        # grab alias if present: "expr AS alias" or "tbl.col alias"
+        alias_m = re.search(r'\bAS\s+(\w+)\s*$', col_expr, re.IGNORECASE)
+        if alias_m:
+            selected_exprs.add(alias_m.group(1).lower())
+        # also store the bare expression (strip table prefix)
+        bare = re.sub(r'^\w+\.', '', col_expr.strip()).lower()
+        selected_exprs.add(bare)
+        # and fully-qualified form
+        selected_exprs.add(col_expr.strip().lower())
+
+    # Identify ORDER BY terms not covered by the SELECT list
+    missing = []
+    for term in order_terms:
+        term_lower = term.lower()
+        bare_term = re.sub(r'^\w+\.', '', term_lower)
+        if term_lower not in selected_exprs and bare_term not in selected_exprs:
+            missing.append(term)
+
+    if not missing:
+        return sql
+
+    # Add missing terms to the SELECT list
+    insert_pos = from_match.start()
+    additions = ', '.join(missing)
+    patched = sql[:insert_pos] + ', ' + additions + ' ' + sql[insert_pos:]
+    logger.info(
+        "plan_node: added %d column(s) to SELECT list to satisfy DISTINCT+ORDER BY: %s",
+        len(missing), missing,
+    )
+    return patched
+
+
 def _is_raw_row_query(sql: str) -> bool:
     """Return True when the SQL has no aggregation (GROUP BY / COUNT / SUM …)."""
     return not bool(_AGG_PATTERN.search(sql))
@@ -1621,6 +1741,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _fix_percentage(sql, natural_query, config.db_type)
             sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
             sql = _fix_subquery_order_by(sql, config.db_type)
+            sql = _fix_distinct_order_by(sql)
 
             # Multi-table / no-join-key check
             sql_no_strings = re.sub(r"'[^']*'", "''", sql)

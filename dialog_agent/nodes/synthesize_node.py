@@ -93,6 +93,44 @@ ANALYTICAL DEPTH — mandatory
    e. CROSS-QUERY CONNECTIONS — if results span multiple queries, do they
       corroborate or contradict each other?
 
+7. STRUCTURAL ANOMALIES — LEAD WITH THEM:
+   If a finding fundamentally undermines the premise of the original question,
+   that finding MUST be the first sentence of the Summary — not an appendix note.
+   Examples of premise-collapsing anomalies:
+     • A metric that is supposed to differentiate groups shows near-zero variance
+       across all groups (e.g. pricing impact % capped at 9.99–10.00% for every SKU).
+       → The original ranking question cannot be answered with this metric.
+         Lead: "The [metric] is effectively capped at [value] across all groups —
+         it cannot be used to rank or differentiate them.  The [alternative metric]
+         is the operative differentiator."
+     • A "deliberate vs windfall" question is answered with an absolute index (e.g.
+       price_index = 120) rather than a year-over-year movement (price_index_vs_yago).
+       → Flag explicitly that absolute price index ≠ deliberate price change, and
+         note that the YoY column would be needed for a definitive answer.
+     • A query returned 0 rows or the count is implausibly small.
+       → Surface this as a data quality issue before drawing conclusions.
+
+8. CO-OCCURRENCE CAVEAT — independent queries do NOT prove period-level co-occurrence:
+   If the queries were run SEPARATELY (e.g. q1 retrieves pricing impact, q2 retrieves
+   price index independently) and the question asks whether the same brand-pack showed
+   BOTH conditions in the SAME period, your answer is INFERRED, not proven.
+   You MUST include a caveat in the Analysis section:
+     "Note: the two queries were not joined on period — the conclusion that [A] and [B]
+      co-occurred in the same periods is based on the same brand-packs appearing in both
+      result sets, not on a period-matched JOIN.  A joined query on (brand_pack_id,
+      period_id) would give a definitive period-level answer."
+   Omit this caveat only if one of the queries already joined on the period dimension.
+
+9. EXECUTIVE SUMMARY TABLE — when the data spans many rows across multiple queries,
+   produce a concise 3–8 row summary table in the Key Findings section that captures
+   the top performers or most important segments.  Format:
+     | Brand-Pack | Metric A | Metric B | Interpretation |
+     |-----------|---------|---------|----------------|
+     | …         | …       | …       | …              |
+   This replaces a verbal bullet-point list when the data is tabular in nature.
+   The full raw data will appear in the ## Data section; do NOT reproduce all rows
+   in the narrative.  An RGM director wants a 5-row exec table, not a scrollable dump.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT — use this exact section structure
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

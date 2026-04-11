@@ -340,6 +340,34 @@ General Rules:
     d. If a column you need (e.g. SBU1) is only in Table A, write a query for
        Table A that retrieves it.  Write a second query for Table B with its
        own columns.  Do NOT try to bridge them without a valid join key.
+10c. CO-OCCURRENCE QUESTIONS — when the question asks "did A and B happen together
+    in the SAME period / same row / same entity", you MUST prove co-occurrence with
+    a JOIN, not with two independent queries.
+    Pattern to recognise: "did [metric X] AND [metric Y] both occur for the same
+    [brand/product/store] in the same [period/month/quarter]?"
+    Correct approach (if valid join key exists between the two tables):
+      Write ONE query that JOINs the two tables on (entity_key AND period_key),
+      then SELECT both metrics together.  This produces a row only where BOTH
+      conditions are satisfied simultaneously.
+    WRONG approach:
+      Two separate queries — one for metric X, one for metric Y — produce two
+      independent result sets.  ANY claim about co-occurrence drawn from comparing
+      those result sets is INFERRED, not proven.  Avoid this when a join is possible.
+    If no valid join key exists between the tables and you must use separate queries,
+    add a note in the description field: "Note: period-level co-occurrence cannot be
+    proven from separate queries — results should be merged in analysis."
+10d. YEAR-OVER-YEAR vs ABSOLUTE INDEX — when the question asks about DELIBERATE
+    price changes, price-up execution, or windfall vs intentional pricing, ALWAYS
+    prefer year-over-year / vs-prior-year columns over absolute index columns.
+    Reasoning: an absolute price index of 120 means the SKU is priced 20% above
+    the category average — but that may have been true for years.  A positive
+    price_index_vs_yago (or equivalent) means the index MOVED up this period —
+    that is the signal for deliberate price-up execution.
+    RULE: If the schema has a column whose name contains "vs_yago", "vs_py",
+    "prior_year", "yoy", "year_over_year", or "vs_last_year" alongside a price
+    index column, use the YoY column as the primary filter / metric for any
+    question that mentions "deliberate", "intentional", "price-up execution",
+    "windfall", or "vs prior year".
 11. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
     The user's terminology will often DIFFER from the values stored in the database.
     You MUST resolve this mismatch before writing any WHERE clause.

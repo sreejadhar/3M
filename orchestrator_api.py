@@ -424,6 +424,39 @@ async def _startup() -> None:
                     logger.info("Startup taxonomy sync: %d columns for %s", n, src["id"][:8])
             except Exception as _ts_exc:
                 logger.warning("Startup taxonomy sync failed for %s: %s", src["id"][:8], _ts_exc)
+
+        # Startup bridge inference — run across all restored KG pairs so bridges
+        # are available immediately after restart without requiring a re-index.
+        # Only runs when ≥2 KGs are registered.  Non-blocking: runs in a thread
+        # so it does not delay server startup.
+        if len(restored) >= 2:
+            def _startup_bridge_inference():
+                try:
+                    from dialog_agent.kg_registry import list_all as _reg_list
+                    from dialog_agent.kg_inference_engine import KGContext, run_all_pairs
+                    entries = _reg_list()
+                    if len(entries) < 2:
+                        return
+                    contexts = []
+                    for entry in entries:
+                        src = _sources.get(entry.source_id) or {}
+                        contexts.append(KGContext(
+                            kg_id=entry.kg_id,
+                            display_name=entry.display_name,
+                            domain=(entry.domain_keywords or [""])[0],
+                            nodes=src.get("kg_nodes") or [],
+                            report=src.get("report"),
+                        ))
+                    result = run_all_pairs(contexts)
+                    logger.info(
+                        "Startup bridge inference: %d pairs processed, %d bridges saved",
+                        result["pairs_processed"], result["bridges_saved"],
+                    )
+                except Exception as _bi_exc:
+                    logger.warning("Startup bridge inference failed (non-fatal): %s", _bi_exc)
+
+            import threading as _threading
+            _threading.Thread(target=_startup_bridge_inference, daemon=True, name="startup-bridge-infer").start()
     except Exception as exc:
         logger.warning("kg_store restore failed (non-fatal): %s", exc)
 
@@ -1098,11 +1131,29 @@ async def _index_source(source_id: str) -> None:
                     continue
                 other_src = _sources.get(other.source_id)
                 if not other_src:
-                    logger.warning(
-                        "KG bridge inference skipped: registry has KG %s but "
-                        "source %s is not loaded — re-index that source to enable bridges",
-                        other.kg_id[:8], other.source_id[:8],
-                    )
+                    # Fall back to loading from persistent store — the source
+                    # was indexed in a previous server run and lives in the DB.
+                    try:
+                        from_store = [s for s in _kg_store.load_all()
+                                      if s["id"] == other.source_id]
+                        if from_store:
+                            other_src = from_store[0]
+                            _sources[other.source_id] = other_src  # cache it
+                            logger.info(
+                                "KG bridge inference: loaded %s from store for bridge pairing",
+                                other.source_id[:8],
+                            )
+                        else:
+                            logger.warning(
+                                "KG bridge inference skipped: KG %s (source %s) not found "
+                                "in _sources or kg_store — re-index that source to enable bridges",
+                                other.kg_id[:8], other.source_id[:8],
+                            )
+                    except Exception as _load_exc:
+                        logger.warning(
+                            "KG bridge inference: kg_store lookup failed for %s: %s",
+                            other.source_id[:8], _load_exc,
+                        )
                 if other_src:
                     saved = _infer_bridges(
                         entry.kg_id,  src.get("kg_nodes", []),

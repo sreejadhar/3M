@@ -195,23 +195,70 @@ def _type_compat(ta: str, tb: str) -> float:
 # ---------------------------------------------------------------------------
 
 def _profiles_from_nodes(kg_id: str, nodes: List[Dict]) -> List[ColumnProfile]:
-    """Extract ColumnProfile list from KG graph nodes."""
+    """Extract ColumnProfile list from KG graph nodes.
+
+    Two extraction strategies in priority order:
+      1. Structured ``properties`` list  — present in nodes built by
+         translate_node._build_graph_data (commit 69cb67e+).
+         Format: [{"name": col, "type": xsd_type}, ...]
+      2. Title-text fallback — for nodes indexed before the structured
+         properties field was added.  Parses lines of the form:
+         "  col_name: xsd_type  -- optional comment"
+         that appear after the ``Properties:`` marker in the node title.
+    """
+    # Matches "  col_name: xsd_type" (2-space indent) in a multi-line string.
+    # Non-greedy (.+?) stops at the first colon so col names like "fiscal_year"
+    # are captured correctly.  The type token (\S+) may include the "xsd:" prefix.
+    _TITLE_PROP_RE = re.compile(r'^\s{2}(.+?):\s+(\S+)', re.MULTILINE)
+
     out: List[ColumnProfile] = []
     for node in nodes:
-        entity = node.get("label") or node.get("title") or ""
-        for prop in node.get("properties") or []:
-            col = (prop.get("name") or prop.get("column") or "").strip()
-            if not col:
+        entity = node.get("label") or ""
+        if not entity:
+            # Extract entity name from title header "Class: <Name>"
+            head = (node.get("title") or "").split("\n", 1)[0]
+            m_head = re.match(r'^Class:\s+(.+)', head)
+            entity = m_head.group(1).strip() if m_head else (node.get("title") or "")
+
+        props = node.get("properties") or []
+
+        if props:
+            # Strategy 1: structured property list (fast path)
+            for prop in props:
+                col = (prop.get("name") or prop.get("column") or "").strip()
+                if not col:
+                    continue
+                col_l = col.lower()
+                dtype = (prop.get("type") or prop.get("data_type") or "").lower()
+                cp = ColumnProfile(
+                    kg_id=kg_id, entity=entity, col=col_l,
+                    col_norm=_normalise(col_l), data_type=dtype,
+                    domain="", description="",
+                )
+                cp.text_repr = f"{col_l}: {dtype}".strip(": ")
+                out.append(cp)
+        else:
+            # Strategy 2: parse the node title text (legacy nodes)
+            title = node.get("title") or ""
+            props_idx = title.find("Properties:")
+            if props_idx == -1:
                 continue
-            col_l = col.lower()
-            dtype = (prop.get("type") or prop.get("data_type") or "").lower()
-            cp = ColumnProfile(
-                kg_id=kg_id, entity=entity, col=col_l,
-                col_norm=_normalise(col_l), data_type=dtype,
-                domain="", description="",
-            )
-            cp.text_repr = f"{col_l}: {dtype}".strip(": ")
-            out.append(cp)
+            props_section = title[props_idx + len("Properties:"):]
+            for m in _TITLE_PROP_RE.finditer(props_section):
+                col = m.group(1).strip().lower()
+                dtype = m.group(2).strip().lower()
+                if dtype.startswith("xsd:"):
+                    dtype = dtype[4:]
+                if not col:
+                    continue
+                cp = ColumnProfile(
+                    kg_id=kg_id, entity=entity, col=col,
+                    col_norm=_normalise(col), data_type=dtype,
+                    domain="", description="",
+                )
+                cp.text_repr = f"{col}: {dtype}".strip(": ")
+                out.append(cp)
+
     return out
 
 
@@ -592,10 +639,13 @@ def run_enterprise_inference(
     opts = options or DEFAULT_OPTIONS
 
     # ── adjust thresholds for cross-domain pairs ──────────────────────────────
-    same_domain = (
-        bool(ctx_a.domain) and bool(ctx_b.domain) and
-        ctx_a.domain.lower() == ctx_b.domain.lower()
-    )
+    # Only penalise when BOTH domains are known AND they are different.
+    # If either domain is empty / unset we have no evidence of a cross-domain
+    # mismatch, so treat the pair as same-domain (no penalty).
+    if not ctx_a.domain or not ctx_b.domain:
+        same_domain = True   # unknown domain — give benefit of the doubt
+    else:
+        same_domain = ctx_a.domain.lower() == ctx_b.domain.lower()
     penalty = 0.0 if same_domain else opts.cross_domain_penalty
     auto_threshold = opts.auto_enable_threshold + penalty
     min_conf       = opts.min_confidence + penalty * 0.5   # relax min less aggressively

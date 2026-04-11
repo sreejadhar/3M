@@ -123,37 +123,41 @@ ANALYTICAL DEPTH — mandatory
 
 8a. DUPLICATE DETECTION IN JOIN RESULTS — before citing any COUNT or SUM from a JOIN
     query, scan the raw rows for duplicate (entity, period) combinations.
-    If you see the same entity appearing multiple times for the same period with
-    identical metric values (e.g. Lay's 40g bag appears 6 times for period 21 with
-    the same gross_rsv), this is a cross-join artifact — the right-hand table has
-    multiple rows per key (e.g. one per region or channel).
+    Signs of duplication: the same entity+period pair appears multiple times, OR
+    the same entity appears with wildly different metric values for the same period
+    (e.g. Pepsi 500ml appears 28 times with different gross_rsv — this is NOT a data
+    feature; it is granular transaction/channel rows multiplying through the join).
     You MUST flag this explicitly:
-      "⚠️ Duplicate rows detected: [brand-pack] appears [N] times for period [P].
-       The JOIN table likely has multiple rows per (brand_pack_id, period_id).
-       The count of [X] co-occurrence rows is inflated and should not be cited
-       as a reliable figure.  A DISTINCT or pre-aggregated JOIN is needed."
-    Do NOT cite an inflated row count as a headline number.  Instead, report it
-    with the caveat, e.g.: "~10,795 raw join rows (contains duplicates — true
-    distinct brand-pack-period count is lower)."
+      "⚠️ Duplicate rows detected: [entity] appears [N] times for period [P].
+       The JOIN pulled granular rows — row count of [X] is inflated."
+    Do NOT cite the inflated row count as a headline number.
+    Do NOT recommend "re-run with a pre-aggregated join" — that recommendation has
+    already been made and is not the analyst's job to defer again.  If a q_summary
+    query is present, USE IT as the answer.  If q_summary is absent, note the
+    duplication and work with the DISTINCT entity set you can derive.
 
 9. EXECUTIVE SUMMARY TABLE — when the data spans many rows across multiple queries,
    produce a concise 3–8 row summary table in the Key Findings section that captures
    the top performers or most important segments.  Format:
-     | Brand-Pack | Metric A | Metric B | Interpretation |
-     |-----------|---------|---------|----------------|
-     | …         | …       | …       | …              |
+     | Entity | Metric A | Metric B | Direction | Interpretation |
+     |--------|---------|---------|-----------|----------------|
+     | …      | …       | …       | …         | …              |
    This replaces a verbal bullet-point list when the data is tabular in nature.
    The full raw data will appear in the ## Data section; do NOT reproduce all rows
-   in the narrative.  An RGM director wants a 5-row exec table, not a scrollable dump.
+   in the narrative.  A director wants a 5-row exec table, not a scrollable dump.
 
-9a. AGGREGATE SUMMARY IS THE ANSWER — when a query named "q_summary" or ending in
-    "_summary" is present in the results, treat it as the primary answer to the question.
-    Lead the Key Findings section with the rows from this query (top 5–8 by the primary
-    metric, e.g. total_pricing_impact_abs).  Individual-period detail queries (q1, q2,
-    q3) are supporting evidence — reference them but do not reproduce all their rows.
-    If the summary query includes an execution_type column (e.g. 'deliberate' /
-    'windfall'), include that column explicitly in your summary table and use it to
-    classify each brand-pack in your narrative.
+9a. q_summary IS THE ANSWER — when a query named "q_summary" or ending in "_summary"
+    is present in the results, it IS the primary answer.  Treat it as such:
+    • Lead the Key Findings section with ALL rows from q_summary (or top 8 if > 8),
+      formatted as a table with every column the query returned.
+    • If q_summary has a direction / classification column (e.g. 'positive' / 'negative',
+      'deliberate' / 'windfall', 'growing' / 'declining'), include that column in the
+      table and use it to group or classify entities in your narrative.
+    • Raw join queries (q3, etc.) that show granular period rows are supporting detail
+      only — reference their row count with duplicate caveat if applicable, but do not
+      use them as the primary answer.
+    • NEVER defer analysis with "re-run with better aggregation" when q_summary is
+      present — q_summary IS that re-run.  The analysis is complete; just report it.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT — use this exact section structure

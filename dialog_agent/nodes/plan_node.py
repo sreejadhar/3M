@@ -383,77 +383,101 @@ General Rules:
     add a note in the description field: "Note: period-level co-occurrence cannot be
     proven from separate queries — results should be merged in analysis."
 
-10c-i. JOIN DEDUPLICATION — CRITICAL: when the right-hand table in a co-occurrence
-    JOIN has MULTIPLE ROWS per (entity_key, period_key) — e.g. one row per region,
-    channel, or retailer — a straight JOIN will MULTIPLY fact rows and produce:
-      • duplicate entity+period rows in the result
-      • inflated COUNT(*) / SUM() values (each fact row counted N times)
-    You MUST detect this situation and prevent it.
+10c-i. JOIN DEDUPLICATION — MANDATORY, NO EXCEPTIONS:
+    EVERY table you join that contains fact/metric rows (not a pure dimension
+    table like a product master or calendar) MUST be pre-aggregated to exactly
+    ONE ROW per (entity_key, period_key) before the join.
 
-    How to detect: look at the description and column list of the right-hand table.
-    If it contains dimension columns like region, channel, store, customer, retailer,
-    or any column that would make (entity_key, period_key) non-unique, treat it as
-    a "many-rows-per-key" table.
+    DEFAULT RULE: assume every metric/fact table has multiple rows per key
+    (because of region, channel, customer, store, or transaction granularity).
+    Do NOT rely on your own judgement about whether a table is granular —
+    ALWAYS wrap it in a CTE that aggregates to (entity_key, period_key) level.
 
-    Fix — use a pre-aggregated subquery or CTE on the right-hand table before
-    joining, so you guarantee at most one row per (entity_key, period_key):
+    The ONLY exception is a pure lookup/dimension table that has exactly one row
+    per entity by construction (e.g. a product master with one row per SKU, or a
+    calendar table with one row per date).  Fact tables, KPI tables, sales tables,
+    and any table with a metric column are NEVER safe to join without pre-aggregation.
 
-      WITH right_agg AS (
+    Mandatory pattern — wrap EVERY metric table in a CTE before joining:
+
+      WITH left_agg AS (
+        SELECT entity_key, period_key,
+               SUM(metric_1)      AS total_metric_1,
+               SUM(metric_2)      AS total_metric_2
+        FROM   left_fact_table
+        GROUP BY entity_key, period_key
+      ),
+      right_agg AS (
         SELECT entity_key, period_key,
                AVG(metric_col_a)  AS avg_metric_a,
                AVG(metric_col_b)  AS avg_metric_b
-        FROM   right_hand_table
+        FROM   right_fact_table
         GROUP BY entity_key, period_key
       )
-      SELECT f.entity_key, f.period_key,
-             f.fact_metric_1, f.fact_metric_2,
+      SELECT l.entity_key, l.period_key,
+             l.total_metric_1, l.total_metric_2,
              r.avg_metric_a, r.avg_metric_b
-      FROM   fact_table  AS f
-      JOIN   right_agg   AS r
-        ON   f.entity_key  = r.entity_key
-        AND  f.period_key  = r.period_key
+      FROM   left_agg  AS l
+      JOIN   right_agg AS r
+        ON   l.entity_key  = r.entity_key
+        AND  l.period_key  = r.period_key
 
-    Replace entity_key / period_key / metric_col_a / metric_col_b with the
-    actual column names from the schema.  The pattern applies to any domain:
-    brand+period (RGM), employee+month (HR), store+week (retail), etc.
+    Replace entity_key / period_key / metric columns with actual schema names.
+    The pattern applies to any domain: brand+period (RGM), employee+month (HR),
+    store+week (retail), supplier+quarter (supply chain).
 
-    NEVER write: FROM fact JOIN detail_table ON (entity_key, period_key)
-    without first confirming detail_table has exactly one row per key.
-    When in doubt — always pre-aggregate.
+    NEVER write: FROM fact_a JOIN fact_b ON (entity_key, period_key)
+    without BOTH tables wrapped in pre-aggregation CTEs first.
+    When in doubt — always pre-aggregate both sides.
 
-10c-ii. FINAL SUMMARY AGGREGATE — when a multi-step analytical question produces
-    a co-occurrence or filtered dataset, ALWAYS emit a final summary query that
-    aggregates the co-occurrence result to the primary entity level.
+10c-ii. FINAL SUMMARY AGGREGATE — MANDATORY after every co-occurrence JOIN:
+    Whenever you emit a JOIN / co-occurrence query (rule 10c), you MUST also emit
+    a separate query with query_id "q_summary" that aggregates the join result to
+    ONE ROW per primary entity.  This is not optional.  Without it, the downstream
+    analysis has thousands of granular rows with no board-ready answer.
+
     This applies in ANY domain: products/brands, employees, stores, customers,
     suppliers, regions, etc.
 
-    Generic pattern (substitute actual column names from the schema):
+    Mandatory columns in q_summary:
+      1. entity_key + entity label columns (brand_name, employee_name, store_name, …)
+      2. COUNT(DISTINCT period_key) AS qualifying_periods
+      3. The primary metric aggregated: SUM(primary_metric) AS total_primary_metric
+      4. Any secondary metrics: AVG(secondary_metric) AS avg_secondary_metric
+      5. REQUIRED if the schema has a YoY/change column (name contains _vs_yago,
+         _vs_py, _yoy, _growth, _change, _delta): include BOTH:
+           AVG(yoy_col) AS avg_yoy_movement
+           CASE WHEN AVG(yoy_col) > 0 THEN 'positive' ELSE 'negative' END AS direction
+         This classifies whether the metric MOVED in this period vs prior year.
+      6. ORDER BY total_primary_metric DESC
+
+    Generic pattern:
 
       SELECT entity_key,
-             <entity_label_cols>,           -- e.g. brand_name, employee_name, store_name
-             COUNT(DISTINCT period_key)      AS qualifying_periods,
-             SUM(primary_metric)            AS total_primary_metric,
-             AVG(secondary_metric)          AS avg_secondary_metric,
-             <optional CASE classification based on domain logic>
-      FROM   <co-occurrence CTE or subquery>
-      GROUP BY entity_key, <entity_label_cols>
+             entity_label_col,
+             COUNT(DISTINCT period_key)   AS qualifying_periods,
+             SUM(primary_metric)          AS total_primary_metric,
+             AVG(secondary_metric)        AS avg_secondary_metric,
+             AVG(yoy_col)                 AS avg_yoy_movement,   -- if yoy col exists
+             CASE WHEN AVG(yoy_col) > 0
+                  THEN 'positive' ELSE 'negative' END AS direction  -- if yoy col exists
+      FROM   <co-occurrence pre-aggregated JOIN — see rule 10c-i>
+      GROUP BY entity_key, entity_label_col
       ORDER BY total_primary_metric DESC
 
-    Examples across domains:
-      • RGM/Pricing:    entity=brand_pack_id, metrics=pricing_impact_abs, gross_rsv
-      • HR/Workforce:   entity=employee_id,   metrics=headcount, attrition_count
-      • Retail/Sales:   entity=store_id,      metrics=revenue, units_sold
-      • Finance:        entity=cost_centre_id, metrics=budget_variance, actuals
-      • Supply Chain:   entity=supplier_id,   metrics=order_fill_rate, lead_time_days
+    Domain examples:
+      • RGM/Pricing:    entity=brand_pack_id, primary=pricing_impact_abs,
+                        secondary=gross_rsv, yoy=price_index_vs_yago
+      • HR/Workforce:   entity=employee_id,   primary=attrition_count,
+                        secondary=headcount,  yoy=headcount_change
+      • Retail/Sales:   entity=store_id,      primary=revenue,
+                        secondary=units_sold, yoy=revenue_growth_pct
+      • Finance:        entity=cost_centre_id, primary=budget_variance_abs,
+                        secondary=actuals,    yoy=variance_vs_py
 
-    This final aggregate is the board-ready answer — it replaces thousands of
-    raw co-occurrence rows with a concise per-entity summary.  Without it, the
-    analysis forces the reader to draw their own conclusions from raw data.
-
-    Pattern: whenever you emit a JOIN / co-occurrence query (rule 10c), ALWAYS
-    follow it with one additional query_id (e.g. "q_summary") that wraps the join
-    result in an aggregation to entity level.  Use a CTE or subquery to avoid
-    repeating the full JOIN logic.
+    The q_summary IS the answer.  It replaces thousands of raw join rows with a
+    concise per-entity table.  The LLM synthesiser will use q_summary as the
+    primary result and treat the raw join query as supporting detail only.
 
 10d. YEAR-OVER-YEAR vs ABSOLUTE LEVEL — when the question asks whether a metric
     CHANGED, IMPROVED, GREW, or MOVED (not just whether it is high or low),

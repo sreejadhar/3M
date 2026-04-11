@@ -716,6 +716,135 @@ Return the JSON array of SQL queries now.
 """
 
 
+# ── Dimension column name signals (indicate sub-key grain when present) ───────
+# If a table has these column patterns ALONGSIDE a period key, it records data
+# at sub-period grain (e.g. one row per brand-pack × period × channel).
+_DIMENSION_COL_SIGNALS = (
+    "channel", "region", "geography", "territory", "district",
+    "customer", "retailer", "outlet", "store", "account",
+    "sub_channel", "trade_channel", "route_to_market",
+    "segment", "cluster", "zone",
+)
+
+# Period key column name signals
+_PERIOD_COL_SIGNALS = (
+    "period", "month", "quarter", "week", "date", "year",
+    "fiscal", "time_period",
+)
+
+# Entity key column name signals (the primary join key, not a dimension)
+_ENTITY_KEY_SIGNALS = (
+    "_id", "_key", "_code", "brand", "product", "sku", "item",
+    "employee", "supplier", "store_id", "cost_centre",
+)
+
+
+def _annotate_schema_grain(schema_context: str) -> str:
+    """
+    Parse the schema context produced by understand_node and inject ⚠️ grain
+    annotations for any table that has sub-join-key granularity.
+
+    Detection heuristic:
+      A table is flagged as "multi-row-per-key" when it has ALL of:
+        1. At least one period-key column (_PERIOD_COL_SIGNALS)
+        2. At least one entity-key column (_ENTITY_KEY_SIGNALS or join-key cols)
+        3. At least one extra dimension column (_DIMENSION_COL_SIGNALS) beyond
+           the entity + period keys — indicating rows repeat per entity+period
+
+    For flagged tables, a warning block is inserted immediately after the
+    "Table: ..." line so the LLM sees it before reading the column list.
+
+    This is deterministic Python — no LLM call, no false negatives from
+    prompt rules the LLM can ignore.
+    """
+    lines = schema_context.splitlines()
+    result: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        result.append(line)
+
+        # Detect a "Table: ..." header line
+        if not re.match(r'\s*Table:\s+\S', line, re.IGNORECASE):
+            i += 1
+            continue
+
+        # Collect the columns for this table (lines until the next blank or Table:)
+        j = i + 1
+        col_names: List[str] = []
+        while j < len(lines):
+            peek = lines[j]
+            if re.match(r'\s*Table:\s+', peek, re.IGNORECASE):
+                break
+            if re.match(r'\s*={3,}', peek):
+                break
+            # Column lines look like "    col_name: type ..."
+            col_m = re.match(r'\s{2,}(\w+)\s*:', peek)
+            if col_m:
+                col_names.append(col_m.group(1).lower())
+            j += 1
+
+        if not col_names:
+            i += 1
+            continue
+
+        # Check for period key, entity key, and dimension signals
+        has_period  = any(any(sig in c for sig in _PERIOD_COL_SIGNALS) for c in col_names)
+        has_entity  = any(any(sig in c for sig in _ENTITY_KEY_SIGNALS) for c in col_names)
+        dim_cols    = [c for c in col_names
+                       if any(sig in c for sig in _DIMENSION_COL_SIGNALS)]
+
+        if has_period and has_entity and dim_cols:
+            # Extract table name for a targeted warning
+            tbl_match = re.search(r'Table:\s+(\S+)', line, re.IGNORECASE)
+            tbl_name  = tbl_match.group(1) if tbl_match else "this table"
+            dim_sample = ", ".join(dim_cols[:3])
+            result.append(
+                f"  ⚠️  GRAIN WARNING: {tbl_name} has MULTIPLE ROWS per (entity_key, period_key)."
+            )
+            result.append(
+                f"     Extra dimension columns detected: {dim_sample}."
+            )
+            result.append(
+                f"     MANDATORY: before joining this table, wrap it in a CTE that"
+            )
+            result.append(
+                f"     aggregates to one row per (entity_key, period_key):"
+            )
+            result.append(
+                f"       WITH tbl_agg AS ("
+            )
+            result.append(
+                f"         SELECT entity_key, period_key,"
+            )
+            result.append(
+                f"                AVG(metric_col_a) AS avg_metric_a,  -- replace with real cols"
+            )
+            result.append(
+                f"         FROM   {tbl_name}"
+            )
+            result.append(
+                f"         GROUP BY entity_key, period_key"
+            )
+            result.append(
+                f"       )"
+            )
+            result.append(
+                f"     NEVER join {tbl_name} directly on (entity_key, period_key)"
+            )
+            result.append(
+                f"     without this pre-aggregation step."
+            )
+            logger.debug(
+                "plan_node: grain warning injected for table %s (dim cols: %s)",
+                tbl_name, dim_sample,
+            )
+
+        i += 1
+
+    return "\n".join(result)
+
+
 # ── YoY / change column name patterns ────────────────────────────────────────
 _YOY_PATTERNS = (
     "vs_yago", "vs_py", "_yoy", "year_over_year", "prior_year",
@@ -1928,6 +2057,12 @@ def plan_node(state: DialogState) -> DialogState:
         if n.get("label") and n.get("label", "").lower() not in _EXCLUDED_LABELS
     ]
 
+    # Inject grain annotations before the LLM sees the schema context.
+    # This deterministically flags any table with sub-join-key granularity
+    # (e.g. price_index recorded at channel grain, not brand-pack-period grain)
+    # so the LLM knows it MUST pre-aggregate that table before joining.
+    schema_context = _annotate_schema_grain(schema_context)
+
     # Build a set of all valid column names from the schema context so we can
     # reject any SQL the LLM generates using hallucinated column names.
     known_columns = _extract_known_columns(schema_context)
@@ -2085,12 +2220,12 @@ def plan_node(state: DialogState) -> DialogState:
             state["plan_explanation"] = prose
             logger.info("plan_node: LLM returned [] with explanation (%d chars)", len(prose))
 
-    # ── Pre-flight completeness check ─────────────────────────────────────────
-    # Runs on the raw plan (before SQL validation / execution) to catch analytical
-    # gaps: missing CTEs, key-only CTEs, absent q_summary, missing YoY columns.
-    # If gaps are found we do ONE targeted correction call before the normal
-    # validation pass.  This is separate from the existing retry (which fires
-    # only when ALL queries are structurally rejected).
+    # ── Pre-flight completeness check (detection only — no LLM correction) ───
+    # Runs on the raw plan to detect analytical gaps and log them.
+    # NOTE: A correction LLM call was tried but caused regressions — the
+    # full-plan rewrite destroyed working queries.  Gap detection is kept
+    # for observability; the real fix is grain annotations injected into the
+    # schema context BEFORE the first LLM call (see _annotate_schema_grain).
     if plan:
         preflight_gaps = _preflight_check_plan(plan, known_columns, natural_query)
         if preflight_gaps:
@@ -2100,47 +2235,9 @@ def plan_node(state: DialogState) -> DialogState:
                 len(preflight_gaps), gap_text,
             )
             state.setdefault("errors", []).append(
-                f"plan_node: pre-flight gaps detected — triggering correction: "
+                "plan_node: pre-flight gaps (logged, not corrected): "
                 + "; ".join(preflight_gaps)
             )
-            preflight_user = (
-                "ANALYTICAL COMPLETENESS CORRECTION REQUIRED\n"
-                "=" * 60 + "\n"
-                "Your query plan has the following analytical gaps that MUST be "
-                "fixed before the plan can be accepted:\n\n"
-                f"{gap_text}\n\n"
-                "Produce a corrected plan that addresses EVERY gap listed above.\n"
-                "Rules:\n"
-                "  1. Every fact/metric JOIN query must use pre-aggregation CTEs "
-                "     (WITH left_agg AS (...), right_agg AS (...)) that GROUP BY "
-                "     (entity_key, period_key) and SELECT all needed metric columns.\n"
-                "  2. Every JOIN plan must include a q_summary query that is fully "
-                "     self-contained (its own CTEs + JOIN + GROUP BY entity).\n"
-                "  3. If the schema has YoY/change columns relevant to the question, "
-                "     they must appear in at least one query (preferably q_summary).\n"
-                "  4. All other rules from your original instructions still apply.\n"
-                "=" * 60 + "\n\n"
-                + user
-            )
-            try:
-                pf_raw  = _call_llm(system, preflight_user, config.plan_llm_model, config.llm_temperature)
-                pf_plan = _extract_json(pf_raw)
-                if pf_plan:
-                    # Re-check: if the corrected plan also has gaps, log and proceed
-                    # with it anyway (better than the original) rather than looping.
-                    remaining = _preflight_check_plan(pf_plan, known_columns, natural_query)
-                    if remaining:
-                        logger.warning(
-                            "plan_node: corrected plan still has %d gap(s) — proceeding: %s",
-                            len(remaining), remaining,
-                        )
-                    else:
-                        logger.info("plan_node: pre-flight correction resolved all gaps")
-                    plan = pf_plan
-                else:
-                    logger.warning("plan_node: pre-flight correction returned empty plan — keeping original")
-            except Exception as pf_exc:
-                logger.warning("plan_node: pre-flight correction call failed — %s", pf_exc)
 
     # Build valid join pair whitelist from schema context (used in join validation below)
     valid_join_pairs = _extract_valid_join_pairs(schema_context)

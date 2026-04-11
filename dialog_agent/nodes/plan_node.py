@@ -540,6 +540,47 @@ General Rules:
       • HR:            headcount_change     > total_headcount
       • Margin:        margin_improvement   > absolute_margin
       • Supply Chain:  fill_rate_change     > absolute_fill_rate
+
+10e. ANALYTICAL COMPLETENESS — answer EVERY part of the question:
+    Before finalising your query list, re-read the original question and ask:
+    "Have I generated queries that produce data for EVERY sub-question asked?"
+
+    The most common failure mode: the question has two parts —
+      Part A: "rank / identify entities by [primary metric]"
+      Part B: "determine whether the pattern was deliberate / driven / caused by X"
+    The system generates a query for Part A, then either skips Part B or writes
+    "this cannot be answered from the data" — even when the schema clearly has the
+    columns needed to answer Part B.
+
+    RULE: If the schema contains a YoY/change column (name contains _vs_yago,
+    _vs_py, _yoy, _growth, _change, _delta) for a metric related to the question,
+    you MUST include that column in your answer plan.  Doing so is not optional —
+    either:
+      (a) Add it to the same table query if both columns are in the same table, OR
+      (b) Add a second query (e.g. q2) that pulls the YoY metric for the relevant
+          entities, and join it in q3/q_summary using the pre-aggregation pattern
+          in rules 10c, 10c-i, 10c-ii.
+
+    "The data is not available" is ONLY acceptable when:
+      • The required column does not appear in the schema at all, OR
+      • No valid join key exists between the primary metric table and the YoY table
+        (and you have already looked carefully — see rule 10b).
+
+    It is NOT acceptable to omit a query for Part B simply because the question
+    did not use the exact words "deliberate", "YoY", or "prior year" — if the
+    analytical intent is to understand a performance driver and the YoY column
+    exists, include it.
+
+    Checklist before submitting your plan:
+      □ Does the question ask about more than one metric or dimension?  If yes,
+        is there a query for each?
+      □ Does the schema have a YoY/change column relevant to the question?  If yes,
+        is it in at least one query?
+      □ If two metrics come from different tables with a valid join key, is there a
+        joined query (with pre-aggregated CTEs) that shows them together?
+      □ Is there a q_summary that aggregates the joined result to entity level?
+    Only submit the plan when all four boxes are ticked.
+
 11. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
     The user's terminology will often DIFFER from the values stored in the database.
     You MUST resolve this mismatch before writing any WHERE clause.

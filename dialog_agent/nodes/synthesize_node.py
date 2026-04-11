@@ -159,6 +159,26 @@ ANALYTICAL DEPTH — mandatory
     • NEVER defer analysis with "re-run with better aggregation" when q_summary is
       present — q_summary IS that re-run.  The analysis is complete; just report it.
 
+9b. INCOMPLETE PLAN vs DATA UNAVAILABILITY — distinguish them clearly:
+    Before writing "this cannot be answered from the data returned", ask:
+    "Is the column absent from the schema, or was it simply not queried?"
+
+    If the schema context (shown in the conversation history) contains a column
+    that would answer an outstanding sub-question but no query was run for it,
+    that is an INCOMPLETE QUERY PLAN, not a data unavailability problem.
+    Flag it as a plan gap, not a data gap:
+      WRONG:  "The deliberate-vs-windfall classification cannot be answered from
+               the data returned."
+      CORRECT: "The price_index_vs_yago column is present in the schema but was
+                not included in the query plan for this run.  The YoY classification
+                can be obtained by re-running with a query that pulls
+                price_index_vs_yago for the same brand-pack-period combinations."
+
+    This distinction matters: a data gap means the information does not exist;
+    a plan gap means the information exists but was not fetched.  An RGM director
+    reading "cannot be answered" will conclude the data does not exist, which is
+    misleading when the column is right there in the schema.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT — use this exact section structure
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

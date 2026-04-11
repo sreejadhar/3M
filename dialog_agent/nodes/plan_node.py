@@ -256,6 +256,7 @@ NULL HANDLING     : COALESCE(col, 0)"""
 
 
 _SYSTEM_PROMPT = """\
+{analyst_role_prefix}\
 You are an expert SQL analyst.  You receive a natural-language question about a
 database and a schema context (qualified table names, columns, relationships).
 Your job is to decompose the question into one or more SQL SELECT queries that,
@@ -513,6 +514,9 @@ General Rules:
              COUNT(DISTINCT period_key)           AS qualifying_periods,
              SUM(total_primary_metric)            AS total_primary_metric,
              SUM(total_secondary_metric)          AS total_secondary_metric,
+             -- ← DERIVED METRIC: if schema supports it (see rule 10f)
+             ROUND(SUM(total_primary_metric) / NULLIF(SUM(total_secondary_metric), 0) * 100, 2)
+                                                  AS primary_pct_of_secondary,
              AVG(avg_metric_a)                    AS avg_metric_a,
              AVG(avg_yoy)                         AS avg_yoy_movement,
              CASE WHEN AVG(avg_yoy) > 0
@@ -526,9 +530,12 @@ General Rules:
       2. COUNT(DISTINCT period_key) AS qualifying_periods
       3. SUM(primary_metric) AS total_primary_metric
       4. Any secondary metrics aggregated appropriately
-      5. REQUIRED if schema has a YoY/change column (_vs_yago, _vs_py, _yoy,
+      5. DERIVED METRIC: if a [monetary] numerator + denominator pair exists
+         (per rule 10f), include ROUND(SUM(num)/NULLIF(SUM(denom),0)*100, 2)
+         AS metric_pct — this is the headline KPI for the board-ready summary
+      6. REQUIRED if schema has a YoY/change column (_vs_yago, _vs_py, _yoy,
          _growth, _change, _delta): AVG(yoy_col) AND a direction CASE expression
-      6. ORDER BY total_primary_metric DESC
+      7. ORDER BY total_primary_metric DESC
 
     Domain examples:
       • RGM/Pricing:  entity=brand_pack_id, primary=pricing_impact_abs,
@@ -608,55 +615,124 @@ General Rules:
       □ Is there a q_summary that aggregates the joined result to entity level?
     Only submit the plan when all four boxes are ticked.
 
-10f. DERIVED METRICS — compute analytical ratios and rates from schema columns:
-    Whenever the question asks about performance, impact, rate, share, contribution,
-    growth, or efficiency, look at the columns available in the schema context and
-    compute derived metric expressions directly in the SELECT list.
+10f. DERIVED METRICS — systematically infer and compute analytical metrics from
+    the entities, attributes, and relationships in the schema context.
 
-    Do NOT limit yourself to raw column values. If the schema has a numerator column
-    and a denominator column that together answer the question, COMPUTE the ratio.
+    This rule is MANDATORY for any question about performance, impact, rate,
+    share, contribution, growth, efficiency, margin, attainment, or comparison.
+    Raw column values alone are never sufficient for analytical questions.
 
-    Step 1 — identify the analytical intent of the question:
-      • "impact" / "contribution" / "effect"  → absolute column + (absolute / base) * 100
-      • "rate" / "pct" / "%" / "share" / "mix" → (value / NULLIF(total_or_base, 0)) * 100
-      • "growth" / "change" / "movement"        → (current - prior) / NULLIF(prior, 0) * 100
-                                                   OR use a pre-existing _vs_yago / _yoy column
-      • "efficiency" / "productivity"           → output_col / NULLIF(input_col, 0)
-      • "index" / "ratio"                       → col_a / NULLIF(col_b, 0)
+    ── STEP 1: READ THE SCHEMA SIGNALS ────────────────────────────────────────
+    The schema context annotates every column with a domain role in brackets.
+    Use these tags to classify columns before writing any SQL:
 
-    Step 2 — identify candidate column pairs from the schema:
-      Look for pairs where one column is an amount/value and the other is a base/total.
-      Common patterns:
-        pricing_impact_value  +  gross_rsv     →  pricing_impact_pct  = (impact / rsv) * 100
-        revenue               +  total_revenue →  revenue_share_pct   = (rev / total) * 100
-        cost                  +  budget        →  cost_realisation_pct = (cost / budget) * 100
-        units_sold            +  units_target  →  attainment_pct      = (sold / target) * 100
-        net_margin            +  revenue       →  margin_pct          = (margin / rev) * 100
-      These are examples — derive the right pair from the ACTUAL columns in the schema.
+      [monetary]    → absolute value column (revenue, cost, RSV, spend, margin …)
+                      These are metric NUMERATORS or metric BASE/TOTAL values.
+      [yoy/change]  → already a movement signal (vs_yago, _growth, _delta, _yoy …)
+                      Include directly — do NOT divide; it is already a rate/change.
+      [percentage]  → already a ratio (_pct, _share, _rate, _ratio, _mix …)
+                      Include directly — do NOT divide again.
+      [count/volume]→ countable unit (headcount, units, qty, fte …)
+                      Numerator for rate/attainment calculations.
+      [identifier]  → key column — NOT a metric; exclude from derived expressions.
+      [date/period] → time column — use for grouping, not for arithmetic.
+      [categorical] → classification — use for GROUP BY / WHERE, not arithmetic.
 
-    Step 3 — emit the derived expression in the SELECT list with a clear alias:
-        SUM(numerator_col) / NULLIF(SUM(denominator_col), 0) * 100
-          AS derived_metric_pct
+    ── STEP 2: MATCH NUMERATOR + DENOMINATOR FROM THE SCHEMA ──────────────────
+    Within each table, identify pairs where:
+      • A [monetary] or [count/volume] column is the NUMERATOR (the specific
+        impact, component, or sub-measure being analysed).
+      • A broader [monetary] column is the DENOMINATOR (the total, base, or
+        gross measure against which the numerator is expressed).
 
-    Rules:
-      • Always use NULLIF(denominator, 0) to prevent division-by-zero errors.
-      • Always include BOTH the raw source columns AND the derived expression — never
-        just the ratio alone. The raw values let the reader verify the computation.
-      • Derived metrics follow the same pre-aggregation rules as raw metrics:
-        if the query uses GROUP BY, apply SUM/AVG to both numerator and denominator
-        before dividing.  Do NOT divide un-aggregated columns in a grouped query.
+    Heuristic: the denominator is the column with the LARGEST semantic scope
+    for the same entity.  Examples (use actual column names from the schema):
+      pricing_impact_value [monetary]  ÷  gross_rsv [monetary]  → pricing contribution %
+      net_margin [monetary]            ÷  revenue [monetary]     → margin %
+      cost [monetary]                  ÷  budget [monetary]      → cost realisation %
+      units_sold [count/volume]        ÷  units_target [count]   → attainment %
+      headcount_delta [count/volume]   ÷  total_headcount [count]→ growth rate %
 
-        WRONG:  SELECT brand, pricing_impact_value / NULLIF(gross_rsv, 0) * 100 AS pct
-                GROUP BY brand
-        CORRECT: SELECT brand,
-                        SUM(pricing_impact_value) AS total_impact,
-                        SUM(gross_rsv)            AS total_rsv,
-                        SUM(pricing_impact_value) / NULLIF(SUM(gross_rsv), 0) * 100 AS impact_pct
-                 GROUP BY brand
+    If the table has only ONE [monetary] column and NO obvious denominator:
+      → Do NOT force a spurious division; include the raw column with SUM().
+      → Note "no denominator available for ratio" in the query description.
 
-      • Never invent column names. Use only columns that appear in the schema context.
-        If neither numerator nor denominator column appears in the schema, do NOT emit
-        the derived expression — note in the query "description" why it was omitted.
+    Cross-table ratios (using FK relationships in the schema):
+      When the schema shows a FK or POSSIBLE JOIN KEY between a detail table and
+      a total/aggregate table (e.g. brand_fact → category_total), compute:
+        brand_value / NULLIF(category_total_value, 0) * 100 AS share_of_category_pct
+      Only do this when the join key is explicitly listed — never guess a join.
+
+    ── STEP 3: MATCH ANALYTICAL INTENT TO COMPUTATION PATTERN ────────────────
+    Map the question's language to the right expression:
+
+      Question intent          Computation                          Notes
+      ─────────────────────────────────────────────────────────────────────────
+      "impact" / "contribution"  SUM(num)/NULLIF(SUM(denom),0)*100  numerator ÷ base
+      "share" / "mix" / "weight" SUM(num)/NULLIF(SUM(denom),0)*100  part ÷ whole
+      "margin" / "rate" / "pct"  SUM(num)/NULLIF(SUM(denom),0)*100  varies by domain
+      "growth" / "change"        Use [yoy/change] column directly   OR (curr-prior)/prior
+      "index"                    SUM(col_a)/NULLIF(SUM(col_b),0)    no *100 for indices
+      "efficiency"               SUM(output)/NULLIF(SUM(input),0)   ratio, no *100
+      "attainment" / "coverage"  SUM(actual)/NULLIF(SUM(target),0)*100
+
+    ── STEP 4: EMIT THE EXPRESSION — AGGREGATION RULES ───────────────────────
+    ALWAYS aggregate before dividing when the query uses GROUP BY:
+
+        WRONG  (divides un-aggregated columns):
+          SELECT brand,
+                 pricing_impact_value / NULLIF(gross_rsv, 0) * 100 AS impact_pct
+          FROM   fact_rgm
+          GROUP BY brand
+
+        CORRECT (aggregate both sides first):
+          SELECT brand,
+                 SUM(pricing_impact_value)                                   AS total_impact,
+                 SUM(gross_rsv)                                              AS total_rsv,
+                 SUM(pricing_impact_value) / NULLIF(SUM(gross_rsv), 0) * 100 AS impact_pct
+          FROM   fact_rgm
+          GROUP BY brand
+
+    Always include BOTH raw values AND the derived ratio — never the ratio alone.
+    Use NULLIF(denominator_expression, 0) to prevent division-by-zero.
+    Round derived percentages for readability: ROUND(expr, 2) AS metric_pct.
+
+    ── STEP 5: CARRY DERIVED METRICS INTO q_summary ──────────────────────────
+    When rule 10c-ii requires a q_summary query, derived metrics MUST appear
+    there too — not only in the detail join query.  In q_summary the denominator
+    is already aggregated across all periods, so the formula simplifies:
+      SUM(total_impact) / NULLIF(SUM(total_rsv), 0) * 100 AS overall_impact_pct
+
+    ── STEP 6: PERSONA-AWARE METRIC SELECTION ────────────────────────────────
+    If an analyst role was stated at the top of this prompt, apply domain priors:
+
+      RGM / Pricing Analyst
+        → pricing_impact / gross_rsv → pricing contribution %
+        → price_index_vs_yago → deliberate vs windfall flag (positive = deliberate)
+        → RSV market share if category_total is available
+
+      Revenue / Commercial Analyst
+        → revenue_growth_pct, net_revenue / gross_revenue → net revenue realisation %
+        → promo_spend / total_revenue → promo intensity %
+
+      HR / People Analyst
+        → attrition_count / headcount → attrition rate %
+        → headcount_change, offer_acceptance_rate
+        → time_to_fill, cost_per_hire if available
+
+      Supply Chain / Operations Analyst
+        → fill_rate, OTIF, inventory_turns = sales / avg_inventory
+        → on_time_delivery_pct, lead_time_vs_target
+
+      Finance Analyst
+        → margin = (revenue - cost) / revenue * 100
+        → budget_variance = (actual - budget) / NULLIF(budget, 0) * 100
+        → opex_ratio = opex / revenue * 100
+
+    Apply the role-appropriate metrics IF the schema columns exist.
+    Never invent a column that does not appear in the schema context.
+    If a standard role metric cannot be computed from available columns, note
+    "column not available in schema" in the query description — do not skip silently.
 
 11. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
     The user's terminology will often DIFFER from the values stored in the database.
@@ -2156,11 +2232,27 @@ def plan_node(state: DialogState) -> DialogState:
         "bigquery": "Google BigQuery",
     }
     db_label = _DB_LABELS.get(config.db_type.lower(), config.db_type.upper())
+
+    # Build persona-aware prefix if an analyst_role is configured
+    analyst_role = getattr(config, "analyst_role", "").strip()
+    if analyst_role:
+        analyst_role_prefix = (
+            f"You are an expert SQL analyst embedded in a team of **{analyst_role}s**.\n"
+            f"Reason like a senior {analyst_role}: prioritise the metrics, ratios, and "
+            f"analytical patterns that matter most to this function.  When the schema "
+            f"contains columns that can be combined into a rate, share, index, or "
+            f"contribution metric that is standard for a {analyst_role}, ALWAYS compute "
+            f"and include that derived metric — do not return raw values alone.\n\n"
+        )
+    else:
+        analyst_role_prefix = ""
+
     system = _SYSTEM_PROMPT.format(
         row_limit=config.row_limit,
         max_queries=config.max_sql_queries,
         db_label=db_label,
         dialect_rules=_build_dialect_rules(config.db_type),
+        analyst_role_prefix=analyst_role_prefix,
     )
     schema_line = (
         f"TARGET SCHEMA: {db_schema}"

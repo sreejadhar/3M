@@ -306,6 +306,65 @@ def _build_taxonomy_hierarchy(
     return hierarchy
 
 
+# ── Column domain annotation ──────────────────────────────────────────────────
+# Ordered: first match wins.  Each entry: (role_tag, compiled_regex_on_lower_name)
+_COL_DOMAIN_PATTERNS: List[tuple] = [
+    # Change / YoY signals — strongest signal, check first
+    ("yoy/change",
+     re.compile(
+         r'(_vs_yago|_vs_py|_vs_prior|_prior_year|_yoy|year_over_year'
+         r'|_growth|_change|_delta|_improvement|_variance|_vs_last_year)',
+         re.I,
+     )),
+    # Percentage / rate / share — already a ratio, no further division needed
+    ("percentage",
+     re.compile(r'(_pct|_percent|_ratio|_share|_mix|_rate|_proportion)$', re.I)),
+    # Monetary values — strong numerator / denominator candidates
+    ("monetary",
+     re.compile(
+         r'(revenue|gross_rsv|net_rsv|\brsv\b|cost|price|amount|salary|wage'
+         r'|budget|expense|\bvalue\b|profit|loss|margin|fee|spend|sales'
+         r'|invoice|turnover|impact)',
+         re.I,
+     )),
+    # Count / volume — numerator candidate for rate calculations
+    ("count/volume",
+     re.compile(
+         r'(\bcount\b|_qty|quantity|volume|units|headcount|fte|\bstaff\b'
+         r'|employees|resources)',
+         re.I,
+     )),
+    # Identifier columns — not metrics; skip for derived-metric inference
+    ("identifier",
+     re.compile(r'(_id|_key|_code|_no\b|_num\b|_ref|_pk|_fk|_seq|uuid|guid)$', re.I)),
+    # Date / period columns
+    ("date/period",
+     re.compile(
+         r'(date|time|year|month|day|period|quarter|week|\bcreated\b|updated|timestamp)',
+         re.I,
+     )),
+    # Categorical / classification columns
+    ("categorical",
+     re.compile(
+         r'(status|flag|type|category|class|tier|level|grade|region|country'
+         r'|channel|segment|brand|product|market|customer|supplier)',
+         re.I,
+     )),
+]
+
+
+def _infer_col_domain(col_name: str) -> Optional[str]:
+    """
+    Return a short domain role tag for a column based on its name alone.
+    Returns None if no pattern matches (to avoid noisy annotations).
+    """
+    lower = col_name.lower()
+    for role, pat in _COL_DOMAIN_PATTERNS:
+        if pat.search(lower):
+            return role
+    return None
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_columns_from_title(title: str, table_label: str) -> List[str]:
@@ -583,7 +642,14 @@ def _summarise_graph(
                     else:
                         lines.append(f"    {display}  [sample values: {sample_str}]")
                 else:
-                    lines.append(f"    {display}")
+                    # No sample data (DB source) — annotate with inferred domain role
+                    # so the planner can identify metric numerators / denominators.
+                    col_name_for_domain = sql_col if samples is not None else original_col
+                    domain_tag = _infer_col_domain(col_name_for_domain)
+                    if domain_tag:
+                        lines.append(f"    {display}  [{domain_tag}]")
+                    else:
+                        lines.append(f"    {display}")
 
         # Foreign-key relationships (edges)
         for edge in edges_by_src.get(node_id, []):

@@ -773,44 +773,111 @@ def _find_hallucinated_columns(sql: str, known_cols: set) -> List[str]:
 
 def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
     """
-    Remove WHERE / AND / OR conditions that reference hallucinated dotted columns
-    (e.g. ``AND md.Check_PC = 'X'``).  Returns cleaned SQL so the rest of the
-    query can still execute.  Falls back to the original SQL on any error.
+    Remove references to hallucinated dotted columns (alias.col where col is not
+    in the schema) from wherever they appear in the SQL:
 
-    Handles the three most common placements:
-      1. WHERE alias.col op value  (sole condition → remove entire WHERE clause)
-      2. WHERE alias.col op value AND next_cond  (→ convert next_cond to WHERE)
-      3. AND/OR alias.col op value  (→ remove the AND/OR arm)
+      1. WHERE / AND / OR filters  — remove the condition
+      2. SELECT list               — remove the column expression (with its AS alias)
+      3. ORDER BY list             — remove the term
+      4. GROUP BY list             — remove the term
+      5. HAVING clause             — remove the condition arm
+
+    Falls back to the original SQL on any unhandled exception.
     """
     try:
         for col in bad_cols:
             cp = re.escape(col)
-            # Value token: a quoted string, a number, or a bare word (handles =, LIKE, IN, IS)
             val = r"""(?:'[^']*'|\([^)]*\)|[^\s,)]+)"""
             op  = r"(?:=|!=|<>|>=|<=|>|<|(?:NOT\s+)?LIKE|(?:NOT\s+)?IN|IS(?:\s+NOT)?)"
 
-            # Case 3: AND/OR condition  — simplest, remove the entire arm
+            # ── WHERE / AND / OR filters ──────────────────────────────────
+            # Case: AND/OR arm
             sql = re.sub(
                 r"(?i)\s+(?:AND|OR)\s+\w+\." + cp + r"\s+" + op + r"\s*" + val,
-                "",
-                sql,
+                "", sql,
             )
-
-            # Case 2: WHERE col ... AND next → replace with WHERE next
+            # Case: WHERE col ... AND next → convert to WHERE next
             sql = re.sub(
                 r"(?i)\bWHERE\s+\w+\." + cp + r"\s+" + op + r"\s*" + val + r"\s+AND\s+",
-                "WHERE ",
-                sql,
+                "WHERE ", sql,
             )
-
-            # Case 1: WHERE col ... (nothing follows, or clause keywords follow)
+            # Case: sole WHERE condition
             sql = re.sub(
                 r"(?i)\s+WHERE\s+\w+\." + cp + r"\s+" + op + r"\s*" + val
                 + r"(?=\s*(?:GROUP\b|ORDER\b|HAVING\b|LIMIT\b|$))",
-                "",
-                sql,
+                "", sql,
             )
 
+            # ── HAVING filters (same patterns as WHERE) ───────────────────
+            sql = re.sub(
+                r"(?i)\s+(?:AND|OR)\s+\w+\." + cp + r"\s+" + op + r"\s*" + val,
+                "", sql,
+            )
+            sql = re.sub(
+                r"(?i)\bHAVING\s+\w+\." + cp + r"\s+" + op + r"\s*" + val + r"\s+AND\s+",
+                "HAVING ", sql,
+            )
+            sql = re.sub(
+                r"(?i)\s+HAVING\s+\w+\." + cp + r"\s+" + op + r"\s*" + val
+                + r"(?=\s*(?:GROUP\b|ORDER\b|LIMIT\b|$))",
+                "", sql,
+            )
+
+            # ── SELECT list: remove   alias.col [AS label]  ───────────────
+            # Mid-list: ", alias.col AS label" or ", alias.col"
+            sql = re.sub(
+                r"(?i),\s*\w+\." + cp + r"(?:\s+AS\s+\w+)?(?=\s*[,\n]|\s*FROM\b)",
+                "", sql,
+            )
+            # Leading item after SELECT [DISTINCT]: capture keyword, strip col + comma
+            sql = re.sub(
+                r"(?i)(SELECT(?:\s+DISTINCT)?)\s+\w+\." + cp + r"(?:\s+AS\s+\w+)?\s*,\s*",
+                r"\1 ", sql,
+            )
+
+            # ── ORDER BY: remove the term (with optional ASC/DESC) ────────
+            # Strategy: remove any occurrence of "alias.col [ASC|DESC]" inside
+            # an ORDER BY clause, cleaning up surrounding commas.
+            # Step 1: remove when preceded by a comma  ", alias.col [ASC|DESC]"
+            sql = re.sub(
+                r"(?i),\s*\w+\." + cp + r"(?:\s+(?:ASC|DESC))?",
+                "", sql,
+            )
+            # Step 2: remove when it is the first (or only) term, followed by comma
+            # "ORDER BY alias.col [ASC|DESC] ,"  →  "ORDER BY "
+            sql = re.sub(
+                r"(?i)(ORDER\s+BY\s+)\w+\." + cp + r"(?:\s+(?:ASC|DESC))?\s*,\s*",
+                r"\1", sql,
+            )
+            # Step 3: remove when it is the only remaining term — drop entire ORDER BY
+            sql = re.sub(
+                r"(?i)\s+ORDER\s+BY\s+\w+\." + cp + r"(?:\s+(?:ASC|DESC))?\s*[;]?\s*\Z",
+                "", sql,
+            )
+            # Step 3b: same but not at \Z (something follows like LIMIT)
+            sql = re.sub(
+                r"(?i)\s+ORDER\s+BY\s+\w+\." + cp + r"(?:\s+(?:ASC|DESC))?\s*(?=LIMIT|FETCH|OFFSET)",
+                " ", sql,
+            )
+
+            # ── GROUP BY: remove the term ─────────────────────────────────
+            # Mid-list
+            sql = re.sub(r"(?i),\s*\w+\." + cp + r"(?=\s*[,;]|\s*$|\s*(?:ORDER|HAVING|LIMIT)\b)", "", sql)
+            # Leading item followed by comma
+            sql = re.sub(r"(?i)(GROUP\s+BY\s+)\w+\." + cp + r"\s*,\s*", r"\1", sql)
+            # Sole term — drop entire GROUP BY clause
+            sql = re.sub(
+                r"(?i)\s+GROUP\s+BY\s+\w+\." + cp
+                + r"(?=\s*(?:ORDER|HAVING|LIMIT|\s*;|\s*\Z))",
+                "", sql,
+            )
+
+        # Tidy up artefacts left by removals
+        sql = re.sub(r",\s*,", ",", sql)                                    # double comma
+        sql = re.sub(r"(?i)(SELECT(?:\s+DISTINCT)?)\s*,", r"\1 ", sql)      # SELECT ,
+        sql = re.sub(r"(?i),\s*(FROM\b)", r" \1", sql)                      # trailing comma before FROM
+        sql = re.sub(r"(?i)(ORDER\s+BY|GROUP\s+BY)\s*(?=(?:LIMIT|HAVING|ORDER|$|\s*;))",
+                     "", sql)                                                # empty ORDER/GROUP BY
         return sql.strip()
     except Exception:
         return sql

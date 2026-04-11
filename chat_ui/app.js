@@ -2601,7 +2601,7 @@ async function openKGExplorer(sourceId) {
   // Destroy any existing vis network
   if (_kgNetwork) { _kgNetwork.destroy(); _kgNetwork = null; }
 
-  // Load graph + ontology in parallel
+  // Load graph, ontology and bridges in parallel
   const [graphData, ontologyData] = await Promise.all([
     apiGetSourceGraph(sourceId),
     apiGetSourceOntology(sourceId),
@@ -2615,6 +2615,9 @@ async function openKGExplorer(sourceId) {
   const editor = document.getElementById('kgOntologyEditor');
   editor.value  = _kgOntologyOriginal;
   editor.disabled = false;
+
+  // Render bridges diagram below the graph (non-blocking)
+  loadAndRenderBridgeDiagram(sourceId);
 }
 
 function closeKGExplorer() {
@@ -2631,6 +2634,210 @@ function closeKGExplorer() {
   document.getElementById('kgGraphragLegend').style.display = 'none';
   document.getElementById('kgGraphragReset').style.display  = 'none';
   document.getElementById('kgGraphragInput').value          = '';
+}
+
+// ── KG Bridges diagram ─────────────────────────────────────────────────────────
+// Renders a canvas diagram of all cross-source bridges that involve the current
+// source.  Each distinct KG name becomes a rounded-rect node; each bridge is an
+// arc/line between them labelled with entity.column → entity.column.
+
+async function loadAndRenderBridgeDiagram(sourceId) {
+  const canvas   = document.getElementById('kgBridgesCanvas');
+  const emptyEl  = document.getElementById('kgBridgesEmpty');
+  const countEl  = document.getElementById('kgBridgesCount');
+  if (!canvas) return;
+
+  // Fetch all bridges
+  let bridges = [];
+  try { bridges = await apiBridgeList(); } catch (_) { bridges = []; }
+
+  // Filter to those involving this source's KG name (match source_id substring or KG name)
+  const srcObj   = sources[sourceId];
+  const kgName   = srcObj ? (srcObj.name || sourceId) : sourceId;
+  // Match bridges where from_kg or to_kg mentions the source name/id (case-insensitive)
+  const re       = new RegExp(escapeRegex(kgName), 'i');
+  const srcBridges = bridges.filter(b =>
+    re.test(b.from_kg) || re.test(b.to_kg) ||
+    b.from_source_id === sourceId || b.to_source_id === sourceId
+  );
+
+  // Fall back to all bridges if no source-specific match (allows seeing the full bridge map)
+  const drawBridges = srcBridges.length ? srcBridges : bridges;
+
+  if (!drawBridges.length) {
+    canvas.style.display  = 'none';
+    emptyEl.style.display = 'flex';
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+  canvas.style.display  = 'block';
+  if (countEl) countEl.textContent = drawBridges.length;
+
+  renderBridgeDiagram(canvas, drawBridges);
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function renderBridgeDiagram(canvas, bridges) {
+  const isDark  = document.documentElement.classList.contains('dark-mode') ||
+                  window.matchMedia('(prefers-color-scheme: dark)').matches;
+
+  const COLORS = {
+    nodeFill:    isDark ? '#1e293b' : '#f0f4ff',
+    nodeBorder:  isDark ? '#4285F4' : '#4285F4',
+    nodeText:    isDark ? '#e2e8f0' : '#1a202c',
+    edgeDeclared:  '#059669',
+    edgeInferred:  '#3b82f6',
+    edgeDisabled:  isDark ? '#4b5563' : '#d1d5db',
+    edgeLabel:   isDark ? '#94a3b8' : '#475569',
+    bg:          isDark ? '#111827' : '#f8fafc',
+  };
+
+  // Collect distinct KG node names
+  const kgNames = [...new Set(bridges.flatMap(b => [b.from_kg, b.to_kg]))];
+  const N = kgNames.length;
+
+  const H          = 180;
+  const NODE_W     = 140;
+  const NODE_H     = 42;
+  const MIN_COL_W  = NODE_W + 60;
+  const totalW     = Math.max(800, N * MIN_COL_W + 60);
+
+  canvas.width  = totalW;
+  canvas.height = H;
+  canvas.style.height = H + 'px';
+
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, totalW, H);
+
+  // Background
+  ctx.fillStyle = COLORS.bg;
+  ctx.fillRect(0, 0, totalW, H);
+
+  // Lay nodes out evenly across the top half
+  const nodeY  = 48;
+  const nodePositions = {};   // kgName → {x, y}
+
+  kgNames.forEach((name, i) => {
+    const x = Math.round((totalW / (N + 1)) * (i + 1));
+    nodePositions[name] = { x, y: nodeY };
+  });
+
+  // Draw edges first (behind nodes)
+  bridges.forEach(b => {
+    const from = nodePositions[b.from_kg];
+    const to   = nodePositions[b.to_kg];
+    if (!from || !to) return;
+
+    const disabled  = b.enabled === false;
+    const isInferred = b.source === 'inferred';
+    const strokeColor = disabled ? COLORS.edgeDisabled
+                      : isInferred ? COLORS.edgeInferred
+                      : COLORS.edgeDeclared;
+
+    ctx.save();
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth   = disabled ? 1 : 2;
+    if (disabled) ctx.setLineDash([4, 4]);
+    ctx.globalAlpha = disabled ? 0.45 : 1;
+
+    // Curved arc between nodes
+    const x1 = from.x;
+    const x2 = to.x;
+    const y1 = from.y + NODE_H;
+    const y2 = to.y + NODE_H;
+    const mx = (x1 + x2) / 2;
+    const curveY = y1 + 60 + Math.abs(x2 - x1) * 0.08;
+
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.quadraticCurveTo(mx, curveY, x2, y2);
+    ctx.stroke();
+
+    // Arrowhead at destination
+    const angle = Math.atan2(y2 - curveY, x2 - mx);
+    ctx.save();
+    ctx.translate(x2, y2);
+    ctx.rotate(angle);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(-10, -5);
+    ctx.lineTo(-10,  5);
+    ctx.closePath();
+    ctx.fillStyle = strokeColor;
+    ctx.globalAlpha = disabled ? 0.45 : 1;
+    ctx.fill();
+    ctx.restore();
+
+    // Edge label: "entity.col → entity.col  (join_type, conf%)"
+    if (!disabled) {
+      const confPct   = Math.round((b.confidence || 0) * 100);
+      const joinLabel = b.join_type || 'FK';
+      const edgeLabel = `${b.from_entity ? b.from_entity + '.' : ''}${b.from_column} → ${b.to_entity ? b.to_entity + '.' : ''}${b.to_column}`;
+      const subLabel  = `${joinLabel} · ${confPct}%`;
+      const labelX    = mx;
+      const labelY    = curveY + 14;
+
+      ctx.globalAlpha = 1;
+      ctx.font        = 'bold 11px system-ui, sans-serif';
+      ctx.fillStyle   = strokeColor;
+      ctx.textAlign   = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(edgeLabel, labelX, labelY);
+
+      ctx.font      = '10px system-ui, sans-serif';
+      ctx.fillStyle = COLORS.edgeLabel;
+      ctx.fillText(subLabel, labelX, labelY + 13);
+    }
+
+    ctx.restore();
+  });
+
+  // Draw nodes on top of edges
+  kgNames.forEach(name => {
+    const { x, y } = nodePositions[name];
+    const nx = x - NODE_W / 2;
+    const ny = y - NODE_H / 2;
+    const r  = 8;  // border radius
+
+    // Rounded rect fill
+    ctx.beginPath();
+    ctx.moveTo(nx + r, ny);
+    ctx.lineTo(nx + NODE_W - r, ny);
+    ctx.arcTo(nx + NODE_W, ny, nx + NODE_W, ny + r, r);
+    ctx.lineTo(nx + NODE_W, ny + NODE_H - r);
+    ctx.arcTo(nx + NODE_W, ny + NODE_H, nx + NODE_W - r, ny + NODE_H, r);
+    ctx.lineTo(nx + r, ny + NODE_H);
+    ctx.arcTo(nx, ny + NODE_H, nx, ny + NODE_H - r, r);
+    ctx.lineTo(nx, ny + r);
+    ctx.arcTo(nx, ny, nx + r, ny, r);
+    ctx.closePath();
+
+    ctx.fillStyle   = COLORS.nodeFill;
+    ctx.fill();
+    ctx.strokeStyle = COLORS.nodeBorder;
+    ctx.lineWidth   = 2;
+    ctx.stroke();
+
+    // Label
+    ctx.font         = 'bold 12px system-ui, sans-serif';
+    ctx.fillStyle    = COLORS.nodeText;
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    // Truncate long names
+    let label = name;
+    if (ctx.measureText(label).width > NODE_W - 16) {
+      while (label.length > 4 && ctx.measureText(label + '…').width > NODE_W - 16) {
+        label = label.slice(0, -1);
+      }
+      label += '…';
+    }
+    ctx.fillText(label, x, y);
+  });
 }
 
 function renderKGGraph(nodes, edges) {

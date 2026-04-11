@@ -771,36 +771,50 @@
         <button class="modal-close" id="kgExplorerClose">✕</button>
       </div>
       <div class="kg-explorer-body">
-        <!-- Left pane: KG graph -->
-        <div class="kg-graph-pane">
-          <div class="kg-pane-label">Knowledge Graph</div>
-          <!-- GraphRAG query bar -->
-          <div class="kg-graphrag-bar">
-            <input class="kg-graphrag-input" id="kgGraphragInput"
-                   type="text" placeholder="Test GraphRAG: type a natural language question…" />
-            <button class="kg-graphrag-btn" id="kgGraphragBtn">Search</button>
-            <button class="kg-graphrag-reset" id="kgGraphragReset" title="Clear highlights" style="display:none">✕</button>
+        <!-- Top row: graph + ontology -->
+        <div class="kg-top-row">
+          <!-- Left pane: KG graph -->
+          <div class="kg-graph-pane">
+            <div class="kg-pane-label">Knowledge Graph</div>
+            <!-- GraphRAG query bar -->
+            <div class="kg-graphrag-bar">
+              <input class="kg-graphrag-input" id="kgGraphragInput"
+                     type="text" placeholder="Test GraphRAG: type a natural language question…" />
+              <button class="kg-graphrag-btn" id="kgGraphragBtn">Search</button>
+              <button class="kg-graphrag-reset" id="kgGraphragReset" title="Clear highlights" style="display:none">✕</button>
+            </div>
+            <div class="kg-graphrag-legend" id="kgGraphragLegend" style="display:none">
+              <span class="kg-legend-seed">Seed (top-K)</span>
+              <span class="kg-legend-expanded">Expanded (BFS)</span>
+              <span class="kg-legend-other">Other nodes</span>
+              <span class="kg-graphrag-backend" id="kgGraphragBackend"></span>
+            </div>
+            <div class="kg-graph-container" id="kgGraphContainer">
+              <div class="kg-graph-placeholder" id="kgGraphPlaceholder">Loading graph…</div>
+            </div>
           </div>
-          <div class="kg-graphrag-legend" id="kgGraphragLegend" style="display:none">
-            <span class="kg-legend-seed">Seed (top-K)</span>
-            <span class="kg-legend-expanded">Expanded (BFS)</span>
-            <span class="kg-legend-other">Other nodes</span>
-            <span class="kg-graphrag-backend" id="kgGraphragBackend"></span>
-          </div>
-          <div class="kg-graph-container" id="kgGraphContainer">
-            <div class="kg-graph-placeholder" id="kgGraphPlaceholder">Loading graph…</div>
+          <!-- Right pane: Ontology editor -->
+          <div class="kg-ontology-pane">
+            <div class="kg-pane-label">
+              Ontology (OWL/Turtle)
+              <span class="kg-modified-badge" id="kgModifiedBadge" style="display:none">modified</span>
+            </div>
+            <textarea class="kg-ontology-editor" id="kgOntologyEditor"
+                      placeholder="Ontology text will appear here…" spellcheck="false"></textarea>
+            <div class="kg-ontology-hint" id="kgOntologyHint">
+              Editing the ontology will update the graph preview. Admin can save changes.
+            </div>
           </div>
         </div>
-        <!-- Right pane: Ontology editor -->
-        <div class="kg-ontology-pane">
+        <!-- Bottom strip: KG Bridges diagram -->
+        <div class="kg-bridges-section" id="kgBridgesSection">
           <div class="kg-pane-label">
-            Ontology (OWL/Turtle)
-            <span class="kg-modified-badge" id="kgModifiedBadge" style="display:none">modified</span>
+            Cross-Source Bridges
+            <span class="kg-bridges-count" id="kgBridgesCount"></span>
           </div>
-          <textarea class="kg-ontology-editor" id="kgOntologyEditor"
-                    placeholder="Ontology text will appear here…" spellcheck="false"></textarea>
-          <div class="kg-ontology-hint" id="kgOntologyHint">
-            Editing the ontology will update the graph preview. Admin can save changes.
+          <div class="kg-bridges-canvas-wrap" id="kgBridgesCanvasWrap">
+            <div class="kg-bridges-empty" id="kgBridgesEmpty">No bridges defined for this source.</div>
+            <canvas id="kgBridgesCanvas" style="display:none"></canvas>
           </div>
         </div>
       </div>
@@ -894,6 +908,6 @@
     </div>
   </div>
 
-  <script src="/ui/app.js?v=13"></script>
+  <script src="/ui/app.js?v=14"></script>
 </body>
 </html>

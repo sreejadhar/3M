@@ -372,41 +372,53 @@ General Rules:
     Fix — use a pre-aggregated subquery or CTE on the right-hand table before
     joining, so you guarantee at most one row per (entity_key, period_key):
 
-      WITH price_agg AS (
-        SELECT brand_pack_id, period_id,
-               AVG(price_index)         AS avg_price_index,
-               AVG(price_index_vs_yago) AS avg_price_index_vs_yago
-        FROM   price_index_table
-        GROUP BY brand_pack_id, period_id
+      WITH right_agg AS (
+        SELECT entity_key, period_key,
+               AVG(metric_col_a)  AS avg_metric_a,
+               AVG(metric_col_b)  AS avg_metric_b
+        FROM   right_hand_table
+        GROUP BY entity_key, period_key
       )
-      SELECT f.brand_pack_id, f.period_id,
-             f.pricing_impact_abs, f.gross_rsv,
-             p.avg_price_index, p.avg_price_index_vs_yago
-      FROM   fact_table AS f
-      JOIN   price_agg  AS p
-        ON   f.brand_pack_id = p.brand_pack_id
-        AND  f.period_id     = p.period_id
+      SELECT f.entity_key, f.period_key,
+             f.fact_metric_1, f.fact_metric_2,
+             r.avg_metric_a, r.avg_metric_b
+      FROM   fact_table  AS f
+      JOIN   right_agg   AS r
+        ON   f.entity_key  = r.entity_key
+        AND  f.period_key  = r.period_key
 
-    NEVER write: FROM fact JOIN price_index ON (brand_pack_id, period_id)
-    without first confirming price_index has exactly one row per key.
+    Replace entity_key / period_key / metric_col_a / metric_col_b with the
+    actual column names from the schema.  The pattern applies to any domain:
+    brand+period (RGM), employee+month (HR), store+week (retail), etc.
+
+    NEVER write: FROM fact JOIN detail_table ON (entity_key, period_key)
+    without first confirming detail_table has exactly one row per key.
     When in doubt — always pre-aggregate.
 
 10c-ii. FINAL SUMMARY AGGREGATE — when a multi-step analytical question produces
-    a co-occurrence or filtered dataset (e.g. "brand-packs with both high pricing
-    impact AND elevated price index"), ALWAYS emit a final summary query that
-    aggregates the co-occurrence result to the entity level:
+    a co-occurrence or filtered dataset, ALWAYS emit a final summary query that
+    aggregates the co-occurrence result to the primary entity level.
+    This applies in ANY domain: products/brands, employees, stores, customers,
+    suppliers, regions, etc.
 
-      SELECT brand_pack_id, brand_name, pack_size,
-             COUNT(DISTINCT period_id)         AS qualifying_periods,
-             SUM(pricing_impact_abs)           AS total_pricing_impact_abs,
-             SUM(gross_rsv)                    AS total_gross_rsv,
-             AVG(avg_price_index)              AS avg_price_index,
-             AVG(avg_price_index_vs_yago)      AS avg_yoy_movement,
-             CASE WHEN AVG(avg_price_index_vs_yago) > 0
-                  THEN 'deliberate' ELSE 'windfall' END AS execution_type
-      FROM   <co-occurrence CTE>
-      GROUP BY brand_pack_id, brand_name, pack_size
-      ORDER BY total_pricing_impact_abs DESC
+    Generic pattern (substitute actual column names from the schema):
+
+      SELECT entity_key,
+             <entity_label_cols>,           -- e.g. brand_name, employee_name, store_name
+             COUNT(DISTINCT period_key)      AS qualifying_periods,
+             SUM(primary_metric)            AS total_primary_metric,
+             AVG(secondary_metric)          AS avg_secondary_metric,
+             <optional CASE classification based on domain logic>
+      FROM   <co-occurrence CTE or subquery>
+      GROUP BY entity_key, <entity_label_cols>
+      ORDER BY total_primary_metric DESC
+
+    Examples across domains:
+      • RGM/Pricing:    entity=brand_pack_id, metrics=pricing_impact_abs, gross_rsv
+      • HR/Workforce:   entity=employee_id,   metrics=headcount, attrition_count
+      • Retail/Sales:   entity=store_id,      metrics=revenue, units_sold
+      • Finance:        entity=cost_centre_id, metrics=budget_variance, actuals
+      • Supply Chain:   entity=supplier_id,   metrics=order_fill_rate, lead_time_days
 
     This final aggregate is the board-ready answer — it replaces thousands of
     raw co-occurrence rows with a concise per-entity summary.  Without it, the
@@ -417,18 +429,32 @@ General Rules:
     result in an aggregation to entity level.  Use a CTE or subquery to avoid
     repeating the full JOIN logic.
 
-10d. YEAR-OVER-YEAR vs ABSOLUTE INDEX — when the question asks about DELIBERATE
-    price changes, price-up execution, or windfall vs intentional pricing, ALWAYS
-    prefer year-over-year / vs-prior-year columns over absolute index columns.
-    Reasoning: an absolute price index of 120 means the SKU is priced 20% above
-    the category average — but that may have been true for years.  A positive
-    price_index_vs_yago (or equivalent) means the index MOVED up this period —
-    that is the signal for deliberate price-up execution.
-    RULE: If the schema has a column whose name contains "vs_yago", "vs_py",
-    "prior_year", "yoy", "year_over_year", or "vs_last_year" alongside a price
-    index column, use the YoY column as the primary filter / metric for any
-    question that mentions "deliberate", "intentional", "price-up execution",
-    "windfall", or "vs prior year".
+10d. YEAR-OVER-YEAR vs ABSOLUTE LEVEL — when the question asks whether a metric
+    CHANGED, IMPROVED, GREW, or MOVED (not just whether it is high or low),
+    ALWAYS prefer a period-over-period / YoY column over an absolute level column.
+
+    Reasoning: an absolute value of 120 (price index, revenue, headcount, etc.)
+    describes the current position — it may have been there for years.  A positive
+    YoY / change column means the metric MOVED this period — that is the signal
+    for deliberate change, growth, or improvement.
+
+    RULE: If the schema has a column whose name contains any of:
+      "vs_yago", "vs_py", "prior_year", "yoy", "year_over_year", "vs_last_year",
+      "_growth", "_change", "_delta", "_improvement", "_vs_prior", "_variance"
+    alongside an absolute level column for the same metric, use the change/YoY
+    column as the primary filter / metric whenever the question uses language like:
+      • "deliberate", "intentional", "executed", "driven" (pricing/revenue)
+      • "grew", "increased", "improved", "declined", "fell" (any metric)
+      • "change in", "movement in", "shift in", "vs prior year/period"
+      • "headcount growth" (not headcount size), "margin improvement" (not margin level)
+      • "sales growth" (not total sales), "cost increase" (not cost level)
+
+    This applies across ALL domains:
+      • RGM/Pricing:   price_index_vs_yago  > absolute price_index
+      • Revenue:       revenue_growth_pct   > total_revenue
+      • HR:            headcount_change     > total_headcount
+      • Margin:        margin_improvement   > absolute_margin
+      • Supply Chain:  fill_rate_change     > absolute_fill_rate
 11. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
     The user's terminology will often DIFFER from the values stored in the database.
     You MUST resolve this mismatch before writing any WHERE clause.

@@ -398,24 +398,38 @@ General Rules:
     calendar table with one row per date).  Fact tables, KPI tables, sales tables,
     and any table with a metric column are NEVER safe to join without pre-aggregation.
 
-    Mandatory pattern — wrap EVERY metric table in a CTE before joining:
+    CRITICAL — CTEs must SELECT all metric columns, not just keys:
+    The CTE must carry through every metric column you need in the final SELECT.
+    A CTE that only selects (entity_key, period_key) is useless — the outer query
+    will have no metrics to return.
 
+    WRONG — CTE selects only keys, outer query has no metrics:
+      WITH right_agg AS (
+        SELECT entity_key, period_key     ← NO metric columns here
+        FROM   right_fact_table
+        GROUP BY entity_key, period_key
+      )
+      SELECT l.entity_key, l.period_key   ← nothing to show the user
+      FROM   left_fact_table AS l
+      JOIN   right_agg AS r ON l.entity_key = r.entity_key AND l.period_key = r.period_key
+
+    CORRECT — CTEs carry all metrics, outer SELECT exposes them all:
       WITH left_agg AS (
         SELECT entity_key, period_key,
-               SUM(metric_1)      AS total_metric_1,
+               SUM(metric_1)      AS total_metric_1,   ← metrics included
                SUM(metric_2)      AS total_metric_2
         FROM   left_fact_table
         GROUP BY entity_key, period_key
       ),
       right_agg AS (
         SELECT entity_key, period_key,
-               AVG(metric_col_a)  AS avg_metric_a,
+               AVG(metric_col_a)  AS avg_metric_a,     ← metrics included
                AVG(metric_col_b)  AS avg_metric_b
         FROM   right_fact_table
         GROUP BY entity_key, period_key
       )
       SELECT l.entity_key, l.period_key,
-             l.total_metric_1, l.total_metric_2,
+             l.total_metric_1, l.total_metric_2,       ← all metrics in final SELECT
              r.avg_metric_a, r.avg_metric_b
       FROM   left_agg  AS l
       JOIN   right_agg AS r
@@ -427,57 +441,78 @@ General Rules:
     store+week (retail), supplier+quarter (supply chain).
 
     NEVER write: FROM fact_a JOIN fact_b ON (entity_key, period_key)
-    without BOTH tables wrapped in pre-aggregation CTEs first.
+    without BOTH tables wrapped in pre-aggregation CTEs that include metric columns.
     When in doubt — always pre-aggregate both sides.
 
 10c-ii. FINAL SUMMARY AGGREGATE — MANDATORY after every co-occurrence JOIN:
     Whenever you emit a JOIN / co-occurrence query (rule 10c), you MUST also emit
-    a separate query with query_id "q_summary" that aggregates the join result to
-    ONE ROW per primary entity.  This is not optional.  Without it, the downstream
-    analysis has thousands of granular rows with no board-ready answer.
+    a separate query with query_id "q_summary" that produces ONE ROW per primary
+    entity with all metrics aggregated.  This is not optional.
 
-    This applies in ANY domain: products/brands, employees, stores, customers,
-    suppliers, regions, etc.
+    CRITICAL — q_summary must be a FULLY SELF-CONTAINED SQL query:
+    q_summary cannot reference another query_id (e.g. "FROM q3") — each query in
+    the JSON array is executed independently.  q_summary must contain its OWN
+    pre-aggregation CTEs (copying the same CTE logic from the join query) and then
+    GROUP BY entity_key to roll up to entity level.
 
-    Mandatory columns in q_summary:
-      1. entity_key + entity label columns (brand_name, employee_name, store_name, …)
-      2. COUNT(DISTINCT period_key) AS qualifying_periods
-      3. The primary metric aggregated: SUM(primary_metric) AS total_primary_metric
-      4. Any secondary metrics: AVG(secondary_metric) AS avg_secondary_metric
-      5. REQUIRED if the schema has a YoY/change column (name contains _vs_yago,
-         _vs_py, _yoy, _growth, _change, _delta): include BOTH:
-           AVG(yoy_col) AS avg_yoy_movement
-           CASE WHEN AVG(yoy_col) > 0 THEN 'positive' ELSE 'negative' END AS direction
-         This classifies whether the metric MOVED in this period vs prior year.
-      6. ORDER BY total_primary_metric DESC
+    Full self-contained pattern for q_summary:
 
-    Generic pattern:
-
-      SELECT entity_key,
-             entity_label_col,
-             COUNT(DISTINCT period_key)   AS qualifying_periods,
-             SUM(primary_metric)          AS total_primary_metric,
-             AVG(secondary_metric)        AS avg_secondary_metric,
-             AVG(yoy_col)                 AS avg_yoy_movement,   -- if yoy col exists
-             CASE WHEN AVG(yoy_col) > 0
-                  THEN 'positive' ELSE 'negative' END AS direction  -- if yoy col exists
-      FROM   <co-occurrence pre-aggregated JOIN — see rule 10c-i>
-      GROUP BY entity_key, entity_label_col
+      WITH left_agg AS (                          ← same CTEs as the join query
+        SELECT entity_key, period_key,
+               SUM(primary_metric)  AS total_primary_metric,
+               SUM(secondary_metric) AS total_secondary_metric
+        FROM   left_fact_table
+        GROUP BY entity_key, period_key
+      ),
+      right_agg AS (
+        SELECT entity_key, period_key,
+               AVG(metric_col_a)  AS avg_metric_a,
+               AVG(yoy_col)       AS avg_yoy            ← include YoY if it exists
+        FROM   right_fact_table
+        GROUP BY entity_key, period_key
+      ),
+      joined AS (                                 ← same JOIN as the join query
+        SELECT l.entity_key, l.period_key,
+               l.total_primary_metric,
+               l.total_secondary_metric,
+               r.avg_metric_a,
+               r.avg_yoy
+        FROM   left_agg  AS l
+        JOIN   right_agg AS r
+          ON   l.entity_key = r.entity_key
+          AND  l.period_key = r.period_key
+      )
+      SELECT entity_key,                          ← final GROUP BY to entity level
+             COUNT(DISTINCT period_key)           AS qualifying_periods,
+             SUM(total_primary_metric)            AS total_primary_metric,
+             SUM(total_secondary_metric)          AS total_secondary_metric,
+             AVG(avg_metric_a)                    AS avg_metric_a,
+             AVG(avg_yoy)                         AS avg_yoy_movement,
+             CASE WHEN AVG(avg_yoy) > 0
+                  THEN 'positive' ELSE 'negative' END AS direction
+      FROM   joined
+      GROUP BY entity_key
       ORDER BY total_primary_metric DESC
 
-    Domain examples:
-      • RGM/Pricing:    entity=brand_pack_id, primary=pricing_impact_abs,
-                        secondary=gross_rsv, yoy=price_index_vs_yago
-      • HR/Workforce:   entity=employee_id,   primary=attrition_count,
-                        secondary=headcount,  yoy=headcount_change
-      • Retail/Sales:   entity=store_id,      primary=revenue,
-                        secondary=units_sold, yoy=revenue_growth_pct
-      • Finance:        entity=cost_centre_id, primary=budget_variance_abs,
-                        secondary=actuals,    yoy=variance_vs_py
+    Mandatory columns in q_summary:
+      1. entity_key (+ entity label columns if available in schema)
+      2. COUNT(DISTINCT period_key) AS qualifying_periods
+      3. SUM(primary_metric) AS total_primary_metric
+      4. Any secondary metrics aggregated appropriately
+      5. REQUIRED if schema has a YoY/change column (_vs_yago, _vs_py, _yoy,
+         _growth, _change, _delta): AVG(yoy_col) AND a direction CASE expression
+      6. ORDER BY total_primary_metric DESC
 
-    The q_summary IS the answer.  It replaces thousands of raw join rows with a
-    concise per-entity table.  The LLM synthesiser will use q_summary as the
-    primary result and treat the raw join query as supporting detail only.
+    Domain examples:
+      • RGM/Pricing:  entity=brand_pack_id, primary=pricing_impact_abs,
+                      secondary=gross_rsv, yoy=price_index_vs_yago
+      • HR:           entity=employee_id,   primary=attrition_count,
+                      secondary=headcount,  yoy=headcount_change
+      • Retail:       entity=store_id,      primary=revenue,
+                      secondary=units_sold, yoy=revenue_growth_pct
+
+    The q_summary IS the board-ready answer.  The raw join query (q3) exists only
+    to show per-period detail — q_summary is what the synthesiser leads with.
 
 10d. YEAR-OVER-YEAR vs ABSOLUTE LEVEL — when the question asks whether a metric
     CHANGED, IMPROVED, GREW, or MOVED (not just whether it is high or low),

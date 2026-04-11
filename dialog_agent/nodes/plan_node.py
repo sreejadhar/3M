@@ -173,7 +173,14 @@ TYPE CASTING      : CAST(col AS INT), CAST(col AS DECIMAL(10,2)), CAST(col AS NV
 DATE TRUNCATION   : DATEADD(month, DATEDIFF(month, 0, date_col), 0) for month-start
                     DATE_TRUNC does NOT exist in SQL Server
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
-                    Window functions cannot be used in WHERE clause — use a CTE or subquery"""
+                    Window functions cannot be used in WHERE clause — use a CTE or subquery
+ORDER BY IN SUBS  : ORDER BY is ILLEGAL inside subqueries, CTEs, derived tables, views,
+                    and inline functions UNLESS the subquery also has TOP, OFFSET, or FOR XML.
+                    Error 1033 will be raised at runtime.
+                    WRONG: SELECT * FROM (SELECT col FROM t ORDER BY col) sub
+                    WRONG: WITH cte AS (SELECT col FROM t ORDER BY col) SELECT * FROM cte
+                    RIGHT: SELECT * FROM (SELECT TOP 10 col FROM t ORDER BY col) sub
+                    RIGHT: Use ORDER BY only at the outermost query level unless paired with TOP"""
 
     if db == "oracle":
         return """\
@@ -1117,6 +1124,95 @@ def _enforce_sql_limits(sql: str, row_limit: int, db_type: str = "") -> str:
             return patched
 
 
+def _fix_subquery_order_by(sql: str, db_type: str) -> str:
+    """
+    SQL Server (error 1033): ORDER BY is illegal inside a subquery, CTE body,
+    derived table, view, or inline function unless TOP, OFFSET, or FOR XML is
+    also present in that same block.
+
+    This function walks paren depth to locate every ORDER BY at depth > 0, checks
+    whether the enclosing block contains TOP / OFFSET / FOR XML, and strips it if
+    not.  All other dialects allow ORDER BY in subqueries so the function is a
+    no-op for them.
+    """
+    if db_type.lower() != "sqlserver":
+        return sql
+    if not re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE):
+        return sql
+
+    spans_to_remove: List[tuple] = []
+
+    for m in re.finditer(r'\bORDER\s+BY\b', sql, re.IGNORECASE):
+        ob_pos = m.start()
+
+        # Paren depth at this ORDER BY position
+        prefix = sql[:ob_pos]
+        depth  = prefix.count('(') - prefix.count(')')
+        if depth <= 0:
+            continue  # outer-level ORDER BY — leave alone
+
+        # Scan backwards to find the enclosing open paren
+        block_open: Optional[int] = None
+        d = 0
+        for i in range(ob_pos - 1, -1, -1):
+            c = sql[i]
+            if c == ')':
+                d += 1
+            elif c == '(':
+                if d == 0:
+                    block_open = i
+                    break
+                d -= 1
+
+        if block_open is None:
+            continue
+
+        # Scan forwards to find the matching close paren
+        block_close: Optional[int] = None
+        d = 1
+        for i in range(block_open + 1, len(sql)):
+            c = sql[i]
+            if c == '(':
+                d += 1
+            elif c == ')':
+                d -= 1
+                if d == 0:
+                    block_close = i
+                    break
+
+        if block_close is None:
+            continue
+
+        block_content = sql[block_open + 1:block_close]
+
+        # Leave alone if protected by TOP, OFFSET, or FOR XML
+        if re.search(r'\bSELECT\s+(?:DISTINCT\s+)?TOP\s+\d+\b', block_content, re.IGNORECASE):
+            continue
+        if re.search(r'\bOFFSET\b', block_content, re.IGNORECASE):
+            continue
+        if re.search(r'\bFOR\s+XML\b', block_content, re.IGNORECASE):
+            continue
+
+        # Strip from ORDER BY up to (not including) the closing paren,
+        # also eating any leading whitespace before ORDER BY
+        strip_start = ob_pos
+        while strip_start > block_open and sql[strip_start - 1] in (' ', '\t', '\n', '\r'):
+            strip_start -= 1
+
+        spans_to_remove.append((strip_start, block_close))
+
+    if not spans_to_remove:
+        return sql
+
+    # Apply right-to-left to preserve earlier positions
+    result = sql
+    for start, end in sorted(spans_to_remove, key=lambda x: -x[0]):
+        result = result[:start] + result[end:]
+        logger.info("plan_node: stripped bare ORDER BY from subquery/CTE context (SQL Server)")
+
+    return result
+
+
 def _is_raw_row_query(sql: str) -> bool:
     """Return True when the SQL has no aggregation (GROUP BY / COUNT / SUM …)."""
     return not bool(_AGG_PATTERN.search(sql))
@@ -1409,6 +1505,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _fix_count_vs_sum(sql, natural_query)
             sql = _fix_percentage(sql, natural_query, config.db_type)
             sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
+            sql = _fix_subquery_order_by(sql, config.db_type)
 
             # Multi-table / no-join-key check
             sql_no_strings = re.sub(r"'[^']*'", "''", sql)

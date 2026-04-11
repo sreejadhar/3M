@@ -608,6 +608,56 @@ General Rules:
       □ Is there a q_summary that aggregates the joined result to entity level?
     Only submit the plan when all four boxes are ticked.
 
+10f. DERIVED METRICS — compute analytical ratios and rates from schema columns:
+    Whenever the question asks about performance, impact, rate, share, contribution,
+    growth, or efficiency, look at the columns available in the schema context and
+    compute derived metric expressions directly in the SELECT list.
+
+    Do NOT limit yourself to raw column values. If the schema has a numerator column
+    and a denominator column that together answer the question, COMPUTE the ratio.
+
+    Step 1 — identify the analytical intent of the question:
+      • "impact" / "contribution" / "effect"  → absolute column + (absolute / base) * 100
+      • "rate" / "pct" / "%" / "share" / "mix" → (value / NULLIF(total_or_base, 0)) * 100
+      • "growth" / "change" / "movement"        → (current - prior) / NULLIF(prior, 0) * 100
+                                                   OR use a pre-existing _vs_yago / _yoy column
+      • "efficiency" / "productivity"           → output_col / NULLIF(input_col, 0)
+      • "index" / "ratio"                       → col_a / NULLIF(col_b, 0)
+
+    Step 2 — identify candidate column pairs from the schema:
+      Look for pairs where one column is an amount/value and the other is a base/total.
+      Common patterns:
+        pricing_impact_value  +  gross_rsv     →  pricing_impact_pct  = (impact / rsv) * 100
+        revenue               +  total_revenue →  revenue_share_pct   = (rev / total) * 100
+        cost                  +  budget        →  cost_realisation_pct = (cost / budget) * 100
+        units_sold            +  units_target  →  attainment_pct      = (sold / target) * 100
+        net_margin            +  revenue       →  margin_pct          = (margin / rev) * 100
+      These are examples — derive the right pair from the ACTUAL columns in the schema.
+
+    Step 3 — emit the derived expression in the SELECT list with a clear alias:
+        SUM(numerator_col) / NULLIF(SUM(denominator_col), 0) * 100
+          AS derived_metric_pct
+
+    Rules:
+      • Always use NULLIF(denominator, 0) to prevent division-by-zero errors.
+      • Always include BOTH the raw source columns AND the derived expression — never
+        just the ratio alone. The raw values let the reader verify the computation.
+      • Derived metrics follow the same pre-aggregation rules as raw metrics:
+        if the query uses GROUP BY, apply SUM/AVG to both numerator and denominator
+        before dividing.  Do NOT divide un-aggregated columns in a grouped query.
+
+        WRONG:  SELECT brand, pricing_impact_value / NULLIF(gross_rsv, 0) * 100 AS pct
+                GROUP BY brand
+        CORRECT: SELECT brand,
+                        SUM(pricing_impact_value) AS total_impact,
+                        SUM(gross_rsv)            AS total_rsv,
+                        SUM(pricing_impact_value) / NULLIF(SUM(gross_rsv), 0) * 100 AS impact_pct
+                 GROUP BY brand
+
+      • Never invent column names. Use only columns that appear in the schema context.
+        If neither numerator nor denominator column appears in the schema, do NOT emit
+        the derived expression — note in the query "description" why it was omitted.
+
 11. String/text filters and SEMANTIC TERM RESOLUTION — critical for categorical columns.
     The user's terminology will often DIFFER from the values stored in the database.
     You MUST resolve this mismatch before writing any WHERE clause.

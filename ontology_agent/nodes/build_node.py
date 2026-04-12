@@ -43,31 +43,116 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _CONCEPT_SYSTEM = """\
-You are a database metadata expert. Given a list of column names and their SQL
-data types from a database table, identify the standard business concept each
-column represents.
+You are a database metadata expert. Given a table name, column names, SQL data
+types, and OBSERVED DATA EVIDENCE (sample values, numeric range, cardinality,
+existing description), identify the standard business concept each column
+represents.
+
+You MUST ground every label in the observed data evidence — do NOT guess from
+column names alone.  Abbreviations are common (arpu, gmv, nii, tts, nrv, gsv,
+fte, oee, cac, otif) and their meaning must be confirmed by the evidence.
 
 Return ONLY a JSON object mapping each column name to a short concept label
-(kebab-case, lowercase), or null if the column is an identifier/key/date with
-no meaningful business concept to add.
+(kebab-case, lowercase), or null when:
+  - The column is an identifier, primary/foreign key, or date/timestamp.
+  - The column name is already self-explanatory (e.g. "revenue", "headcount").
+  - The evidence contradicts the apparent meaning (e.g. "value" column that
+    holds only 0/1 flags is a status column, not a monetary value).
 
-Rules:
-- Use domain-standard terminology: "gross-rsv", "net-realized-value",
-  "trade-spend", "headcount", "attrition-rate", "avg-revenue-per-user",
-  "net-interest-income", "gross-merchandise-value", etc.
-- For self-explanatory names (e.g. "revenue", "headcount", "market_share_pct")
-  return null — no concept label needed.
-- For opaque abbreviations (arpu, gmv, nii, mou, oee, cac, ltv, tts, nrv,
-  gsv, fte, otif, casa, gnpa) ALWAYS return a concept label.
-- Keep labels concise: 1-4 words, kebab-case, no spaces.
-- Return ONLY the JSON object — no prose, no markdown fences.
+Grounding rules — read the evidence fields in this order:
+  1. top_values — the strongest signal.  Numeric values confirm measures;
+     string categories confirm dimensions; 0/1 confirms flags.
+  2. description — already inferred from metadata; use it directly.
+  3. min/max/avg — numeric range confirms monetary (large), percentage (0-100
+     or 0-1), count (small integer), or index (near 100).
+  4. cardinality_ratio — unique_count / row_count.  Near 1.0 → identifier or
+     continuous measure.  Near 0.0 with few distinct values → categorical.
+  5. data_type — decimal/float → measure or percentage; integer → count or id;
+     varchar/text → categorical or free text.
+  6. column name — use last, only to disambiguate when evidence is neutral.
 
-Example input:
-  table: fact_telecom_kpis, columns: [arpu (decimal), mou (integer), churn_cnt (integer), rev (decimal)]
+Label conventions:
+  - Use domain-standard terms: "gross-rsv", "net-realized-value", "trade-spend",
+    "avg-revenue-per-user", "net-interest-income", "gross-merchandise-value",
+    "overall-equipment-effectiveness", "customer-acquisition-cost", etc.
+  - Keep labels concise: 1–4 words, kebab-case, no spaces.
+  - Return ONLY valid JSON — no prose, no markdown fences.
 
-Example output:
-  {"arpu": "avg-revenue-per-user", "mou": "minutes-of-use", "churn_cnt": "attrition-count", "rev": "revenue"}
+Example:
+  Input:
+    table: fact_telecom_kpis
+    columns:
+      arpu | decimal | min=45.2 max=312.0 avg=118.5 | top_values=[120.5,98.3,145.2] | high cardinality
+      mou  | integer | min=0 max=1200 avg=342 | top_values=[250,480,120] | high cardinality
+      sub_type | varchar | top_values=['Prepaid','Postpaid','Enterprise'] | 3 distinct values
+      churn_flag | integer | top_values=[0,1] | 2 distinct values
+      rev  | decimal | min=120.0 max=98000.0 avg=4200.0 | high cardinality | description: monetary revenue column
+
+  Output:
+    {"arpu": "avg-revenue-per-user", "mou": "minutes-of-use", "sub_type": null, "churn_flag": null, "rev": "revenue"}
 """
+
+
+def _build_col_evidence(col: Dict) -> str:
+    """
+    Build a compact evidence string for one column to include in the annotation
+    prompt.  Covers all signals that help the LLM ground its concept label in
+    observed data rather than guessing from the name alone.
+    """
+    parts: List[str] = []
+
+    dtype = col.get("data_type", "unknown")
+    parts.append(dtype)
+
+    # Numeric range — confirms monetary, percentage, count, index
+    mn, mx, avg = col.get("min_value"), col.get("max_value"), col.get("avg_value")
+    if mn is not None and mx is not None:
+        avg_str = f" avg={avg:.2f}" if avg is not None else ""
+        parts.append(f"min={mn} max={mx}{avg_str}")
+
+    # Top values — the strongest grounding signal
+    top = col.get("top_values") or []
+    if top:
+        sample = top[:6]
+        parts.append(f"top_values={sample}")
+
+    # Cardinality signal
+    unique = col.get("unique_count")
+    rows   = col.get("row_count") or col.get("unique_count")
+    if unique is not None and rows:
+        ratio = unique / rows
+        if ratio >= 0.95:
+            parts.append("high-cardinality")
+        elif unique <= 2:
+            parts.append(f"{unique}-distinct-values")
+        elif unique <= 20:
+            parts.append(f"{unique}-distinct-values")
+
+    # Null rate
+    null_rate = col.get("null_rate")
+    if null_rate and null_rate > 0.01:
+        parts.append(f"null_rate={null_rate:.0%}")
+
+    # Rule-based description from extraction_node — already grounded in metadata.
+    # Trim to first clause (split on ' — ' or first parenthetical) to avoid
+    # truncating mid-word on decimal points (e.g. "range: 0.0 – 500000.0").
+    desc = col.get("description", "")
+    if desc:
+        # Prefer splitting at ' — ' (used by extraction_node as clause separator)
+        # rather than '.' which appears in numeric range values.
+        short = desc.split(" — ")[0].strip()
+        if len(short) < 20:          # too short, take more
+            short = desc.split("(")[0].strip() or desc[:120]
+        short = short[:120]          # hard cap to keep prompt size predictable
+        if short:
+            parts.append(f'description="{short}"')
+
+    # Rule-based domain from extraction_node
+    domain = col.get("domain", "")
+    if domain and domain != "unknown":
+        parts.append(f"domain={domain}")
+
+    return " | ".join(parts)
 
 
 def _annotate_column_concepts(
@@ -77,12 +162,12 @@ def _annotate_column_concepts(
     domain_hint: str = "",
 ) -> Dict[str, str]:
     """
-    Call an LLM to map each column in `columns` to a standard business concept.
+    Call an LLM to map each column in `columns` to a standard business concept,
+    grounded in observed data evidence (sample values, numeric range, cardinality,
+    rule-based description and domain already computed by extraction_node).
 
-    Returns a dict: {column_name: concept_label} for columns that received a
-    non-null label.  Columns where the LLM returned null are omitted.
-
-    Fails gracefully — on any error returns an empty dict so indexing continues.
+    Returns {column_name: concept_label} for columns that received a non-null
+    label.  Fails gracefully — returns empty dict on any error.
     """
     if not columns:
         return {}
@@ -93,16 +178,20 @@ def _annotate_column_concepts(
     except Exception:
         return {}
 
-    col_list = ", ".join(
-        f"{c['name']} ({c.get('data_type', 'unknown')})"
-        for c in columns
-    )
-    domain_clause = f" This database is in the **{domain_hint}** domain." if domain_hint else ""
+    # Build one evidence line per column
+    col_lines = []
+    for c in columns:
+        name     = c.get("name", "")
+        evidence = _build_col_evidence(c)
+        col_lines.append(f"  {name} | {evidence}")
+
+    domain_clause = f"\nDomain context: {domain_hint}." if domain_hint else ""
     user_msg = (
-        f"Table: {table_name}.{domain_clause}\n"
-        f"Columns: [{col_list}]\n\n"
-        f"Return a JSON object mapping each column name to its business concept label, "
-        f"or null if no concept label is needed."
+        f"Table: {table_name}{domain_clause}\n"
+        f"Columns (name | data_type | range | top_values | cardinality | description | domain):\n"
+        + "\n".join(col_lines)
+        + "\n\nReturn a JSON object mapping each column name to its business concept "
+          "label (grounded in the evidence above), or null if no concept label is needed."
     )
 
     try:

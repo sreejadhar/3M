@@ -550,6 +550,23 @@ def _infer_col_concept(col_name: str) -> Optional[str]:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+def _extract_concept_from_col_comment(col_line: str) -> Optional[str]:
+    """
+    Extract the 'Business concept: <label>' annotation from a column's inline
+    comment (the '  -- ...' suffix appended by translate_node when it renders
+    the rdfs:comment for a DatatypeProperty).
+
+    col_line looks like:
+        arpu: xsd:decimal  -- avg-revenue-per-user | Business concept: avg-revenue-per-user
+      or:
+        arpu: xsd:decimal  -- Business concept: avg-revenue-per-user
+    """
+    m = re.search(r'Business concept:\s*([^\|]+)', col_line, re.I)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
 def _extract_columns_from_title(title: str, table_label: str) -> List[str]:
     """
     Parse the KG node title tooltip to get a list of column definitions.
@@ -830,7 +847,14 @@ def _summarise_graph(
                     # numerators/denominators and bridge column names to business terms.
                     col_name_for_domain = sql_col if samples is not None else original_col
                     domain_tag = _infer_col_domain(col_name_for_domain)
-                    concept    = _infer_col_concept(col_name_for_domain)
+
+                    # Concept resolution: prefer KG-stored LLM annotation (stored
+                    # at index time by build_node as "Business concept: <label>")
+                    # over rule-based inference.  This handles any domain — telecom,
+                    # banking, healthcare, manufacturing — generically.
+                    kg_concept = _extract_concept_from_col_comment(col)
+                    concept    = kg_concept or _infer_col_concept(col_name_for_domain)
+
                     if domain_tag and concept:
                         lines.append(f"    {display}  [{domain_tag} — ≈ {concept}]")
                     elif domain_tag:

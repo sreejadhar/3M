@@ -17,9 +17,24 @@ class OntologyConfig:
     serialize_format  : "turtle" (.ttl) | "xml" (.owl) | "n3"
     include_statistics: Annotate datatype properties with column stats
                         (unique count, null count, min/max) as rdfs:comment.
+    annotate_concepts : Use an LLM call at index time to annotate each column
+                        with its standard business concept label (e.g. "arpu" →
+                        "avg-revenue-per-user", "nii" → "net-interest-income").
+                        Stored as rdfs:comment "Business concept: <label>" so
+                        downstream nodes can surface the label in schema_context.
+                        Default: True — disable only to reduce indexing cost.
+    llm_model         : Model used for concept annotation (if annotate_concepts).
+                        Defaults to claude-haiku-4-5 (cheapest, sufficient for
+                        column-name interpretation).
+    source_domain     : Optional domain hint passed to the concept LLM
+                        (e.g. "telecom", "banking", "healthcare").  When set the
+                        LLM resolves ambiguous abbreviations in domain context.
     """
     base_uri:           str  = "http://metadata-agent.io/ontology/"
     ontology_name:      str  = "DatabaseOntology"
     output_path:        Optional[str] = None
     serialize_format:   str  = "turtle"
     include_statistics: bool = True
+    annotate_concepts:  bool = True
+    llm_model:          str  = "claude-haiku-4-5-20251001"
+    source_domain:      str  = ""

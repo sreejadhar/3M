@@ -25,15 +25,110 @@ All descriptions are derived from metadata facts — no LLM, no hallucination.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
-from typing import Dict, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from rdflib import BNode, Graph, Literal, Namespace, RDF, RDFS, OWL, URIRef, XSD
 
 from ..state import OntologyState
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# LLM-based concept annotation (one batched call per table at index time)
+# ---------------------------------------------------------------------------
+
+_CONCEPT_SYSTEM = """\
+You are a database metadata expert. Given a list of column names and their SQL
+data types from a database table, identify the standard business concept each
+column represents.
+
+Return ONLY a JSON object mapping each column name to a short concept label
+(kebab-case, lowercase), or null if the column is an identifier/key/date with
+no meaningful business concept to add.
+
+Rules:
+- Use domain-standard terminology: "gross-rsv", "net-realized-value",
+  "trade-spend", "headcount", "attrition-rate", "avg-revenue-per-user",
+  "net-interest-income", "gross-merchandise-value", etc.
+- For self-explanatory names (e.g. "revenue", "headcount", "market_share_pct")
+  return null — no concept label needed.
+- For opaque abbreviations (arpu, gmv, nii, mou, oee, cac, ltv, tts, nrv,
+  gsv, fte, otif, casa, gnpa) ALWAYS return a concept label.
+- Keep labels concise: 1-4 words, kebab-case, no spaces.
+- Return ONLY the JSON object — no prose, no markdown fences.
+
+Example input:
+  table: fact_telecom_kpis, columns: [arpu (decimal), mou (integer), churn_cnt (integer), rev (decimal)]
+
+Example output:
+  {"arpu": "avg-revenue-per-user", "mou": "minutes-of-use", "churn_cnt": "attrition-count", "rev": "revenue"}
+"""
+
+
+def _annotate_column_concepts(
+    table_name: str,
+    columns: List[Dict],
+    model: str,
+    domain_hint: str = "",
+) -> Dict[str, str]:
+    """
+    Call an LLM to map each column in `columns` to a standard business concept.
+
+    Returns a dict: {column_name: concept_label} for columns that received a
+    non-null label.  Columns where the LLM returned null are omitted.
+
+    Fails gracefully — on any error returns an empty dict so indexing continues.
+    """
+    if not columns:
+        return {}
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    except Exception:
+        return {}
+
+    col_list = ", ".join(
+        f"{c['name']} ({c.get('data_type', 'unknown')})"
+        for c in columns
+    )
+    domain_clause = f" This database is in the **{domain_hint}** domain." if domain_hint else ""
+    user_msg = (
+        f"Table: {table_name}.{domain_clause}\n"
+        f"Columns: [{col_list}]\n\n"
+        f"Return a JSON object mapping each column name to its business concept label, "
+        f"or null if no concept label is needed."
+    )
+
+    try:
+        resp = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            temperature=0,
+            system=_CONCEPT_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = resp.content[0].text if resp.content else "{}"
+        # Strip markdown fences if present
+        raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
+        result = json.loads(raw)
+        # Filter nulls and non-string values; lowercase keys for lookup
+        return {
+            str(k).lower(): str(v).lower().strip()
+            for k, v in result.items()
+            if v and isinstance(v, str) and v.strip()
+        }
+    except Exception as exc:
+        logger.warning(
+            "build_node: concept annotation failed for table %s: %s",
+            table_name, exc,
+        )
+        return {}
 
 # ---------------------------------------------------------------------------
 # XSD type mapping
@@ -174,6 +269,25 @@ def build_node(state: OntologyState) -> OntologyState:
         if not isinstance(table_meta, dict):
             continue
 
+        # ── LLM concept annotation (one batched call per table) ──────────
+        # Maps opaque column names (arpu, gsv, tts, nii, gmv…) to standard
+        # business concept labels regardless of domain.  Skipped when
+        # annotate_concepts=False or when ANTHROPIC_API_KEY is not set.
+        col_concepts: Dict[str, str] = {}
+        if getattr(config, "annotate_concepts", True) and os.environ.get("ANTHROPIC_API_KEY"):
+            cols_for_annotation = table_meta.get("columns") or []
+            col_concepts = _annotate_column_concepts(
+                table_name,
+                [c for c in cols_for_annotation if isinstance(c, dict)],
+                model=getattr(config, "llm_model", "claude-haiku-4-5-20251001"),
+                domain_hint=getattr(config, "source_domain", ""),
+            )
+            if col_concepts:
+                logger.debug(
+                    "build_node: concept annotations for %s: %s",
+                    table_name, col_concepts,
+                )
+
         for col in table_meta.get("columns") or []:
             if not isinstance(col, dict):
                 continue
@@ -207,6 +321,12 @@ def build_node(state: OntologyState) -> OntologyState:
             col_desc = col.get("description")
             if col_desc:
                 prop_desc_parts.append(col_desc)
+
+            # Business concept label (from LLM annotation or rule-based fallback)
+            # Stored as "Business concept: <label>" so understand_node can read it.
+            concept_label = col_concepts.get(col_name.lower(), "")
+            if concept_label:
+                prop_desc_parts.append(f"Business concept: {concept_label}")
 
             # Semantic domain label
             domain = col.get("domain")

@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # Keyed by (schema_hash, backend, _NODE_TEXT_VERSION) so cache is invalidated
 # when the schema changes OR when _node_text() logic is updated.
 _EMBED_CACHE: Dict[str, "_Cache"] = {}
-_NODE_TEXT_VERSION = "3"   # bump when _node_text() or _expand_table_name() changes
+_NODE_TEXT_VERSION = "4"   # bump when _node_text() or _expand_table_name() changes
 
 
 class _Cache:
@@ -205,21 +205,114 @@ def _expand_table_name(label: str) -> str:
     return parts
 
 
+def _extract_col_semantic_hints(label: str, title: str) -> str:
+    """
+    Extract semantically meaningful tokens from column names in a node title
+    and return them as a space-separated hint string to append to the node text.
+
+    This is the generic complement to _expand_table_name: instead of looking
+    at the table name, we look at every column name in the title and split each
+    one into its constituent words.  Tokens that already appear in the table
+    name are deduplicated so we only surface *new* information.
+
+    Example:
+      label = "v_env_metrics"
+      title contains columns: weighted_temperature, precipitation_mm,
+                               humidity_pct, wind_speed_ms, region_code, period_date
+
+      table tokens already in label: {"v", "env", "metrics"}
+      column tokens after split:     {"weighted", "temperature", "precipitation",
+                                       "mm", "humidity", "pct", "wind", "speed",
+                                       "ms", "region", "code", "period", "date"}
+      new tokens (not in label):     "weighted temperature precipitation humidity
+                                      wind speed region period"
+
+    These tokens are appended to the node text so that a query for "temperature"
+    or "humidity" will score high against this node even though neither word
+    appears in the table name.
+
+    Business concept annotations ("Business concept: <label>") from the ontology
+    annotation step are also extracted and included — these are the richest signal
+    since they are human-readable labels like "temperature", "avg-revenue-per-user".
+    """
+    # Tokens already present in the table label — don't repeat them
+    label_tokens: set = set(re.findall(r'[a-z]+', label.lower()))
+
+    col_tokens: List[str] = []
+    concept_labels: List[str] = []
+
+    # Structural tokens from the title format itself — not meaningful for retrieval
+    _STRUCTURAL = {
+        "properties", "class", "columns", "type", "comment", "comments",
+        "integer", "varchar", "decimal", "boolean", "date", "timestamp",
+        "float", "text", "bigint", "smallint", "numeric", "char",
+        "true", "false", "null", "none",
+        "min", "max", "avg", "count", "sum", "distinct", "values",
+        "sample", "range", "null_rate", "row", "rows",
+        "pk", "fk", "id", "key", "ref",
+        "mm", "pct", "ms", "km", "kg", "gb", "mb",  # unit suffixes
+    }
+
+    # Parse every "  colname: type  -- ..." line from the Properties section.
+    # Require at least 2 leading spaces so the "Properties:" header (0 spaces)
+    # and top-level comments are not misidentified as column lines.
+    col_line_re  = re.compile(r'^ {2,4}(\w+)\s*:', re.MULTILINE)
+    concept_re   = re.compile(r'Business concept:\s*([^\n\-\|]+)', re.IGNORECASE)
+
+    for m in col_line_re.finditer(title):
+        col_name = m.group(1)
+        # Split on underscores and camelCase transitions
+        raw = re.sub(r'([a-z])([A-Z])', r'\1 \2', col_name)
+        raw = re.sub(r'[_]+', ' ', raw)
+        for tok in raw.lower().split():
+            if tok not in label_tokens and tok not in _STRUCTURAL and len(tok) > 2:
+                col_tokens.append(tok)
+
+    for m in concept_re.finditer(title):
+        raw_label = m.group(1).strip().rstrip('.')
+        # kebab-case concept labels → space-separated words
+        words = re.split(r'[-\s]+', raw_label)
+        concept_labels.extend(w.lower() for w in words if len(w) > 1)
+
+    # Deduplicate while preserving first-occurrence order
+    seen: set = set()
+    unique: List[str] = []
+    for tok in concept_labels + col_tokens:   # concepts first — higher signal
+        if tok not in seen and tok not in label_tokens:
+            seen.add(tok)
+            unique.append(tok)
+
+    return " ".join(unique)
+
+
 def _node_text(node: Dict) -> str:
     """
     Build a rich text representation of a KG node for embedding.
-    Uses expanded label (with granularity hints) + full title (columns,
-    comments, sample values).  The expansion ensures that sibling tables
-    with identical column sets but different dimensional granularities
-    (e.g. JSR_bottler_channel vs JSR_maker_category_channel) score
-    differently for queries that don't ask for a specific dimension.
+
+    Combines three layers:
+      1. Expanded table label  — _expand_table_name splits underscores/camelCase
+                                 and appends pattern-based domain hints.
+      2. Title body            — full KG title: class comments, column names,
+                                 types, stats, and business concept annotations.
+      3. Column semantic hints — _extract_col_semantic_hints splits every column
+                                 name into its constituent tokens so that queries
+                                 for "temperature" match v_env_metrics even though
+                                 the table name contains no such word.
+
+    Layer 3 is the generic fix for opaque table names: the embedding sees the
+    column-level vocabulary regardless of what the table is called.
     """
     label = node.get("label", "")
     title = node.get("title", "")
-    expanded = _expand_table_name(label)
+    expanded   = _expand_table_name(label)
     # Strip "Class: X" prefix — redundant with expanded label
     title_body = re.sub(r'^Class:\s*\S+\s*', '', title, flags=re.IGNORECASE).strip()
-    return f"{expanded} {title_body}".strip()
+    col_hints  = _extract_col_semantic_hints(label, title)
+
+    parts = [expanded, title_body]
+    if col_hints:
+        parts.append(f"columns: {col_hints}")
+    return " ".join(p for p in parts if p).strip()
 
 
 # ── Embedding backends ────────────────────────────────────────────────────────

@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # Keyed by (schema_hash, backend, _NODE_TEXT_VERSION) so cache is invalidated
 # when the schema changes OR when _node_text() logic is updated.
 _EMBED_CACHE: Dict[str, "_Cache"] = {}
-_NODE_TEXT_VERSION = "2"   # bump when _node_text() or _expand_table_name() changes
+_NODE_TEXT_VERSION = "3"   # bump when _node_text() or _expand_table_name() changes
 
 
 class _Cache:
@@ -101,6 +101,55 @@ class _Cache:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Patterns that signal a cross-table analytic query: the user is asking about
+# the relationship between TWO distinct data domains.  In these cases the NLQ
+# embedding will cluster around whichever domain dominates the wording and
+# miss the second domain entirely.  We decompose the query into two halves and
+# run independent retrieval for each, then union the seed sets.
+_CROSS_DOMAIN_PATTERNS = re.compile(
+    r'\b(correlat\w*|vs\.?|versus|compared?\s+to|relationship\s+between|impact\s+of'
+    r'|effect\s+of|influence\s+of|driven\s+by|against|by\s+\w+\s+condition'
+    r'|trend\s+with|associat\w*|co.?relat\w*)',
+    re.IGNORECASE,
+)
+
+# Split-point markers — words that separate the two sides of the comparison
+_CROSS_SPLIT_RE = re.compile(
+    r'\s+(?:vs\.?|versus|and|with|against|on|by|across|compared?\s+to|'
+    r'impact\s+of|effect\s+of|influence\s+of)\s+',
+    re.IGNORECASE,
+)
+# "between X and Y" → normalise to "X and Y" so the splitter can split on " and "
+_BETWEEN_RE = re.compile(r'\bbetween\s+', re.IGNORECASE)
+
+
+def _decompose_cross_query(query: str) -> List[str]:
+    """
+    If the query is a cross-domain analytic question (correlation, vs, impact of…),
+    return [left_phrase, right_phrase] so both sides can be embedded independently.
+    Otherwise return [query] (single-vector path).
+
+    Examples:
+      "temperature vs purchasing behavior"       → ["temperature", "purchasing behavior"]
+      "impact of weather on sales"               → ["impact of weather", "sales"]
+      "correlation between weather and sales"    → ["weather", "sales"]
+      "relationship between arpu and churn"      → ["arpu", "churn"]
+    """
+    if not _CROSS_DOMAIN_PATTERNS.search(query):
+        return [query]
+
+    # Normalise "between X and Y" → "X and Y" so the splitter finds " and "
+    normalised = _BETWEEN_RE.sub("", query).strip()
+
+    # Try to split on the separator keyword
+    parts = _CROSS_SPLIT_RE.split(normalised, maxsplit=1)
+    if len(parts) == 2 and all(p.strip() for p in parts):
+        return [p.strip() for p in parts]
+
+    # Fallback: return the full query so multi-vector path is a no-op
+    return [query]
+
+
 def _l2_norm(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
     return v / max(n, 1e-9)
@@ -146,6 +195,10 @@ def _expand_table_name(label: str) -> str:
         hints.append("retail sales")
     if re.search(r'\bpromotion\b|\bpromo\b', lower):
         hints.append("promotion promotional activity")
+    if re.search(r'\bweather\b|\bclimate\b|\btemperatur\b|\bprecip\b|\brainfall\b|\bhumid\b|\bwindspeed\b|\bforecast\b', lower):
+        hints.append("weather climate temperature environmental conditions")
+    if re.search(r'\bview\b|^v_|^vw_', lower):
+        hints.append("view aggregated precomputed")
 
     if hints:
         return f"{parts} {' '.join(hints)}"
@@ -502,9 +555,22 @@ def retrieve_node(state: DialogState) -> DialogState:
     cache = _EMBED_CACHE[key]
 
     # ── Embed query and rank nodes ─────────────────────────────────────────────
+    # For cross-domain analytic queries (correlation / vs / impact of …) the NLQ
+    # embedding clusters around whichever domain dominates the wording.  We
+    # decompose into sub-queries and take the element-wise max so both sides
+    # of the comparison get fair representation in the seed set.
+    sub_queries = _decompose_cross_query(query)
     try:
-        q_vec  = cache.embed_query(query)                        # [D]
-        scores = cache.matrix @ q_vec                            # [N] cosine similarities
+        scores = np.zeros(len(nodes), dtype=np.float32)
+        for sq in sub_queries:
+            q_vec   = cache.embed_query(sq)                      # [D]
+            sq_scores = cache.matrix @ q_vec                     # [N] cosine similarities
+            scores  = np.maximum(scores, sq_scores)              # element-wise max
+        if len(sub_queries) > 1:
+            logger.info(
+                "retrieve_node: cross-domain query decomposed into %d sub-queries: %s",
+                len(sub_queries), sub_queries,
+            )
     except Exception as exc:
         logger.warning("retrieve_node: query embedding failed (%s) — using full schema", exc)
         return state

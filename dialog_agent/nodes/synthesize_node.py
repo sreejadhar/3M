@@ -499,6 +499,17 @@ def synthesize_node(state: DialogState) -> DialogState:
 
     if not query_results:
         plan_explanation = state.get("plan_explanation", "").strip()
+        # Guard: if plan_explanation looks like raw JSON (malformed plan that
+        # leaked through), discard it so we fall through to the generic message.
+        if plan_explanation and (
+            plan_explanation.lstrip().startswith('[')
+            or plan_explanation.lstrip().startswith('{')
+            or re.search(r'"query_id"\s*:', plan_explanation[:200])
+        ):
+            logger.warning(
+                "synthesize_node: plan_explanation looks like raw JSON — discarding to avoid leaking to user"
+            )
+            plan_explanation = ""
         if plan_explanation:
             state["insights"] = plan_explanation
             state["phase"] = "synthesize"

@@ -2555,9 +2555,15 @@ def plan_node(state: DialogState) -> DialogState:
     if not plan:
         prose = re.sub(r'```(?:json)?\s*\[\s*\]\s*```', '', raw).strip()
         prose = re.sub(r'^\s*\[\s*\]\s*', '', prose).strip()
-        if prose:
+        # Strip any residual JSON array content — if the LLM returned a
+        # malformed or truncated JSON plan, _extract_json returns [] and `raw`
+        # still contains the JSON.  Never let raw JSON reach the user as prose.
+        prose = re.sub(r'\[\s*\{.*', '', prose, flags=re.DOTALL).strip()
+        if prose and not prose.strip().startswith('[') and not prose.strip().startswith('{'):
             state["plan_explanation"] = prose
             logger.info("plan_node: LLM returned [] with explanation (%d chars)", len(prose))
+        elif not prose:
+            logger.info("plan_node: LLM returned [] with no prose explanation")
 
     # ── Pre-flight completeness check (detection only — no LLM correction) ───
     # Runs on the raw plan to detect analytical gaps and log them.

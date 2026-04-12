@@ -69,6 +69,13 @@ class GenerateRequest(BaseModel):
     ontology_name:      str  = "DatabaseOntology"
     serialize_format:   str  = "turtle"
     include_statistics: bool = True
+    # Concept annotation settings (passed through to OntologyConfig)
+    annotate_concepts:  bool = True
+    source_domain:      str  = ""   # e.g. "telecom", "banking", "RGM/CPG"
+    source_name:        str  = ""   # human-readable source name
+    source_description: str  = ""   # source description from registration
+    db_type:            str  = ""   # e.g. "postgresql", "bigquery", "snowflake"
+    llm_model:          str  = "claude-haiku-4-5-20251001"
 
 
 class ContentUpdate(BaseModel):
@@ -135,12 +142,26 @@ def generate_ontology(req: GenerateRequest, background_tasks: BackgroundTasks):
     ext    = {"turtle": ".ttl", "xml": ".owl", "n3": ".n3"}.get(req.serialize_format, ".ttl")
     out    = str(DATA_DIR / f"ontology_{job_id[:8]}{ext}")
 
+    # Build a rich domain context string for the concept annotation LLM.
+    # Combines all available source metadata so the LLM can contextualise
+    # abbreviations correctly (e.g. "arpu" in telecom vs "arpu" in SaaS).
+    domain_parts = [p for p in [
+        req.source_domain,
+        req.db_type,
+        req.source_name,
+        req.source_description,
+    ] if p and p.strip()]
+    full_domain_context = " | ".join(domain_parts)
+
     cfg = OntologyConfig(
         base_uri           = req.base_uri,
         ontology_name      = req.ontology_name,
         output_path        = out,
         serialize_format   = req.serialize_format,
         include_statistics = req.include_statistics,
+        annotate_concepts  = req.annotate_concepts,
+        source_domain      = full_domain_context,
+        llm_model          = req.llm_model,
     )
 
     with _lock:

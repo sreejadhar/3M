@@ -42,54 +42,74 @@ logger = logging.getLogger(__name__)
 # LLM-based concept annotation (one batched call per table at index time)
 # ---------------------------------------------------------------------------
 
-_CONCEPT_SYSTEM = """\
-You are a database metadata expert. Given a table name, column names, SQL data
-types, and OBSERVED DATA EVIDENCE (sample values, numeric range, cardinality,
-existing description), identify the standard business concept each column
-represents.
+_CONCEPT_SYSTEM_TEMPLATE = """\
+You are a database metadata expert specialising in {domain_context}.
+Given a table name, column names, SQL data types, and OBSERVED DATA EVIDENCE
+(sample values, numeric range, cardinality, rule-based description and domain),
+identify the standard business concept each column represents.
 
-You MUST ground every label in the observed data evidence — do NOT guess from
-column names alone.  Abbreviations are common (arpu, gmv, nii, tts, nrv, gsv,
-fte, oee, cac, otif) and their meaning must be confirmed by the evidence.
+SOURCE CONTEXT
+==============
+{source_context_block}
+
+You MUST ground every label in the observed data evidence AND the source context
+above.  Do NOT guess from column names alone — abbreviations like arpu, gmv,
+nii, tts, nrv, gsv, fte, oee, cac, otif are common across industries but mean
+different things in different domains.  Use the source context to disambiguate.
 
 Return ONLY a JSON object mapping each column name to a short concept label
 (kebab-case, lowercase), or null when:
   - The column is an identifier, primary/foreign key, or date/timestamp.
   - The column name is already self-explanatory (e.g. "revenue", "headcount").
-  - The evidence contradicts the apparent meaning (e.g. "value" column that
-    holds only 0/1 flags is a status column, not a monetary value).
+  - The evidence contradicts the apparent meaning (e.g. a "value" column with
+    only 0/1 values is a status flag, not a monetary measure).
 
-Grounding rules — read the evidence fields in this order:
-  1. top_values — the strongest signal.  Numeric values confirm measures;
-     string categories confirm dimensions; 0/1 confirms flags.
-  2. description — already inferred from metadata; use it directly.
-  3. min/max/avg — numeric range confirms monetary (large), percentage (0-100
-     or 0-1), count (small integer), or index (near 100).
-  4. cardinality_ratio — unique_count / row_count.  Near 1.0 → identifier or
-     continuous measure.  Near 0.0 with few distinct values → categorical.
-  5. data_type — decimal/float → measure or percentage; integer → count or id;
-     varchar/text → categorical or free text.
-  6. column name — use last, only to disambiguate when evidence is neutral.
+GROUNDING RULES — read evidence in this priority order:
+  1. top_values  — strongest signal: numeric → measure; strings → dimension;
+                   0/1 → flag; currency-scale integers → monetary.
+  2. description — already rule-grounded by the extraction pipeline; trust it.
+  3. min/max/avg — range confirms type: large decimals → monetary;
+                   0–100 range → percentage; small integers → count or index.
+  4. cardinality — near 1.0 (high) → continuous measure or identifier;
+                   few distinct values → categorical dimension.
+  5. data_type   — decimal/float → measure; integer → count/id; varchar → text/category.
+  6. column name — last resort only; resolve against source domain context.
 
-Label conventions:
-  - Use domain-standard terms: "gross-rsv", "net-realized-value", "trade-spend",
-    "avg-revenue-per-user", "net-interest-income", "gross-merchandise-value",
-    "overall-equipment-effectiveness", "customer-acquisition-cost", etc.
-  - Keep labels concise: 1–4 words, kebab-case, no spaces.
-  - Return ONLY valid JSON — no prose, no markdown fences.
+DOMAIN-AWARE LABEL CONVENTIONS
+Use the exact terminology standard for the source domain:
+  CPG / RGM    : gross-rsv, net-realized-value, trade-spend, pricing-impact,
+                 price-index, market-share, volume-offtake
+  Telecom      : avg-revenue-per-user, minutes-of-use, data-usage, churn-rate,
+                 net-promoter-score, revenue-per-gb
+  Banking / FS : net-interest-income, net-interest-margin, gross-npa,
+                 casa-ratio, return-on-assets, cost-to-income-ratio
+  E-commerce   : gross-merchandise-value, avg-order-value, customer-acquisition-cost,
+                 lifetime-value, return-on-ad-spend, conversion-rate
+  Manufacturing: overall-equipment-effectiveness, first-pass-yield, scrap-rate,
+                 mean-time-between-failures, cycle-time, capacity-utilisation
+  Healthcare   : length-of-stay, bed-occupancy, claims-paid, denial-rate,
+                 cost-per-patient, readmission-rate
+  HR / People  : headcount, attrition-rate, time-to-hire, cost-per-hire,
+                 offer-acceptance-rate, engagement-score
+  Supply Chain : fill-rate, on-time-in-full, inventory-days, lead-time,
+                 perfect-order-rate, supplier-on-time-delivery
 
-Example:
-  Input:
-    table: fact_telecom_kpis
-    columns:
-      arpu | decimal | min=45.2 max=312.0 avg=118.5 | top_values=[120.5,98.3,145.2] | high cardinality
-      mou  | integer | min=0 max=1200 avg=342 | top_values=[250,480,120] | high cardinality
-      sub_type | varchar | top_values=['Prepaid','Postpaid','Enterprise'] | 3 distinct values
-      churn_flag | integer | top_values=[0,1] | 2 distinct values
-      rev  | decimal | min=120.0 max=98000.0 avg=4200.0 | high cardinality | description: monetary revenue column
+Keep labels concise: 1–4 words, kebab-case, no spaces.
+Return ONLY valid JSON — no prose, no markdown fences.
 
-  Output:
-    {"arpu": "avg-revenue-per-user", "mou": "minutes-of-use", "sub_type": null, "churn_flag": null, "rev": "revenue"}
+EXAMPLE
+-------
+Source context: Telecom operator | postgresql | Subscriber analytics system
+Table: fact_subscriber_kpis
+Columns:
+  arpu    | decimal | min=45.2 max=312.0 avg=118.5 | top_values=[120.5,98.3,145.2] | high-cardinality | domain=numeric_measure
+  mou     | integer | min=0 max=1200 avg=342 | top_values=[250,480,120] | high-cardinality | domain=count/volume
+  subtype | varchar | top_values=['Prepaid','Postpaid','Enterprise'] | 3-distinct-values | domain=status_flag
+  churn   | integer | top_values=[0,1] | 2-distinct-values | domain=status_flag
+  rev     | decimal | min=120.0 max=98000.0 avg=4200.0 | high-cardinality | description="decimal monetary column" | domain=monetary
+
+Output:
+  {{"arpu": "avg-revenue-per-user", "mou": "minutes-of-use", "subtype": null, "churn": null, "rev": "revenue"}}
 """
 
 
@@ -178,6 +198,20 @@ def _annotate_column_concepts(
     except Exception:
         return {}
 
+    # Render the system prompt with domain context baked in so the LLM
+    # resolves abbreviations against the correct industry vocabulary.
+    if domain_hint:
+        domain_context    = f"the {domain_hint} domain"
+        source_ctx_block  = f"Domain / industry : {domain_hint}"
+    else:
+        domain_context    = "enterprise data systems across multiple industries"
+        source_ctx_block  = "(No domain context provided — use evidence signals only)"
+
+    system = _CONCEPT_SYSTEM_TEMPLATE.format(
+        domain_context       = domain_context,
+        source_context_block = source_ctx_block,
+    )
+
     # Build one evidence line per column
     col_lines = []
     for c in columns:
@@ -185,13 +219,13 @@ def _annotate_column_concepts(
         evidence = _build_col_evidence(c)
         col_lines.append(f"  {name} | {evidence}")
 
-    domain_clause = f"\nDomain context: {domain_hint}." if domain_hint else ""
     user_msg = (
-        f"Table: {table_name}{domain_clause}\n"
+        f"Table: {table_name}\n"
         f"Columns (name | data_type | range | top_values | cardinality | description | domain):\n"
         + "\n".join(col_lines)
-        + "\n\nReturn a JSON object mapping each column name to its business concept "
-          "label (grounded in the evidence above), or null if no concept label is needed."
+        + "\n\nReturn a JSON object mapping each column name to its concept label "
+          "(grounded in both the source context and the evidence above), "
+          "or null if no concept label is needed."
     )
 
     try:
@@ -199,7 +233,7 @@ def _annotate_column_concepts(
             model=model,
             max_tokens=1024,
             temperature=0,
-            system=_CONCEPT_SYSTEM,
+            system=system,
             messages=[{"role": "user", "content": user_msg}],
         )
         raw = resp.content[0].text if resp.content else "{}"

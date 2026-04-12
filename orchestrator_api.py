@@ -1017,7 +1017,16 @@ async def _index_source(source_id: str) -> None:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 ro = await client.post(f"{ONTOLOGY_API}/generate",
-                                       json={"report": report, "include_statistics": True})
+                                       json={
+                                           "report":             report,
+                                           "include_statistics": True,
+                                           "annotate_concepts":  True,
+                                           "source_domain":      src.get("domain", ""),
+                                           "source_name":        src.get("name", ""),
+                                           "source_description": src.get("description", ""),
+                                           "db_type":            src.get("db_type", ""),
+                                           "ontology_name":      src.get("name", "DatabaseOntology"),
+                                       })
                 ro.raise_for_status()
                 onto_job_id = ro.json()["job_id"]
 

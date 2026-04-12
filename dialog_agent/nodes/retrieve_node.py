@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # Keyed by (schema_hash, backend, _NODE_TEXT_VERSION) so cache is invalidated
 # when the schema changes OR when _node_text() logic is updated.
 _EMBED_CACHE: Dict[str, "_Cache"] = {}
-_NODE_TEXT_VERSION = "4"   # bump when _node_text() or _expand_table_name() changes
+_NODE_TEXT_VERSION = "5"   # bump when _node_text() or _expand_table_name() changes
 
 
 class _Cache:
@@ -109,7 +109,9 @@ class _Cache:
 _CROSS_DOMAIN_PATTERNS = re.compile(
     r'\b(correlat\w*|vs\.?|versus|compared?\s+to|relationship\s+between|impact\s+of'
     r'|effect\s+of|influence\s+of|driven\s+by|against|by\s+\w+\s+condition'
-    r'|trend\s+with|associat\w*|co.?relat\w*)',
+    r'|trend\s+with|associat\w*|co.?relat\w*'
+    r'|systematically|trailing\s+\d+|over\s+the\s+\w+\s+\d+\s+period'
+    r'|dragging|portfolio\s+toward|consistently\s+\w+\s+over)',
     re.IGNORECASE,
 )
 
@@ -125,19 +127,40 @@ _BETWEEN_RE = re.compile(r'\bbetween\s+', re.IGNORECASE)
 
 def _decompose_cross_query(query: str) -> List[str]:
     """
-    If the query is a cross-domain analytic question (correlation, vs, impact of…),
-    return [left_phrase, right_phrase] so both sides can be embedded independently.
+    If the query is a cross-domain analytic question (correlation, vs, impact of…)
+    OR a multi-table analytical question (systematically X over trailing N periods,
+    dragging portfolio, etc.), return multiple sub-queries so all relevant tables
+    get fair representation in the seed set.
     Otherwise return [query] (single-vector path).
 
     Examples:
-      "temperature vs purchasing behavior"       → ["temperature", "purchasing behavior"]
-      "impact of weather on sales"               → ["impact of weather", "sales"]
-      "correlation between weather and sales"    → ["weather", "sales"]
-      "relationship between arpu and churn"      → ["arpu", "churn"]
+      "temperature vs purchasing behavior"
+          → ["temperature", "purchasing behavior"]
+      "correlation between weather and sales"
+          → ["weather", "sales"]
+      "customers showing systematically negative mix contribution over trailing 12 periods"
+          → [original query, "customer mix contribution metrics", "period time trailing"]
     """
     if not _CROSS_DOMAIN_PATTERNS.search(query):
         return [query]
 
+    # ── Trailing-period / systematically-over-time patterns ───────────────────
+    # These are single-domain but multi-table: entity (dim) + metric (fact) + time (dim).
+    # Don't split them; instead emit additional sub-queries for the dimension tables.
+    _TRAILING_PATTERN = re.compile(
+        r'\b(systematically|trailing\s+\d+|over\s+the\s+\w+\s+\d+\s+period'
+        r'|dragging|portfolio\s+toward|consistently\s+\w+\s+over)\b',
+        re.IGNORECASE,
+    )
+    if _TRAILING_PATTERN.search(query):
+        # Sub-queries that pull in metric/fact table and time dimension
+        return [
+            query,
+            "metric contribution measure value fact table",
+            "period time date calendar trailing rolling",
+        ]
+
+    # ── Two-domain cross-domain split ─────────────────────────────────────────
     # Normalise "between X and Y" → "X and Y" so the splitter finds " and "
     normalised = _BETWEEN_RE.sub("", query).strip()
 
@@ -184,7 +207,9 @@ def _expand_table_name(label: str) -> str:
 
     hints = []
     if re.search(r'\bfact\b', lower):
-        hints.append("fact table sales measures")
+        hints.append("fact table sales measures metrics")
+    if re.search(r'\bdim\b|^dim_', lower):
+        hints.append("dimension lookup reference attributes master")
     if re.search(r'\bchannel\b', lower) and not re.search(r'\bcategory\b', lower):
         hints.append("channel-level breakdown distribution channel")
     if re.search(r'\bcategory\b', lower) and not re.search(r'\bchannel\b', lower):
@@ -199,6 +224,10 @@ def _expand_table_name(label: str) -> str:
         hints.append("weather climate temperature environmental conditions")
     if re.search(r'\bview\b|^v_|^vw_', lower):
         hints.append("view aggregated precomputed")
+    if re.search(r'\bcustomer\b', lower):
+        hints.append("customer account client buyer")
+    if re.search(r'\bperiod\b|\btime\b|\bdate\b|\bcalendar\b|\bfiscal\b', lower):
+        hints.append("period time date calendar fiscal trailing rolling")
 
     if hints:
         return f"{parts} {' '.join(hints)}"

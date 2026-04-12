@@ -905,7 +905,73 @@ General Rules:
     c. When a question requires data from multiple KGs, emit one query per KG
        and use the bridge column names so the synthesizer can merge them.
     d. If no bridges are listed, treat each KG independently.
-16. Pre-defined KPI formulas — when DEFINED KPIs section is present:
+16a. TRAILING N PERIODS — when the question asks about behaviour "over the last/trailing N
+    periods", restrict to the N most recent periods available in the data, not a
+    hard-coded period value:
+
+      WITH ranked_periods AS (
+        SELECT period_id,
+               ROW_NUMBER() OVER (ORDER BY period_id DESC) AS rn
+        FROM   dim_period                        ← or whatever the period dim is named
+      ),
+      trailing AS (
+        SELECT period_id FROM ranked_periods WHERE rn <= {N}   ← N from the question
+      )
+      SELECT ...
+      FROM   fact_table f
+      JOIN   trailing t ON f.period_id = t.period_id
+      ...
+
+    If there is no dim_period table, use:
+      WHERE period_id IN (
+        SELECT DISTINCT period_id
+        FROM   fact_table
+        ORDER BY period_id DESC
+        LIMIT {N}
+      )
+
+16b. SYSTEMATICALLY NEGATIVE / CONSISTENTLY ABOVE / ALWAYS BELOW — when the question
+    asks which entities show a metric that is negative (or above/below a threshold)
+    in ALL or MOST of the qualifying periods, use a HAVING clause that counts the
+    qualifying periods and compares it to the total period count:
+
+    Pattern A — ALL periods must satisfy the condition:
+      HAVING SUM(CASE WHEN metric_col < 0 THEN 1 ELSE 0 END) = COUNT(DISTINCT period_id)
+
+    Pattern B — MAJORITY of periods (>50%) must satisfy:
+      HAVING SUM(CASE WHEN metric_col < 0 THEN 1 ELSE 0 END) * 1.0
+           / NULLIF(COUNT(DISTINCT period_id), 0) > 0.5
+
+    "Systematically" means Pattern A (every period).  "Consistently" or "tend to"
+    means Pattern B.  Always include both:
+      - negative_periods  = SUM(CASE WHEN metric_col < 0 THEN 1 ELSE 0 END)
+      - total_periods     = COUNT(DISTINCT period_id)
+      - avg_metric        = AVG(metric_col)
+      - direction         = CASE WHEN AVG(metric_col) < 0 THEN 'negative' ELSE 'positive' END
+    in the SELECT so the synthesiser can explain the finding.
+
+    Full example — customers with systematically negative mix_contribution over trailing 12:
+      WITH trailing AS (
+        SELECT period_id FROM (
+          SELECT DISTINCT period_id FROM fact_rgm_metrics
+          ORDER BY period_id DESC LIMIT 12
+        )
+      )
+      SELECT
+        f.customer_id,
+        c.customer_name,
+        COUNT(DISTINCT f.period_id)                                         AS total_periods,
+        SUM(CASE WHEN f.mix_contribution < 0 THEN 1 ELSE 0 END)            AS negative_periods,
+        ROUND(AVG(f.mix_contribution), 4)                                   AS avg_mix_contribution,
+        ROUND(SUM(f.mix_contribution), 4)                                   AS total_mix_contribution
+      FROM fact_rgm_metrics f
+      JOIN dim_customer     c ON f.customer_id = c.customer_id
+      JOIN trailing         t ON f.period_id   = t.period_id
+      GROUP BY f.customer_id, c.customer_name
+      HAVING SUM(CASE WHEN f.mix_contribution < 0 THEN 1 ELSE 0 END) = COUNT(DISTINCT f.period_id)
+      ORDER BY avg_mix_contribution ASC
+
+18. Pre-defined KPI formulas — when DEFINED KPIs section is present:
     a. If the user's question references a KPI by name (e.g. "RSV Growth", "Market Share"),
        check the DEFINED KPIs section for a matching KPI with a sql_expression.
     b. When a match is found AND sql_expression is non-empty, use that expression

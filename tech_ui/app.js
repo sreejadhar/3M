@@ -122,7 +122,7 @@ function renderSourceList() {
       <div class="src-icon">${dbIcon}</div>
       <div style="flex:1;min-width:0;">
         <div class="src-name">${_esc(s.name)}</div>
-        <div class="src-meta">${_esc(s.db_type)} · ${s.table_count ?? 0} tables</div>
+        <div class="src-meta">${_esc(s.db_type)} · ${s.table_count ?? 0} tables${s.domain && s.domain !== 'Other' ? ` · <span style="color:var(--accent)">${_esc(s.domain)}</span>` : ''}</div>
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
         <span class="status-dot ${statusClass}"></span>
@@ -171,6 +171,7 @@ async function selectSource(sourceId) {
 
   const stats = [];
   if (src.table_count) stats.push(`<span><b>${src.table_count}</b> tables</span>`);
+  if (src.domain && src.domain !== 'Other') stats.push(`<span>Domain: <b style="color:var(--accent)">${_esc(src.domain)}</b></span>`);
   if (src.status) stats.push(`<span>Status: <b style="color:${src.status==='ready'?'var(--green)':src.status==='indexing'?'var(--accent)':'var(--red)'}">${src.status}</b></span>`);
   if (src.indexed_at) stats.push(`<span>Last indexed: <b>${_fmtTime(src.indexed_at)}</b></span>`);
   document.getElementById('detail-src-stats').innerHTML = stats.join('&nbsp;&nbsp;·&nbsp;&nbsp;');

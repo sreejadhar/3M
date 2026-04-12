@@ -1729,6 +1729,18 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
         sql_queries   = result.get("sql_queries") or []
         errors        = result.get("errors") or []
 
+        # Internal pipeline errors (plan_node SQL generation failures, schema
+        # gaps, etc.) are useful for engineers but confusing to business users.
+        # Log all errors, then only expose them to analyst / admin personas.
+        persona = session.get("persona", "business_user")
+        if errors:
+            for err in errors:
+                logger.warning(
+                    "plan_node error [session=%s msg=%s persona=%s]: %s",
+                    session_id[:8], msg_id[:8], persona, err,
+                )
+        visible_errors = errors if persona in ("analyst", "admin") else []
+
         # Record AI message
         ai_ts = time.time()
         session["messages"].append({
@@ -1737,7 +1749,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
             "content":       insights,
             "results":       query_results,
             "sql":           sql_queries,
-            "errors":        errors,
+            "errors":        visible_errors,
             "ts":            ai_ts,
         })
 
@@ -1747,7 +1759,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
             "content":       insights,
             "results":       query_results,
             "sql":           sql_queries,
-            "errors":        errors,
+            "errors":        visible_errors,
             "ts":            ai_ts,
             "cache_hit":     result.get("cache_hit", False),
         })

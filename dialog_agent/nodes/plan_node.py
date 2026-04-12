@@ -638,20 +638,57 @@ General Rules:
       [date/period] → time column — use for grouping, not for arithmetic.
       [categorical] → classification — use for GROUP BY / WHERE, not arithmetic.
 
-    ── STEP 2: MATCH NUMERATOR + DENOMINATOR FROM THE SCHEMA ──────────────────
+    ── STEP 2: BRIDGE COLUMN NAMES TO BUSINESS TERMS (≈ concept hints) ────────
+    CRITICAL: Source column names are often opaque DBA names that differ from
+    business terminology.  The schema_context annotates such columns with a
+    concept hint using "≈":
+
+        trade_investment_value: xsd:decimal  [monetary — ≈ trade-spend]
+        customer_trade_fund:    xsd:decimal  [monetary — ≈ trade-spend]
+        gsv:                    xsd:decimal  [monetary — ≈ gross-rsv]
+        net_realised_rev:       xsd:decimal  [monetary — ≈ net-realized-value]
+        tts:                    xsd:decimal  [monetary — ≈ trade-spend]
+
+    RULE: When a column has "≈ concept-name", treat the column AS that business
+    concept, regardless of what the column is physically named.  Use the
+    standard business term as the output alias (after "AS"):
+
+        SUM(trade_investment_value) AS total_trade_spend     ← concept in alias
+        SUM(customer_trade_fund)    AS total_trade_spend     ← same concept, different col
+        SUM(gsv)                    AS total_gross_rsv
+        SUM(net_realised_rev)       AS total_net_realized_value
+
+    Standard alias conventions (use these exact alias names for recognisable output):
+      ≈ trade-spend          → total_trade_spend,  avg_trade_spend
+      ≈ gross-rsv            → total_gross_rsv,    avg_gross_rsv
+      ≈ net-realized-value   → total_net_realized_value, prior_net_realized_value
+      ≈ pricing-impact       → total_pricing_impact, pricing_impact_pct
+      ≈ price-index          → avg_price_index,    price_index_vs_yago
+      ≈ market-share         → avg_market_share_pct
+      ≈ headcount            → total_headcount,    avg_headcount
+      ≈ attrition            → total_attrition,    attrition_rate_pct
+      ≈ revenue              → total_revenue,      revenue_growth_pct
+      ≈ cost                 → total_cost,         cost_ratio_pct
+      ≈ gross-margin         → total_gross_margin, gross_margin_pct
+      ≈ inventory            → avg_inventory,      inventory_days
+      ≈ fill-rate            → avg_fill_rate_pct
+
+    This rule applies even when the user's question uses the business term and
+    the schema shows only the DBA column name.
+
+    ── STEP 3: MATCH NUMERATOR + DENOMINATOR FROM THE SCHEMA ──────────────────
     Within each table, identify pairs where:
       • A [monetary] or [count/volume] column is the NUMERATOR (the specific
         impact, component, or sub-measure being analysed).
       • A broader [monetary] column is the DENOMINATOR (the total, base, or
         gross measure against which the numerator is expressed).
 
-    Heuristic: the denominator is the column with the LARGEST semantic scope
-    for the same entity.  Examples (use actual column names from the schema):
-      pricing_impact_value [monetary]  ÷  gross_rsv [monetary]  → pricing contribution %
-      net_margin [monetary]            ÷  revenue [monetary]     → margin %
-      cost [monetary]                  ÷  budget [monetary]      → cost realisation %
-      units_sold [count/volume]        ÷  units_target [count]   → attainment %
-      headcount_delta [count/volume]   ÷  total_headcount [count]→ growth rate %
+    When concept hints are present, the denominator is the column tagged with the
+    broadest revenue/base concept for the same entity:
+      ≈ trade-spend  ÷  ≈ gross-rsv   → trade_spend_ratio_pct
+      ≈ pricing-impact ÷ ≈ gross-rsv  → pricing_contribution_pct
+      ≈ gross-margin ÷ ≈ revenue       → gross_margin_pct
+      ≈ attrition    ÷ ≈ headcount     → attrition_rate_pct
 
     If the table has only ONE [monetary] column and NO obvious denominator:
       → Do NOT force a spurious division; include the raw column with SUM().

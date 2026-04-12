@@ -319,19 +319,24 @@ _COL_DOMAIN_PATTERNS: List[tuple] = [
     # Percentage / rate / share — already a ratio, no further division needed
     ("percentage",
      re.compile(r'(_pct|_percent|_ratio|_share|_mix|_rate|_proportion)$', re.I)),
-    # Monetary values — strong numerator / denominator candidates
+    # Monetary values — strong numerator / denominator candidates.
+    # Use suffix-aware patterns instead of \b to handle snake_case (_value, _rev, etc.)
     ("monetary",
      re.compile(
-         r'(revenue|gross_rsv|net_rsv|\brsv\b|cost|price|amount|salary|wage'
-         r'|budget|expense|\bvalue\b|profit|loss|margin|fee|spend|sales'
-         r'|invoice|turnover|impact)',
+         r'revenue|gross_rsv|net_rsv|(?:^|_)rsv(?:_|$)'
+         r'|(?:^|_)gsv(?:_|$)|(?:^|_)nsv(?:_|$)|(?:^|_)nrv(?:_|$)'
+         r'|(?:^|_)tts(?:_|$)|(?:^|_)cti(?:_|$)'
+         r'|cost|price|amount|salary|wage|budget|expense'
+         r'|(?:^|_)value(?:_|$)|_value$|^value_|profit|loss|margin|fee|spend'
+         r'|(?:^|_)sales(?:_|$)|invoice|turnover|impact',
          re.I,
      )),
-    # Count / volume — numerator candidate for rate calculations
+    # Count / volume — numerator candidate for rate calculations.
+    # Remove \b so _count suffix works in snake_case (e.g. emp_count, fte_count)
     ("count/volume",
      re.compile(
-         r'(\bcount\b|_qty|quantity|volume|units|headcount|fte|\bstaff\b'
-         r'|employees|resources)',
+         r'(?:^|_)count(?:_|$)|_qty|quantity|volume|units|headcount|fte'
+         r'|staff|employees|resources',
          re.I,
      )),
     # Identifier columns — not metrics; skip for derived-metric inference
@@ -362,6 +367,184 @@ def _infer_col_domain(col_name: str) -> Optional[str]:
     for role, pat in _COL_DOMAIN_PATTERNS:
         if pat.search(lower):
             return role
+    return None
+
+
+# ── Semantic concept mapping ───────────────────────────────────────────────────
+# Maps source column names (however the DBA named them) to standard business
+# concepts that analysts use.  The concept label is injected into schema_context
+# as "≈ <concept>" so the LLM can alias derived metrics with the canonical name
+# even when the physical column name is opaque.
+#
+# Ordered: first match wins.  Patterns are intentionally broad to cover common
+# naming conventions across orgs (snake_case, camelCase, abbreviations).
+_CONCEPT_PATTERNS: List[tuple] = [
+    # ── RGM / Revenue Growth Management ──────────────────────────────────────
+    # trade-spend: covers TTS, CTI, CTF, ATI abbreviations and verbose names
+    ("trade-spend",
+     re.compile(
+         r'trade.*(invest|spend|discount|promo|allow|support|fund)'
+         r'|promo.*(spend|cost|invest|allow|discount|fund)'
+         r'|customer.*(invest|support|fund|allow)'
+         r'|(?:^|_)tts(?:_|$)|(?:^|_)cti(?:_|$)|(?:^|_)ctf(?:_|$)|(?:^|_)ati(?:_|$)',
+         re.I,
+     )),
+    # net-realized-value BEFORE gross-rsv so net_rsv → net-realized-value, not gross-rsv.
+    # Requires 'realized/realised', net_rsv/net_inv, or known acronyms.
+    # Plain 'net_revenue' stays as Finance revenue — not mapped here.
+    ("net-realized-value",
+     re.compile(
+         r'net.*(realized|realised)'
+         r'|net_rsv|net_sales_value|net_inv'
+         r'|(?:^|_)nrv(?:_|$)|(?:^|_)nsv(?:_|$)|(?:^|_)ner(?:_|$)',
+         re.I,
+     )),
+    # gross-rsv: covers GSV, base sales value, total RSV before deductions
+    ("gross-rsv",
+     re.compile(
+         r'gross.*(rsv|revenue|sales|value|inv)'
+         r'|(total|base).*(rsv|revenue|sales)'
+         r'|(?:^|_)gsv(?:_|$)|(?:^|_)rsv(?:_|$)',
+         re.I,
+     )),
+    # pricing-impact: RGM/price actions contribution to revenue
+    ("pricing-impact",
+     re.compile(
+         r'pric.*(impact|effect|contribution|benefit|gain)'
+         r'|rgm.*(impact|contribution|effect)'
+         r'|impact.*(pric|rgm|price)',
+         re.I,
+     )),
+    ("price-index",
+     re.compile(r'price.*(index|idx|ix)|pric.*(index|idx)', re.I)),
+    ("market-share",
+     re.compile(
+         r'(market|value|volume).*(share|sos|sov)'
+         r'|(?:^|_)sos(?:_|$)|(?:^|_)sov(?:_|$)|share_of_',
+         re.I,
+     )),
+    ("volume",
+     re.compile(
+         r'(?:^|_)vol(?:_|$)|tonnage|units_sold'
+         r'|case_equiv|(?:^|_)ceq(?:_|$)|sku_vol',
+         re.I,
+     )),
+
+    # ── Finance / P&L — cost MUST come before revenue (cost_of_sales guard) ──
+    # cost: COGS and all forms of direct/variable/manufacturing cost
+    ("cost",
+     re.compile(
+         r'cogs|cost_of_goods|cost_of_sales|cost_of_revenue'
+         r'|direct_cost|variable_cost|manufacturing_cost|unit_cost',
+         re.I,
+     )),
+    # gross-margin: profit before overhead
+    ("gross-margin",
+     re.compile(r'gross.*(margin|profit)|(?:^|_)gp(?:_|$)|gross_p', re.I)),
+    # opex: catches both leading and embedded 'opex', SG&A
+    ("opex",
+     re.compile(
+         r'opex|operating_exp|overhead|indirect_cost'
+         r'|(?:^|_)sga(?:_|$)|sg_and_a',
+         re.I,
+     )),
+    # revenue: net/total sales — after cost guard above
+    ("revenue",
+     re.compile(
+         r'(?:^|_)revenue(?:_|$)|net_sales|(?:^|_)turnover(?:_|$)',
+         re.I,
+     )),
+    ("budget",
+     re.compile(
+         r'(?:^|_)budget(?:_|$)|forecast|planned_value|target_value',
+         re.I,
+     )),
+    ("actual",
+     re.compile(r'(?:^|_)actual(?:s)?(?:_|$)|actual_value|real_value', re.I)),
+
+    # ── HR / Workforce ────────────────────────────────────────────────────────
+    # headcount: FTE with underscore prefix/suffix included
+    ("headcount",
+     re.compile(
+         r'headcount|emp.*count|staff.*count|employee_count|no_of_emp'
+         r'|(?:^|_)fte(?:_|$)|(?:^|_)pax(?:_|$)',
+         re.I,
+     )),
+    # attrition: churn/resignation without word-boundary restriction
+    ("attrition",
+     re.compile(r'attrition|leaver|resignation|churn', re.I)),
+    ("salary",
+     re.compile(
+         r'salary|compensation|base_pay|total_pay|wage|remuneration'
+         r'|(?:^|_)ctc(?:_|$)',
+         re.I,
+     )),
+    ("recruitment-cost",
+     re.compile(r'recruit.*(cost|spend|fee)|cost_per_hire|hiring_cost', re.I)),
+
+    # ── Supply Chain / Operations ─────────────────────────────────────────────
+    ("inventory",
+     re.compile(
+         r'inventory|stock_on_hand|on_hand|(?:^|_)woh(?:_|$)'
+         r'|(?:^|_)doh(?:_|$)|days_of_supply',
+         re.I,
+     )),
+    ("fill-rate",
+     re.compile(
+         r'fill.*(rate|pct|level)|service.*(level|rate|pct)'
+         r'|fulfil.*rate|fulfillment.*rate',
+         re.I,
+     )),
+    ("lead-time",
+     re.compile(r'lead.?time|cycle.?time|order.?to.?delivery|(?:^|_)otd(?:_|$)', re.I)),
+    ("on-time",
+     re.compile(r'otif|on.?time.*in.?full|on.?time.*delivery', re.I)),
+
+    # ── Marketing / Commercial ────────────────────────────────────────────────
+    # media-spend: covers ATL/BTL/TTL abbreviations
+    ("media-spend",
+     re.compile(
+         r'media.*(spend|invest|cost|budget|exp)'
+         r'|advert.*(spend|cost|invest|exp)'
+         r'|(?:^|_)atl(?:_|$)|(?:^|_)btl(?:_|$)|(?:^|_)ttl(?:_|$)',
+         re.I,
+     )),
+    ("promo-uplift",
+     re.compile(r'promo.*(uplift|lift|incremental)|incremental.*(sales|volume)', re.I)),
+]
+
+# Normalise a concept name to a column-name key for exact-match suppression
+# e.g. "trade-spend" → "trade_spend",  "net-realized-value" → "net_realized_value"
+def _concept_key(concept: str) -> str:
+    return concept.replace("-", "_")
+
+
+def _infer_col_concept(col_name: str) -> Optional[str]:
+    """
+    Return a standard business concept label for a column based on its name.
+
+    Examples of bridging opaque DBA names to business terms:
+      'trade_investment_value' → 'trade-spend'
+      'gsv'                   → 'gross-rsv'
+      'tts'                   → 'trade-spend'
+      'fte_count'             → 'headcount'
+      'churn_rate'            → 'attrition'
+      'cost_of_sales'         → 'cost'
+
+    Returns None when:
+      - No pattern matches, OR
+      - The column name is exactly the concept key (already self-evident;
+        e.g. 'trade_spend' for concept 'trade-spend').
+    """
+    lower = col_name.lower()
+    for concept, pat in _CONCEPT_PATTERNS:
+        if pat.search(lower):
+            # Only suppress when the column IS the concept verbatim.
+            # Compound names like 'total_trade_spend', 'fte_count' still get
+            # annotated because the concept key is not an exact match.
+            if lower == _concept_key(concept):
+                return None
+            return concept
     return None
 
 
@@ -643,11 +826,20 @@ def _summarise_graph(
                         lines.append(f"    {display}  [sample values: {sample_str}]")
                 else:
                     # No sample data (DB source) — annotate with inferred domain role
-                    # so the planner can identify metric numerators / denominators.
+                    # and semantic concept hint so the planner can identify metric
+                    # numerators/denominators and bridge column names to business terms.
                     col_name_for_domain = sql_col if samples is not None else original_col
                     domain_tag = _infer_col_domain(col_name_for_domain)
-                    if domain_tag:
+                    concept    = _infer_col_concept(col_name_for_domain)
+                    if domain_tag and concept:
+                        lines.append(f"    {display}  [{domain_tag} — ≈ {concept}]")
+                    elif domain_tag:
                         lines.append(f"    {display}  [{domain_tag}]")
+                    elif concept:
+                        # Abbreviations/opaque names (gsv, tts, nrv) have a known
+                        # concept but no domain signal — annotate concept alone so the
+                        # LLM can still map the column to its business meaning.
+                        lines.append(f"    {display}  [≈ {concept}]")
                     else:
                         lines.append(f"    {display}")
 

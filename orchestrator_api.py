@@ -758,6 +758,137 @@ async def _run_pipeline(session_id: str) -> None:
 _FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
 
 
+# ---------------------------------------------------------------------------
+# Domain inference from extracted report
+# ---------------------------------------------------------------------------
+# Ordered: first match wins.  Each entry:
+#   (domain_label, set_of_signal_words_in_table_or_column_names)
+# Signal words are matched against the full set of table names + column names
+# from the extracted report, lowercased.
+_DOMAIN_SIGNALS: List[tuple] = [
+    # CPG / RGM — Revenue Growth Management
+    ("CPG/RGM", {
+        "rsv", "gsv", "nrv", "nsv", "tts", "cti", "trade_spend",
+        "pricing_impact", "price_index", "market_share", "offtake",
+        "brand_pack", "sku", "volume_offtake", "gross_rsv", "net_rsv",
+        "promo_spend", "rgm", "revenue_growth",
+    }),
+    # Telecom / Telco
+    ("Telecom", {
+        "arpu", "mou", "data_usage", "subscriber", "churn_rate",
+        "prepaid", "postpaid", "sim", "roaming", "spectrum",
+        "minutes_of_use", "revenue_per_user", "nps_score",
+        "network_quality", "cell_tower", "bandwidth",
+    }),
+    # Banking / Financial Services
+    ("Banking/FS", {
+        "nii", "nim", "casa", "gnpa", "nnpa", "crar", "slr", "crr",
+        "net_interest", "loan_book", "deposit", "borrowing",
+        "credit_risk", "provisioning", "capital_adequacy",
+        "return_on_assets", "cost_to_income",
+    }),
+    # Insurance
+    ("Insurance", {
+        "premium", "claim", "loss_ratio", "combined_ratio",
+        "policy", "underwriting", "reinsurance", "actuarial",
+        "incurred_loss", "earned_premium", "lapse_rate",
+    }),
+    # E-commerce / Retail-tech
+    ("E-commerce", {
+        "gmv", "aov", "cac", "ltv", "roas", "cart",
+        "conversion_rate", "basket_size", "add_to_cart",
+        "checkout", "order_value", "return_rate", "refund",
+    }),
+    # Retail (physical)
+    ("Retail", {
+        "store_sales", "same_store", "comp_sales", "footfall",
+        "basket", "shrinkage", "planogram", "assortment",
+        "markdown", "sell_through", "stock_turn",
+    }),
+    # Manufacturing / Industrials
+    ("Manufacturing", {
+        "oee", "scrap_rate", "yield_pct", "downtime", "mtbf",
+        "cycle_time", "throughput", "defect_rate", "work_in_progress",
+        "machine_utilisation", "production_order", "quality_inspection",
+    }),
+    # Supply Chain / Logistics
+    ("Supply Chain", {
+        "otif", "fill_rate", "lead_time", "inventory_days",
+        "doh", "woh", "perfect_order", "on_time_delivery",
+        "supplier_on_time", "stock_out", "safety_stock", "replenishment",
+    }),
+    # Healthcare / Pharma
+    ("Healthcare", {
+        "length_of_stay", "bed_occupancy", "claims_paid", "denial_rate",
+        "readmission", "patient", "diagnosis", "procedure_code",
+        "cost_per_patient", "clinical_trial", "adverse_event",
+    }),
+    # HR / People Analytics
+    ("HR/People", {
+        "headcount", "attrition", "time_to_hire", "cost_per_hire",
+        "offer_acceptance", "engagement_score", "absenteeism",
+        "performance_rating", "fte_count", "salary_band",
+    }),
+    # Marketing / Media
+    ("Marketing", {
+        "impressions", "click_through", "cpm", "cpc", "cpa",
+        "media_spend", "brand_awareness", "campaign", "reach",
+        "frequency", "attribution", "media_mix",
+    }),
+    # SaaS / Product Analytics
+    ("SaaS/Product", {
+        "dau", "mau", "churn", "mrr", "arr", "expansion_revenue",
+        "activation_rate", "feature_adoption", "session_duration",
+        "retention_rate", "nrr", "logo_churn",
+    }),
+]
+
+
+def _infer_domain_from_report(report: Dict) -> str:
+    """
+    Scan all table names and column names in the extraction report and return
+    the best-matching business domain label.
+
+    Uses a signal-word voting approach: count how many domain-specific terms
+    appear across the schema, return the domain with the highest count.
+    Falls back to "" (empty string) when no signals fire so that the caller
+    can detect the no-match case and use the admin-provided domain instead.
+    """
+    tables: Dict = report.get("tables") or {}
+
+    # Build a flat set of all lowercase tokens from table + column names
+    tokens: set = set()
+    for table_name, table_meta in tables.items():
+        # Add whole table name and individual underscore-split tokens
+        tl = table_name.lower()
+        tokens.add(tl)
+        tokens.update(tl.split("_"))
+        if isinstance(table_meta, dict):
+            for col in table_meta.get("columns") or []:
+                if isinstance(col, dict):
+                    cl = col.get("name", "").lower()
+                    tokens.add(cl)
+                    tokens.update(cl.split("_"))
+
+    # Vote: count signal words matched per domain
+    scores: Dict[str, int] = {}
+    for domain_label, signals in _DOMAIN_SIGNALS:
+        hit = len(tokens & signals)
+        if hit:
+            scores[domain_label] = hit
+
+    if not scores:
+        return ""
+
+    # Return domain with the most signal word hits
+    best = max(scores, key=lambda d: scores[d])
+    logger.info(
+        "_infer_domain_from_report: best=%s (score=%d), all=%s",
+        best, scores[best], scores,
+    )
+    return best
+
+
 def _build_db_config(db_type: str, conn: Dict) -> Dict:
     if db_type.lower() in _FILE_BASED_TYPES:
         return {"db_type": db_type, "file_path": conn.get("file_path", "")}
@@ -990,6 +1121,18 @@ async def _index_source(source_id: str) -> None:
         src["report"]      = report
         src["table_names"] = list((report.get("tables") or {}).keys())
         src["table_count"] = len(src["table_names"])
+
+        # Auto-infer domain from table/column names if admin left it as
+        # the default "Other" or blank — so concept annotation always has
+        # a domain context even when none was explicitly set.
+        admin_domain = (src.get("domain") or "").strip()
+        if not admin_domain or admin_domain.lower() == "other":
+            inferred = _infer_domain_from_report(report)
+            if inferred:
+                src["domain"] = inferred
+                _push_index_event(source_id, "extract", "running",
+                                  f"Domain auto-detected: {inferred}",
+                                  "Inferred from table and column name signals in the schema")
         _push_index_event(source_id, "extract", "done",
                           f"Metadata extracted — {src['table_count']} tables found",
                           f"Tables: {', '.join(src['table_names'][:10])}" + ("…" if src['table_count'] > 10 else ""))

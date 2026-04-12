@@ -17,12 +17,17 @@ This document describes every major algorithm implemented in the Metadata Agent 
    - 3.1 [_extract_ontology() — OWL Graph Parsing](#31-_extract_ontology--owl-graph-parsing)
    - 3.2 [_build_graph_data() — UI Visualisation Format](#32-_build_graph_data--ui-visualisation-format)
    - 3.3 [_generate_cypher() / _generate_gremlin() — Query Generation](#33-_generate_cypher--_generate_gremlin--query-generation)
-4. [Query Resolution Algorithms](#4-query-resolution-algorithms)
-   - 4.1 [_load_samples_from_catalog() — Categorical Value Loading](#41-_load_samples_from_catalog--categorical-value-loading)
-   - 4.2 [_detect_parent_child_pairs() — Taxonomy Hierarchy Detection](#42-_detect_parent_child_pairs--taxonomy-hierarchy-detection)
-   - 4.3 [_build_taxonomy_hierarchy() — Cross-Tab Hierarchy Building](#43-_build_taxonomy_hierarchy--cross-tab-hierarchy-building)
-   - 4.4 [_fuzzy_match_candidates() — Multi-Strategy Token Matching](#44-_fuzzy_match_candidates--multi-strategy-token-matching)
-   - 4.5 [_apply_fuzzy_fallback() — Safety Net Resolution](#45-_apply_fuzzy_fallback--safety-net-resolution)
+4. [Domain Inference & Concept Annotation](#4-domain-inference--concept-annotation)
+   - 4.1 [_infer_domain_from_report() — Signal-Word Voting](#41-_infer_domain_from_report--signal-word-voting)
+   - 4.2 [_build_col_evidence() — Per-Column Evidence String](#42-_build_col_evidence--per-column-evidence-string)
+   - 4.3 [_annotate_column_concepts() — LLM Concept Mapping](#43-_annotate_column_concepts--llm-concept-mapping)
+   - 4.4 [End-to-End Pipeline & Examples](#44-end-to-end-pipeline--examples)
+5. [Query Resolution Algorithms](#5-query-resolution-algorithms)
+   - 5.1 [_load_samples_from_catalog() — Categorical Value Loading](#51-_load_samples_from_catalog--categorical-value-loading)
+   - 5.2 [_detect_parent_child_pairs() — Taxonomy Hierarchy Detection](#52-_detect_parent_child_pairs--taxonomy-hierarchy-detection)
+   - 5.3 [_build_taxonomy_hierarchy() — Cross-Tab Hierarchy Building](#53-_build_taxonomy_hierarchy--cross-tab-hierarchy-building)
+   - 5.4 [_fuzzy_match_candidates() — Multi-Strategy Token Matching](#54-_fuzzy_match_candidates--multi-strategy-token-matching)
+   - 5.5 [_apply_fuzzy_fallback() — Safety Net Resolution](#55-_apply_fuzzy_fallback--safety-net-resolution)
 
 ---
 
@@ -346,11 +351,256 @@ These `join_columns` are later consumed by `understand_node._summarise_graph()` 
 
 ---
 
-## 4. Query Resolution Algorithms
+## 4. Domain Inference & Concept Annotation
+
+These algorithms ensure that every column in an indexed data source has a human-readable business concept label — even when the column name is an opaque abbreviation like `tts`, `arpu`, or `nii`.  The pipeline runs in two stages: first a deterministic voting step identifies the industry domain from the schema; then an LLM call maps each column to a standard concept label, grounded in both the domain context and observed data evidence.
+
+### Why this matters
+
+Abbreviations are deeply ambiguous across industries:
+
+| Column | Telecom meaning | CPG/RGM meaning | Banking meaning |
+|--------|----------------|-----------------|-----------------|
+| `arpu` | avg revenue per user | — | avg revenue per user |
+| `tts` | time to serve | trade spend | — |
+| `nii`  | — | — | net interest income |
+| `gsv`  | — | gross sales value | — |
+| `gmv`  | — | — | — (e-commerce term) |
+
+Without knowing the domain, a generic LLM will guess or return `null`.  With domain context it resolves correctly every time.
+
+---
+
+### 4.1 `_infer_domain_from_report()` — Signal-Word Voting
+
+**File:** [`orchestrator_api.py:847`](orchestrator_api.py#L847)
+
+**Purpose:** Detect the business domain of a data source automatically from its table and column names, so that concept annotation always has a domain context even when the admin did not specify one during source registration.
+
+**Inputs:**
+- `report` — the full extraction report dict (`{ "tables": { table_name: { "columns": [...] } } }`)
+
+**Output:** A domain label string such as `"CPG/RGM"`, `"Telecom"`, `"Banking/FS"`, or `""` if no signals fire.
+
+**Algorithm:**
+
+1. **Tokenise** every table name and column name: add the full name and each `_`-split part to a flat token set, all lowercased.
+2. **Vote** by intersecting the token set with each domain's signal-word set (`_DOMAIN_SIGNALS`). The score for a domain is the number of tokens that matched.
+3. **Select** the domain with the highest score. Ties are broken by whichever entry appears first in the ordered list. Return `""` if no domain scored > 0.
+
+**Signal vocabulary (`_DOMAIN_SIGNALS`):**
+
+| Domain | Example signals |
+|--------|----------------|
+| CPG/RGM | `gsv`, `nrv`, `tts`, `rsv`, `sku`, `rgm`, `trade_spend`, `market_share` |
+| Telecom | `arpu`, `mou`, `subscriber`, `churn_rate`, `prepaid`, `roaming` |
+| Banking/FS | `nii`, `nim`, `casa`, `gnpa`, `loan_book`, `provisioning` |
+| Insurance | `premium`, `claim`, `loss_ratio`, `lapse_rate`, `underwriting` |
+| E-commerce | `gmv`, `aov`, `cac`, `roas`, `cart`, `conversion_rate` |
+| Retail | `footfall`, `same_store`, `basket`, `planogram`, `sell_through` |
+| Manufacturing | `oee`, `scrap_rate`, `mtbf`, `cycle_time`, `yield_pct` |
+| Supply Chain | `otif`, `fill_rate`, `lead_time`, `doh`, `safety_stock` |
+| Healthcare | `length_of_stay`, `bed_occupancy`, `readmission`, `patient` |
+| HR/People | `headcount`, `attrition`, `time_to_hire`, `engagement_score` |
+| Marketing | `impressions`, `cpm`, `cpc`, `media_spend`, `attribution` |
+| SaaS/Product | `dau`, `mau`, `mrr`, `arr`, `churn`, `retention_rate` |
+
+**Example:**
+
+Schema with tables `fact_rgm_kpis`, `dim_brand_pack` and columns `gsv`, `nrv`, `tts`, `price_index`, `market_share`, `sku`:
+
+```
+Token set: {fact, rgm, kpis, gsv, nrv, tts, price_index, market_share, dim, brand, pack, sku, ...}
+
+Scores:
+  CPG/RGM    → gsv ✓, nrv ✓, tts ✓, market_share ✓, sku ✓, rgm ✓  = 6
+  Telecom    → 0
+  Banking/FS → 0
+  ...
+
+Winner: CPG/RGM
+```
+
+**Fallback behaviour:** Called in `_index_source` only when `src["domain"]` is blank or `"Other"`.  If inference fires, the result is written back to `src["domain"]` in place and a status event is pushed to the UI:
+```
+Domain auto-detected: CPG/RGM
+```
+If inference returns `""`, the empty string is used — the annotation LLM falls back to a generic multi-industry prompt.
+
+---
+
+### 4.2 `_build_col_evidence()` — Per-Column Evidence String
+
+**File:** [`ontology_agent/nodes/build_node.py:116`](ontology_agent/nodes/build_node.py#L116)
+
+**Purpose:** Serialise all observed data signals for one column into a compact pipe-delimited string that is included verbatim in the LLM annotation prompt.
+
+**Input:** A column dict from the extraction report (same schema as persisted to the metadata catalog).
+
+**Output:** A single string like:
+```
+decimal | min=0 max=500000 avg=45200.00 | top_values=[5000, 12000, 88000] | high-cardinality | description="decimal monetary column" | domain=monetary
+```
+
+**Signals included (in order):**
+
+| Signal | Source field | Why it matters |
+|--------|-------------|---------------|
+| SQL data type | `data_type` | Distinguishes measure (decimal) from flag (integer 0/1) from category (varchar) |
+| Numeric range | `min_value`, `max_value`, `avg_value` | Large range → monetary; 0–100 → percentage; small integers → count |
+| Top values | `top_values` | Strongest signal: currency-scale numerics → monetary; short strings → dimension |
+| Cardinality | `unique_count` / `row_count` | Near-1.0 ratio → continuous measure or identifier; ≤ 20 distinct → categorical |
+| Null rate | `null_rate` | High null rate → optional attribute, not a key |
+| Rule-based description | `description` | Already grounded by the extraction pipeline's pattern rules |
+| Rule-based domain | `domain` | `monetary`, `status_flag`, `categorical`, `numeric_measure`, etc. |
+
+**Design note:** The `description` field is truncated at the first ` — ` clause separator (not at `.`) to avoid cutting mid-number in range strings like `"range: 0.0 – 500000.0"`.
+
+---
+
+### 4.3 `_annotate_column_concepts()` — LLM Concept Mapping
+
+**File:** [`ontology_agent/nodes/build_node.py:178`](ontology_agent/nodes/build_node.py#L178)
+
+**Purpose:** Call Claude to map every column in a table to a standard business concept label (kebab-case, 1–4 words), grounded in both the domain context and the per-column evidence.  Returns `null` for identifiers, timestamps, and self-explanatory names to avoid annotation noise.
+
+**Inputs:**
+- `table_name` — used in the user message for context
+- `columns` — list of column dicts from the extraction report
+- `model` — LLM model ID (default `claude-haiku-4-5-20251001`)
+- `domain_hint` — the `source_domain` string from `OntologyConfig`, e.g. `"CPG/RGM | bigquery | Pricing Analytics DB"`
+
+**Output:** `{ column_name: concept_label_or_null }`
+
+**Prompt construction:**
+
+The system prompt is rendered from `_CONCEPT_SYSTEM_TEMPLATE` with two placeholders:
+
+- `{domain_context}` — e.g. `"the CPG/RGM | bigquery | Pricing Analytics DB domain"` or `"enterprise data systems across multiple industries"` when no domain is known
+- `{source_context_block}` — the full domain hint displayed under `SOURCE CONTEXT`
+
+The user message lists every column as one evidence line (output of `_build_col_evidence`):
+```
+Table: fact_rgm_kpis
+Columns (name | data_type | range | top_values | cardinality | description | domain):
+  gsv   | decimal | min=0 max=9800000 avg=420000.00 | high-cardinality | domain=monetary
+  tts   | decimal | min=0 max=500000 avg=45200.00 | top_values=[5000,12000,88000] | high-cardinality | description="decimal monetary column" | domain=monetary
+  ...
+```
+
+**Grounding rules baked into the system prompt (priority order):**
+
+1. `top_values` — strongest signal (0/1 → flag; currency-scale → monetary; strings → dimension)
+2. `description` — already rule-grounded by extraction pipeline; trust it
+3. `min/max/avg` — range confirms type
+4. `cardinality` — near 1.0 → continuous measure; few distinct → categorical
+5. `data_type` — decimal/float → measure; integer → count/id; varchar → category
+6. `column name` — last resort; resolve against source domain vocabulary
+
+**Return `null` when:**
+- The column is an identifier, primary/foreign key, or date/timestamp
+- The name is already self-explanatory (e.g. `revenue`, `headcount`)
+- Evidence contradicts the apparent meaning (e.g. a `value` column with only 0/1 values is a status flag, not a monetary measure)
+
+**Model choice:** `claude-haiku-4-5-20251001` by default — cheapest and fast enough for column-name interpretation at indexing time.  Can be overridden per source via `OntologyConfig.llm_model`.
+
+**Failure mode:** Any exception returns an empty dict — annotation is best-effort and never blocks ontology generation.
+
+---
+
+### 4.4 End-to-End Pipeline & Examples
+
+**Flow from source registration to OWL annotation:**
+
+```
+Admin registers source
+  domain = "Other" (or blank)
+        │
+        ▼
+_index_source() — extraction completes
+        │
+        ├── admin_domain blank or "Other"?
+        │       YES → _infer_domain_from_report()
+        │               schema tokens voted against _DOMAIN_SIGNALS
+        │               → src["domain"] = "CPG/RGM"   (written in place)
+        │       NO  → src["domain"] unchanged
+        │
+        ▼
+POST /generate to ontology_api
+  source_domain = "CPG/RGM"
+  source_name   = "Pricing Analytics DB"
+  db_type       = "bigquery"
+  source_description = "Revenue Growth Management data mart"
+        │
+        ▼
+ontology_api.py — builds full_domain_context
+  "CPG/RGM | bigquery | Pricing Analytics DB | Revenue Growth Management data mart"
+        │
+        ▼
+build_node.py — for each table:
+  _build_col_evidence() per column
+  _annotate_column_concepts(domain_hint=full_domain_context)
+        │
+        ▼
+LLM returns { "tts": "trade-spend", "gsv": "gross-sales-value", ... }
+        │
+        ▼
+OWL triple written:
+  :fact_rgm_kpis_tts rdfs:comment "Business concept: trade-spend"
+```
+
+**Example A — CPG/RGM schema (domain auto-detected)**
+
+Input columns in `fact_rgm_kpis`:
+
+| Column | Data type | Evidence | Annotation |
+|--------|-----------|----------|------------|
+| `gsv` | decimal | min=0 max=9.8M, high-cardinality, domain=monetary | `gross-sales-value` |
+| `nrv` | decimal | min=0 max=8.5M, high-cardinality, domain=monetary | `net-realized-value` |
+| `tts` | decimal | min=0 max=500K, top_values=[5000,12000,88000], domain=monetary | `trade-spend` |
+| `price_index` | decimal | min=85.2 max=112.4 avg=99.8, domain=numeric_measure | `price-index` |
+| `region_id` | integer | 5-distinct-values, domain=categorical | `null` — categorical key |
+| `period_dt` | date | — | `null` — timestamp |
+
+**Example B — Telecom schema**
+
+Input columns in `fact_subscriber_kpis`:
+
+| Column | Evidence | Without domain | With Telecom domain |
+|--------|----------|---------------|---------------------|
+| `arpu` | decimal, min=45 max=312 | `avg-revenue-per-user` *(guessed from name)* | `avg-revenue-per-user` *(confirmed)* |
+| `mou` | integer, min=0 max=1200 | `null` *(ambiguous abbreviation)* | `minutes-of-use` |
+| `subtype` | varchar, 3-distinct-values: Prepaid/Postpaid/Enterprise | `null` | `null` — self-explanatory |
+| `churn` | integer, top_values=[0,1] | `null` *(flag detected)* | `null` *(flag)* |
+
+**Example C — Same abbreviation, different domains**
+
+| Column | Domain hint | LLM output | Correct? |
+|--------|-------------|------------|---------|
+| `tts` | *(none)* | `total-time-spent` | Wrong — ambiguous |
+| `tts` | CPG/RGM | `trade-spend` | Correct |
+| `nii` | *(none)* | `null` | Safe fallback |
+| `nii` | Banking/FS | `net-interest-income` | Correct |
+| `gmv` | *(none)* | `gross-merchandise-value` *(name is known)* | Correct |
+| `gmv` | Banking/FS | `null` *(not a banking term)* | Correct — LLM rejects it |
+
+**OWL output** for `tts` in the CPG/RGM case:
+```turtle
+:fact_rgm_kpis_tts
+    a owl:DatatypeProperty ;
+    rdfs:label "tts" ;
+    rdfs:comment "Business concept: trade-spend" ;
+    rdfs:domain :FactRgmKpis ;
+    rdfs:range xsd:decimal .
+```
+
+---
+
+## 5. Query Resolution Algorithms
 
 These algorithms bridge user natural language to the exact values stored in the database — the critical step that prevents the SQL planning LLM from inventing filter values.
 
-### 4.1 `_load_samples_from_catalog()` — Categorical Value Loading
+### 5.1 `_load_samples_from_catalog()` — Categorical Value Loading
 
 **File:** `dialog_agent/nodes/understand_node.py`
 
@@ -367,14 +617,14 @@ These algorithms bridge user natural language to the exact values stored in the 
 1. Load all active entities for the source via `_mc.list_entities(source_id)`.
 2. For each entity, call `_mc.get_entity()` to get the full attribute list including `statistical_type` and `top_values`.
 3. Include a column in `samples` only if it has `statistical_type ∈ {categorical, ordinal}` AND non-empty `top_values`. This filters out identifiers, measures, and dates that should never appear in WHERE clause resolution.
-4. Detect parent-child column pairs via `_detect_parent_child_pairs()` (see §4.2).
+4. Detect parent-child column pairs via `_detect_parent_child_pairs()` (see §5.2).
 5. For each detected pair, build a hierarchy entry with the child column's values grouped under the key `"(all sub-values)"`. Without a live DB cross-tab we cannot know which parent value owns which child values, so the entire child value list is exposed.
 
 This function is the bridge between the indexing pipeline (which runs once) and the query pipeline (which runs per user query) — it ensures the query pipeline has categorical value knowledge even for database sources that cannot be sampled live.
 
 ---
 
-### 4.2 `_detect_parent_child_pairs()` — Taxonomy Hierarchy Detection
+### 5.2 `_detect_parent_child_pairs()` — Taxonomy Hierarchy Detection
 
 **File:** `dialog_agent/nodes/understand_node.py`
 
@@ -395,7 +645,7 @@ Both conditions must hold. This dual heuristic (naming + cardinality) prevents f
 
 ---
 
-### 4.3 `_build_taxonomy_hierarchy()` — Cross-Tab Hierarchy Building
+### 5.3 `_build_taxonomy_hierarchy()` — Cross-Tab Hierarchy Building
 
 **File:** `dialog_agent/nodes/understand_node.py`
 
@@ -419,7 +669,7 @@ Group results by parent value. Each parent value maps to the sorted list of dist
 
 ---
 
-### 4.4 `_fuzzy_match_candidates()` — Multi-Strategy Token Matching
+### 5.4 `_fuzzy_match_candidates()` — Multi-Strategy Token Matching
 
 **File:** `dialog_agent/nodes/resolve_node.py`
 
@@ -465,7 +715,7 @@ These labels appear in the hint block sent to the LLM, annotated as `[PARENT LEV
 
 ---
 
-### 4.5 `_apply_fuzzy_fallback()` — Safety Net Resolution
+### 5.5 `_apply_fuzzy_fallback()` — Safety Net Resolution
 
 **File:** `dialog_agent/nodes/resolve_node.py`
 

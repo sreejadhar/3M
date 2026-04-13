@@ -915,7 +915,7 @@ General Rules:
         FROM   dim_period                        ← or whatever the period dim is named
       ),
       trailing AS (
-        SELECT period_id FROM ranked_periods WHERE rn <= {N}   ← N from the question
+        SELECT period_id FROM ranked_periods WHERE rn <= {{N}}   ← N from the question
       )
       SELECT ...
       FROM   fact_table f
@@ -927,7 +927,7 @@ General Rules:
         SELECT DISTINCT period_id
         FROM   fact_table
         ORDER BY period_id DESC
-        LIMIT {N}
+        LIMIT {{N}}
       )
 
 16b. SYSTEMATICALLY NEGATIVE / CONSISTENTLY ABOVE / ALWAYS BELOW — when the question

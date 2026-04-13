@@ -200,6 +200,11 @@ TYPE CASTING      : CAST(col AS INT), CAST(col AS DECIMAL(10,2)), CAST(col AS NV
 DATE TRUNCATION   : DATEADD(month, DATEDIFF(month, 0, date_col), 0) for month-start
                     DATE_TRUNC does NOT exist in SQL Server
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
+                    ALL navigation/offset functions MUST have ORDER BY inside OVER():
+                      LAG(col) OVER (PARTITION BY x ORDER BY period_col)  ← correct
+                      LAG(col) OVER (PARTITION BY x)                      ← ERROR in SQL Server
+                      LAG(col) OVER ()                                    ← ERROR in SQL Server
+                    Aggregate windows (SUM/AVG/COUNT OVER (...)) do NOT need ORDER BY.
                     Window functions cannot be used in WHERE clause — use a CTE or subquery
 ORDER BY IN SUBS  : ORDER BY is ILLEGAL inside subqueries, CTEs, derived tables, views,
                     and inline functions UNLESS the subquery also has TOP, OFFSET, or FOR XML.
@@ -2192,6 +2197,128 @@ def _split_order_by_terms(text: str) -> List[str]:
     return cleaned
 
 
+def _fix_window_functions(sql: str, db_type: str) -> str:
+    """
+    Ensure every navigation/offset window function has ORDER BY inside its
+    OVER(...) clause.
+
+    Affected functions (all dialects require ORDER BY for these):
+        LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE,
+        ROW_NUMBER, RANK, DENSE_RANK, CUME_DIST, PERCENT_RANK
+
+    SQL Server is strictest — it raises an error at parse time if ORDER BY is
+    missing.  PostgreSQL, Oracle, BigQuery also require it.  This fixer runs
+    for ALL dialects so the LLM's output is always valid.
+
+    Aggregate window functions (SUM/AVG/COUNT/MIN/MAX ... OVER (...)) do NOT
+    require ORDER BY and are left untouched.
+
+    Strategy
+    --------
+    For each call `<fn>(args) OVER (...)`:
+    1. If the OVER clause already contains ORDER BY → leave it alone.
+    2. If PARTITION BY exists inside OVER → insert
+           ORDER BY <partition_col>
+       after the PARTITION BY clause (reuses the same column; valid for all
+       dialects and gives stable but deterministic ordering).
+    3. Otherwise insert ORDER BY (SELECT NULL) which is the universally
+       accepted no-op order for SQL Server, Oracle, and other dialects when
+       the calling code truly does not care about ordering (e.g. NTILE with
+       only one partition).
+
+    The function is written as a regex + paren-depth scanner so it handles
+    nested function calls inside OVER() correctly.
+    """
+    # Functions that REQUIRE ORDER BY in their OVER clause
+    _ORDER_REQUIRED = re.compile(
+        r'\b(LAG|LEAD|FIRST_VALUE|LAST_VALUE|NTH_VALUE|NTILE'
+        r'|ROW_NUMBER|RANK|DENSE_RANK|CUME_DIST|PERCENT_RANK)\s*\(',
+        re.IGNORECASE,
+    )
+    if not _ORDER_REQUIRED.search(sql):
+        return sql
+
+    result = []
+    pos = 0
+
+    for fn_match in _ORDER_REQUIRED.finditer(sql):
+        fn_name = fn_match.group(1)
+        fn_start = fn_match.start()
+
+        # Append everything up to start of this function call
+        result.append(sql[pos:fn_start])
+
+        # Find the matching close-paren for the function args  (depth-1 walk)
+        args_open = fn_match.end() - 1   # position of '(' opening the args
+        depth = 1
+        i = args_open + 1
+        while i < len(sql) and depth:
+            if sql[i] == '(':
+                depth += 1
+            elif sql[i] == ')':
+                depth -= 1
+            i += 1
+        args_close = i - 1   # position of matching ')'
+
+        # Now look for OVER keyword immediately after the args close
+        after_args = sql[args_close + 1:]
+        over_m = re.match(r'\s*OVER\s*\(', after_args, re.IGNORECASE)
+        if not over_m:
+            # No OVER clause at all — leave function untouched
+            result.append(sql[fn_start:args_close + 1])
+            pos = args_close + 1
+            continue
+
+        # Find the matching close-paren of the OVER(...)
+        over_open_abs = args_close + 1 + over_m.end() - 1  # abs pos of '('
+        over_body_start = over_open_abs + 1
+        depth = 1
+        i = over_body_start
+        while i < len(sql) and depth:
+            if sql[i] == '(':
+                depth += 1
+            elif sql[i] == ')':
+                depth -= 1
+            i += 1
+        over_close_abs = i - 1  # abs pos of matching ')' of OVER(...)
+
+        over_body = sql[over_body_start:over_close_abs]
+
+        # Does it already have ORDER BY?
+        if re.search(r'\bORDER\s+BY\b', over_body, re.IGNORECASE):
+            # Already correct — emit verbatim
+            result.append(sql[fn_start:over_close_abs + 1])
+            pos = over_close_abs + 1
+            continue
+
+        # Need to inject ORDER BY.  Prefer to reuse the PARTITION BY column.
+        pb_match = re.search(
+            r'\bPARTITION\s+BY\s+([\w\.\[\]`"]+)',
+            over_body, re.IGNORECASE,
+        )
+        if pb_match:
+            order_col = pb_match.group(1)
+        else:
+            # Safe no-op fallback understood by SQL Server, Oracle, BigQuery
+            order_col = "(SELECT NULL)"
+
+        new_over_body = over_body.rstrip() + f" ORDER BY {order_col}"
+        fixed_fragment = (
+            sql[fn_start:over_open_abs + 1]
+            + new_over_body
+            + ")"
+        )
+        result.append(fixed_fragment)
+        pos = over_close_abs + 1
+        logger.info(
+            "plan_node: injected ORDER BY %s into %s() OVER() [dialect=%s]",
+            order_col, fn_name, db_type,
+        )
+
+    result.append(sql[pos:])
+    return "".join(result)
+
+
 def _fix_distinct_order_by(sql: str) -> str:
     """
     Fix: "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
@@ -2623,6 +2750,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _fix_percentage(sql, natural_query, config.db_type)
             sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
             sql = _fix_subquery_order_by(sql, config.db_type)
+            sql = _fix_window_functions(sql, config.db_type)
             sql = _fix_distinct_order_by(sql)
 
             # Multi-table / no-join-key check

@@ -171,13 +171,55 @@ async function selectSource(sourceId) {
 
   const stats = [];
   if (src.table_count) stats.push(`<span><b>${src.table_count}</b> tables</span>`);
-  if (src.domain && src.domain !== 'Other') stats.push(`<span>Domain: <b style="color:var(--accent)">${_esc(src.domain)}</b></span>`);
+  // Domain — always shown, always editable (pencil icon)
+  const domainDisplay = (src.domain && src.domain !== 'Other') ? _esc(src.domain) : '<span style="color:var(--text-2);font-style:italic">None</span>';
+  stats.push(`<span>Domain:&nbsp;<b id="domain-label" style="color:var(--accent)">${domainDisplay}</b>&nbsp;<button title="Edit domain" onclick="editDomain('${_esc(src.id)}')" style="background:none;border:none;cursor:pointer;padding:0 2px;color:var(--text-2);font-size:11px;vertical-align:middle">✎</button></span>`);
   if (src.status) stats.push(`<span>Status: <b style="color:${src.status==='ready'?'var(--green)':src.status==='indexing'?'var(--accent)':'var(--red)'}">${src.status}</b></span>`);
   if (src.indexed_at) stats.push(`<span>Last indexed: <b>${_fmtTime(src.indexed_at)}</b></span>`);
   document.getElementById('detail-src-stats').innerHTML = stats.join('&nbsp;&nbsp;·&nbsp;&nbsp;');
 
   // Subscribe to SSE
   startSSE(sourceId);
+}
+
+function editDomain(sourceId) {
+  const src = _sources.find(s => s.id === sourceId);
+  if (!src) return;
+  const current = (src.domain && src.domain !== 'Other') ? src.domain : '';
+  const label = document.getElementById('domain-label');
+  if (!label) return;
+  // Replace the label with an inline input + save/cancel
+  label.outerHTML = `<span id="domain-edit-wrap" style="display:inline-flex;align-items:center;gap:4px">
+    <input id="domain-input" type="text" value="${_esc(current)}"
+      placeholder="e.g. CPG/FP&amp;A"
+      style="font-size:11px;padding:1px 5px;border:1px solid var(--accent);border-radius:4px;background:var(--bg-0);color:var(--text-1);width:140px;"
+      onkeydown="if(event.key==='Enter')saveDomain('${_esc(sourceId)}');if(event.key==='Escape')selectSource('${_esc(sourceId)}')"
+    />
+    <button onclick="saveDomain('${_esc(sourceId)}')" style="background:var(--accent);border:none;border-radius:4px;color:#fff;padding:1px 7px;font-size:11px;cursor:pointer">Save</button>
+    <button onclick="selectSource('${_esc(sourceId)}')" style="background:none;border:1px solid var(--border);border-radius:4px;color:var(--text-2);padding:1px 6px;font-size:11px;cursor:pointer">✕</button>
+  </span>`;
+  document.getElementById('domain-input')?.focus();
+}
+
+async function saveDomain(sourceId) {
+  const input = document.getElementById('domain-input');
+  if (!input) return;
+  const newDomain = input.value.trim();
+  try {
+    const updated = await apiFetch(`/sources/${encodeURIComponent(sourceId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ domain: newDomain || 'Other' }),
+    });
+    // Update local state
+    const idx = _sources.findIndex(s => s.id === sourceId);
+    if (idx !== -1) _sources[idx] = { ..._sources[idx], ...updated };
+    toast(`Domain updated: ${updated.domain || 'Other'}`, 'success', 3000);
+    // Re-render the detail header and source list
+    await selectSource(sourceId);
+    renderSourceList();
+  } catch (e) {
+    toast('Failed to save domain: ' + e.message, 'error');
+  }
 }
 
 function onGlobalSourceChange(sourceId) {

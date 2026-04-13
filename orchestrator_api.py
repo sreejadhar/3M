@@ -762,23 +762,40 @@ _FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
 # Domain inference from extracted report
 # ---------------------------------------------------------------------------
 # Ordered: first match wins.  Each entry:
-#   (domain_label, set_of_signal_words_in_table_or_column_names)
-# Signal words are matched against the full set of table names + column names
-# from the extracted report, lowercased.
-_DOMAIN_SIGNALS: List[tuple] = [
-    # CPG / RGM — Revenue Growth Management
-    ("CPG/RGM", {
-        "rsv", "gsv", "nrv", "nsv", "tts", "cti", "trade_spend",
-        "pricing_impact", "price_index", "market_share", "offtake",
+# ── Two-tier domain inference ────────────────────────────────────────────────
+# INDUSTRY signals: broad vertical (e.g. CPG, Life Sciences, Retail, Telecom)
+# FUNCTION signals: cross-cutting capability (e.g. FP&A, Supply Chain, RGM)
+#
+# The inference algorithm scores both tiers independently and combines them
+# as "Industry/Function" (e.g. "CPG/FP&A", "LS/Supply Chain").  When only
+# one tier fires the single label is returned (e.g. "Telecom", "Supply Chain").
+
+_INDUSTRY_SIGNALS: List[tuple] = [
+    # Consumer Packaged Goods (CPG / FMCG)
+    ("CPG", {
+        "rsv", "gsv", "nrv", "nsv", "tts", "cti",
         "brand_pack", "sku", "volume_offtake", "gross_rsv", "net_rsv",
-        "promo_spend", "rgm", "revenue_growth",
+        "trade_spend", "promo_spend", "offtake", "category_mgmt",
+        "consumer_goods", "fmcg", "pack_size", "distribution_points",
+    }),
+    # Life Sciences / Pharma
+    ("LS", {
+        "clinical_trial", "adverse_event", "iqvia", "ndc", "formulary",
+        "rx", "otc", "molecule", "drug", "prescription", "patient",
+        "diagnosis", "procedure_code", "hospital", "physician",
+        "therapy_area", "indication", "dosage", "biomarker",
+    }),
+    # Healthcare (non-pharma / payer / provider)
+    ("Healthcare", {
+        "length_of_stay", "bed_occupancy", "claims_paid", "denial_rate",
+        "readmission", "cost_per_patient", "icd", "cpt_code",
+        "admission", "discharge", "inpatient", "outpatient", "payer",
     }),
     # Telecom / Telco
     ("Telecom", {
         "arpu", "mou", "data_usage", "subscriber", "churn_rate",
         "prepaid", "postpaid", "sim", "roaming", "spectrum",
-        "minutes_of_use", "revenue_per_user", "nps_score",
-        "network_quality", "cell_tower", "bandwidth",
+        "minutes_of_use", "cell_tower", "bandwidth", "network_quality",
     }),
     # Banking / Financial Services
     ("Banking/FS", {
@@ -793,17 +810,17 @@ _DOMAIN_SIGNALS: List[tuple] = [
         "policy", "underwriting", "reinsurance", "actuarial",
         "incurred_loss", "earned_premium", "lapse_rate",
     }),
-    # E-commerce / Retail-tech
-    ("E-commerce", {
-        "gmv", "aov", "cac", "ltv", "roas", "cart",
-        "conversion_rate", "basket_size", "add_to_cart",
-        "checkout", "order_value", "return_rate", "refund",
-    }),
     # Retail (physical)
     ("Retail", {
         "store_sales", "same_store", "comp_sales", "footfall",
         "basket", "shrinkage", "planogram", "assortment",
         "markdown", "sell_through", "stock_turn",
+    }),
+    # E-commerce
+    ("E-commerce", {
+        "gmv", "aov", "cac", "ltv", "roas", "cart",
+        "conversion_rate", "basket_size", "add_to_cart",
+        "checkout", "order_value", "return_rate", "refund",
     }),
     # Manufacturing / Industrials
     ("Manufacturing", {
@@ -811,17 +828,48 @@ _DOMAIN_SIGNALS: List[tuple] = [
         "cycle_time", "throughput", "defect_rate", "work_in_progress",
         "machine_utilisation", "production_order", "quality_inspection",
     }),
-    # Supply Chain / Logistics
+    # SaaS / Technology
+    ("SaaS", {
+        "dau", "mau", "mrr", "arr", "expansion_revenue",
+        "activation_rate", "feature_adoption", "session_duration",
+        "retention_rate", "nrr", "logo_churn", "saas",
+    }),
+]
+
+_FUNCTION_SIGNALS: List[tuple] = [
+    # Revenue Growth Management (RGM)
+    ("RGM", {
+        "rgm", "revenue_growth", "pricing_impact", "price_index",
+        "market_share", "mix_contribution", "price_mix", "volume_mix",
+        "promo_effectiveness", "trade_rate", "net_revenue_mgmt",
+    }),
+    # Financial Planning & Analysis (FP&A)
+    ("FP&A", {
+        "budget", "forecast", "variance", "actuals", "plan",
+        "p_and_l", "pnl", "income_statement", "ebitda", "ebit",
+        "cash_flow", "capex", "opex", "cost_centre", "cost_center",
+        "financial_planning", "fp_and_a", "fpa", "headcount_plan",
+        "rolling_forecast", "zero_based", "ytd", "qtd",
+    }),
+    # Supply Chain & Logistics
     ("Supply Chain", {
         "otif", "fill_rate", "lead_time", "inventory_days",
         "doh", "woh", "perfect_order", "on_time_delivery",
-        "supplier_on_time", "stock_out", "safety_stock", "replenishment",
+        "supplier_on_time", "stock_out", "stockout", "safety_stock",
+        "replenishment", "demand_plan", "s_and_op", "sop",
+        "warehouse", "3pl", "distribution",
     }),
-    # Healthcare / Pharma
-    ("Healthcare", {
-        "length_of_stay", "bed_occupancy", "claims_paid", "denial_rate",
-        "readmission", "patient", "diagnosis", "procedure_code",
-        "cost_per_patient", "clinical_trial", "adverse_event",
+    # Sales & Commercial
+    ("Sales", {
+        "sales_rep", "territory", "quota", "pipeline", "opportunity",
+        "win_rate", "deal_size", "crm", "account_manager",
+        "sales_force", "coverage_model", "gtm",
+    }),
+    # Marketing
+    ("Marketing", {
+        "impressions", "click_through", "cpm", "cpc", "cpa",
+        "media_spend", "brand_awareness", "campaign", "reach",
+        "frequency", "attribution", "media_mix",
     }),
     # HR / People Analytics
     ("HR/People", {
@@ -829,17 +877,16 @@ _DOMAIN_SIGNALS: List[tuple] = [
         "offer_acceptance", "engagement_score", "absenteeism",
         "performance_rating", "fte_count", "salary_band",
     }),
-    # Marketing / Media
-    ("Marketing", {
-        "impressions", "click_through", "cpm", "cpc", "cpa",
-        "media_spend", "brand_awareness", "campaign", "reach",
-        "frequency", "attribution", "media_mix",
+    # Manufacturing / Operations (function, not industry)
+    ("Operations", {
+        "oee", "downtime", "throughput", "cycle_time", "capacity",
+        "utilisation", "shift", "plant", "production_schedule",
     }),
-    # SaaS / Product Analytics
-    ("SaaS/Product", {
-        "dau", "mau", "churn", "mrr", "arr", "expansion_revenue",
-        "activation_rate", "feature_adoption", "session_duration",
-        "retention_rate", "nrr", "logo_churn",
+    # Customer Experience / Service
+    ("CX", {
+        "nps", "csat", "net_promoter", "ticket", "resolution_time",
+        "first_contact", "escalation", "customer_effort", "churn",
+        "voice_of_customer",
     }),
 ]
 
@@ -847,19 +894,18 @@ _DOMAIN_SIGNALS: List[tuple] = [
 def _infer_domain_from_report(report: Dict) -> str:
     """
     Scan all table names and column names in the extraction report and return
-    the best-matching business domain label.
+    a compound domain label "Industry/Function" (e.g. "CPG/FP&A",
+    "LS/Supply Chain") when both tiers fire, or a single label when only one
+    tier fires.
 
-    Uses a signal-word voting approach: count how many domain-specific terms
-    appear across the schema, return the domain with the highest count.
-    Falls back to "" (empty string) when no signals fire so that the caller
-    can detect the no-match case and use the admin-provided domain instead.
+    Falls back to "" when no signals match so the caller can detect the
+    no-match case and preserve the admin-provided domain.
     """
     tables: Dict = report.get("tables") or {}
 
     # Build a flat set of all lowercase tokens from table + column names
     tokens: set = set()
     for table_name, table_meta in tables.items():
-        # Add whole table name and individual underscore-split tokens
         tl = table_name.lower()
         tokens.add(tl)
         tokens.update(tl.split("_"))
@@ -870,23 +916,39 @@ def _infer_domain_from_report(report: Dict) -> str:
                     tokens.add(cl)
                     tokens.update(cl.split("_"))
 
-    # Vote: count signal words matched per domain
-    scores: Dict[str, int] = {}
-    for domain_label, signals in _DOMAIN_SIGNALS:
-        hit = len(tokens & signals)
-        if hit:
-            scores[domain_label] = hit
+    def _best(signal_list: List[tuple]) -> Optional[tuple]:
+        scores: Dict[str, int] = {}
+        for label, signals in signal_list:
+            hit = len(tokens & signals)
+            if hit:
+                scores[label] = hit
+        if not scores:
+            return None
+        best_label = max(scores, key=lambda d: scores[d])
+        return best_label, scores[best_label], scores
 
-    if not scores:
-        return ""
+    industry_result = _best(_INDUSTRY_SIGNALS)
+    function_result = _best(_FUNCTION_SIGNALS)
 
-    # Return domain with the most signal word hits
-    best = max(scores, key=lambda d: scores[d])
     logger.info(
-        "_infer_domain_from_report: best=%s (score=%d), all=%s",
-        best, scores[best], scores,
+        "_infer_domain_from_report: industry=%s function=%s",
+        industry_result, function_result,
     )
-    return best
+
+    if industry_result and function_result:
+        ind_label, ind_score, _ = industry_result
+        fn_label,  fn_score,  _ = function_result
+        # Only combine when both tiers have meaningful signal
+        # (at least 1 hit each); prefer higher-scoring tier when they conflict
+        return f"{ind_label}/{fn_label}"
+
+    if industry_result:
+        return industry_result[0]
+
+    if function_result:
+        return function_result[0]
+
+    return ""
 
 
 def _build_db_config(db_type: str, conn: Dict) -> Dict:
@@ -1840,6 +1902,28 @@ async def get_source(source_id: str):
     s = _sources.get(source_id)
     if not s:
         raise HTTPException(status_code=404, detail="Source not found")
+    return _source_public(s)
+
+
+class UpdateSourceRequest(BaseModel):
+    name:        Optional[str] = None
+    description: Optional[str] = None
+    domain:      Optional[str] = None
+
+
+@app.patch("/sources/{source_id}", status_code=200)
+async def update_source(source_id: str, req: UpdateSourceRequest):
+    """Update editable fields (name, description, domain) on an existing source."""
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if req.name is not None:
+        s["name"] = req.name.strip()
+    if req.description is not None:
+        s["description"] = req.description.strip()
+    if req.domain is not None:
+        s["domain"] = req.domain.strip()
+    logger.info("Source updated: %s — domain=%s", source_id[:8], s.get("domain"))
     return _source_public(s)
 
 

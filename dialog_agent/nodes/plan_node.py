@@ -2553,17 +2553,27 @@ def plan_node(state: DialogState) -> DialogState:
     # question cannot be answered from the schema.  Capture that text so
     # synthesize_node can surface it to the user instead of a generic error.
     if not plan:
-        prose = re.sub(r'```(?:json)?\s*\[\s*\]\s*```', '', raw).strip()
-        prose = re.sub(r'^\s*\[\s*\]\s*', '', prose).strip()
-        # Strip any residual JSON array content — if the LLM returned a
-        # malformed or truncated JSON plan, _extract_json returns [] and `raw`
-        # still contains the JSON.  Never let raw JSON reach the user as prose.
-        prose = re.sub(r'\[\s*\{.*', '', prose, flags=re.DOTALL).strip()
-        if prose and not prose.strip().startswith('[') and not prose.strip().startswith('{'):
-            state["plan_explanation"] = prose
-            logger.info("plan_node: LLM returned [] with explanation (%d chars)", len(prose))
-        elif not prose:
-            logger.info("plan_node: LLM returned [] with no prose explanation")
+        # Detect whether raw looks like a JSON plan that failed to parse
+        # (malformed / truncated).  If raw starts with '[' after stripping
+        # code fences, it is a broken JSON plan — do not use it as prose.
+        raw_stripped = re.sub(r'```(?:json)?', '', raw).strip().rstrip('`').strip()
+        # raw_stripped starts with '[{' → broken JSON plan (array of objects)
+        # raw_stripped starts with '[]' → empty array, prose may follow → extract it
+        # raw_stripped starts with '[' but not '[{' or '[]' → broken partial JSON → skip
+        if raw_stripped.startswith('[{') or (
+            raw_stripped.startswith('[') and not raw_stripped.startswith('[]')
+        ):
+            logger.warning(
+                "plan_node: LLM returned unparseable JSON plan (%d chars) — "
+                "no plan_explanation set to avoid leaking raw JSON to user",
+                len(raw),
+            )
+        else:
+            prose = re.sub(r'```(?:json)?\s*\[\s*\]\s*```', '', raw).strip()
+            prose = re.sub(r'^\s*\[\s*\]\s*', '', prose).strip()
+            if prose:
+                state["plan_explanation"] = prose
+                logger.info("plan_node: LLM returned [] with explanation (%d chars)", len(prose))
 
     # ── Pre-flight completeness check (detection only — no LLM correction) ───
     # Runs on the raw plan to detect analytical gaps and log them.

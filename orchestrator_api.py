@@ -772,11 +772,23 @@ _FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
 
 _INDUSTRY_SIGNALS: List[tuple] = [
     # Consumer Packaged Goods (CPG / FMCG)
+    # Broad product-hierarchy vocabulary that appears in ANY CPG database
+    # (supply chain, FP&A, sales, RGM) — not just RGM-specific revenue terms.
     ("CPG", {
+        # Product hierarchy (present in virtually every CPG system)
+        "sku", "brand", "sub_brand", "pack_size", "pack_type", "upc",
+        "ean", "product_hierarchy", "category", "sub_category",
+        "brand_pack", "flavor", "variant", "ppg", "pog",
+        # CPG-specific revenue / trade vocabulary
         "rsv", "gsv", "nrv", "nsv", "tts", "cti",
-        "brand_pack", "sku", "volume_offtake", "gross_rsv", "net_rsv",
-        "trade_spend", "promo_spend", "offtake", "category_mgmt",
-        "consumer_goods", "fmcg", "pack_size", "distribution_points",
+        "volume_offtake", "gross_rsv", "net_rsv",
+        "trade_spend", "promo_spend", "offtake",
+        # CPG channel / customer vocabulary
+        "retailer", "customer_group", "trade_channel", "modern_trade",
+        "general_trade", "gt", "mt", "key_account", "distributor",
+        # Generic identifiers
+        "consumer_goods", "fmcg", "cpg", "category_mgmt",
+        "distribution_points", "weighted_distribution", "numeric_distribution",
     }),
     # Life Sciences / Pharma
     ("LS", {
@@ -838,18 +850,32 @@ _INDUSTRY_SIGNALS: List[tuple] = [
 
 _FUNCTION_SIGNALS: List[tuple] = [
     # Revenue Growth Management (RGM)
+    # Keep these specific — avoid terms that appear in non-RGM databases
     ("RGM", {
         "rgm", "revenue_growth", "pricing_impact", "price_index",
         "market_share", "mix_contribution", "price_mix", "volume_mix",
         "promo_effectiveness", "trade_rate", "net_revenue_mgmt",
+        "pack_price", "price_ladder", "revenue_mgmt",
     }),
     # Financial Planning & Analysis (FP&A)
+    # Cover the full vocabulary of FP&A tables/columns: GL, budget, forecast,
+    # P&L, cost centres, period structures, etc.
     ("FP&A", {
-        "budget", "forecast", "variance", "actuals", "plan",
-        "p_and_l", "pnl", "income_statement", "ebitda", "ebit",
-        "cash_flow", "capex", "opex", "cost_centre", "cost_center",
+        # Core planning vocab
+        "budget", "forecast", "actuals", "variance", "rolling_forecast",
+        "zero_based", "ytd", "qtd", "mtd", "period_budget",
+        # P&L / income statement
+        "p_and_l", "pnl", "income_statement", "ebitda", "ebit", "ebitda_margin",
+        "gross_profit", "operating_profit", "net_income",
+        # Cash / balance sheet
+        "cash_flow", "capex", "opex", "working_capital", "balance_sheet",
+        # Cost structure
+        "cost_centre", "cost_center", "cost_element", "gl_account",
+        "chart_of_accounts", "profit_centre", "profit_center",
+        "business_unit_plan", "entity_plan",
+        # FP&A-specific identifiers
         "financial_planning", "fp_and_a", "fpa", "headcount_plan",
-        "rolling_forecast", "zero_based", "ytd", "qtd",
+        "scenario", "version", "baseline", "reforecast",
     }),
     # Supply Chain & Logistics
     ("Supply Chain", {
@@ -858,6 +884,10 @@ _FUNCTION_SIGNALS: List[tuple] = [
         "supplier_on_time", "stock_out", "stockout", "safety_stock",
         "replenishment", "demand_plan", "s_and_op", "sop",
         "warehouse", "3pl", "distribution",
+        # Additional supply chain vocab
+        "purchase_order", "po_line", "goods_receipt", "grn",
+        "shipment", "delivery", "transit", "backorder", "reorder",
+        "supplier", "vendor", "procurement", "inventory_turn",
     }),
     # Sales & Commercial
     ("Sales", {

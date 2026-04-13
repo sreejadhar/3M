@@ -2063,16 +2063,72 @@ def _enforce_sql_limits(sql: str, row_limit: int, db_type: str = "") -> str:
             return patched
 
 
+def _fix_sqlserver_subquery_limits(sql: str, db_type: str) -> str:
+    """
+    SQL Server does not support LIMIT.  After _enforce_sql_limits has handled
+    the outermost SELECT, any LIMIT N that remains (inside CTEs, derived tables,
+    or IN-subqueries) is still invalid SQL Server syntax.
+
+    This pass converts all remaining  "ORDER BY <terms> LIMIT N"  patterns to
+    "ORDER BY <terms> OFFSET 0 ROWS FETCH NEXT N ROWS ONLY", which is the
+    SQL Server equivalent and is also legal inside CTEs and derived tables
+    (because OFFSET/FETCH counts as a valid row-limiter).
+
+    When LIMIT appears without a preceding ORDER BY (unusual), it is simply
+    dropped — the caller should rely on _enforce_sql_limits having added TOP
+    to the outermost SELECT.
+
+    Running this BEFORE _fix_subquery_order_by ensures that ORDER BY clauses
+    that precede LIMIT are now protected by OFFSET, so the subquery-ORDER-BY
+    fixer leaves them in place.
+    """
+    if db_type.lower() != "sqlserver":
+        return sql
+    if not re.search(r'\bLIMIT\s+\d+\b', sql, re.IGNORECASE):
+        return sql
+
+    # Replace "ORDER BY <anything> LIMIT N" with OFFSET/FETCH equivalent.
+    # The non-greedy [^;)]+ stops at subquery boundaries (')' or ';').
+    # Captures: (ORDER BY clause)(optional whitespace)(LIMIT N)
+    sql = re.sub(
+        r'(\bORDER\s+BY\b[^;)]+?)\s+LIMIT\s+(\d+)',
+        lambda m: m.group(1) + f" OFFSET 0 ROWS FETCH NEXT {m.group(2)} ROWS ONLY",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    # Strip any bare LIMIT N that remain (no preceding ORDER BY in the block)
+    leftover = re.search(r'\bLIMIT\s+\d+\b', sql, re.IGNORECASE)
+    if leftover:
+        sql = re.sub(r'\bLIMIT\s+\d+\b', '', sql, flags=re.IGNORECASE)
+        logger.info("plan_node: stripped bare LIMIT (no ORDER BY) from SQL Server query")
+
+    logger.info("plan_node: converted LIMIT → OFFSET/FETCH for SQL Server subqueries")
+    return sql
+
+
 def _fix_subquery_order_by(sql: str, db_type: str) -> str:
     """
     SQL Server (error 1033): ORDER BY is illegal inside a subquery, CTE body,
     derived table, view, or inline function unless TOP, OFFSET, or FOR XML is
     also present in that same block.
 
-    This function walks paren depth to locate every ORDER BY at depth > 0, checks
-    whether the enclosing block contains TOP / OFFSET / FOR XML, and strips it if
-    not.  All other dialects allow ORDER BY in subqueries so the function is a
-    no-op for them.
+    This function walks paren depth to locate every ORDER BY at depth > 0,
+    determines whether the enclosing paren is a window-function OVER clause
+    (in which case ORDER BY is REQUIRED and must never be stripped), checks
+    whether the non-OVER enclosing block contains TOP / OFFSET / FOR XML, and
+    strips the ORDER BY only when none of those protectors is present.
+
+    Key fix vs the naive approach
+    ------------------------------
+    The backward-scan finds the NEAREST enclosing '('.  For:
+        LAG(x) OVER (PARTITION BY k ORDER BY period_id)
+    the nearest '(' is the OVER paren, not the outer CTE/subquery paren.
+    Without the OVER check, the old code stripped the ORDER BY from the window
+    spec itself, breaking the window function.  We now detect the OVER paren
+    and skip it — ORDER BY inside OVER is always valid, even in CTEs.
+
+    All other dialects allow ORDER BY in subqueries, so this is a no-op for them.
     """
     if db_type.lower() != "sqlserver":
         return sql
@@ -2090,7 +2146,7 @@ def _fix_subquery_order_by(sql: str, db_type: str) -> str:
         if depth <= 0:
             continue  # outer-level ORDER BY — leave alone
 
-        # Scan backwards to find the enclosing open paren
+        # Scan backwards to find the nearest enclosing open paren
         block_open: Optional[int] = None
         d = 0
         for i in range(ob_pos - 1, -1, -1):
@@ -2105,6 +2161,16 @@ def _fix_subquery_order_by(sql: str, db_type: str) -> str:
 
         if block_open is None:
             continue
+
+        # ── Critical guard: skip ORDER BY that is inside an OVER() clause ────
+        # SQL Server (and all other dialects) require ORDER BY inside OVER()
+        # for window functions.  The restriction on ORDER BY applies only to
+        # SET-ordering at the query/CTE level, NOT to window specs.
+        # Detection: if the text immediately before the '(' (ignoring spaces)
+        # is the keyword OVER, this is a window spec — leave it completely alone.
+        text_before_open = sql[:block_open].rstrip()
+        if re.search(r'\bOVER$', text_before_open, re.IGNORECASE):
+            continue  # ORDER BY is part of a window function spec — do not touch
 
         # Scan forwards to find the matching close paren
         block_close: Optional[int] = None
@@ -2124,7 +2190,7 @@ def _fix_subquery_order_by(sql: str, db_type: str) -> str:
 
         block_content = sql[block_open + 1:block_close]
 
-        # Leave alone if protected by TOP, OFFSET, or FOR XML
+        # Leave alone if the block is protected by TOP, OFFSET, or FOR XML
         if re.search(r'\bSELECT\s+(?:DISTINCT\s+)?TOP\s+\d+\b', block_content, re.IGNORECASE):
             continue
         if re.search(r'\bOFFSET\b', block_content, re.IGNORECASE):
@@ -2132,8 +2198,8 @@ def _fix_subquery_order_by(sql: str, db_type: str) -> str:
         if re.search(r'\bFOR\s+XML\b', block_content, re.IGNORECASE):
             continue
 
-        # Strip from ORDER BY up to (not including) the closing paren,
-        # also eating any leading whitespace before ORDER BY
+        # Strip from ORDER BY up to (but not past) the closing paren,
+        # also consuming any leading whitespace before ORDER BY
         strip_start = ob_pos
         while strip_start > block_open and sql[strip_start - 1] in (' ', '\t', '\n', '\r'):
             strip_start -= 1
@@ -2749,6 +2815,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _fix_count_vs_sum(sql, natural_query)
             sql = _fix_percentage(sql, natural_query, config.db_type)
             sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
+            sql = _fix_sqlserver_subquery_limits(sql, config.db_type)
             sql = _fix_subquery_order_by(sql, config.db_type)
             sql = _fix_window_functions(sql, config.db_type)
             sql = _fix_distinct_order_by(sql)

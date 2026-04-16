@@ -2221,14 +2221,41 @@ def _fix_subquery_order_by(sql: str, db_type: str) -> str:
         if block_close is None:
             continue
 
-        block_content = sql[block_open + 1:block_close]
+        # ── Protection checks — must be depth-aware ──────────────────────────
+        # BUG FIX: the naive approach of re.search(r'\bOFFSET\b', block_content)
+        # is too broad.  If a *nested* subquery inside this CTE/subquery block has
+        # an OFFSET clause (e.g. added by _fix_sqlserver_subquery_limits), the outer
+        # ORDER BY would be incorrectly left alone.  We must only count TOP / OFFSET /
+        # FOR XML that appear at depth-0 relative to this block.
+        #
+        # "Depth 0 within the block" means: not inside any further nested ( ).
+        # • TOP N appears BEFORE the ORDER BY → scan block_open..ob_pos
+        # • OFFSET / FOR XML appear AFTER the ORDER BY → scan ob_pos..block_close
 
-        # Leave alone if the block is protected by TOP, OFFSET, or FOR XML
-        if re.search(r'\bSELECT\s+(?:DISTINCT\s+)?TOP\s+\d+\b', block_content, re.IGNORECASE):
+        # Helper: does `pattern` appear at paren-depth 0 within `text`?
+        def _keyword_at_d0(text: str, pattern: str) -> bool:
+            depth = 0
+            for tok in re.finditer(r'[()]|' + pattern, text, re.IGNORECASE):
+                s = tok.group(0)
+                if s == '(':
+                    depth += 1
+                elif s == ')':
+                    depth -= 1
+                elif depth == 0:
+                    return True
+            return False
+
+        before_ob = sql[block_open + 1 : ob_pos]
+        after_ob  = sql[ob_pos : block_close]          # includes ORDER BY itself
+
+        # Leave alone if SELECT TOP N precedes ORDER BY at depth 0 in this block
+        if _keyword_at_d0(before_ob, r'SELECT\s+(?:DISTINCT\s+)?TOP\s+\d+'):
             continue
-        if re.search(r'\bOFFSET\b', block_content, re.IGNORECASE):
+        # Leave alone if OFFSET follows ORDER BY at depth 0 (i.e. same ORDER BY clause)
+        if _keyword_at_d0(after_ob, r'\bOFFSET\b'):
             continue
-        if re.search(r'\bFOR\s+XML\b', block_content, re.IGNORECASE):
+        # Leave alone if FOR XML follows ORDER BY at depth 0
+        if _keyword_at_d0(after_ob, r'\bFOR\s+XML\b'):
             continue
 
         # Strip from ORDER BY up to (but not past) the closing paren,

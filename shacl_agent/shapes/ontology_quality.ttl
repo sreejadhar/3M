@@ -1,0 +1,139 @@
+@prefix sh:    <http://www.w3.org/ns/shacl#> .
+@prefix owl:   <http://www.w3.org/2002/07/owl#> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+@prefix mqsh:  <http://metadata-agent.io/shacl/> .
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHAPE 1 — OWL Class completeness
+# Every owl:Class in the ontology must carry a human-readable label and at
+# least one descriptive comment so downstream consumers (NL query, UI) can
+# display meaningful names.
+# ─────────────────────────────────────────────────────────────────────────────
+mqsh:ClassCompletenessShape
+    a sh:NodeShape ;
+    sh:name          "ClassCompleteness" ;
+    sh:description   "Every owl:Class must have rdfs:label and rdfs:comment." ;
+    sh:targetClass   owl:Class ;
+
+    sh:property [
+        sh:path      rdfs:label ;
+        sh:minCount  1 ;
+        sh:datatype  xsd:string ;
+        sh:severity  sh:Violation ;
+        sh:message   "owl:Class '{$this}' is missing rdfs:label — add a human-readable table name." ;
+    ] ;
+
+    sh:property [
+        sh:path      rdfs:comment ;
+        sh:minCount  1 ;
+        sh:datatype  xsd:string ;
+        sh:severity  sh:Warning ;
+        sh:message   "owl:Class '{$this}' has no rdfs:comment — add a description (entity type, row count, domain)." ;
+    ] .
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHAPE 2 — DatatypeProperty completeness
+# Column-level properties must declare their domain (the owning table class)
+# and range (an XSD datatype).  Without these the ontology is not valid OWL-DL
+# and downstream tooling cannot infer column–table membership.
+# ─────────────────────────────────────────────────────────────────────────────
+mqsh:DatatypePropertyShape
+    a sh:NodeShape ;
+    sh:name          "DatatypePropertyCompleteness" ;
+    sh:description   "Every owl:DatatypeProperty must declare rdfs:domain and rdfs:range." ;
+    sh:targetClass   owl:DatatypeProperty ;
+
+    sh:property [
+        sh:path      rdfs:label ;
+        sh:minCount  1 ;
+        sh:severity  sh:Warning ;
+        sh:message   "owl:DatatypeProperty '{$this}' is missing rdfs:label." ;
+    ] ;
+
+    sh:property [
+        sh:path      rdfs:domain ;
+        sh:minCount  1 ;
+        sh:severity  sh:Violation ;
+        sh:message   "owl:DatatypeProperty '{$this}' has no rdfs:domain — the owning table class is unknown." ;
+    ] ;
+
+    sh:property [
+        sh:path      rdfs:range ;
+        sh:minCount  1 ;
+        sh:severity  sh:Violation ;
+        sh:message   "owl:DatatypeProperty '{$this}' has no rdfs:range — the XSD datatype is unknown." ;
+    ] .
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHAPE 3 — ObjectProperty completeness
+# Relationship-level properties (FK / IND edges) must carry domain and range
+# so the graph topology is unambiguous and Cypher/Gremlin translation works.
+# ─────────────────────────────────────────────────────────────────────────────
+mqsh:ObjectPropertyShape
+    a sh:NodeShape ;
+    sh:name          "ObjectPropertyCompleteness" ;
+    sh:description   "Every owl:ObjectProperty must declare rdfs:domain and rdfs:range." ;
+    sh:targetClass   owl:ObjectProperty ;
+
+    sh:property [
+        sh:path      rdfs:domain ;
+        sh:minCount  1 ;
+        sh:severity  sh:Violation ;
+        sh:message   "owl:ObjectProperty '{$this}' has no rdfs:domain — the source table is unknown." ;
+    ] ;
+
+    sh:property [
+        sh:path      rdfs:range ;
+        sh:minCount  1 ;
+        sh:severity  sh:Violation ;
+        sh:message   "owl:ObjectProperty '{$this}' has no rdfs:range — the target table is unknown." ;
+    ] ;
+
+    sh:property [
+        sh:path      rdfs:comment ;
+        sh:minCount  1 ;
+        sh:severity  sh:Warning ;
+        sh:message   "owl:ObjectProperty '{$this}' has no rdfs:comment — add join columns, coverage, and relationship type." ;
+    ] .
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHAPE 4 — Ontology header
+# The owl:Ontology declaration must carry a label so the ontology is
+# self-identifying.
+# ─────────────────────────────────────────────────────────────────────────────
+mqsh:OntologyHeaderShape
+    a sh:NodeShape ;
+    sh:name          "OntologyHeader" ;
+    sh:description   "The owl:Ontology declaration must carry rdfs:label." ;
+    sh:targetClass   owl:Ontology ;
+
+    sh:property [
+        sh:path      rdfs:label ;
+        sh:minCount  1 ;
+        sh:severity  sh:Warning ;
+        sh:message   "owl:Ontology node '{$this}' has no rdfs:label — add a human-readable ontology name." ;
+    ] .
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHAPE 5 — FunctionalProperty must be a DatatypeProperty or ObjectProperty
+# owl:FunctionalProperty used as a cardinality marker must also be typed as
+# either a datatype or object property so reasoners can classify it.
+# ─────────────────────────────────────────────────────────────────────────────
+mqsh:FunctionalPropertyClassificationShape
+    a sh:NodeShape ;
+    sh:name          "FunctionalPropertyClassification" ;
+    sh:description   "owl:FunctionalProperty nodes must also carry a datatype or object property type." ;
+    sh:targetClass   owl:FunctionalProperty ;
+
+    sh:or (
+        [ sh:class owl:DatatypeProperty ]
+        [ sh:class owl:ObjectProperty   ]
+    ) ;
+    sh:severity  sh:Warning ;
+    sh:message   "owl:FunctionalProperty '{$this}' is not typed as DatatypeProperty or ObjectProperty." .

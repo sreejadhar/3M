@@ -151,6 +151,7 @@ services:
       ONTOLOGY_API_URL: "http://ontology-api:8001"
       KG_API_URL:       "http://kg-api:8002"
       DIALOG_API_URL:   "http://dialog-api:8003"
+      SHACL_API_URL:    "http://shacl-api:8007"
       LOG_LEVEL:        "${LOG_LEVEL:-info}"
       METADATA_DB:      "/data/metadata.db"
       KG_STORE_DB:      "/data/kg_store.db"
@@ -235,6 +236,27 @@ services:
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8006/health', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - metadata-net
+
+  shacl-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.shacl
+    container_name: metadata-shacl-api
+    restart: unless-stopped
+    ports:
+      - "${SHACL_PORT:-8007}:8007"
+    environment:
+      SHACL_API_PORT: "8007"
+      LOG_LEVEL:      "${LOG_LEVEL:-info}"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8007/health', timeout=4)"]
       interval: 15s
       timeout: 5s
       retries: 5

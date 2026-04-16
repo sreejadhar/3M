@@ -218,7 +218,7 @@ METADATA_API = os.environ.get("METADATA_API_URL", "http://localhost:8000")
 ONTOLOGY_API = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001")
 KG_API       = os.environ.get("KG_API_URL",       "http://localhost:8002")
 DIALOG_API   = os.environ.get("DIALOG_API_URL",   "http://localhost:8003")
-SHACL_API    = os.environ.get("SHACL_API_URL",    "http://localhost:8006")
+SHACL_API    = os.environ.get("SHACL_API_URL",    "http://localhost:8007")
 
 # ── Neo4j persistence ──────────────────────────────────────────────────────────
 # KG nodes/edges are persisted to Neo4j only in production (APP_ENV=production)

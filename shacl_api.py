@@ -253,5 +253,5 @@ def list_jobs():
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("SHACL_API_PORT", 8006))
+    port = int(os.environ.get("SHACL_API_PORT", 8007))
     uvicorn.run("shacl_api:app", host="0.0.0.0", port=port, reload=False)

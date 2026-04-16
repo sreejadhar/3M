@@ -993,118 +993,276 @@ function copyOntology() {
 
 // ── SHACL Ontology Validation ────────────────────────────────────────────────
 
+// Catalogue of every check the service runs — used to render the full checklist
+// including checks that PASSED (not just failures).
+const _SHACL_CHECKS = [
+  // SHACL structural shapes
+  {
+    id:          'ClassCompleteness',
+    shapeKey:    'ClassCompletenessShape',
+    category:    'Structure',
+    title:       'Class Completeness',
+    description: 'Every table class (owl:Class) must have a human-readable label (rdfs:label) and a description (rdfs:comment). These are used by the NL query planner to identify tables.',
+    affectsWhat: 'owl:Class nodes',
+  },
+  {
+    id:          'DatatypePropertyCompleteness',
+    shapeKey:    'DatatypePropertyShape',
+    category:    'Structure',
+    title:       'Column Property Completeness',
+    description: 'Every column property (owl:DatatypeProperty) must declare its owning table (rdfs:domain) and XSD data type (rdfs:range). Without these the KG translator cannot map columns to tables.',
+    affectsWhat: 'owl:DatatypeProperty nodes',
+  },
+  {
+    id:          'ObjectPropertyCompleteness',
+    shapeKey:    'ObjectPropertyShape',
+    category:    'Structure',
+    title:       'Relationship Completeness',
+    description: 'Every FK/IND relationship (owl:ObjectProperty) must declare the source table (rdfs:domain), target table (rdfs:range), and include join column details in rdfs:comment.',
+    affectsWhat: 'owl:ObjectProperty nodes',
+  },
+  {
+    id:          'OntologyHeader',
+    shapeKey:    'OntologyHeaderShape',
+    category:    'Structure',
+    title:       'Ontology Header',
+    description: 'The owl:Ontology declaration must carry a human-readable name (rdfs:label) so the ontology is self-identifying.',
+    affectsWhat: 'owl:Ontology declaration',
+  },
+  {
+    id:          'FunctionalPropertyClassification',
+    shapeKey:    'FunctionalPropertyClassificationShape',
+    category:    'Structure',
+    title:       'Functional Property Typing',
+    description: 'owl:FunctionalProperty markers (used for 1:1 and 1:N cardinality) must also be typed as either owl:DatatypeProperty or owl:ObjectProperty so OWL reasoners can classify them correctly.',
+    affectsWhat: 'owl:FunctionalProperty nodes',
+  },
+  // Semantic / Python checks
+  {
+    id:          'OrphanClass',
+    shapeKey:    null,
+    category:    'Semantics',
+    title:       'Orphan Classes',
+    description: 'Classes that are never referenced as domain or range of any property. These suggest missing FK or inclusion-dependency (IND) relationships. Orphan classes produce isolated KG nodes with no edges.',
+    affectsWhat: 'owl:Class nodes with no edges',
+  },
+  {
+    id:          'LowCoverage',
+    shapeKey:    null,
+    category:    'Semantics',
+    title:       'Low-Coverage Relationships',
+    description: 'ObjectProperty edges where the IND coverage (% of source values found in target) is below the threshold. Low-coverage edges are candidate links that should be confirmed before using as JOIN keys.',
+    affectsWhat: 'owl:ObjectProperty edges',
+  },
+  {
+    id:          'NamespaceDrift',
+    shapeKey:    null,
+    category:    'Semantics',
+    title:       'Namespace Consistency',
+    description: 'All class and property URIs should share the same base namespace as the owl:Ontology declaration. Mismatched namespaces indicate copy-paste errors and break URI-based lookups.',
+    affectsWhat: 'All owl:Class / owl:*Property URIs',
+  },
+  {
+    id:          'DuplicateClassLabel',
+    shapeKey:    null,
+    category:    'Semantics',
+    title:       'Duplicate Class Labels',
+    description: 'Two or more classes sharing the same rdfs:label (case-insensitive). The NL query planner uses labels to match table names — duplicates cause ambiguous table resolution.',
+    affectsWhat: 'owl:Class rdfs:label values',
+  },
+];
+
 async function validateOntology() {
   if (!_ontoSourceId) { toast('Select a source first', 'warn'); return; }
   const content = document.getElementById('ontology-editor').value.trim();
   if (!content)       { toast('Ontology is empty', 'warn'); return; }
 
-  const btn   = document.getElementById('onto-validate-btn');
-  const panel = document.getElementById('onto-shacl-panel');
-  const badge = document.getElementById('onto-shacl-badge');
-  const sumEl = document.getElementById('onto-shacl-summary');
-  const body  = document.getElementById('onto-shacl-body');
-
+  const btn = document.getElementById('onto-validate-btn');
   btn.disabled = true;
   btn.textContent = 'Validating…';
-  panel.style.display = 'block';
-  badge.textContent  = '…';
-  badge.style.cssText = 'font-size:11px;font-weight:700;padding:2px 8px;border-radius:3px;background:var(--surface-3);color:var(--text-2)';
-  sumEl.textContent  = 'Running SHACL validation…';
-  body.innerHTML     = '';
-  document.getElementById('onto-shacl-body').classList.remove('onto-tab-hidden');
+
+  // Open modal immediately in loading state
+  _openShaclModal();
 
   try {
     const report = await apiFetch(`/sources/${_ontoSourceId}/validate-ontology`, {
       method: 'POST',
       body: JSON.stringify({ ontology_text: content }),
     });
-    _renderShaclReport(report);
+    _renderShaclModal(report);
   } catch (e) {
-    badge.textContent = 'ERROR';
-    badge.style.cssText = 'font-size:11px;font-weight:700;padding:2px 8px;border-radius:3px;background:#7f1d1d;color:#fca5a5';
-    sumEl.textContent = e.message || 'Validation failed';
-    body.innerHTML = `<pre style="color:var(--text-2);white-space:pre-wrap">${_esc(e.message || String(e))}</pre>`;
+    _renderShaclModalError(e.message || String(e));
   } finally {
     btn.disabled = false;
-    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg> Validate';
+    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg> Validate`;
   }
 }
 
-function _renderShaclReport(r) {
-  const badge = document.getElementById('onto-shacl-badge');
-  const sumEl = document.getElementById('onto-shacl-summary');
-  const body  = document.getElementById('onto-shacl-body');
+function _openShaclModal() {
+  const overlay = document.getElementById('shacl-modal-overlay');
+  overlay.style.display = 'flex';
 
-  const quality   = r.quality || 'ERROR';
-  const stats     = r.ontology_stats || {};
-  const vCount    = (r.violations || []).length;
-  const wCount    = (r.warnings   || []).length;
-  const sCount    = (r.semantic_issues || []).length;
+  document.getElementById('shacl-modal-badge').textContent = '…';
+  document.getElementById('shacl-modal-badge').style.cssText =
+    'font-size:11px;font-weight:700;padding:2px 10px;border-radius:3px;background:var(--surface-3);color:var(--text-2);margin-left:4px';
+  document.getElementById('shacl-modal-stats').innerHTML = '';
+  document.getElementById('shacl-modal-body').innerHTML =
+    '<div style="text-align:center;padding:40px;color:var(--text-2)">Running validation checks…</div>';
+}
 
-  // Badge colour
-  const badgeStyle = {
-    PASS:  'background:#14532d;color:#86efac',
-    WARN:  'background:#713f12;color:#fde68a',
-    FAIL:  'background:#7f1d1d;color:#fca5a5',
+function closeShaclModal(e) {
+  if (e && e.target !== document.getElementById('shacl-modal-overlay')) return;
+  document.getElementById('shacl-modal-overlay').style.display = 'none';
+}
+
+function _renderShaclModalError(msg) {
+  const badge = document.getElementById('shacl-modal-badge');
+  badge.textContent = 'ERROR';
+  badge.style.cssText = 'font-size:11px;font-weight:700;padding:2px 10px;border-radius:3px;background:#7f1d1d;color:#fca5a5;margin-left:4px';
+  document.getElementById('shacl-modal-stats').innerHTML = '';
+  document.getElementById('shacl-modal-body').innerHTML =
+    `<div style="color:#fca5a5;padding:16px 0">${_esc(msg)}</div>`;
+}
+
+function _renderShaclModal(r) {
+  const quality  = r.quality || 'ERROR';
+  const stats    = r.ontology_stats || {};
+  const allViol  = r.violations      || [];
+  const allWarn  = r.warnings        || [];
+  const allSem   = r.semantic_issues || [];
+  const allSugg  = r.suggestions     || [];
+
+  // ── Badge ──────────────────────────────────────────────────────────────────
+  const badge = document.getElementById('shacl-modal-badge');
+  const badgeCss = {
+    PASS: 'background:#14532d;color:#86efac',
+    WARN: 'background:#713f12;color:#fde68a',
+    FAIL: 'background:#7f1d1d;color:#fca5a5',
   }[quality] || 'background:var(--surface-3);color:var(--text-2)';
   badge.textContent = quality;
-  badge.style.cssText = `font-size:11px;font-weight:700;padding:2px 8px;border-radius:3px;${badgeStyle}`;
+  badge.style.cssText = `font-size:11px;font-weight:700;padding:2px 10px;border-radius:3px;margin-left:4px;${badgeCss}`;
 
-  sumEl.textContent = [
-    stats.classes   != null ? `${stats.classes} classes` : '',
-    stats.object_props != null ? `${stats.object_props} relationships` : '',
-    stats.triples   != null ? `${stats.triples} triples` : '',
-    vCount ? `${vCount} violation${vCount !== 1 ? 's' : ''}` : '',
-    wCount ? `${wCount} warning${wCount !== 1 ? 's' : ''}` : '',
-    sCount ? `${sCount} semantic issue${sCount !== 1 ? 's' : ''}` : '',
-  ].filter(Boolean).join(' · ') || 'No issues found';
+  // ── Stats bar ──────────────────────────────────────────────────────────────
+  const statsBar = document.getElementById('shacl-modal-stats');
+  const statItems = [
+    { label: 'Classes',       value: stats.classes        ?? '—' },
+    { label: 'Relationships', value: stats.object_props   ?? '—' },
+    { label: 'Columns',       value: stats.datatype_props ?? '—' },
+    { label: 'Triples',       value: stats.triples        ?? '—' },
+    { label: 'Violations',    value: allViol.length,  color: allViol.length  ? '#fca5a5' : '#86efac' },
+    { label: 'Warnings',      value: allWarn.length + allSem.filter(s => s.severity === 'Warning').length,
+                               color: (allWarn.length + allSem.filter(s => s.severity === 'Warning').length) ? '#fde68a' : '#86efac' },
+  ];
+  statsBar.innerHTML = statItems.map(s => `
+    <div style="flex:1;padding:10px 14px;border-right:1px solid var(--border);text-align:center;min-width:0">
+      <div style="font-size:18px;font-weight:700;color:${s.color || 'var(--text-0)'}">${s.value}</div>
+      <div style="font-size:10px;color:var(--text-2);text-transform:uppercase;letter-spacing:.05em;margin-top:2px">${s.label}</div>
+    </div>`).join('');
 
+  // ── Body ───────────────────────────────────────────────────────────────────
   let html = '';
 
-  // Suggestions
-  if ((r.suggestions || []).length) {
-    html += `<div style="margin-bottom:10px">
-      <div style="color:var(--accent);font-weight:600;margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em">Suggestions</div>
-      ${r.suggestions.map(s => `<div style="display:flex;gap:6px;margin-bottom:3px"><span style="color:#f59e0b">⚡</span><span style="color:var(--text-1)">${_esc(s)}</span></div>`).join('')}
+  // ── 1. Suggestions banner (if any) ────────────────────────────────────────
+  if (allSugg.length) {
+    html += `<div style="background:#1c1a0e;border:1px solid #713f12;border-radius:6px;padding:12px 16px;margin-bottom:18px">
+      <div style="font-size:11px;font-weight:700;color:#fde68a;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">
+        ⚡ Recommendations
+      </div>
+      ${allSugg.map(s => `<div style="display:flex;gap:8px;margin-bottom:5px;font-size:12px">
+        <span style="color:#f59e0b;flex-shrink:0">→</span>
+        <span style="color:var(--text-1)">${_esc(s)}</span>
+      </div>`).join('')}
     </div>`;
   }
 
-  // Violations
-  if (vCount) {
-    html += _shaclSection('Violations', r.violations, '#fca5a5', '✕');
+  // ── 2. Check-by-check results ──────────────────────────────────────────────
+  // Build lookup: which issues belong to each check?
+  const byShape = {};   // shapeKey → issues from violations+warnings
+  for (const item of [...allViol, ...allWarn]) {
+    const key = (item.shape || '').split('/').pop().split('#').pop();
+    (byShape[key] = byShape[key] || []).push(item);
+  }
+  const bySemCheck = {};  // check name → semantic issues
+  for (const item of allSem) {
+    (bySemCheck[item.check] = bySemCheck[item.check] || []).push(item);
   }
 
-  // SHACL Warnings
-  if (wCount) {
-    html += _shaclSection('Warnings', r.warnings, '#fde68a', '⚠');
+  // Group checks by category
+  const categories = [...new Set(_SHACL_CHECKS.map(c => c.category))];
+  for (const cat of categories) {
+    const checks = _SHACL_CHECKS.filter(c => c.category === cat);
+
+    html += `<div style="margin-bottom:22px">
+      <div style="font-size:10px;font-weight:700;color:var(--text-2);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;padding-bottom:5px;border-bottom:1px solid var(--border)">${_esc(cat)} Checks</div>`;
+
+    for (const chk of checks) {
+      // Gather issues for this check
+      const issues = chk.shapeKey
+        ? (byShape[chk.shapeKey] || [])
+        : (bySemCheck[chk.id]    || []);
+
+      const hasViolation = issues.some(i => (i.severity || '').toLowerCase() === 'violation' || (i.check && !i.severity));
+      const passed       = issues.length === 0;
+
+      const statusIcon  = passed      ? '✓' : hasViolation ? '✕' : '⚠';
+      const statusColor = passed      ? '#86efac'
+                        : hasViolation ? '#fca5a5'
+                        :               '#fde68a';
+      const statusLabel = passed      ? 'PASS'
+                        : hasViolation ? 'FAIL'
+                        :               'WARN';
+      const borderColor = passed      ? '#166534'
+                        : hasViolation ? '#7f1d1d'
+                        :               '#713f12';
+
+      const detailId = `shacl-detail-${chk.id}`;
+
+      html += `<div style="margin-bottom:8px;border:1px solid ${borderColor};border-radius:6px;overflow:hidden">
+        <!-- Check header — always visible -->
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface-2);cursor:${issues.length ? 'pointer' : 'default'}"
+             onclick="${issues.length ? `_toggleShaclDetail('${detailId}')` : ''}">
+          <span style="font-size:13px;font-weight:700;color:${statusColor};width:16px;text-align:center;flex-shrink:0">${statusIcon}</span>
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <span style="font-size:12px;font-weight:600;color:var(--text-0)">${_esc(chk.title)}</span>
+              <span style="font-size:10px;padding:1px 6px;border-radius:3px;font-weight:700;background:${borderColor}22;color:${statusColor}">${statusLabel}</span>
+              ${issues.length ? `<span style="font-size:10px;color:var(--text-2)">${issues.length} issue${issues.length !== 1 ? 's' : ''} · ${_esc(chk.affectsWhat)}</span>` : `<span style="font-size:10px;color:var(--text-2)">${_esc(chk.affectsWhat)}</span>`}
+            </div>
+            <div style="font-size:11px;color:var(--text-2);margin-top:3px">${_esc(chk.description)}</div>
+          </div>
+          ${issues.length ? `<span style="color:var(--text-2);font-size:12px;flex-shrink:0" id="${detailId}-arrow">▸</span>` : ''}
+        </div>
+        <!-- Issues detail — collapsed by default -->
+        ${issues.length ? `<div id="${detailId}" style="display:none;padding:10px 14px;border-top:1px solid ${borderColor};background:var(--bg-3)">
+          ${issues.map(item => {
+            const node = item.node
+              ? item.node.split('/').pop().split('#').pop()
+              : (item.nodes || []).map(n => n.split('/').pop().split('#').pop()).join(', ');
+            const cov  = item.coverage != null ? ` — coverage ${(item.coverage * 100).toFixed(1)}%` : '';
+            return `<div style="display:flex;gap:8px;margin-bottom:6px;padding:6px 8px;background:var(--surface-2);border-radius:4px;border-left:3px solid ${statusColor}">
+              <div style="flex:1;min-width:0">
+                ${node ? `<div style="font-size:10px;font-weight:600;color:${statusColor};margin-bottom:2px;font-family:var(--font-mono)">${_esc(node)}${cov}</div>` : ''}
+                <div style="color:var(--text-1);font-size:11px">${_esc(item.message || '')}</div>
+              </div>
+            </div>`;
+          }).join('')}
+        </div>` : ''}
+      </div>`;
+    }
+
+    html += '</div>';
   }
 
-  // Semantic issues
-  if (sCount) {
-    html += _shaclSection('Semantic Issues', r.semantic_issues, '#93c5fd', '○');
-  }
-
-  if (!html) {
-    html = '<div style="color:#86efac;padding:6px 0">✓ Ontology passes all quality checks.</div>';
-  }
-
-  body.innerHTML = html;
+  document.getElementById('shacl-modal-body').innerHTML = html;
 }
 
-function _shaclSection(title, items, color, icon) {
-  const rows = items.map(item => {
-    const node = item.node || item.nodes?.join(', ') || '';
-    const msg  = item.message || '';
-    const sev  = item.check || item.severity || '';
-    return `<div style="margin-bottom:6px;padding:5px 8px;background:var(--surface-2);border-radius:4px;border-left:3px solid ${color}">
-      <div style="color:${color};font-weight:600;font-size:10px;margin-bottom:2px">${icon} ${_esc(sev)}${node ? ' · ' + _esc(node.split('/').pop().split('#').pop()) : ''}</div>
-      <div style="color:var(--text-1)">${_esc(msg)}</div>
-    </div>`;
-  }).join('');
-  return `<div style="margin-bottom:10px">
-    <div style="color:${color};font-weight:600;margin-bottom:5px;text-transform:uppercase;letter-spacing:.04em;font-size:10px">${_esc(title)} (${items.length})</div>
-    ${rows}
-  </div>`;
+function _toggleShaclDetail(id) {
+  const el    = document.getElementById(id);
+  const arrow = document.getElementById(id + '-arrow');
+  if (!el) return;
+  const open = el.style.display === 'none';
+  el.style.display    = open ? 'block' : 'none';
+  if (arrow) arrow.textContent = open ? '▾' : '▸';
 }
 
 function switchOntoTab(tab) {

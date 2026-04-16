@@ -2385,6 +2385,206 @@ def _fix_window_functions(sql: str, db_type: str) -> str:
     return "".join(result)
 
 
+def _fix_multicolumn_subquery(sql: str) -> str:
+    """
+    Fix: "Only one expression can be specified in the select list when the
+    subquery is not introduced with EXISTS."  (SQL Server, and ANSI SQL rule
+    for all dialects.)
+
+    Two patterns the LLM generates that trigger this:
+
+    Pattern 1 — multi-column IN/NOT IN/= subquery
+    ──────────────────────────────────────────────
+    Scalar-context subqueries (IN, NOT IN, =, <>, <, >, ANY, ALL) must return
+    exactly one column.  The LLM sometimes writes:
+
+        WHERE period_id IN (SELECT period_id, rn FROM ranked_periods WHERE rn <= 12)
+        WHERE col = (SELECT a, b FROM t WHERE ...)
+
+    Fix: keep only the first SELECT expression inside the subquery.
+
+    Pattern 2 — row-value constructor  (a, b) IN (SELECT x, y FROM …)
+    ──────────────────────────────────────────────────────────────────
+    SQL Server does not support row-value constructors in WHERE clauses.
+    PostgreSQL and SQLite do, but BigQuery and Oracle do not support them
+    either in all contexts.  The universal rewrite is EXISTS:
+
+        WHERE (a, b) IN (SELECT x, y FROM t WHERE cond)
+        →
+        WHERE EXISTS (SELECT 1 FROM t WHERE x = a AND y = b AND cond)
+
+    The rewrite maps outer tuple columns to subquery SELECT columns by
+    position, then merges any existing WHERE condition with AND.
+
+    This function runs for ALL dialects (same ANSI rule; SQL Server is just
+    strictest about the error message).
+    """
+    if not re.search(r'\bIN\s*\(', sql, re.IGNORECASE):
+        return sql
+
+    def _find_matching_close(s: str, open_pos: int) -> int:
+        """Return the position of the ')' that matches '(' at open_pos."""
+        depth = 1
+        i = open_pos + 1
+        in_str = False
+        esc = False
+        while i < len(s) and depth:
+            c = s[i]
+            if esc:
+                esc = False
+            elif c == '\\' and in_str:
+                esc = True
+            elif c == "'":
+                in_str = not in_str
+            elif not in_str:
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+            i += 1
+        return i - 1  # position of matching ')'
+
+    # ── Pattern 1: scalar IN / NOT IN / = subquery with multiple columns ─────
+    # Match:  [NOT ]IN\s*( SELECT …
+    # Also:   = \s*( SELECT …    >= ( SELECT …   etc.
+    _SCALAR_SUB_RE = re.compile(
+        r'\b((?:NOT\s+)?IN|=|<>|!=|>=|<=|>(?!=)|<(?!=))\s*(\(\s*SELECT\b)',
+        re.IGNORECASE,
+    )
+    pieces = []
+    pos = 0
+    for m in _SCALAR_SUB_RE.finditer(sql):
+        paren_open = m.start(2) + m.group(2).index('(')
+        paren_close = _find_matching_close(sql, paren_open)
+        sub_body = sql[paren_open + 1: paren_close]  # content inside the (…)
+
+        # Extract the SELECT list of the inner query
+        sel_m = re.match(r'\s*SELECT\s+', sub_body, re.IGNORECASE)
+        if not sel_m:
+            continue
+
+        # Find the FROM keyword at depth 0 to isolate the SELECT list
+        after_select = sub_body[sel_m.end():]
+        from_pos = None
+        depth = 0
+        for i, ch in enumerate(after_select):
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif depth == 0 and re.match(r'\bFROM\b', after_select[i:], re.IGNORECASE):
+                from_pos = i
+                break
+
+        if from_pos is None:
+            continue  # can't parse — leave alone
+
+        select_list_text = after_select[:from_pos]
+        select_items = _split_select_list(select_list_text)
+
+        # Only fix when there are multiple columns
+        if len(select_items) <= 1:
+            continue
+
+        # Rebuild: keep only the first expression
+        first_col = select_items[0].strip()
+        rest_of_sub = after_select[from_pos:]  # FROM … onwards
+        new_sub = f"(SELECT {first_col} {rest_of_sub})"
+        pieces.append(sql[pos: m.start(2)])
+        pieces.append(new_sub)
+        pos = paren_close + 1
+        logger.info(
+            "plan_node: stripped extra SELECT columns from scalar subquery "
+            "(kept '%s', dropped %d col(s))",
+            first_col, len(select_items) - 1,
+        )
+
+    if pieces:
+        pieces.append(sql[pos:])
+        sql = "".join(pieces)
+
+    # ── Pattern 2: row-value constructor  (a, b, …) IN (SELECT x, y, … FROM t …) ──
+    # Match:  \( col_list \) \s* [NOT\s+]? IN \s* \( SELECT …
+    _ROW_CTOR_RE = re.compile(
+        r'\(\s*([\w\.\[\]`"]+(?:\s*,\s*[\w\.\[\]`"]+)+)\s*\)\s*(NOT\s+)?IN\s*(\(\s*SELECT\b)',
+        re.IGNORECASE,
+    )
+    pieces = []
+    pos = 0
+    for m in _ROW_CTOR_RE.finditer(sql):
+        outer_cols_str = m.group(1)
+        negated = bool(m.group(2))
+        paren_open = m.start(3) + m.group(3).index('(')
+        paren_close = _find_matching_close(sql, paren_open)
+        sub_body = sql[paren_open + 1: paren_close]
+
+        outer_cols = [c.strip() for c in outer_cols_str.split(',')]
+
+        # Parse subquery: SELECT list + everything after SELECT list
+        sel_m = re.match(r'\s*SELECT\s+(?:DISTINCT\s+)?', sub_body, re.IGNORECASE)
+        if not sel_m:
+            continue
+
+        after_select = sub_body[sel_m.end():]
+        from_pos = None
+        depth = 0
+        for i, ch in enumerate(after_select):
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif depth == 0 and re.match(r'\bFROM\b', after_select[i:], re.IGNORECASE):
+                from_pos = i
+                break
+
+        if from_pos is None:
+            continue
+
+        select_list_text = after_select[:from_pos]
+        sub_cols = [c.strip() for c in _split_select_list(select_list_text)]
+        from_onwards = after_select[from_pos:]  # "FROM t [WHERE …] [GROUP BY …] …"
+
+        if len(sub_cols) != len(outer_cols):
+            # Column count mismatch — can't safely rewrite; skip
+            continue
+
+        # Build the correlated WHERE conditions: sub_col = outer_col
+        join_conds = " AND ".join(
+            f"{sc} = {oc}" for sc, oc in zip(sub_cols, outer_cols)
+        )
+
+        # Merge with existing WHERE inside the subquery (if any)
+        where_m = re.match(
+            r'(.*?\bFROM\b\s+[\w\.\[\]`"]+(?:\s+(?:AS\s+)?\w+)?)\s+WHERE\b\s*(.*)',
+            from_onwards, re.IGNORECASE | re.DOTALL,
+        )
+        if where_m:
+            from_part = where_m.group(1)
+            existing_where = where_m.group(2).strip()
+            # Anything after the WHERE that is at depth 0 up to GROUP BY / ORDER BY / end
+            exists_body = f"SELECT 1 {from_part} WHERE {join_conds} AND ({existing_where})"
+        else:
+            exists_body = f"SELECT 1 {from_onwards} WHERE {join_conds}"
+
+        exists_expr = ("NOT EXISTS" if negated else "EXISTS") + f" ({exists_body})"
+
+        # Replace the whole  (outer_cols) [NOT] IN (subquery)  span
+        span_start = m.start()
+        pieces.append(sql[pos:span_start])
+        pieces.append(exists_expr)
+        pos = paren_close + 1
+        logger.info(
+            "plan_node: rewrote row-value constructor (%s) %sIN → %s",
+            outer_cols_str, "NOT " if negated else "", exists_expr[:80],
+        )
+
+    if pieces:
+        pieces.append(sql[pos:])
+        sql = "".join(pieces)
+
+    return sql
+
+
 def _fix_distinct_order_by(sql: str) -> str:
     """
     Fix: "for SELECT DISTINCT, ORDER BY expressions must appear in select list"
@@ -2818,6 +3018,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _fix_sqlserver_subquery_limits(sql, config.db_type)
             sql = _fix_subquery_order_by(sql, config.db_type)
             sql = _fix_window_functions(sql, config.db_type)
+            sql = _fix_multicolumn_subquery(sql)
             sql = _fix_distinct_order_by(sql)
 
             # Multi-table / no-join-key check

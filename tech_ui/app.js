@@ -991,6 +991,122 @@ function copyOntology() {
   navigator.clipboard.writeText(content).then(() => toast('Ontology copied to clipboard', 'success'));
 }
 
+// ── SHACL Ontology Validation ────────────────────────────────────────────────
+
+async function validateOntology() {
+  if (!_ontoSourceId) { toast('Select a source first', 'warn'); return; }
+  const content = document.getElementById('ontology-editor').value.trim();
+  if (!content)       { toast('Ontology is empty', 'warn'); return; }
+
+  const btn   = document.getElementById('onto-validate-btn');
+  const panel = document.getElementById('onto-shacl-panel');
+  const badge = document.getElementById('onto-shacl-badge');
+  const sumEl = document.getElementById('onto-shacl-summary');
+  const body  = document.getElementById('onto-shacl-body');
+
+  btn.disabled = true;
+  btn.textContent = 'Validating…';
+  panel.style.display = 'block';
+  badge.textContent  = '…';
+  badge.style.cssText = 'font-size:11px;font-weight:700;padding:2px 8px;border-radius:3px;background:var(--surface-3);color:var(--text-2)';
+  sumEl.textContent  = 'Running SHACL validation…';
+  body.innerHTML     = '';
+  document.getElementById('onto-shacl-body').classList.remove('onto-tab-hidden');
+
+  try {
+    const report = await apiFetch(`/sources/${_ontoSourceId}/validate-ontology`, {
+      method: 'POST',
+      body: JSON.stringify({ ontology_text: content }),
+    });
+    _renderShaclReport(report);
+  } catch (e) {
+    badge.textContent = 'ERROR';
+    badge.style.cssText = 'font-size:11px;font-weight:700;padding:2px 8px;border-radius:3px;background:#7f1d1d;color:#fca5a5';
+    sumEl.textContent = e.message || 'Validation failed';
+    body.innerHTML = `<pre style="color:var(--text-2);white-space:pre-wrap">${_esc(e.message || String(e))}</pre>`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg> Validate';
+  }
+}
+
+function _renderShaclReport(r) {
+  const badge = document.getElementById('onto-shacl-badge');
+  const sumEl = document.getElementById('onto-shacl-summary');
+  const body  = document.getElementById('onto-shacl-body');
+
+  const quality   = r.quality || 'ERROR';
+  const stats     = r.ontology_stats || {};
+  const vCount    = (r.violations || []).length;
+  const wCount    = (r.warnings   || []).length;
+  const sCount    = (r.semantic_issues || []).length;
+
+  // Badge colour
+  const badgeStyle = {
+    PASS:  'background:#14532d;color:#86efac',
+    WARN:  'background:#713f12;color:#fde68a',
+    FAIL:  'background:#7f1d1d;color:#fca5a5',
+  }[quality] || 'background:var(--surface-3);color:var(--text-2)';
+  badge.textContent = quality;
+  badge.style.cssText = `font-size:11px;font-weight:700;padding:2px 8px;border-radius:3px;${badgeStyle}`;
+
+  sumEl.textContent = [
+    stats.classes   != null ? `${stats.classes} classes` : '',
+    stats.object_props != null ? `${stats.object_props} relationships` : '',
+    stats.triples   != null ? `${stats.triples} triples` : '',
+    vCount ? `${vCount} violation${vCount !== 1 ? 's' : ''}` : '',
+    wCount ? `${wCount} warning${wCount !== 1 ? 's' : ''}` : '',
+    sCount ? `${sCount} semantic issue${sCount !== 1 ? 's' : ''}` : '',
+  ].filter(Boolean).join(' · ') || 'No issues found';
+
+  let html = '';
+
+  // Suggestions
+  if ((r.suggestions || []).length) {
+    html += `<div style="margin-bottom:10px">
+      <div style="color:var(--accent);font-weight:600;margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em">Suggestions</div>
+      ${r.suggestions.map(s => `<div style="display:flex;gap:6px;margin-bottom:3px"><span style="color:#f59e0b">⚡</span><span style="color:var(--text-1)">${_esc(s)}</span></div>`).join('')}
+    </div>`;
+  }
+
+  // Violations
+  if (vCount) {
+    html += _shaclSection('Violations', r.violations, '#fca5a5', '✕');
+  }
+
+  // SHACL Warnings
+  if (wCount) {
+    html += _shaclSection('Warnings', r.warnings, '#fde68a', '⚠');
+  }
+
+  // Semantic issues
+  if (sCount) {
+    html += _shaclSection('Semantic Issues', r.semantic_issues, '#93c5fd', '○');
+  }
+
+  if (!html) {
+    html = '<div style="color:#86efac;padding:6px 0">✓ Ontology passes all quality checks.</div>';
+  }
+
+  body.innerHTML = html;
+}
+
+function _shaclSection(title, items, color, icon) {
+  const rows = items.map(item => {
+    const node = item.node || item.nodes?.join(', ') || '';
+    const msg  = item.message || '';
+    const sev  = item.check || item.severity || '';
+    return `<div style="margin-bottom:6px;padding:5px 8px;background:var(--surface-2);border-radius:4px;border-left:3px solid ${color}">
+      <div style="color:${color};font-weight:600;font-size:10px;margin-bottom:2px">${icon} ${_esc(sev)}${node ? ' · ' + _esc(node.split('/').pop().split('#').pop()) : ''}</div>
+      <div style="color:var(--text-1)">${_esc(msg)}</div>
+    </div>`;
+  }).join('');
+  return `<div style="margin-bottom:10px">
+    <div style="color:${color};font-weight:600;margin-bottom:5px;text-transform:uppercase;letter-spacing:.04em;font-size:10px">${_esc(title)} (${items.length})</div>
+    ${rows}
+  </div>`;
+}
+
 function switchOntoTab(tab) {
   document.getElementById('tab-ttl').classList.toggle('active', tab === 'ttl');
   document.getElementById('tab-sparql').classList.toggle('active', tab === 'sparql');

@@ -218,6 +218,7 @@ METADATA_API = os.environ.get("METADATA_API_URL", "http://localhost:8000")
 ONTOLOGY_API = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001")
 KG_API       = os.environ.get("KG_API_URL",       "http://localhost:8002")
 DIALOG_API   = os.environ.get("DIALOG_API_URL",   "http://localhost:8003")
+SHACL_API    = os.environ.get("SHACL_API_URL",    "http://localhost:8006")
 
 # ── Neo4j persistence ──────────────────────────────────────────────────────────
 # KG nodes/edges are persisted to Neo4j only in production (APP_ENV=production)
@@ -2087,6 +2088,95 @@ async def save_source_ontology(source_id: str, req: SaveOntologyRequest):
     if req.rebuild_kg:
         asyncio.create_task(_rebuild_kg(source_id, req.content))
     return {"saved": True, "rebuild_kg": req.rebuild_kg}
+
+
+class ValidateOntologyRequest(BaseModel):
+    """
+    Optional override — if omitted the saved ontology for this source is used.
+    Allows the UI to validate unsaved edits before saving.
+    """
+    ontology_text:      Optional[str] = None
+    min_coverage:       float = 0.5
+    check_orphan_classes: bool = True
+    check_namespace:    bool  = True
+    extra_shapes_ttl:   str   = ""
+
+
+@app.post("/sources/{source_id}/validate-ontology")
+async def validate_source_ontology(source_id: str, req: ValidateOntologyRequest):
+    """
+    Validate the OWL/RDF ontology for a source using the SHACL Validation Service.
+
+    This is a purely read-only, opt-in endpoint — it does not modify any state.
+    It delegates to the standalone SHACL API (port 8006) so the existing
+    ontology / KG pipeline is completely unaffected.
+
+    Workflow:
+      1. Resolves ontology text (from request body or stored source ontology).
+      2. POSTs to SHACL API /validate and polls until done (max 60 s).
+      3. Returns the full validation report:
+           quality          : "PASS" | "WARN" | "FAIL"
+           violations        : list of SHACL sh:Violation entries
+           warnings          : list of SHACL sh:Warning entries
+           semantic_issues   : orphan classes, low-coverage edges, namespace drift, …
+           ontology_stats    : {classes, datatype_props, object_props, triples}
+           suggestions       : actionable remediation suggestions
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    ontology_text = req.ontology_text or s.get("ontology_content") or ""
+    if not ontology_text:
+        raise HTTPException(
+            status_code=409,
+            detail="No ontology available for this source. Run indexing first.",
+        )
+
+    payload = {
+        "ontology_text":       ontology_text,
+        "ontology_format":     "auto",
+        "min_coverage":        req.min_coverage,
+        "check_orphan_classes": req.check_orphan_classes,
+        "check_namespace":     req.check_namespace,
+        "extra_shapes_ttl":    req.extra_shapes_ttl,
+    }
+
+    try:
+        # Submit
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(f"{SHACL_API}/validate", json=payload)
+            r.raise_for_status()
+            job_id = r.json()["job_id"]
+
+        # Poll (SHACL validation is fast — typically < 5 s)
+        deadline = time.time() + 60
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            while time.time() < deadline:
+                pr  = await client.get(f"{SHACL_API}/jobs/{job_id}/report")
+                if pr.status_code == 200:
+                    return pr.json()
+                if pr.status_code == 409:
+                    # Still running — back off briefly
+                    await asyncio.sleep(1)
+                    continue
+                pr.raise_for_status()
+
+        raise HTTPException(status_code=504, detail="SHACL validation timed out.")
+
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "SHACL Validation Service is not reachable. "
+                "Start it with: python shacl_api.py  (port 8006)"
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("validate_source_ontology: unexpected error")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 class KGPreviewRequest(BaseModel):

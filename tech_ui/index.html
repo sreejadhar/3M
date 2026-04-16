@@ -283,10 +283,24 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                 Copy
               </button>
+              <button class="btn btn-ghost" id="onto-validate-btn" onclick="validateOntology()" title="Run SHACL quality validation — does not modify anything">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+                Validate
+              </button>
               <button class="btn btn-primary" id="onto-save-btn" onclick="saveOntology()">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
                 Save &amp; Rebuild KG
               </button>
+            </div>
+
+            <!-- SHACL validation result panel (hidden until validate is run) -->
+            <div id="onto-shacl-panel" style="display:none; border:1px solid var(--border); border-radius:6px; margin:8px 0; overflow:hidden;">
+              <div id="onto-shacl-header" style="display:flex; align-items:center; gap:8px; padding:7px 12px; background:var(--surface-2); cursor:pointer;" onclick="document.getElementById('onto-shacl-body').classList.toggle('onto-tab-hidden')">
+                <span id="onto-shacl-badge" style="font-size:11px; font-weight:700; padding:2px 8px; border-radius:3px;">…</span>
+                <span style="font-size:11px; color:var(--text-2)" id="onto-shacl-summary">Running validation…</span>
+                <button onclick="event.stopPropagation(); document.getElementById('onto-shacl-panel').style.display='none'" style="margin-left:auto; background:none; border:none; color:var(--text-2); cursor:pointer; font-size:14px; line-height:1">✕</button>
+              </div>
+              <div id="onto-shacl-body" style="padding:10px 14px; font-size:11px; max-height:260px; overflow-y:auto;"></div>
             </div>
 
             <!-- Editor panels -->

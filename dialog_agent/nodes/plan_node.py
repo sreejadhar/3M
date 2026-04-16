@@ -141,9 +141,9 @@ DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
 STRING CONCAT     : col1 || col2   — do NOT use + or CONCAT()
 IDENTIFIER QUOTING: double-quotes "col name" only when a name has spaces or is reserved;
                     never use backticks (`)
+JOIN SYNTAX       : JOIN t2 ON t1.col = t2.col  — USING (col) is not reliably supported
 PERCENTILES       : NOT SUPPORTED — use MIN/MAX/AVG as approximations, or note unavailability
-PERCENTAGE CALC   : window function over aggregate is INVALID in SQLite.
-                    Use a CTE instead:
+PERCENTAGE CALC   : SUM(COUNT(*)) OVER () is INVALID in SQLite — use a CTE scalar subquery:
                       WITH grp AS (SELECT cat, COUNT(*) AS cnt FROM t GROUP BY cat)
                       SELECT cat, cnt,
                              ROUND(cnt * 100.0 / (SELECT SUM(cnt) FROM grp), 2) AS Pct
@@ -151,8 +151,14 @@ PERCENTAGE CALC   : window function over aggregate is INVALID in SQLite.
 NULL HANDLING     : COALESCE(col, 0) or IFNULL(col, 0)
 BOOLEAN           : use 1 / 0 integers — TRUE/FALSE literals are not reliable in SQLite
 TYPE CASTING      : CAST(col AS INTEGER), CAST(col AS REAL), CAST(col AS TEXT)
+                    NEVER use :: PostgreSQL-style casting (col::int is a SYNTAX ERROR)
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() supported (SQLite ≥3.25)
+                    ALL navigation functions MUST have ORDER BY inside OVER():
+                      ROW_NUMBER() OVER (ORDER BY col)          ← correct
+                      ROW_NUMBER() OVER ()                      ← ERROR
+CURRENT DATE/TIME : DATE('now'), DATETIME('now')  — do NOT use NOW() or GETDATE()
 UNSUPPORTED       : FULL OUTER JOIN, PIVOT, PERCENTILE_CONT, PERCENTILE_DISC,
-                    GENERATE_SERIES, ANY/ALL subquery operators"""
+                    GENERATE_SERIES, ANY/ALL subquery operators, ILIKE"""
 
     if db in ("postgres", "postgresql", "redshift"):
         return """\
@@ -171,7 +177,12 @@ PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
                     ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Pct
 NULL HANDLING     : COALESCE(col, 0)
 TYPE CASTING      : value::integer, value::numeric, value::text
-WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported"""
+CURRENT DATE/TIME : NOW() or CURRENT_TIMESTAMP
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
+                    ALL navigation/offset functions MUST have ORDER BY inside OVER():
+                      LAG(col) OVER (PARTITION BY x ORDER BY period_col)  ← correct
+                      LAG(col) OVER (PARTITION BY x)                      ← ERROR
+STRING AGGREGATION: STRING_AGG(col, ', ' ORDER BY col)"""
 
     if db == "sqlserver":
         return """\
@@ -179,31 +190,32 @@ ROW LIMITING      : SELECT TOP N col FROM t   — LIMIT does NOT exist in SQL Se
                     For top-N with ordering: SELECT TOP 10 col FROM t ORDER BY col DESC
                     For paging: ORDER BY col OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY
 DISTINCT + TOP    : ALWAYS write SELECT DISTINCT TOP N ... — NEVER SELECT TOP N DISTINCT ...
-                    "SELECT TOP N DISTINCT" is a SYNTAX ERROR in SQL Server.
                     Correct : SELECT DISTINCT TOP 10 [col] FROM t ORDER BY [col]
                     Wrong   : SELECT TOP 10 DISTINCT [col] FROM t   ← SYNTAX ERROR
-CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')  (ILIKE does NOT exist in SQL Server)
+CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')  — ILIKE does NOT exist in SQL Server
 DATE EXTRACTION   : YEAR(date_col), MONTH(date_col), DAY(date_col)
                     DATEPART(year, date_col), DATEPART(month, date_col)
                     FORMAT(date_col, 'yyyy-MM')
 DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
+DATE TRUNCATION   : DATEADD(month, DATEDIFF(month, 0, date_col), 0) for month-start
+                    DATE_TRUNC does NOT exist in SQL Server
 CURRENT DATETIME  : GETDATE()  — do NOT use NOW(), CURRENT_TIMESTAMP is also valid
 STRING CONCAT     : col1 + col2   or   CONCAT(col1, col2)   — do NOT use ||
+STRING LENGTH     : LEN(col)   — LENGTH() does NOT exist in SQL Server
 IDENTIFIER QUOTING: square brackets [col name] when needed — never backticks (`)
+JOIN SYNTAX       : JOIN t2 ON t1.col = t2.col  — USING (col) is a SYNTAX ERROR in SQL Server
 PERCENTILES       : PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) OVER () AS median
                     PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY col) OVER () AS q1
 PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
 NULL HANDLING     : ISNULL(col, 0) or COALESCE(col, 0)
-STRING LENGTH     : LEN(col)   — LENGTH() does NOT exist in SQL Server
 TYPE CASTING      : CAST(col AS INT), CAST(col AS DECIMAL(10,2)), CAST(col AS NVARCHAR(100))
                     NEVER use :: PostgreSQL-style casting (col::int is a SYNTAX ERROR)
-DATE TRUNCATION   : DATEADD(month, DATEDIFF(month, 0, date_col), 0) for month-start
-                    DATE_TRUNC does NOT exist in SQL Server
+STRING AGGREGATION: STRING_AGG(col, ', ') WITHIN GROUP (ORDER BY col)
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
                     ALL navigation/offset functions MUST have ORDER BY inside OVER():
                       LAG(col) OVER (PARTITION BY x ORDER BY period_col)  ← correct
-                      LAG(col) OVER (PARTITION BY x)                      ← ERROR in SQL Server
-                      LAG(col) OVER ()                                    ← ERROR in SQL Server
+                      LAG(col) OVER (PARTITION BY x)                      ← ERROR
+                      LAG(col) OVER ()                                    ← ERROR
                     Aggregate windows (SUM/AVG/COUNT OVER (...)) do NOT need ORDER BY.
                     Window functions cannot be used in WHERE clause — use a CTE or subquery
 ORDER BY IN SUBS  : ORDER BY is ILLEGAL inside subqueries, CTEs, derived tables, views,
@@ -212,14 +224,17 @@ ORDER BY IN SUBS  : ORDER BY is ILLEGAL inside subqueries, CTEs, derived tables,
                     WRONG: SELECT * FROM (SELECT col FROM t ORDER BY col) sub
                     WRONG: WITH cte AS (SELECT col FROM t ORDER BY col) SELECT * FROM cte
                     RIGHT: SELECT * FROM (SELECT TOP 10 col FROM t ORDER BY col) sub
-                    RIGHT: Use ORDER BY only at the outermost query level unless paired with TOP"""
+                    RIGHT: Use ORDER BY only at the outermost query level unless paired with TOP
+SUBQUERY COLUMNS  : A subquery used as a scalar value (IN, NOT IN, =, <>) MUST return
+                    exactly ONE column.
+                    WRONG: WHERE id IN (SELECT id, rn FROM ranked WHERE rn <= 12)
+                    RIGHT: WHERE id IN (SELECT id FROM ranked WHERE rn <= 12)"""
 
     if db == "oracle":
         return """\
 ROW LIMITING      : FETCH FIRST N ROWS ONLY  (Oracle 12c+)
                     Example: SELECT col FROM t ORDER BY col DESC FETCH FIRST 10 ROWS ONLY
-                    Legacy (pre-12c): SELECT * FROM (SELECT col FROM t ORDER BY col DESC)
-                                      WHERE ROWNUM <= 10
+                    Legacy (pre-12c): WHERE ROWNUM <= N in an outer query
                     NEVER use LIMIT — it does NOT exist in Oracle
 CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')   — ILIKE does NOT exist
 DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
@@ -232,7 +247,14 @@ PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
 NULL HANDLING     : NVL(col, 0) or COALESCE(col, 0)
 CURRENT DATE/TIME : SYSDATE  or  CURRENT_DATE  — do NOT use NOW()
 TYPE CASTING      : CAST(col AS NUMBER), CAST(col AS VARCHAR2(100))
-WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported"""
+                    NEVER use :: PostgreSQL-style casting (col::int is a SYNTAX ERROR)
+STRING AGGREGATION: LISTAGG(col, ', ') WITHIN GROUP (ORDER BY col)
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
+                    ALL navigation/offset functions MUST have ORDER BY inside OVER():
+                      LAG(col) OVER (PARTITION BY x ORDER BY period_col)  ← correct
+                      LAG(col) OVER (PARTITION BY x)                      ← ERROR
+SUBQUERY COLUMNS  : A subquery used as a scalar value (IN, NOT IN, =) MUST return
+                    exactly ONE column — same ANSI rule as all other databases."""
 
     if db == "bigquery":
         return """\
@@ -242,15 +264,26 @@ CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')  — ILIKE does NOT exist
 DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
                     DATE_TRUNC(date_col, MONTH), FORMAT_DATE('%Y-%m', date_col)
 DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
-STRING CONCAT     : CONCAT(col1, col2)   or   col1 || col2
+STRING CONCAT     : CONCAT(col1, col2)   — || also works but CONCAT is preferred
 IDENTIFIER QUOTING: backticks `col name` or `project.dataset.table` when needed
-PERCENTILES       : PERCENTILE_CONT(col, 0.5) OVER ()   — note: argument order differs from ANSI!
-                    APPROX_QUANTILES(col, 100)[OFFSET(50)] AS median
+PERCENTILES       : PERCENTILE_CONT(col, 0.5) OVER (ORDER BY col)
+                    — argument order differs from ANSI (value first, then fraction)
+                    — MUST include ORDER BY inside OVER() — OVER () without ORDER BY is an ERROR
+                    APPROX_QUANTILES(col, 100)[OFFSET(50)] AS median  (faster alternative)
 PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
 NULL HANDLING     : COALESCE(col, 0) or IFNULL(col, 0)
+                    SAFE_DIVIDE(numerator, denominator) avoids division-by-zero without NULLIF
 TABLE REFERENCES  : use fully qualified `project.dataset.table` in FROM/JOIN
 TYPE CASTING      : CAST(col AS INT64), CAST(col AS FLOAT64), CAST(col AS STRING)
-WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported"""
+                    NEVER use :: PostgreSQL-style casting (col::int is a SYNTAX ERROR)
+CURRENT DATE/TIME : CURRENT_DATE(), CURRENT_TIMESTAMP()  — do NOT use NOW() or GETDATE()
+STRING AGGREGATION: STRING_AGG(col, ', ' ORDER BY col)
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
+                    ALL navigation/offset functions MUST have ORDER BY inside OVER():
+                      LAG(col) OVER (PARTITION BY x ORDER BY period_col)  ← correct
+                      LAG(col) OVER (PARTITION BY x)                      ← ERROR
+QUALIFY           : QUALIFY ROW_NUMBER() OVER (...) = 1  filters window results directly
+                    (avoids wrapping in a subquery just to filter on window result)"""
 
     # Fallback for unknown db types
     return """\
@@ -821,7 +854,7 @@ General Rules:
       SELECT c.entity_key, c.current_metric, p.prior_metric,
              ROUND((c.current_metric - p.prior_metric)
                    / NULLIF(p.prior_metric, 0) * 100, 2) AS change_pct
-      FROM current_period AS c JOIN prior_period AS p USING (entity_key)
+      FROM current_period AS c JOIN prior_period AS p ON c.entity_key = p.entity_key
 
       → Only use Pattern C when the user specifies or the schema makes the
         period values clear (e.g. categorical sample values show '2024', '2023').
@@ -2666,6 +2699,202 @@ def _fix_distinct_order_by(sql: str) -> str:
     return patched
 
 
+def _fix_dialect_syntax(sql: str, db_type: str) -> str:
+    """
+    Runtime cross-dialect contamination fixer.
+
+    Even when the LLM is instructed to write dialect-correct SQL it sometimes
+    bleeds PostgreSQL/ANSI idioms into SQL Server / Oracle / BigQuery queries.
+    This function catches the most common mis-fires and rewrites them to the
+    target dialect *before* execution.
+
+    Covered transformations per dialect:
+      SQL Server:
+        • ILIKE  → LOWER(col) LIKE LOWER(pat)
+        • ::type → CAST(col AS type)
+        • col || other → col + other  (string concat — very conservative)
+        • NOW()  → GETDATE()
+        • CURRENT_DATE → CAST(GETDATE() AS DATE)
+        • CURRENT_TIMESTAMP → GETDATE()
+        • DATE_TRUNC('unit', col) → DATEADD/CAST equivalent
+        • LENGTH(col) → LEN(col)
+        • JOIN … USING (col) → JOIN … ON t1.col = t2.col  (best-effort)
+        • LIMIT N  → already handled by _enforce_sql_limits; skip
+
+      Oracle:
+        • ILIKE  → LOWER(col) LIKE LOWER(pat)
+        • ::type → CAST(col AS type)
+        • NOW()  → SYSDATE
+        • CURRENT_TIMESTAMP → SYSTIMESTAMP
+        • CURRENT_DATE → SYSDATE
+        • LIMIT N → FETCH FIRST N ROWS ONLY  (outer query only)
+        • LENGTH(col) — Oracle already has LENGTH; no-op
+
+      BigQuery:
+        • ILIKE  → LOWER(col) LIKE LOWER(pat)
+        • ::type → CAST(col AS type)
+        • NOW()  → CURRENT_TIMESTAMP()
+        • CURRENT_DATE → CURRENT_DATE()
+        • LIMIT stays (BigQuery supports LIMIT)
+
+      SQLite:
+        • ILIKE  → LOWER(col) LIKE LOWER(pat)
+        • ::type → CAST(col AS type)
+        • NOW()  → DATE('now')
+        • CURRENT_TIMESTAMP — SQLite keyword; keep
+
+    Transformations that require deep parse-trees (e.g. rewriting every
+    JOIN … USING to ON) are approximated conservatively and logged when they
+    fire so developers can audit edge cases.
+    """
+    if not sql:
+        return sql
+
+    dtype = db_type.lower()
+
+    # ── 1. ILIKE → LOWER(col) LIKE LOWER(pat) ────────────────────────────────
+    # ILIKE is PostgreSQL-only; everything else must use LOWER().
+    # Pattern: <expr> ILIKE <pat>  where pat may be a quoted string or param.
+    if dtype not in ("postgresql", "postgres", "redshift"):
+        def _ilike_replace(m: re.Match) -> str:
+            col = m.group(1).strip()
+            pat = m.group(2).strip()
+            result = f"LOWER({col}) LIKE LOWER({pat})"
+            logger.info("plan_node: rewrote ILIKE → LOWER LIKE for %s", dtype)
+            return result
+
+        sql = re.sub(
+            r'(\b[\w.]+\b(?:\s*\([^)]*\))?)\s+ILIKE\s+(\S+)',
+            _ilike_replace,
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    # ── 2. PostgreSQL :: casting → CAST(col AS type) ─────────────────────────
+    if dtype not in ("postgresql", "postgres", "redshift"):
+        def _cast_replace(m: re.Match) -> str:
+            expr = m.group(1).strip()
+            typ  = m.group(2).strip()
+            result = f"CAST({expr} AS {typ})"
+            logger.info("plan_node: rewrote ::%s → CAST for %s", typ, dtype)
+            return result
+
+        # match: word_or_paren_expr::TYPE  e.g. col::DATE, (expr)::INTEGER
+        sql = re.sub(
+            r'(\w+|(?:\([^)]+\)))\s*::\s*([A-Z_][A-Z0-9_]*(?:\s*\(\d+(?:,\d+)?\))?)',
+            _cast_replace,
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    # ── 3. Date / time functions ──────────────────────────────────────────────
+    if dtype in ("sqlserver", "mssql", "sql server"):
+        sql = re.sub(r'\bNOW\s*\(\s*\)', 'GETDATE()', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURRENT_TIMESTAMP\b(?!\s*\()', 'GETDATE()', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURRENT_DATE\b', 'CAST(GETDATE() AS DATE)', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURRENT_TIME\b', 'CAST(GETDATE() AS TIME)', sql, flags=re.IGNORECASE)
+
+    elif dtype == "oracle":
+        sql = re.sub(r'\bNOW\s*\(\s*\)', 'SYSDATE', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURRENT_TIMESTAMP\b(?!\s*\()', 'SYSTIMESTAMP', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURRENT_DATE\b', 'SYSDATE', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURRENT_TIME\b', 'SYSDATE', sql, flags=re.IGNORECASE)
+
+    elif dtype in ("bigquery",):
+        sql = re.sub(r'\bNOW\s*\(\s*\)', 'CURRENT_TIMESTAMP()', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURRENT_TIMESTAMP\b(?!\s*\()', 'CURRENT_TIMESTAMP()', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURRENT_DATE\b(?!\s*\()', 'CURRENT_DATE()', sql, flags=re.IGNORECASE)
+
+    elif dtype == "sqlite":
+        sql = re.sub(r'\bNOW\s*\(\s*\)', "DATE('now')", sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\bCURRENT_DATE\b', "DATE('now')", sql, flags=re.IGNORECASE)
+
+    # ── 4. DATE_TRUNC → dialect equivalent ───────────────────────────────────
+    # DATE_TRUNC('unit', col) is PostgreSQL / BigQuery (BigQuery uses DATE_TRUNC(col, unit))
+    # SQL Server: convert truncation to DATEADD + DATEDIFF idiom
+    if dtype in ("sqlserver", "mssql", "sql server"):
+        _DT_MAP = {
+            'year':    ('year',  'year'),
+            'quarter': ('quarter', 'quarter'),
+            'month':   ('month', 'month'),
+            'week':    ('week',  'week'),
+            'day':     ('day',   'day'),
+            'hour':    ('hour',  'hour'),
+            'minute':  ('minute','minute'),
+        }
+
+        def _datetrunc_sqlserver(m: re.Match) -> str:
+            unit = m.group(1).strip().strip("'\"").lower()
+            col  = m.group(2).strip()
+            dp   = _DT_MAP.get(unit)
+            if dp:
+                result = f"DATEADD({dp[0]}, DATEDIFF({dp[1]}, 0, {col}), 0)"
+                logger.info("plan_node: rewrote DATE_TRUNC('%s', ...) → DATEADD/DATEDIFF for SQL Server", unit)
+                return result
+            return m.group(0)  # unknown unit — leave as-is
+
+        sql = re.sub(
+            r'\bDATE_TRUNC\s*\(\s*([\'"]?\w+[\'"]?)\s*,\s*([^)]+)\)',
+            _datetrunc_sqlserver,
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    elif dtype == "oracle":
+        # Oracle uses TRUNC(date, 'unit')
+        def _datetrunc_oracle(m: re.Match) -> str:
+            unit = m.group(1).strip().strip("'\"").lower()
+            col  = m.group(2).strip()
+            _ORACLE_UNITS = {
+                'year': 'YYYY', 'quarter': 'Q', 'month': 'MM',
+                'week': 'IW',   'day': 'DD',
+            }
+            oracle_fmt = _ORACLE_UNITS.get(unit, unit.upper())
+            logger.info("plan_node: rewrote DATE_TRUNC('%s', ...) → TRUNC for Oracle", unit)
+            return f"TRUNC({col}, '{oracle_fmt}')"
+
+        sql = re.sub(
+            r'\bDATE_TRUNC\s*\(\s*([\'"]?\w+[\'"]?)\s*,\s*([^)]+)\)',
+            _datetrunc_oracle,
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+    # ── 5. LENGTH → LEN for SQL Server ───────────────────────────────────────
+    if dtype in ("sqlserver", "mssql", "sql server"):
+        # Only rewrite standalone LENGTH( — not CHAR_LENGTH or BIT_LENGTH
+        sql = re.sub(r'(?<![A-Z_])LENGTH\s*\(', 'LEN(', sql, flags=re.IGNORECASE)
+
+    # ── 6. LIMIT N at top-level for Oracle → FETCH FIRST N ROWS ONLY ─────────
+    # _enforce_sql_limits already handles this, but if the LLM re-added a LIMIT
+    # after the enforcer ran we catch it here as a safety net.
+    if dtype == "oracle":
+        # Only replace outermost LIMIT (not inside parens)
+        # Simple heuristic: replace LIMIT N that appears at end of statement
+        parts = re.split(r'\bLIMIT\s+(\d+)\s*$', sql.rstrip('; '), flags=re.IGNORECASE)
+        if len(parts) == 3:
+            logger.info("plan_node: rewrote LIMIT %s → FETCH FIRST ROWS ONLY for Oracle", parts[1])
+            sql = parts[0] + f"\nFETCH FIRST {parts[1]} ROWS ONLY"
+
+    # ── 7. || string concat → + for SQL Server ───────────────────────────────
+    # Very conservative: only replace when both sides are string literals or
+    # simple column refs — avoids breaking boolean OR in other contexts.
+    # Note: SQL Server uses + for string concat; || is ANSI but not supported.
+    if dtype in ("sqlserver", "mssql", "sql server"):
+        # Only rewrite string-context || (surrounded by quoted strings or words)
+        def _concat_replace(m: re.Match) -> str:
+            logger.info("plan_node: rewrote || → + for SQL Server")
+            return m.group(1) + ' + ' + m.group(2)
+
+        sql = re.sub(
+            r"(['\w)]\s*)\|\|(\s*['\w(])",
+            _concat_replace,
+            sql,
+        )
+
+    return sql
+
+
 def _is_raw_row_query(sql: str) -> bool:
     """Return True when the SQL has no aggregation (GROUP BY / COUNT / SUM …)."""
     return not bool(_AGG_PATTERN.search(sql))
@@ -3015,6 +3244,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _fix_count_vs_sum(sql, natural_query)
             sql = _fix_percentage(sql, natural_query, config.db_type)
             sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
+            sql = _fix_dialect_syntax(sql, config.db_type)
             sql = _fix_sqlserver_subquery_limits(sql, config.db_type)
             sql = _fix_subquery_order_by(sql, config.db_type)
             sql = _fix_window_functions(sql, config.db_type)

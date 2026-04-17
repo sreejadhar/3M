@@ -1,6 +1,8 @@
-# Algorithm Reference — Metadata Agent
+# Algorithm Reference — DataNanite
 
-This document describes every major algorithm implemented in the Metadata Agent system: how each one works, what inputs it uses, what it produces, and what design decisions were made.
+> **Last updated:** 2026-04-17
+
+This document describes every major algorithm implemented in the DataNanite system: how each one works, what inputs it uses, what it produces, and what design decisions were made.
 
 ---
 
@@ -8,26 +10,36 @@ This document describes every major algorithm implemented in the Metadata Agent 
 
 1. [Metadata Extraction & Persistence](#1-metadata-extraction--persistence)
    - 1.1 [persist() — Upsert with CDC](#11-persist--upsert-with-cdc)
-   - 1.2 [Redundancy Detection — Jaccard Similarity with Domain Gating](#12-redundancy-detection--jaccard-similarity-with-domain-gating)
+   - 1.2 [Redundancy Detection — Jaccard Similarity](#12-redundancy-detection--jaccard-similarity-with-domain-gating)
 2. [Taxonomy Algorithms](#2-taxonomy-algorithms)
-   - 2.1 [infer_taxonomy() — Deterministic Pattern-Based Classification](#21-infer_taxonomy--deterministic-pattern-based-classification)
-   - 2.2 [enrich_taxonomy() — LLM-Based Classification](#22-enrich_taxonomy--llm-based-classification)
+   - 2.1 [infer_taxonomy() — Deterministic Pattern Classification](#21-infer_taxonomy--deterministic-pattern-based-classification)
+   - 2.2 [enrich_taxonomy() — LLM Classification](#22-enrich_taxonomy--llm-based-classification)
    - 2.3 [_sync_taxonomy_from_kg_nodes() — KG Annotation Sync](#23-_sync_taxonomy_from_kg_nodes--kg-annotation-sync)
 3. [Knowledge Graph & Ontology Algorithms](#3-knowledge-graph--ontology-algorithms)
    - 3.1 [_extract_ontology() — OWL Graph Parsing](#31-_extract_ontology--owl-graph-parsing)
    - 3.2 [_build_graph_data() — UI Visualisation Format](#32-_build_graph_data--ui-visualisation-format)
    - 3.3 [_generate_cypher() / _generate_gremlin() — Query Generation](#33-_generate_cypher--_generate_gremlin--query-generation)
 4. [Domain Inference & Concept Annotation](#4-domain-inference--concept-annotation)
-   - 4.1 [_infer_domain_from_report() — Signal-Word Voting](#41-_infer_domain_from_report--signal-word-voting)
+   - 4.1 [_infer_domain_from_report() — Two-Tier Signal Voting](#41-_infer_domain_from_report--two-tier-signal-voting)
    - 4.2 [_build_col_evidence() — Per-Column Evidence String](#42-_build_col_evidence--per-column-evidence-string)
    - 4.3 [_annotate_column_concepts() — LLM Concept Mapping](#43-_annotate_column_concepts--llm-concept-mapping)
    - 4.4 [End-to-End Pipeline & Examples](#44-end-to-end-pipeline--examples)
 5. [Query Resolution Algorithms](#5-query-resolution-algorithms)
-   - 5.1 [_load_samples_from_catalog() — Categorical Value Loading](#51-_load_samples_from_catalog--categorical-value-loading)
-   - 5.2 [_detect_parent_child_pairs() — Taxonomy Hierarchy Detection](#52-_detect_parent_child_pairs--taxonomy-hierarchy-detection)
-   - 5.3 [_build_taxonomy_hierarchy() — Cross-Tab Hierarchy Building](#53-_build_taxonomy_hierarchy--cross-tab-hierarchy-building)
-   - 5.4 [_fuzzy_match_candidates() — Multi-Strategy Token Matching](#54-_fuzzy_match_candidates--multi-strategy-token-matching)
-   - 5.5 [_apply_fuzzy_fallback() — Safety Net Resolution](#55-_apply_fuzzy_fallback--safety-net-resolution)
+   - 5.1 [_load_samples_from_catalog()](#51-_load_samples_from_catalog--categorical-value-loading)
+   - 5.2 [_detect_parent_child_pairs()](#52-_detect_parent_child_pairs--taxonomy-hierarchy-detection)
+   - 5.3 [_build_taxonomy_hierarchy()](#53-_build_taxonomy_hierarchy--cross-tab-hierarchy-building)
+   - 5.4 [_fuzzy_match_candidates()](#54-_fuzzy_match_candidates--multi-strategy-token-matching)
+   - 5.5 [_apply_fuzzy_fallback()](#55-_apply_fuzzy_fallback--safety-net-resolution)
+6. [SQL Post-Processing Pipeline](#6-sql-post-processing-pipeline)
+   - 6.1 [_fix_dialect_syntax() — Cross-Dialect Contamination Fixer](#61-_fix_dialect_syntax--cross-dialect-contamination-fixer)
+   - 6.2 [_fix_subquery_order_by() — Depth-Aware ORDER BY Guard](#62-_fix_subquery_order_by--depth-aware-order-by-guard)
+   - 6.3 [_fix_window_functions() — Window ORDER BY Injection](#63-_fix_window_functions--window-order-by-injection)
+   - 6.4 [_fix_multicolumn_subquery() — Scalar Subquery Fix](#64-_fix_multicolumn_subquery--scalar-subquery-fix)
+   - 6.5 [_fix_sqlserver_subquery_limits()](#65-_fix_sqlserver_subquery_limits)
+7. [SHACL Validation Algorithms](#7-shacl-validation-algorithms)
+   - 7.1 [Structural Validation — pyshacl](#71-structural-validation--pyshacl)
+   - 7.2 [Semantic Checks — Python](#72-semantic-checks--python)
+   - 7.3 [Quality Report Assembly](#73-quality-report-assembly)
 
 ---
 
@@ -37,42 +49,32 @@ This document describes every major algorithm implemented in the Metadata Agent 
 
 **File:** `metadata_catalog.py`
 
-**Purpose:** Take the raw extraction report produced by the metadata extraction service (table names, column names, statistics, sample values) and durably store it — handling new tables, updated statistics, deleted columns, and previously-deleted entities that reappear.
+**Purpose:** Take the raw extraction report and durably store it — handling new tables, updated statistics, deleted columns, and previously-deleted entities that reappear.
 
 **Inputs:**
 - `source_id` — UUID identifying the data source
-- `source_name` — human-readable name
-- `report` — dict of `{ tables: { table_name: { columns: [...], row_count, ... } } }`
-
-**Output:** Count of entities persisted.
+- `report` — dict `{ tables: { table_name: { columns: [...], row_count, ... } } }`
 
 **Algorithm:**
 
-1. **Source registration.** The source is upserted into `md_sources`. On first registration, `_infer_domain(source_name)` uses keyword matching to auto-assign a business domain (e.g., "sales", "hr").
+1. **Source registration.** Upsert into `md_sources`. On first registration, `_infer_domain(source_name)` uses keyword matching to auto-assign a business domain.
 
-2. **Pre-fetch existing state.** All current `md_entities` for this source are loaded into a dict keyed by `(schema_name, table_name)`. This single pre-fetch avoids N+1 queries during the upsert loop.
+2. **Pre-fetch existing state.** All current `md_entities` for this source are loaded into a dict keyed by `(schema_name, table_name)`. Single pre-fetch avoids N+1 queries.
 
 3. **Entity upsert loop.** For each table in the report:
-   - If the entity exists and was previously soft-deleted (`deleted_from_source=True`), it is restored and a `"restored"` change event is logged.
-   - If the entity exists and is active, stats (`row_count`, `size_bytes`, `primary_keys`) are overwritten. The `description` field is only overwritten if it is currently empty — preserving any human-curated descriptions.
-   - If the entity does not exist, a new UUID is generated and a full INSERT is performed.
+   - If previously soft-deleted (`deleted_from_source=True`) → restore + log `"restored"` event
+   - If active → overwrite stats, preserve human-curated `description`
+   - If new → INSERT with new UUID
 
-4. **Attribute upsert loop.** For each column in the table:
-   - Same restore/update/insert pattern as entities.
-   - On update: stats (`unique_count`, `null_count`, `min_value`, `max_value`, `avg_value`, `stddev_value`, `pattern_hints`, `top_values`) are always overwritten. Description is preserved if non-empty.
-   - Data type changes are detected by comparing old vs new `data_type` strings and logged as `"type_changed"` events.
-   - `statistical_type`, `semantic_role`, and `taxonomy_tree` are **not touched** in persist() — these are managed by the taxonomy algorithms and would otherwise be wiped on every re-index.
+4. **Attribute upsert loop.** Same restore/update/insert for each column. Stats always overwritten; `description` preserved if non-empty. `statistical_type`, `semantic_role`, `taxonomy_tree` are **never touched** here — managed by taxonomy algorithms.
 
-5. **Soft-delete pass.** After processing all tables/columns in the report, any entity or attribute that was active before the run but is absent from the new report is marked `deleted_from_source=True`. This is a soft delete — data is preserved, the UI shows the column as removed.
+5. **Soft-delete pass.** Entities/attributes absent from the new report are marked `deleted_from_source=True`. Data is preserved; the UI shows removed columns.
 
-6. **CDC logging.** Every structural event (added, deleted, restored, type_changed) is appended to `md_changes` with a timestamp, source_id, and entity label.
+6. **CDC logging.** Every structural event (added, deleted, restored, type_changed) appended to `md_changes`.
 
-7. **Redundancy check.** `_run_redundancy_check()` is called at the end of the same transaction — see §1.2.
+7. **Redundancy check.** `_run_redundancy_check()` called at end of same transaction.
 
-**Key design decisions:**
-- Never truncate and reload — always diff to preserve golden-record flags and descriptions.
-- Soft deletes rather than hard deletes to maintain history and CDC audit trail.
-- taxonomy fields are excluded from persist() so re-indexing doesn't wipe LLM classifications.
+**Key design:** Never truncate-and-reload — always diff to preserve golden-record flags and descriptions.
 
 ---
 
@@ -80,65 +82,48 @@ This document describes every major algorithm implemented in the Metadata Agent 
 
 **File:** `metadata_catalog.py` → `_run_redundancy_check()`
 
-**Purpose:** Detect tables that are likely duplicates of each other (same data stored in two places) by comparing column name sets using Jaccard similarity.
-
-**Inputs:** All active entities for the current source and any same-domain sources.
-
-**Output:** Upserted rows in `md_redundancies` for pairs with Jaccard ≥ 0.9; deleted rows for pairs that no longer meet the threshold.
+**Purpose:** Detect tables that are likely duplicates by comparing column name sets.
 
 **Algorithm:**
 
-1. **Domain gating.** Retrieve the domain of the source being indexed. Candidate sources for comparison are:
-   - Always: the source itself (within-source duplicate detection)
-   - Conditionally: other sources sharing the same non-empty domain
+1. **Domain gating.** Only compare tables from the same domain to prevent cross-domain false positives.
 
-   This prevents spurious cross-domain matches (e.g., a Sales `customers` table should not be flagged as a duplicate of an HR `employees` table just because both have a `name` column).
+2. **Column set extraction.** Lowercase all column names for case-normalised comparison.
 
-2. **Column set extraction.** For each candidate entity, load its active column names into a lowercase set. Case-normalisation ensures `CustomerID` and `customer_id` are treated as the same column.
-
-3. **Jaccard computation.** For every pair `(A, B)` where A is from the current source:
-
+3. **Jaccard computation.**
    ```
    Jaccard(A, B) = |cols_A ∩ cols_B| / |cols_A ∪ cols_B|
    ```
 
-4. **Threshold decision.** Jaccard ≥ 0.9 → upsert into `md_redundancies` with the shared column list and score. Jaccard < 0.9 → delete any existing redundancy record for this pair.
+4. **Threshold:** Jaccard ≥ 0.9 → upsert `md_redundancies`; < 0.9 → delete existing record.
 
-5. **Canonical pair ordering.** Pairs are stored as `(min(id_a, id_b), max(id_a, id_b))` to satisfy the UNIQUE constraint regardless of which side is A and which is B.
+5. **Canonical pair ordering.** Stored as `(min(id_a, id_b), max(id_a, id_b))` for UNIQUE constraint.
 
-**Threshold rationale:** 0.9 means 90% of all columns are shared — this is intentionally strict to avoid false positives from tables that legitimately share a few common columns (like `id`, `created_at`).
+**Threshold rationale:** 0.9 is intentionally strict to avoid false positives from tables that share common columns like `id`, `created_at`.
 
 ---
 
 ## 2. Taxonomy Algorithms
 
-Taxonomy classification runs in three layers, each acting as a safety net for the one above:
+Three layers, each acting as a safety net:
 
 ```
-Layer 1: infer_taxonomy()      — deterministic, no dependencies, runs immediately after persist()
-Layer 2: enrich_taxonomy()     — LLM-based, overwrites layer 1 with higher confidence
-Layer 3: _sync_taxonomy_from_kg_nodes() — KG profile_node annotations, highest confidence
+Layer 1: infer_taxonomy()             — deterministic, runs immediately after persist()
+Layer 2: enrich_taxonomy()            — LLM-based, overwrites layer 1
+Layer 3: _sync_taxonomy_from_kg_nodes() — KG annotations, highest confidence
 ```
 
 ### 2.1 `infer_taxonomy()` — Deterministic Pattern-Based Classification
 
 **File:** `metadata_catalog.py`
 
-**Purpose:** Assign `statistical_type` and `semantic_role` to every column using only column name regex patterns and SQL data types — zero external dependencies.
+**Purpose:** Assign `statistical_type` and `semantic_role` using column name regex and SQL data types — zero external dependencies.
 
-**Inputs:** All active attributes for a source that have no existing `statistical_type`.
+**Key invariant:** Does NOT overwrite columns that already have a `statistical_type`.
 
-**Output:** Updated `statistical_type`, `semantic_role`, `taxonomy_tree` in `md_attributes`. Returns count updated.
-
-**Key invariant:** Does NOT overwrite columns that already have a `statistical_type` set (LLM or KG annotations take precedence).
-
-**Algorithm — Decision Sequence:**
-
-The algorithm applies rules in a strict priority order. The priority order was designed to prevent numeric dtype from incorrectly winning over semantic column name evidence.
+**Decision sequence (strict priority):**
 
 **Step 1 — Boolean and identifier name rules (highest priority)**
-
-Check the first two name rules before looking at data type. This prevents a column like `is_active INTEGER` from being classified as `continuous` just because its dtype is numeric.
 
 | Pattern | statistical_type | semantic_role |
 |---|---|---|
@@ -147,36 +132,18 @@ Check the first two name rules before looking at data type. This prevents a colu
 
 **Step 2 — Data type rules**
 
-Only reached if step 1 found no match:
-
-| Data type pattern | statistical_type | semantic_role |
+| Data type | statistical_type | semantic_role |
 |---|---|---|
-| date / datetime / timestamp / time | date | time_dimension_key |
-| int / decimal / float / numeric / money | continuous | measure |
+| date / datetime / timestamp | date | time_dimension_key |
+| int / decimal / float / money | continuous | measure |
 
-**Step 3 — Remaining name rules**
+**Step 3 — Remaining name rules** (text types only)
 
-Only reached if step 2 found no match (column is a text type with no boolean/id name):
-
-| Pattern | statistical_type | semantic_role |
-|---|---|---|
-| `fiscal_year\|fy\|calendar_year\|cy\|year_period` | ordinal | time_period |
-| `year\|month\|quarter\|week\|period\|qtr` | ordinal | time_period |
-| `date\|datetime\|timestamp\|time` | date | time_dimension_key |
-| `country\|nation\|region\|market\|geography\|territory` | categorical | geography |
-| `sub_category\|subcategory\|sub_segment` | categorical | product_sub_category |
-| `category\|segment\|vertical\|product_type` | categorical | product_category |
-| `brand\|manufacturer\|vendor\|supplier` | categorical | product_dimension_key |
-| `customer\|account\|client\|retailer\|buyer` | categorical | customer_dimension_key |
-| `channel\|distribution\|outlet\|store` | categorical | org_unit |
-| `division\|business_unit\|department\|org` | categorical | org_unit |
+Patterns for: fiscal year, time period, geography, sub-category, category, brand, customer, channel, division.
 
 **Step 4 — Cardinality fallback**
 
-If no rule matched and the column is a text type with `unique_count ≤ 50` (or top_values contains ≤ 50 entries), it is classified as `categorical / other`. This catches columns that don't follow standard naming conventions but are clearly low-cardinality dimension columns.
-
-**taxonomy_tree population:**
-For categorical and ordinal columns, the `top_values` JSON array (already populated by the extractor) is copied into `taxonomy_tree`. This makes the stored values immediately available to the query resolution pipeline without any additional DB query.
+`unique_count ≤ 50` and text type → `categorical / other`.
 
 ---
 
@@ -184,26 +151,14 @@ For categorical and ordinal columns, the `top_values` JSON array (already popula
 
 **File:** `metadata_catalog.py`
 
-**Purpose:** Use an LLM (Claude Haiku) to classify all columns of all tables in a source, producing higher-confidence taxonomy annotations than pattern matching alone can achieve.
-
-**Inputs:** All active attributes per entity, with their `data_type` and `top_values` (sample values).
-
-**Output:** Overwrites `statistical_type`, `semantic_role`, `taxonomy_tree` for all columns. Returns count updated.
-
 **Algorithm:**
 
-1. **Per-entity LLM call.** For each entity (table), construct a prompt listing every column with its data type and up to 20 sample values. All columns in a table are sent in a single call — this gives the LLM cross-column context (e.g., it can see that `sub_category` and `category` co-exist and infer the parent-child relationship).
+1. Per-entity LLM call with all columns + data types + up to 20 sample values.
+2. Constrained to fixed vocabularies: 8 `statistical_type` values, 16 `semantic_role` values.
+3. JSON response parsed; `taxonomy_tree` populated with the LLM's `taxonomy_values`.
+4. Overwrites any `infer_taxonomy()` classifications.
 
-2. **System prompt constraints.** The LLM is constrained to:
-   - Pick exactly one `statistical_type` from a fixed vocabulary of 8 types
-   - Pick exactly one `semantic_role` from a fixed vocabulary of 16 roles
-   - Return `taxonomy_values` (the distinct stored values) for categorical/ordinal columns
-
-3. **JSON extraction.** The raw LLM response is cleaned of markdown fences, then parsed as JSON. If the top-level parse fails, a fallback substring search finds the first `{...}` block and retries.
-
-4. **Upsert.** Each classified column is written back with `statistical_type`, `semantic_role`, and `taxonomy_tree` (the LLM's `taxonomy_values` list serialised as JSON). This overwrites any `infer_taxonomy()` classifications.
-
-**Why LLM after pattern matching:** Pattern matching handles 80% of cases deterministically. The LLM handles edge cases — renamed columns, multi-lingual names, unconventional schemas — and provides confidence the pattern rules cannot.
+**Why LLM after pattern matching:** Pattern matching handles ~80% of cases deterministically. LLM handles renamed columns, multi-lingual names, unconventional schemas.
 
 ---
 
@@ -211,28 +166,14 @@ For categorical and ordinal columns, the `top_values` JSON array (already popula
 
 **File:** `orchestrator_api.py`
 
-**Purpose:** After the KG pipeline runs its `profile_node` (which writes taxonomy annotations directly into OWL `rdfs:comment` triples on DatatypeProperty nodes), extract those annotations and write them back to `md_attributes`. This is the highest-confidence taxonomy signal because `profile_node` has access to the full ontology context.
-
-**Inputs:** `source_id`, list of KG `kg_nodes` (each with a `title` string assembled by `translate_node`).
-
-**Output:** Updated `statistical_type`, `semantic_role`, `taxonomy_tree` in `md_attributes`. Returns count updated.
+**Purpose:** After `profile_node` writes taxonomy annotations into OWL `rdfs:comment` triples, extract and write them back to `md_attributes`. Highest-confidence signal.
 
 **Algorithm:**
 
-1. **Parse KG node titles.** Each KG node title is a multi-line string. Column definitions appear as:
-   ```
-     column_name: xsd:string  -- taxonomy: statistical_type=categorical | semantic_role=product_category | ...
-   ```
-   The regex `^\s{2}(.+?):\s+\S+.*?--\s*(taxonomy:\s*.+)$` extracts `column_name` and the taxonomy annotation string. The `(.+?)` (non-greedy) handles column names with spaces.
-
-2. **Taxonomy annotation regex.** A second regex extracts the three fields from the annotation:
-   ```
-   taxonomy:\s*statistical_type=(\w+)\s*\|\s*semantic_role=(\w+)(?:\s*\|\s*format_pattern=(\S+))?
-   ```
-
-3. **Normalised matching.** Column names in the KG may use spaces (original DB column names) while `md_attributes` may use underscores. A `_norm()` function (`strip().lower().replace(" ", "_")`) normalises both sides before matching, preventing silent misses.
-
-4. **Write-back.** For each matched column, `statistical_type` and `semantic_role` are written. For categorical/ordinal columns, the existing `top_values` in `md_attributes` is reused as `taxonomy_tree` (the KG annotation doesn't carry the value list — that comes from the extraction phase).
+1. Parse KG node titles with regex: `^\s{2}(.+?):\s+\S+.*?--\s*(taxonomy:\s*.+)$`
+2. Extract three fields: `statistical_type`, `semantic_role`, `format_pattern`
+3. Normalised matching: `strip().lower().replace(" ", "_")` on both sides
+4. Write back `statistical_type` and `semantic_role`; reuse `top_values` for `taxonomy_tree`
 
 ---
 
@@ -242,42 +183,15 @@ For categorical and ordinal columns, the `top_values` JSON array (already popula
 
 **File:** `knowledge_graph_agent/nodes/translate_node.py`
 
-**Purpose:** Parse an rdflib OWL graph and produce a structured in-memory representation of classes (tables), datatype properties (columns), and object properties (FK relationships).
+**Steps:**
 
-**Inputs:** An rdflib `Graph` object populated from OWL/Turtle source.
+1. **Class extraction.** Query `owl:Class` subjects. Skip blank nodes and XSD/OWL/RDF/RDFS meta-vocabulary.
 
-**Outputs:**
-- `classes` dict: `{ uri: { name, comments, datatype_props: [{name, range, comments}] } }`
-- `obj_props` list: `[ { name, domain, range, is_functional, is_inv_functional, comments } ]`
+2. **DatatypeProperty attachment.** For each `owl:DatatypeProperty`: find `rdfs:domain` (skip orphans), find `rdfs:range` (extract local XSD type), collect `rdfs:comment` triples (statistics + taxonomy).
 
-**Algorithm:**
+3. **ObjectProperty extraction.** For each `owl:ObjectProperty`: require both domain and range in known classes, detect `FunctionalProperty` / `InverseFunctionalProperty` for cardinality, extract join-column hints from `rdfs:comment`.
 
-**Step 1 — Class extraction.**
-Query all subjects typed as `owl:Class`. Skip:
-- Blank nodes (anonymous class expressions)
-- URIs in XSD, OWL, RDF, RDFS namespaces (meta-vocabulary, not domain classes)
-
-For each class: extract `rdfs:label` as the display name, all `rdfs:comment` triples as annotation strings.
-
-**Step 2 — DatatypeProperty attachment.**
-Query all subjects typed as `owl:DatatypeProperty`. For each property:
-- Find its `rdfs:domain` — if not in the known classes dict, skip (orphan property)
-- Find its `rdfs:range` — extract the local name (e.g., `xsd:string` → `"string"`)
-- Collect all `rdfs:comment` triples — these carry column statistics and taxonomy annotations
-- Attach to the domain class's `datatype_props` list
-
-**Step 3 — ObjectProperty extraction.**
-Query all subjects typed as `owl:ObjectProperty`. For each property:
-- Require both `rdfs:domain` and `rdfs:range` to be in the known classes — skip cross-namespace or dangling properties
-- Detect `owl:FunctionalProperty` and `owl:InverseFunctionalProperty` annotations to determine cardinality (1:1, 1:N, M:N)
-- Extract `rdfs:comment` triples — these carry FK join-column hints like `"Join columns: order_id → id"`
-- Deduplicate by URI using a `seen_props` set
-
-**Key design:** Comments on DatatypeProperties carry two distinct kinds of information that must coexist:
-1. Statistics (row count, null count, min/max): written by the ontology generator
-2. Taxonomy annotations: written by `profile_node`
-
-Since rdflib returns `rdfs:comment` triples in arbitrary order, `translate_node._build_graph_data()` explicitly partitions them — non-taxonomy comments first, taxonomy comments last — so downstream regex parsers can reliably find the taxonomy annotation at the end of a column definition line.
+**Key design:** Comments carry two distinct information types (statistics + taxonomy) that must coexist. `translate_node` explicitly partitions them — non-taxonomy first, taxonomy last — so downstream regex parsers find annotations reliably.
 
 ---
 
@@ -285,43 +199,22 @@ Since rdflib returns `rdfs:comment` triples in arbitrary order, `translate_node.
 
 **File:** `knowledge_graph_agent/nodes/translate_node.py`
 
-**Purpose:** Convert the parsed ontology classes and object properties into a JSON structure suitable for the vis.js network visualisation in the UI.
-
-**Inputs:** `classes` dict and `obj_props` list from `_extract_ontology()`.
-
-**Output:** `{ nodes: [...], edges: [...] }` where each node/edge has display properties.
-
-**Algorithm:**
-
 **Nodes (one per OWL Class):**
-- `id` = class URI (used as stable identifier in edges)
-- `label` = class name (display name in the graph)
-- `title` = multi-line tooltip string containing:
-  - Class-level `rdfs:comment` lines (row count, FD hints)
-  - All column definitions: `  col_name: xsd_type  -- stats_comment  -- taxonomy_comment`
-- `size` = 20 + min(len(datatype_props) × 2, 20) — tables with more columns appear larger
+- `id` = class URI
+- `label` = class name
+- `title` = multi-line tooltip: row count, FD hints, all columns with types and taxonomy
+- `size` = 20 + min(column_count × 2, 20)
 
-**Column definition construction (critical ordering):**
+**Column definition ordering (critical):**
 ```
-non-taxonomy comments (statistics) → taxonomy comment (always last)
+non-taxonomy comments → taxonomy comment (always last)
 ```
-This ordering is mandatory because `_sync_taxonomy_from_kg_nodes()` uses a regex that expects the taxonomy annotation at the end of the line. Without this partition, rdflib's arbitrary triple ordering would silently drop taxonomy annotations.
+Mandatory because `_sync_taxonomy_from_kg_nodes()` expects taxonomy annotation at end of line.
 
 **Edges (one per OWL ObjectProperty):**
-- `from` / `to` = domain / range URIs
-- `label` = property name
-- `join_columns` = list of `[src_col, tgt_col]` pairs parsed from `rdfs:comment` strings
-
-Two regex patterns extract join column pairs:
-1. `Join columns: col1 → col2` — simple same-name joins
-2. `Explicit FK: tbl1.col1 → tbl2.col2` — cross-name FK joins
-
-These `join_columns` are later consumed by `understand_node._summarise_graph()` to emit precise `JOIN ON t1.col = t2.col` directives to the SQL planning LLM.
-
-**Cardinality annotation:**
-- `is_functional=True, is_inv_functional=True` → `1:1`
-- `is_functional=True` only → `1:N`
-- Neither → `M:N`
+- Semantic verb label (e.g. `has Customer (1:N)`) derived from domain + cardinality
+- `join_columns` = `[[src_col, tgt_col]]` pairs parsed from `rdfs:comment`
+- Cardinality: `1:1` / `1:N` / `M:N` from FunctionalProperty flags
 
 ---
 
@@ -329,298 +222,152 @@ These `join_columns` are later consumed by `understand_node._summarise_graph()` 
 
 **File:** `knowledge_graph_agent/nodes/translate_node.py`
 
-**Purpose:** Generate executable Cypher (Neo4j) or Gremlin (TinkerPop) statements that materialise the OWL ontology as a property graph.
+**Multi-KG isolation:** Every node/edge stamped with `kg_id` = `source_id`. MATCH/MERGE clauses always filter by `kg_id`.
 
-**Multi-KG isolation:** Every node, edge, and vertex is stamped with a `kg_id` property equal to the `source_id`. This allows multiple data sources to coexist in the same graph database with zero URI collisions. All MATCH/MERGE clauses filter by both `uri` AND `kg_id`.
+**Cypher:**
+```cypher
+CREATE CONSTRAINT kg_node_uri IF NOT EXISTS FOR (n:KGNode) REQUIRE (n.uri, n.kg_id) IS UNIQUE
+MERGE (n:KGNode:Orders {uri: '...', kg_id: '...'}) ON CREATE SET n.order_id = 'integer'
+MATCH (a:KGNode {uri: '...'}), (b:KGNode {uri: '...'})
+MERGE (a)-[r:FK_CUSTOMERS {cardinality: '1:N'}]->(b)
+```
 
-**Cypher generation:**
-
-1. **Schema constraint:** `CREATE CONSTRAINT ... FOR (n:KGNode) REQUIRE (n.uri, n.kg_id) IS UNIQUE` — composite key prevents duplicate nodes when the same source is re-indexed.
-
-2. **Class nodes:** `MERGE (n:KGNode:ClassName {uri: '...', kg_id: '...'})` with `ON CREATE SET` for properties. The double label (`KGNode` + class name) allows Neo4j queries to filter by either.
-
-3. **DatatypeProperty columns** are stored as node properties: `n.column_name = 'xsd_type'`. This keeps column metadata on the node rather than creating separate property nodes.
-
-4. **ObjectProperty edges:** `MATCH (a) ... MATCH (b) ... MERGE (a)-[r:RELATIONSHIP_TYPE ...]->(b)`. The MATCH filters by kg_id so edges only connect nodes within the same KG.
-
-**Gremlin generation:**
-
-1. **Vertex upsert:** `g.V().has('uri', ...).has('kg_id', ...).fold().coalesce(unfold(), addV(...))` — find-or-create pattern using both uri and kg_id.
-
-2. **Edge upsert:** `g.V().has(...).as('a').V().has(...).coalesce(inE(...).where(outV().as('a')), addE(...).from('a'))` — prevents duplicate edges on re-index.
+**Gremlin:**
+```groovy
+g.V().has('uri', '...').has('kg_id', '...').fold().coalesce(unfold(), addV('orders').property(...)).next()
+```
 
 ---
 
 ## 4. Domain Inference & Concept Annotation
 
-These algorithms ensure that every column in an indexed data source has a human-readable business concept label — even when the column name is an opaque abbreviation like `tts`, `arpu`, or `nii`.  The pipeline runs in two stages: first a deterministic voting step identifies the industry domain from the schema; then an LLM call maps each column to a standard concept label, grounded in both the domain context and observed data evidence.
+### 4.1 `_infer_domain_from_report()` — Two-Tier Signal Voting
 
-### Why this matters
+**File:** `orchestrator_api.py`
 
-Abbreviations are deeply ambiguous across industries:
+**Purpose:** Detect the compound business domain (Industry/Function) from table and column names automatically at index time.
 
-| Column | Telecom meaning | CPG/RGM meaning | Banking meaning |
-|--------|----------------|-----------------|-----------------|
-| `arpu` | avg revenue per user | — | avg revenue per user |
-| `tts` | time to serve | trade spend | — |
-| `nii`  | — | — | net interest income |
-| `gsv`  | — | gross sales value | — |
-| `gmv`  | — | — | — (e-commerce term) |
+**Inputs:** Full extraction report dict.
 
-Without knowing the domain, a generic LLM will guess or return `null`.  With domain context it resolves correctly every time.
-
----
-
-### 4.1 `_infer_domain_from_report()` — Signal-Word Voting
-
-**File:** [`orchestrator_api.py:847`](orchestrator_api.py#L847)
-
-**Purpose:** Detect the business domain of a data source automatically from its table and column names, so that concept annotation always has a domain context even when the admin did not specify one during source registration.
-
-**Inputs:**
-- `report` — the full extraction report dict (`{ "tables": { table_name: { "columns": [...] } } }`)
-
-**Output:** A domain label string such as `"CPG/RGM"`, `"Telecom"`, `"Banking/FS"`, or `""` if no signals fire.
+**Output:** Compound label such as `"CPG/Supply Chain"`, `"LS/FP&A"`, `"Telecom"`, or `""`.
 
 **Algorithm:**
 
-1. **Tokenise** every table name and column name: add the full name and each `_`-split part to a flat token set, all lowercased.
-2. **Vote** by intersecting the token set with each domain's signal-word set (`_DOMAIN_SIGNALS`). The score for a domain is the number of tokens that matched.
-3. **Select** the domain with the highest score. Ties are broken by whichever entry appears first in the ordered list. Return `""` if no domain scored > 0.
+1. **Tokenise** every table name and column name: full name + `_`-split parts, all lowercased.
 
-**Signal vocabulary (`_DOMAIN_SIGNALS`):**
+2. **Score independently** against two signal tiers:
+   - `_INDUSTRY_SIGNALS`: CPG, Life Sciences, Healthcare, Telecom, Banking/FS, Insurance, Retail, E-commerce, Manufacturing, SaaS
+   - `_FUNCTION_SIGNALS`: RGM, FP&A, Supply Chain, Sales, Marketing, HR/People, Operations, CX
 
-| Domain | Example signals |
-|--------|----------------|
-| CPG/RGM | `gsv`, `nrv`, `tts`, `rsv`, `sku`, `rgm`, `trade_spend`, `market_share` |
-| Telecom | `arpu`, `mou`, `subscriber`, `churn_rate`, `prepaid`, `roaming` |
-| Banking/FS | `nii`, `nim`, `casa`, `gnpa`, `loan_book`, `provisioning` |
-| Insurance | `premium`, `claim`, `loss_ratio`, `lapse_rate`, `underwriting` |
-| E-commerce | `gmv`, `aov`, `cac`, `roas`, `cart`, `conversion_rate` |
-| Retail | `footfall`, `same_store`, `basket`, `planogram`, `sell_through` |
-| Manufacturing | `oee`, `scrap_rate`, `mtbf`, `cycle_time`, `yield_pct` |
-| Supply Chain | `otif`, `fill_rate`, `lead_time`, `doh`, `safety_stock` |
-| Healthcare | `length_of_stay`, `bed_occupancy`, `readmission`, `patient` |
-| HR/People | `headcount`, `attrition`, `time_to_hire`, `engagement_score` |
-| Marketing | `impressions`, `cpm`, `cpc`, `media_spend`, `attribution` |
-| SaaS/Product | `dau`, `mau`, `mrr`, `arr`, `churn`, `retention_rate` |
+3. **Return compound label** when both tiers fire: `f"{industry_label}/{function_label}"`. Single label when only one tier fires. Empty string if neither fires.
 
-**Example:**
+**Industry signals (examples):**
 
-Schema with tables `fact_rgm_kpis`, `dim_brand_pack` and columns `gsv`, `nrv`, `tts`, `price_index`, `market_share`, `sku`:
+| Industry | Signal words |
+|---|---|
+| CPG | `brand`, `sku`, `category`, `retailer`, `upc`, `rsv`, `gsv`, `pack_size`, `distributor` |
+| Life Sciences | `trial`, `cohort`, `adverse_event`, `molecule`, `indication`, `clinical` |
+| Telecom | `arpu`, `mou`, `subscriber`, `churn_rate`, `prepaid`, `roaming`, `spectrum` |
+| Banking/FS | `nii`, `nim`, `casa`, `gnpa`, `loan_book`, `provisioning`, `kyc` |
 
-```
-Token set: {fact, rgm, kpis, gsv, nrv, tts, price_index, market_share, dim, brand, pack, sku, ...}
+**Function signals (examples):**
 
-Scores:
-  CPG/RGM    → gsv ✓, nrv ✓, tts ✓, market_share ✓, sku ✓, rgm ✓  = 6
-  Telecom    → 0
-  Banking/FS → 0
-  ...
+| Function | Signal words |
+|---|---|
+| RGM | `promo`, `trade_spend`, `price_index`, `mix_effect`, `promotion_type` |
+| FP&A | `gl_account`, `cost_centre`, `scenario`, `version`, `reforecast`, `profit_centre` |
+| Supply Chain | `purchase_order`, `goods_receipt`, `shipment`, `vendor`, `otif`, `lead_time` |
 
-Winner: CPG/RGM
-```
-
-**Fallback behaviour:** Called in `_index_source` only when `src["domain"]` is blank or `"Other"`.  If inference fires, the result is written back to `src["domain"]` in place and a status event is pushed to the UI:
-```
-Domain auto-detected: CPG/RGM
-```
-If inference returns `""`, the empty string is used — the annotation LLM falls back to a generic multi-industry prompt.
+**Fallback behaviour:** If inference returns `""`, the LLM concept annotator uses a generic multi-industry prompt rather than domain-specific vocabulary.
 
 ---
 
 ### 4.2 `_build_col_evidence()` — Per-Column Evidence String
 
-**File:** [`ontology_agent/nodes/build_node.py:116`](ontology_agent/nodes/build_node.py#L116)
+**File:** `ontology_agent/nodes/build_node.py`
 
-**Purpose:** Serialise all observed data signals for one column into a compact pipe-delimited string that is included verbatim in the LLM annotation prompt.
+**Purpose:** Serialise all observed data signals for one column into a compact evidence string for the LLM annotation prompt.
 
-**Input:** A column dict from the extraction report (same schema as persisted to the metadata catalog).
-
-**Output:** A single string like:
+**Output example:**
 ```
 decimal | min=0 max=500000 avg=45200.00 | top_values=[5000, 12000, 88000] | high-cardinality | description="decimal monetary column" | domain=monetary
 ```
 
-**Signals included (in order):**
-
-| Signal | Source field | Why it matters |
-|--------|-------------|---------------|
-| SQL data type | `data_type` | Distinguishes measure (decimal) from flag (integer 0/1) from category (varchar) |
-| Numeric range | `min_value`, `max_value`, `avg_value` | Large range → monetary; 0–100 → percentage; small integers → count |
-| Top values | `top_values` | Strongest signal: currency-scale numerics → monetary; short strings → dimension |
-| Cardinality | `unique_count` / `row_count` | Near-1.0 ratio → continuous measure or identifier; ≤ 20 distinct → categorical |
-| Null rate | `null_rate` | High null rate → optional attribute, not a key |
-| Rule-based description | `description` | Already grounded by the extraction pipeline's pattern rules |
-| Rule-based domain | `domain` | `monetary`, `status_flag`, `categorical`, `numeric_measure`, etc. |
-
-**Design note:** The `description` field is truncated at the first ` — ` clause separator (not at `.`) to avoid cutting mid-number in range strings like `"range: 0.0 – 500000.0"`.
+**Signals (in order):** SQL data type → numeric range → top values → cardinality ratio → null rate → rule-based description → rule-based domain.
 
 ---
 
 ### 4.3 `_annotate_column_concepts()` — LLM Concept Mapping
 
-**File:** [`ontology_agent/nodes/build_node.py:178`](ontology_agent/nodes/build_node.py#L178)
+**File:** `ontology_agent/nodes/build_node.py`
 
-**Purpose:** Call Claude to map every column in a table to a standard business concept label (kebab-case, 1–4 words), grounded in both the domain context and the per-column evidence.  Returns `null` for identifiers, timestamps, and self-explanatory names to avoid annotation noise.
+**Purpose:** Map every column to a standard business concept label (kebab-case, 1–4 words) grounded in domain context and per-column evidence.
 
-**Inputs:**
-- `table_name` — used in the user message for context
-- `columns` — list of column dicts from the extraction report
-- `model` — LLM model ID (default `claude-haiku-4-5-20251001`)
-- `domain_hint` — the `source_domain` string from `OntologyConfig`, e.g. `"CPG/RGM | bigquery | Pricing Analytics DB"`
-
-**Output:** `{ column_name: concept_label_or_null }`
-
-**Prompt construction:**
-
-The system prompt is rendered from `_CONCEPT_SYSTEM_TEMPLATE` with two placeholders:
-
-- `{domain_context}` — e.g. `"the CPG/RGM | bigquery | Pricing Analytics DB domain"` or `"enterprise data systems across multiple industries"` when no domain is known
-- `{source_context_block}` — the full domain hint displayed under `SOURCE CONTEXT`
-
-The user message lists every column as one evidence line (output of `_build_col_evidence`):
-```
-Table: fact_rgm_kpis
-Columns (name | data_type | range | top_values | cardinality | description | domain):
-  gsv   | decimal | min=0 max=9800000 avg=420000.00 | high-cardinality | domain=monetary
-  tts   | decimal | min=0 max=500000 avg=45200.00 | top_values=[5000,12000,88000] | high-cardinality | description="decimal monetary column" | domain=monetary
-  ...
-```
-
-**Grounding rules baked into the system prompt (priority order):**
-
-1. `top_values` — strongest signal (0/1 → flag; currency-scale → monetary; strings → dimension)
-2. `description` — already rule-grounded by extraction pipeline; trust it
+**Grounding rules (priority order):**
+1. `top_values` — strongest signal
+2. `description` — already rule-grounded by extraction pipeline
 3. `min/max/avg` — range confirms type
-4. `cardinality` — near 1.0 → continuous measure; few distinct → categorical
-5. `data_type` — decimal/float → measure; integer → count/id; varchar → category
-6. `column name` — last resort; resolve against source domain vocabulary
+4. `cardinality` — near 1.0 → continuous; few distinct → categorical
+5. `data_type` — decimal/float → measure; integer → count/id
+6. `column name` — last resort, resolved against domain vocabulary
 
-**Return `null` when:**
-- The column is an identifier, primary/foreign key, or date/timestamp
-- The name is already self-explanatory (e.g. `revenue`, `headcount`)
-- Evidence contradicts the apparent meaning (e.g. a `value` column with only 0/1 values is a status flag, not a monetary measure)
+**Returns `null` for:** identifiers, PKs, FKs, timestamps, self-explanatory names.
 
-**Model choice:** `claude-haiku-4-5-20251001` by default — cheapest and fast enough for column-name interpretation at indexing time.  Can be overridden per source via `OntologyConfig.llm_model`.
-
-**Failure mode:** Any exception returns an empty dict — annotation is best-effort and never blocks ontology generation.
+**Model:** `claude-haiku-4-5-20251001` — cheapest, sufficient for column-name interpretation. Any exception returns empty dict — never blocks ontology generation.
 
 ---
 
 ### 4.4 End-to-End Pipeline & Examples
 
-**Flow from source registration to OWL annotation:**
-
 ```
-Admin registers source
-  domain = "Other" (or blank)
+Admin registers source → domain = "Other"
         │
         ▼
 _index_source() — extraction completes
         │
-        ├── admin_domain blank or "Other"?
-        │       YES → _infer_domain_from_report()
-        │               schema tokens voted against _DOMAIN_SIGNALS
-        │               → src["domain"] = "CPG/RGM"   (written in place)
-        │       NO  → src["domain"] unchanged
+        ├── domain blank / "Other"?
+        │       YES → _infer_domain_from_report() → "CPG/Supply Chain"
+        │       NO  → domain unchanged
         │
         ▼
 POST /generate to ontology_api
-  source_domain = "CPG/RGM"
-  source_name   = "Pricing Analytics DB"
-  db_type       = "bigquery"
-  source_description = "Revenue Growth Management data mart"
+  source_domain = "CPG/Supply Chain"
         │
         ▼
-ontology_api.py — builds full_domain_context
-  "CPG/RGM | bigquery | Pricing Analytics DB | Revenue Growth Management data mart"
+build_node — per table:
+  _build_col_evidence() + _annotate_column_concepts(domain_hint)
         │
         ▼
-build_node.py — for each table:
-  _build_col_evidence() per column
-  _annotate_column_concepts(domain_hint=full_domain_context)
-        │
-        ▼
-LLM returns { "tts": "trade-spend", "gsv": "gross-sales-value", ... }
-        │
-        ▼
-OWL triple written:
-  :fact_rgm_kpis_tts rdfs:comment "Business concept: trade-spend"
+OWL triple: :fact_kpis_tts rdfs:comment "Business concept: trade-spend"
 ```
 
-**Example A — CPG/RGM schema (domain auto-detected)**
+**Disambiguation examples:**
 
-Input columns in `fact_rgm_kpis`:
-
-| Column | Data type | Evidence | Annotation |
-|--------|-----------|----------|------------|
-| `gsv` | decimal | min=0 max=9.8M, high-cardinality, domain=monetary | `gross-sales-value` |
-| `nrv` | decimal | min=0 max=8.5M, high-cardinality, domain=monetary | `net-realized-value` |
-| `tts` | decimal | min=0 max=500K, top_values=[5000,12000,88000], domain=monetary | `trade-spend` |
-| `price_index` | decimal | min=85.2 max=112.4 avg=99.8, domain=numeric_measure | `price-index` |
-| `region_id` | integer | 5-distinct-values, domain=categorical | `null` — categorical key |
-| `period_dt` | date | — | `null` — timestamp |
-
-**Example B — Telecom schema**
-
-Input columns in `fact_subscriber_kpis`:
-
-| Column | Evidence | Without domain | With Telecom domain |
-|--------|----------|---------------|---------------------|
-| `arpu` | decimal, min=45 max=312 | `avg-revenue-per-user` *(guessed from name)* | `avg-revenue-per-user` *(confirmed)* |
-| `mou` | integer, min=0 max=1200 | `null` *(ambiguous abbreviation)* | `minutes-of-use` |
-| `subtype` | varchar, 3-distinct-values: Prepaid/Postpaid/Enterprise | `null` | `null` — self-explanatory |
-| `churn` | integer, top_values=[0,1] | `null` *(flag detected)* | `null` *(flag)* |
-
-**Example C — Same abbreviation, different domains**
-
-| Column | Domain hint | LLM output | Correct? |
-|--------|-------------|------------|---------|
-| `tts` | *(none)* | `total-time-spent` | Wrong — ambiguous |
-| `tts` | CPG/RGM | `trade-spend` | Correct |
-| `nii` | *(none)* | `null` | Safe fallback |
-| `nii` | Banking/FS | `net-interest-income` | Correct |
-| `gmv` | *(none)* | `gross-merchandise-value` *(name is known)* | Correct |
-| `gmv` | Banking/FS | `null` *(not a banking term)* | Correct — LLM rejects it |
-
-**OWL output** for `tts` in the CPG/RGM case:
-```turtle
-:fact_rgm_kpis_tts
-    a owl:DatatypeProperty ;
-    rdfs:label "tts" ;
-    rdfs:comment "Business concept: trade-spend" ;
-    rdfs:domain :FactRgmKpis ;
-    rdfs:range xsd:decimal .
-```
+| Column | Domain | LLM output |
+|---|---|---|
+| `tts` | CPG/RGM | `trade-spend` |
+| `tts` | (none) | `total-time-spent` *(wrong)* |
+| `nii` | Banking/FS | `net-interest-income` |
+| `nii` | (none) | `null` *(safe fallback)* |
+| `arpu` | Telecom | `avg-revenue-per-user` |
+| `mou` | Telecom | `minutes-of-use` |
+| `mou` | (none) | `null` *(ambiguous)* |
 
 ---
 
 ## 5. Query Resolution Algorithms
 
-These algorithms bridge user natural language to the exact values stored in the database — the critical step that prevents the SQL planning LLM from inventing filter values.
+Bridge user natural language to exact stored values — preventing the SQL planner from inventing filter values.
 
 ### 5.1 `_load_samples_from_catalog()` — Categorical Value Loading
 
 **File:** `dialog_agent/nodes/understand_node.py`
 
-**Purpose:** For non-file-based sources (PostgreSQL, Redshift, etc.) where live DB sampling is not available, load categorical column values and taxonomy hierarchy from the metadata catalog that was populated during indexing.
-
-**Inputs:** `source_id`
-
-**Output:**
-- `samples`: `{ table_name: { col_name: {"values": [...], "categorical": bool} } }`
-- `hierarchy`: `{ table_name: { parent_col: { "(all sub-values)": [child_vals] } } }`
-
 **Algorithm:**
-
-1. Load all active entities for the source via `_mc.list_entities(source_id)`.
-2. For each entity, call `_mc.get_entity()` to get the full attribute list including `statistical_type` and `top_values`.
-3. Include a column in `samples` only if it has `statistical_type ∈ {categorical, ordinal}` AND non-empty `top_values`. This filters out identifiers, measures, and dates that should never appear in WHERE clause resolution.
-4. Detect parent-child column pairs via `_detect_parent_child_pairs()` (see §5.2).
-5. For each detected pair, build a hierarchy entry with the child column's values grouped under the key `"(all sub-values)"`. Without a live DB cross-tab we cannot know which parent value owns which child values, so the entire child value list is exposed.
-
-This function is the bridge between the indexing pipeline (which runs once) and the query pipeline (which runs per user query) — it ensures the query pipeline has categorical value knowledge even for database sources that cannot be sampled live.
+1. Load all active entities + attributes via metadata catalog.
+2. Include column in `samples` only if `statistical_type ∈ {categorical, ordinal}` AND non-empty `top_values`.
+3. Detect parent-child pairs via `_detect_parent_child_pairs()`.
+4. Group child values under `"(all sub-values)"` when live cross-tab is unavailable.
 
 ---
 
@@ -628,20 +375,12 @@ This function is the bridge between the indexing pipeline (which runs once) and 
 
 **File:** `dialog_agent/nodes/understand_node.py`
 
-**Purpose:** Identify parent-child categorical column pairs (e.g., `category → sub_category`) from the column set of a single table, using naming convention and cardinality heuristics.
+For every column starting with `"sub_"`:
+1. Derive parent by stripping prefix: `sub_category` → `category`
+2. Verify parent exists in same table
+3. Verify cardinality: parent distinct count ≤ child distinct count
 
-**Input:** `col_samples` dict for one table.
-
-**Output:** List of `(parent_col, child_col)` tuples.
-
-**Algorithm:**
-
-For every column that starts with `"sub_"`:
-1. Derive the parent candidate by stripping the prefix: `sub_category` → `category`.
-2. Check that the parent candidate exists as a column in the same table.
-3. Verify cardinality: parent distinct count ≤ child distinct count. A parent category must have fewer unique values than its sub-categories.
-
-Both conditions must hold. This dual heuristic (naming + cardinality) prevents false positives like `sub_id` (which might start with `sub_` but has higher cardinality than `id`).
+Both conditions required to prevent false positives.
 
 ---
 
@@ -649,23 +388,13 @@ Both conditions must hold. This dual heuristic (naming + cardinality) prevents f
 
 **File:** `dialog_agent/nodes/understand_node.py`
 
-**Purpose:** For file-based sources with live SQLite access, build a full cross-tabulation of parent → child value mappings.
-
-**Input:** SQLite connection, table name, list of `(parent_col, child_col)` pairs.
-
-**Output:** `{ parent_col: { parent_val: [child_vals] } }`
-
-**Algorithm:**
-
-For each parent-child pair, execute:
+For file-based sources with live SQLite, executes:
 ```sql
-SELECT DISTINCT parent_col, child_col
-FROM table
+SELECT DISTINCT parent_col, child_col FROM table
 WHERE parent_col IS NOT NULL AND child_col IS NOT NULL
 ORDER BY parent_col, child_col
 ```
-
-Group results by parent value. Each parent value maps to the sorted list of distinct child values that co-occur with it in the data. This produces the exact hierarchy used to tell the LLM: *"filtering at parent level captures ALL these child values automatically."*
+Groups by parent value → list of child values.
 
 ---
 
@@ -673,45 +402,15 @@ Group results by parent value. Each parent value maps to the sorted list of dist
 
 **File:** `dialog_agent/nodes/resolve_node.py`
 
-**Purpose:** Find stored categorical values that are likely to match user query terms using three complementary matching strategies, then promote matched child values to their parent column so the LLM filters at the correct hierarchy level.
+**Preprocessing:** Tokenise with `\b[a-zA-Z]\w+\b`, strip 60-word stop-word set, discard tokens < 2 chars.
 
-**Inputs:**
-- `natural_query`: the user's question string
-- `categorical_columns`: `{ table: { col: [stored_values] } }`
-- `column_hierarchy`: `{ table: { parent_col: { ... } } }`
+**Three strategies per token:**
 
-**Output:** List of candidate matches sorted by score descending, each with `{ table, column, stored_value, overlap_tokens, score, match_type, promoted_from }`.
+1. **Exact substring** — `token in stored_value.lower()`
+2. **Stemmed match** — strip common suffixes (`-s`, `-es`, `-ing`, `-ed`, `-er`, `-tion`, `-ness`, `-ment`, `-ies`, `-est`), compare stems (min length 3)
+3. **Edit distance ≤ 1** (tokens ≥ 5 chars) — Levenshtein DP with early exit when `|len(a) - len(b)| > 2`
 
-**Preprocessing:**
-
-Tokenise the query with `\b[a-zA-Z]\w+\b`, strip stop-words (a 60-word set including common English words plus FMCG-specific terms like `"growth"`, `"share"`, `"period"`), and discard tokens shorter than 2 characters. This leaves only semantically significant tokens.
-
-**Three matching strategies (applied per token per stored value):**
-
-**Strategy 1 — Exact substring**
-`token in stored_value.lower()` — catches direct word containment. Example: `"snacks"` in `"Snacks & Foods"`.
-
-**Strategy 2 — Stemmed match**
-Strip common English suffixes (`-s`, `-es`, `-ing`, `-ed`, `-er`, `-tion`, `-ness`, `-ment`, `-ies`, `-est`) from both the query token and each word in the stored value, then compare stems. Minimum root length: 3 characters. Example: `"snack"` (stem of `"snacks"`) matches `"snack"` (stem of `"Snack"` in `"Snack Foods"`).
-
-**Strategy 3 — Edit distance ≤ 1 (for tokens ≥ 5 chars)**
-Compute Levenshtein distance between the query token and each word in the stored value using dynamic programming. Only applied to tokens ≥ 5 characters (shorter tokens have too many 1-edit neighbours). Early exit when `|len(a) - len(b)| > 2`. Example: `"savory"` ↔ `"savoury"` = 1 edit → match.
-
-**Hierarchy promotion:**
-
-After finding direct matches on child columns (e.g., `"savoury"` matches `sub_category = "Savoury Snacks"`), the algorithm promotes parent column candidates. For the parent column of each matching child:
-
-1. Detect `child_col → parent_col` via stored hierarchy OR naming convention (`sub_X` → `X`).
-2. For each parent value, compute how many query tokens also match the parent value directly.
-3. Score the parent candidate as: `len(parent_direct_matches) + len(child_matched_tokens) + 1` — the `+1` ensures promoted parents outscore direct child matches.
-
-This score design means: if the user says "savoury snacks", the promoted `category = 'Snacks & Foods'` candidate scores 4 while the direct `sub_category = 'Savoury Snacks'` scores 2 — the parent always wins in the hint list.
-
-**Output labels:**
-- `match_type = "direct"` — the stored value itself matched the token
-- `match_type = "promoted_parent"` — a child's match caused this parent to be promoted
-
-These labels appear in the hint block sent to the LLM, annotated as `[PARENT LEVEL — via child match]`.
+**Hierarchy promotion:** When a child column matches, promote the parent candidate with score = `parent_direct_matches + child_matched_tokens + 1`. The `+1` ensures promoted parents always outscore direct child matches so the LLM filters at the correct hierarchy level.
 
 ---
 
@@ -719,25 +418,189 @@ These labels appear in the hint block sent to the LLM, annotated as `[PARENT LEV
 
 **File:** `dialog_agent/nodes/resolve_node.py`
 
-**Purpose:** After the LLM has produced term resolutions, fill in any filters where the LLM returned a null `sql_fragment` despite fuzzy evidence existing. This catches cases where the LLM is overly conservative.
+For each filter where the LLM returned null `sql_fragment`:
+1. Score every fuzzy candidate against user term tokens (same three strategies)
+2. Apply `+1` bonus to `match_type = "promoted_parent"` candidates
+3. If score > 0 → inject deterministic `LOWER(col) = 'value'` fragment
 
-**Inputs:**
-- `term_resolution`: LLM output list (may contain null sql_fragments)
-- `candidates`: fuzzy candidates from `_fuzzy_match_candidates()`
-- `categorical_columns`, `column_hierarchy`
+No second LLM call — fragment is constructed directly from Python-computed best match.
 
-**Output:** Patched `term_resolution` list with nulls filled in where possible.
+---
+
+## 6. SQL Post-Processing Pipeline
+
+**File:** `dialog_agent/nodes/plan_node.py`
+
+Every LLM-generated SQL passes through this ordered pipeline before execution:
+
+```python
+sql = _qualify_sql(sql, db_schema, table_labels)
+sql = _fix_count_vs_sum(sql, natural_query)
+sql = _fix_percentage(sql, natural_query, db_type)
+sql = _enforce_sql_limits(sql, row_limit, db_type)
+sql = _fix_dialect_syntax(sql, db_type)              # NEW — cross-dialect fixer
+sql = _fix_sqlserver_subquery_limits(sql, db_type)
+sql = _fix_subquery_order_by(sql, db_type)
+sql = _fix_window_functions(sql, db_type)
+sql = _fix_multicolumn_subquery(sql)
+sql = _fix_distinct_order_by(sql)
+```
+
+**Ordering is critical:** `_fix_dialect_syntax` runs before the SQL Server-specific fixers so OFFSET is already present before `_fix_subquery_order_by` evaluates protection.
+
+---
+
+### 6.1 `_fix_dialect_syntax()` — Cross-Dialect Contamination Fixer
+
+**Purpose:** Catch PostgreSQL/ANSI idioms that the LLM emits for the wrong target dialect and rewrite them at runtime.
+
+**Algorithm:** Pattern-matched regex substitutions per dialect group:
+
+| Transformation | Trigger | Target dialects |
+|---|---|---|
+| `ILIKE` → `LOWER(col) LIKE LOWER(pat)` | `\bILIKE\b` | SQL Server, Oracle, BigQuery, SQLite |
+| `col::TYPE` → `CAST(col AS TYPE)` | `\w+\s*::\s*\w+` | non-PostgreSQL |
+| `NOW()` → `GETDATE()` | `\bNOW\s*\(\s*\)` | SQL Server |
+| `NOW()` → `SYSDATE` | `\bNOW\s*\(\s*\)` | Oracle |
+| `NOW()` → `CURRENT_TIMESTAMP()` | `\bNOW\s*\(\s*\)` | BigQuery |
+| `CURRENT_DATE` → `CAST(GETDATE() AS DATE)` | `\bCURRENT_DATE\b` | SQL Server |
+| `CURRENT_DATE` → `SYSDATE` | `\bCURRENT_DATE\b` | Oracle |
+| `DATE_TRUNC(unit, col)` → `DATEADD(unit, DATEDIFF(unit, 0, col), 0)` | `\bDATE_TRUNC\b` | SQL Server |
+| `DATE_TRUNC(unit, col)` → `TRUNC(col, 'fmt')` | `\bDATE_TRUNC\b` | Oracle |
+| `LENGTH(` → `LEN(` | `(?<![A-Z_])LENGTH\s*\(` | SQL Server |
+| `LIMIT N` (statement end) → `FETCH FIRST N ROWS ONLY` | `\bLIMIT\s+(\d+)\s*$` | Oracle |
+| `\|\|` → `+` | `['\w)]\s*\|\|(\s*['\w(])` | SQL Server |
+
+---
+
+### 6.2 `_fix_subquery_order_by()` — Depth-Aware ORDER BY Guard
+
+**Purpose:** Strip bare `ORDER BY` from SQL Server subqueries/CTEs where it is illegal (error 1033) unless protected by `TOP`, `OFFSET`, or `FOR XML`.
+
+**Root cause addressed:** `_fix_sqlserver_subquery_limits` adds `OFFSET 0 ROWS FETCH NEXT N ROWS ONLY` inside *nested* subqueries. If the outer block's OFFSET check was naive (`re.search(r'\bOFFSET\b', block_content)`), the nested OFFSET would be found and incorrectly exempt the outer bare ORDER BY from being stripped.
+
+**Fix — `_keyword_at_d0()` depth-aware scan:**
+```python
+def _keyword_at_d0(text: str, pattern: str) -> bool:
+    depth = 0
+    for tok in re.finditer(r'[()]|' + pattern, text, re.IGNORECASE):
+        if tok.group(0) == '(':  depth += 1
+        elif tok.group(0) == ')': depth -= 1
+        elif depth == 0: return True
+    return False
+```
+
+Applied separately to `text_before_ORDER_BY` (for TOP check) and `text_after_ORDER_BY` (for OFFSET/FOR XML check). Only keywords at paren-depth 0 relative to the block are counted as protection.
+
+**OVER() guard:** Before the depth scan, if the token immediately preceding the enclosing `(` matches `\bOVER$`, the ORDER BY is part of a window function spec and is **never** stripped.
+
+---
+
+### 6.3 `_fix_window_functions()` — Window ORDER BY Injection
+
+**Purpose:** Inject missing `ORDER BY` into navigation window function `OVER()` clauses for all dialects. SQL Server, Oracle, and BigQuery all require ORDER BY inside OVER for LAG, LEAD, ROW_NUMBER, RANK, DENSE_RANK, FIRST_VALUE, LAST_VALUE, NTILE, CUME_DIST, PERCENT_RANK.
 
 **Algorithm:**
+1. Find navigation function calls with regex `_ORDER_REQUIRED`
+2. Scan forward with paren-depth counter to find the matching `)`
+3. Extract the OVER content; skip if ORDER BY already present
+4. Inject ORDER BY: reuse first PARTITION BY column if available; fall back to `(SELECT NULL)` as a no-op sentinel
 
-For each resolved filter with a null or empty `sql_fragment`:
-1. Tokenise the `user_term` field using the same stop-word filter as the fuzzy pre-match.
-2. Score every fuzzy candidate by how many user term tokens match its stored value (using `_token_matches_text()`, same three-strategy check).
-3. Apply a `+1` bonus to candidates with `match_type = "promoted_parent"`.
-4. Select the highest-scoring candidate.
-5. If score > 0, inject a deterministic `sql_fragment`: `LOWER(col) = 'stored_value_lower'`.
+---
 
-The fallback does not make another LLM call — it constructs the fragment directly from the Python-computed best match. This guarantees the filter is exact and correct rather than relying on the LLM a second time.
+### 6.4 `_fix_multicolumn_subquery()` — Scalar Subquery Fix
+
+**Purpose:** Rewrite scalar subqueries that return multiple columns — illegal in all dialects.
+
+**Two patterns:**
+
+1. **Scalar IN with multi-column SELECT:**
+   ```sql
+   WHERE id IN (SELECT id, rn FROM ranked)
+   -- becomes:
+   WHERE id IN (SELECT id FROM ranked)
+   ```
+
+2. **Row-value constructor `(a,b) IN (SELECT x,y FROM t)`** → rewrites to EXISTS:
+   ```sql
+   WHERE EXISTS (SELECT 1 FROM t WHERE t.x = a AND t.y = b)
+   ```
+   Only triggered for `(col, col) IN (SELECT ...)` patterns — does NOT rewrite every `NOT IN`.
+
+---
+
+### 6.5 `_fix_sqlserver_subquery_limits()`
+
+**Purpose:** Convert `ORDER BY … LIMIT N` inside SQL Server CTEs/subqueries to `ORDER BY … OFFSET 0 ROWS FETCH NEXT N ROWS ONLY`.
+
+**Algorithm:** Paren-depth scan identifies ORDER BY + LIMIT pairs inside subquery blocks; rewrites LIMIT to OFFSET/FETCH; strips bare LIMITs (no ORDER BY) entirely. SQL Server only — no-op for other dialects.
+
+**Pipeline position:** Must run **before** `_fix_subquery_order_by` so the injected OFFSET keyword is in place when the ORDER BY protection check runs.
+
+---
+
+## 7. SHACL Validation Algorithms
+
+**File:** `shacl_agent/nodes/`
+
+The SHACL validation pipeline runs two independent passes and assembles a quality report.
+
+### 7.1 Structural Validation — pyshacl
+
+**File:** `shacl_agent/nodes/validate_node.py`
+
+Calls `pyshacl.validate()` with:
+- `inference="rdfs"` — run RDFS-level inference so `owl:Class` instances resolve
+- `abort_on_first=False` — collect all violations before returning
+- `allow_warnings=True` — distinguish `sh:Violation` from `sh:Warning`
+
+Results graph is walked for `sh:ValidationResult` subjects; each result extracts `sh:focusNode`, `sh:resultPath`, `sh:resultMessage`, `sh:sourceShape`, `sh:resultSeverity`.
+
+**Graceful degradation:** If `pyshacl` is not installed, records a non-fatal error and continues with semantic checks — the service never crashes due to a missing optional dependency.
+
+---
+
+### 7.2 Semantic Checks — Python
+
+Four checks that are beyond SHACL expressivity:
+
+**OrphanClass:**
+```
+all_classes = subjects(rdf:type, owl:Class)
+referenced  = objects(rdfs:domain) ∪ objects(rdfs:range)
+orphans     = all_classes − referenced − blank_nodes
+```
+
+**LowCoverage:**
+Regex `[Cc]overage[:\s]+(\d+(?:\.\d+)?)\s*%` extracts coverage from `rdfs:comment` on `owl:ObjectProperty` nodes. Fires when `coverage < config.min_coverage` (default 0.5).
+
+**NamespaceDrift:**
+Detects the `owl:Ontology` subject URI as base namespace. Flags any `owl:Class` / `owl:DatatypeProperty` / `owl:ObjectProperty` whose URI does not start with that base. Skips blank nodes.
+
+**DuplicateClassLabel:**
+Builds `{ label.lower(): [uris] }` map over all `owl:Class` nodes. Flags any label with `len(uris) > 1`.
+
+---
+
+### 7.3 Quality Report Assembly
+
+**File:** `shacl_agent/nodes/report_node.py`
+
+**Quality label logic:**
+```
+PASS  ← conforms=True AND no violations AND no semantic Violations
+WARN  ← no violations but warnings or semantic issues exist
+FAIL  ← at least one sh:Violation
+```
+
+**Suggestions are auto-generated** for each issue category:
+- Orphan classes → "Review IND detection threshold or add FK constraints"
+- Low coverage → "Treat as candidate links, not confirmed JOIN keys"
+- Namespace drift → "Normalise all URIs to the declared owl:Ontology base URI"
+- Duplicate labels → "Use unique rdfs:label values — NL query planner uses labels to disambiguate tables"
+- Missing rdfs:domain → "Breaks OWL-DL reasoning and KG node→edge translation"
+
+The report is designed so the Tech UI can render a per-check results table — every check shown with pass/fail status, description, and expandable issue detail — giving the user full visibility into both what passed and what failed.
 
 ---
 
@@ -748,39 +611,59 @@ Index time:
   extract report
        │
        ▼
-  persist()              ← upsert tables/columns, CDC log, soft deletes
+  persist()                  ← upsert, CDC log, soft deletes
        │
        ▼
-  infer_taxonomy()       ← pattern rules, immediate, no deps
+  infer_taxonomy()            ← pattern rules, immediate
        │
-       ▼  (async, may fail gracefully)
-  enrich_taxonomy()      ← LLM classification, overwrites pattern
+       ▼ (async, graceful failure)
+  enrich_taxonomy()           ← LLM, overwrites pattern
        │
-       ▼  (if KG pipeline ran)
-  _sync_taxonomy_from_kg_nodes()  ← KG profile_node annotations, highest confidence
+       ▼ (after KG pipeline)
+  _sync_taxonomy_from_kg_nodes() ← KG annotations, highest confidence
        │
-       ▼  (if ontology was built)
+       ▼
+  _infer_domain_from_report() ← two-tier industry/function signal voting
+       │
+       ▼
+  build_node → _annotate_column_concepts() ← domain-grounded LLM concept labels
+       │
+       ▼
   _extract_ontology() → _build_graph_data() → _generate_cypher/gremlin()
-                         KG stored in Neo4j / in-memory graph_data
+  KG stored in Neo4j / in-memory graph_data
+
+  (optional, user-initiated)
+  validate_ontology → SHACL API → structural + semantic checks → quality report
 
 Query time (per user question):
-  _load_samples_from_catalog()      ← pull top_values from md_attributes
+  _load_samples_from_catalog()       ← pull top_values from md_attributes
        │
        ▼
-  _detect_parent_child_pairs()      ← naming + cardinality heuristics
+  _detect_parent_child_pairs()       ← naming + cardinality heuristics
        │
        ▼
-  _build_taxonomy_hierarchy()       ← live cross-tab (file) or flat (catalog)
+  _build_taxonomy_hierarchy()        ← live cross-tab (file) or flat (catalog)
        │
        ▼
-  _fuzzy_match_candidates()         ← substring + stem + edit-distance + hierarchy promotion
+  _fuzzy_match_candidates()          ← substring + stem + edit-distance + hierarchy promotion
        │
        ▼
-  LLM resolve call with hints       ← LLM confirms/ranks fuzzy candidates
+  LLM resolve call with hints        ← LLM confirms/ranks fuzzy candidates
        │
        ▼
-  _apply_fuzzy_fallback()           ← fill nulls deterministically
+  _apply_fuzzy_fallback()            ← fill nulls deterministically
        │
        ▼
-  plan_node SQL generation          ← pre-resolved fragments as mandatory WHERE bindings
+  plan_node SQL generation           ← pre-resolved fragments as mandatory WHERE bindings
+       │
+       ▼
+  _fix_dialect_syntax()              ← cross-dialect contamination (ILIKE, ::, NOW, etc.)
+  _fix_sqlserver_subquery_limits()   ← ORDER BY + LIMIT → OFFSET/FETCH in CTEs
+  _fix_subquery_order_by()           ← depth-aware bare ORDER BY removal
+  _fix_window_functions()            ← inject missing ORDER BY in OVER()
+  _fix_multicolumn_subquery()        ← scalar subquery column count fix
+  _fix_distinct_order_by()           ← add ORDER BY cols to SELECT DISTINCT
+       │
+       ▼
+  execute_node → synthesize_node    ← SQL results → narrative insights
 ```

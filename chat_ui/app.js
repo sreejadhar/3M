@@ -1570,12 +1570,60 @@ function buildScheduleTable(cols, rows, desc) {
 
 // ── Action bar ─────────────────────────────────────────────────────────────────
 
+const _XLS_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/></svg>`;
+
 function buildInsightActionBar(msgId) {
+  const m = _msgStore[msgId] || {};
+  const hasData = (m.results || []).some(r => (r.rows || []).length > 0);
+  const xlsBtn  = hasData
+    ? `<button class="insight-action-btn" id="xls-btn-${msgId}" onclick="downloadInsightExcel('${msgId}')" title="Export to Excel workbook with charts &amp; pivot tables">${_XLS_ICON} Excel</button>`
+    : '';
   return `<div class="insight-action-bar">
     <span class="insight-action-label">Export:</span>
     <button class="insight-action-btn" onclick="downloadInsightPDF('${msgId}')" title="Download as PDF">${_DL_ICON} PDF</button>
+    ${xlsBtn}
     <button class="insight-action-btn" onclick="emailInsight('${msgId}')" title="Share via email">${_EMAIL_ICON} Email</button>
   </div>`;
+}
+
+// ── Excel export ───────────────────────────────────────────────────────────────
+
+async function downloadInsightExcel(msgId) {
+  const m = _msgStore[msgId];
+  if (!m || !(m.results || []).some(r => (r.rows || []).length)) {
+    alert('No data available to export.');
+    return;
+  }
+
+  const btn = document.getElementById(`xls-btn-${msgId}`);
+  const origHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.textContent = 'Generating…'; btn.disabled = true; }
+
+  try {
+    const resp = await fetch(`${API}/export-excel`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({
+        title:   (m.content || 'DataNanite Insight').slice(0, 80),
+        results: m.results,
+      }),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+
+    const blob = await resp.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `datananite_insight_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Excel export failed: ' + e.message);
+  } finally {
+    if (btn) { btn.innerHTML = origHtml; btn.disabled = false; }
+  }
 }
 
 // ── PDF export via print iframe ────────────────────────────────────────────────

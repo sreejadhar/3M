@@ -7,3 +7,4 @@ python-multipart>=0.0.9  # file upload support
 numpy>=1.26.0          # GraphRAG cosine similarity
 scikit-learn>=1.4.0    # TF-IDF embedding backend (optional but recommended)
 # sentence-transformers>=2.7.0  # best-quality embeddings (optional, requires torch)
+openpyxl>=3.1.0               # Excel export (multi-tab workbook + charts)

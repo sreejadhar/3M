@@ -3052,6 +3052,28 @@ async def access_check(user_id: str, source_id: Optional[str] = None, action: Op
     return result
 
 
+# ── Excel export ──────────────────────────────────────────────────────────────
+
+class ExcelExportRequest(BaseModel):
+    title:   str            = "DataNanite Insight Report"
+    results: List[Dict[str, Any]]
+
+
+@app.post("/export-excel")
+async def export_excel(req: ExcelExportRequest):
+    """Generate a multi-tab Excel workbook from one or more query result sets."""
+    from excel_export import build_excel_report
+    from fastapi.responses import Response as _XlsxResponse
+    data     = build_excel_report(req.results, req.title)
+    from datetime import datetime as _dt
+    filename = f"datananite_{_dt.now():%Y%m%d_%H%M%S}.xlsx"
+    return _XlsxResponse(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # ── /api/* compatibility shim ─────────────────────────────────────────────────
 # Older versions of tech_ui_server.py forwarded /api/{path} directly to the
 # orchestrator (i.e. GET http://chat-ui:8005/api/sources).  The real routes

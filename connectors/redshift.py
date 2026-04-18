@@ -74,25 +74,24 @@ class RedshiftConnector(PostgresConnector):
         return [r["column_name"] for r in dist]
 
     def get_indexes(self, schema: str, table: str) -> List[Dict[str, Any]]:
-        # Redshift doesn't support array_agg(ORDER BY) or LATERAL/WITH ORDINALITY.
-        # Use pg_index + pg_attribute with a subquery join instead.
+        # Redshift doesn't support pg_index-style queries (int2vector ANY() fails).
+        # Use information_schema which is fully supported in Redshift.
         schema = schema or "public"
         rows = self.execute(
-            "SELECT i.relname AS index_name, "
-            "  a.attname AS column_name, "
-            "  ix.indisunique AS is_unique, "
-            "  ix.indisprimary AS is_primary "
-            "FROM pg_class t "
-            "JOIN pg_index ix ON t.oid = ix.indrelid "
-            "JOIN pg_class i  ON i.oid  = ix.indexrelid "
-            "JOIN pg_namespace n ON n.oid = t.relnamespace "
-            "JOIN pg_attribute a ON a.attrelid = t.oid "
-            "  AND a.attnum = ANY(ix.indkey) "
-            "WHERE n.nspname = %s AND t.relname = %s "
-            "ORDER BY i.relname, a.attname",
+            "SELECT tc.constraint_name AS index_name, "
+            "  kcu.column_name, "
+            "  CASE tc.constraint_type WHEN 'UNIQUE' THEN true ELSE false END AS is_unique, "
+            "  CASE tc.constraint_type WHEN 'PRIMARY KEY' THEN true ELSE false END AS is_primary "
+            "FROM information_schema.table_constraints tc "
+            "JOIN information_schema.key_column_usage kcu "
+            "  ON tc.constraint_name = kcu.constraint_name "
+            "  AND tc.table_schema = kcu.table_schema "
+            "  AND tc.table_name = kcu.table_name "
+            "WHERE tc.table_schema = %s AND tc.table_name = %s "
+            "  AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE') "
+            "ORDER BY tc.constraint_name, kcu.ordinal_position",
             (schema, table),
         )
-        # Collapse multiple rows per index into one record
         seen: Dict[str, Dict[str, Any]] = {}
         for r in rows:
             name = r["index_name"]

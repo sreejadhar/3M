@@ -98,6 +98,15 @@ def _apply_series_colors(chart, n: int):
         except Exception:
             pass
 
+def _short_label(text: str, max_len: int = 16) -> str:
+    """Word-aware truncation — cuts at the last space before max_len."""
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len].rsplit(" ", 1)[0]
+    if len(cut) < max_len - 6:   # cut too short, use hard truncation
+        cut = text[:max_len - 1]
+    return cut + "…"
+
 def _write_composite_labels(ws, rows: List[Dict], lbl_col: str, sec_col: str,
                              data_row: int, n_rows: int, helper_col_idx: int):
     """
@@ -111,11 +120,9 @@ def _write_composite_labels(ws, rows: List[Dict], lbl_col: str, sec_col: str,
     ws.cell(data_row - 1, helper_col_idx).font = Font(size=8, color=_MUTE)
 
     for i, row in enumerate(rows[:n_rows]):
-        primary = str(row.get(lbl_col, "")).strip()
+        primary   = str(row.get(lbl_col, "")).strip()
         secondary = str(row.get(sec_col, "")).strip()
-        # Truncate long secondary labels so chart ticks stay readable
-        if len(secondary) > 22:
-            secondary = secondary[:20] + "…"
+        secondary = _short_label(secondary, 16)
         ws.cell(data_row + i, helper_col_idx, f"{primary} · {secondary}")
 
     # Hide the helper column — it's only used by the chart
@@ -242,9 +249,10 @@ def _detect_chart(cols: List[str], rows: List[Dict]) -> Optional[Dict]:
 def _add_chart(ws, cols: List[str], rows: List[Dict], cfg: Dict,
                data_row: int, n_rows: int, anchor: str, chart_title: str = "",
                cats_ref=None, max_val: float = 0):
-    ctype   = cfg["type"]
-    # Cap chart data at 100 rows so busy datasets stay readable
-    plot_rows = min(n_rows, 100)
+    ctype     = cfg["type"]
+    # Cap chart rows: hbar gets more (labels need space), others fewer
+    _cap      = 20 if ctype == "hbar" else 15
+    plot_rows = min(n_rows, _cap)
 
     # ── Scatter ───────────────────────────────────────────────────────────────
     if ctype == "scatter":
@@ -365,7 +373,8 @@ def _add_chart(ws, cols: List[str], rows: List[Dict], cfg: Dict,
     chart.legend = _chart_legend(len(num), "b")
 
     if ctype == "hbar":
-        chart.width, chart.height = 22, max(10, min(plot_rows * 0.45 + 4, 20))
+        # Give each bar ~0.9 cm of height — taller chart = more readable labels
+        chart.width, chart.height = 24, max(10, min(plot_rows * 0.9 + 3, 22))
     else:
         chart.width, chart.height = 22, 13
 
@@ -470,8 +479,22 @@ def _write_data_sheet(wb: Workbook, result: Dict, idx: int) -> Dict:
     name = _safe_name(desc, idx)
     ws   = wb.create_sheet(name)
     nc   = len(cols)
-    nr   = len(rows)
     nums = set(_num_cols(cols, rows))
+
+    # Sort rows by primary numeric column descending (makes charts a ranking).
+    # Skip for time-series data where chronological order is meaningful.
+    num_list = list(nums)
+    cat_list = [c for c in cols if c not in nums]
+    lbl_guess = cat_list[0] if cat_list else ""
+    is_time   = bool(re.search(r"date|month|year|week|day|quarter|period|time|fiscal|yr|qtr|wk",
+                               lbl_guess.lower()))
+    if num_list and not is_time:
+        try:
+            rows = sorted(rows, key=lambda r: float(r.get(num_list[0]) or 0), reverse=True)
+        except (TypeError, ValueError):
+            pass
+
+    nr = len(rows)
 
     # Banner row
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=nc)

@@ -18,7 +18,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook
-from openpyxl.chart import BarChart, DoughnutChart, LineChart, PieChart, Reference, ScatterChart, Series
+from openpyxl.chart import BarChart, DoughnutChart, LineChart, Reference, ScatterChart, Series
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.legend import Legend
+from openpyxl.chart.marker import Marker
+from openpyxl.chart.series import SeriesLabel
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -30,6 +34,61 @@ _ACCENT     = "6366F1"
 _ACCENT_BG  = "EEF2FF"
 _MUTE       = "64748B"
 _MAX_ROWS   = 10_000
+
+# Distinct, accessible series colour palette (hex, no #)
+_PALETTE = [
+    "2563EB",  # blue
+    "DC2626",  # red
+    "16A34A",  # green
+    "CA8A04",  # amber
+    "9333EA",  # purple
+    "0891B2",  # cyan
+    "EA580C",  # orange
+    "0D9488",  # teal
+    "DB2777",  # pink
+    "4338CA",  # indigo
+]
+
+# ── Chart helpers ──────────────────────────────────────────────────────────────
+
+def _y_num_fmt(col_names: List[str]) -> str:
+    """Pick y-axis number format based on column semantics."""
+    combined = " ".join(col_names).lower()
+    if re.search(r"pct|percent|rate|ratio|share|%", combined):
+        return "0.0%"
+    if re.search(r"revenue|sales|cost|price|amount|spend|budget|profit|earn|\$|usd|inr|gbp|eur", combined):
+        return '#,##0'
+    return '#,##0'
+
+def _human_label(col: str) -> str:
+    return col.replace("_", " ").title()
+
+def _chart_legend(n_series: int, position: str = "b") -> Optional[Legend]:
+    if n_series <= 1:
+        return None  # no legend for single series
+    lgd = Legend()
+    lgd.position = position
+    lgd.overlay  = False
+    return lgd
+
+def _apply_series_colors(chart, n: int):
+    """Apply palette colours to the first n series after add_data()."""
+    for i, series in enumerate(chart.series):
+        color = _PALETTE[i % len(_PALETTE)]
+        try:
+            series.graphicalProperties.solidFill = color
+            series.graphicalProperties.line.solidFill = color
+        except Exception:
+            pass
+
+def _data_labels(show_pct: bool = False) -> DataLabelList:
+    d = DataLabelList()
+    d.showVal        = not show_pct
+    d.showPercent    = show_pct
+    d.showLegendKey  = False
+    d.showCatName    = False
+    d.showSerName    = False
+    return d
 
 
 # ── Style helpers ──────────────────────────────────────────────────────────────
@@ -136,18 +195,32 @@ def _detect_chart(cols: List[str], rows: List[Dict]) -> Optional[Dict]:
 # ── Chart rendering ────────────────────────────────────────────────────────────
 
 def _add_chart(ws, cols: List[str], rows: List[Dict], cfg: Dict,
-               data_row: int, n_rows: int, anchor: str):
-    ctype = cfg["type"]
+               data_row: int, n_rows: int, anchor: str, chart_title: str = ""):
+    ctype   = cfg["type"]
+    # Cap chart data at 100 rows so busy datasets stay readable
+    plot_rows = min(n_rows, 100)
 
+    # ── Scatter ───────────────────────────────────────────────────────────────
     if ctype == "scatter":
         xi = cols.index(cfg["x"]) + 1
         yi = cols.index(cfg["y"]) + 1
         chart = ScatterChart()
-        chart.style = 10
-        xd = Reference(ws, min_col=xi, min_row=data_row, max_row=data_row + n_rows - 1)
-        yd = Reference(ws, min_col=yi, min_row=data_row - 1, max_row=data_row + n_rows - 1)
-        chart.series.append(Series(yd, xd, title=cfg["y"]))
-        chart.width, chart.height = 18, 10
+        chart.style   = 2
+        chart.title   = chart_title or f"{_human_label(cfg['y'])} vs {_human_label(cfg['x'])}"
+        xd = Reference(ws, min_col=xi, min_row=data_row, max_row=data_row + plot_rows - 1)
+        yd = Reference(ws, min_col=yi, min_row=data_row - 1, max_row=data_row + plot_rows - 1)
+        s  = Series(yd, xd, title=_human_label(cfg["y"]))
+        s.marker         = Marker(symbol="circle", size=5)
+        s.marker.graphicalProperties.solidFill = _PALETTE[0]
+        s.marker.graphicalProperties.line.solidFill = _PALETTE[0]
+        s.graphicalProperties.line.noFill = True
+        chart.series.append(s)
+        chart.x_axis.title   = _human_label(cfg["x"])
+        chart.y_axis.title   = _human_label(cfg["y"])
+        chart.y_axis.numFmt  = _y_num_fmt([cfg["y"]])
+        chart.x_axis.numFmt  = _y_num_fmt([cfg["x"]])
+        chart.legend         = None
+        chart.width, chart.height = 20, 13
         ws.add_chart(chart, anchor)
         return
 
@@ -156,46 +229,100 @@ def _add_chart(ws, cols: List[str], rows: List[Dict], cfg: Dict,
     if not lbl or not num:
         return
 
-    li = cols.index(lbl) + 1
+    li     = cols.index(lbl) + 1
     ni_min = min(cols.index(c) + 1 for c in num)
     ni_max = max(cols.index(c) + 1 for c in num)
 
-    cats = Reference(ws, min_col=li, min_row=data_row, max_row=data_row + n_rows - 1)
+    cats = Reference(ws, min_col=li,     min_row=data_row,     max_row=data_row + plot_rows - 1)
     data = Reference(ws, min_col=ni_min, max_col=ni_max,
-                     min_row=data_row - 1, max_row=data_row + n_rows - 1)
+                     min_row=data_row - 1, max_row=data_row + plot_rows - 1)
 
+    # ── Doughnut ──────────────────────────────────────────────────────────────
+    if ctype == "doughnut":
+        chart = DoughnutChart()
+        chart.style  = 2
+        chart.title  = chart_title or _human_label(num[0])
+        chart.holeSize = 50
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        chart.dLbls          = _data_labels(show_pct=True)
+        chart.legend         = _chart_legend(2, "r")  # always show legend for doughnut
+        chart.width, chart.height = 16, 13
+        ws.add_chart(chart, anchor)
+        return
+
+    # ── Line ──────────────────────────────────────────────────────────────────
     if ctype == "line":
         chart = LineChart()
+        chart.style    = 2
+        chart.title    = chart_title or " · ".join(_human_label(c) for c in num)
         chart.grouping = "standard"
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        _apply_series_colors(chart, len(num))
+        # Smooth lines + circular markers per series
+        for i, s in enumerate(chart.series):
+            s.smooth = True
+            s.marker = Marker(symbol="circle", size=4)
+            color = _PALETTE[i % len(_PALETTE)]
+            s.marker.graphicalProperties.solidFill     = color
+            s.marker.graphicalProperties.line.solidFill = color
+        chart.x_axis.title  = _human_label(lbl)
+        chart.y_axis.title  = " / ".join(_human_label(c) for c in num[:2])
+        chart.y_axis.numFmt = _y_num_fmt(num)
+        chart.y_axis.majorGridlines = chart.y_axis.majorGridlines  # keep
+        chart.legend        = _chart_legend(len(num), "b")
+        chart.width, chart.height = 22, 13
+        ws.add_chart(chart, anchor)
+        return
+
+    # ── Bar variants (vbar, hbar, stacked, grouped, histogram, waterfall) ─────
+    if ctype in ("vbar", "histogram"):
+        chart = BarChart()
+        chart.type     = "col"
+        chart.grouping = "clustered"
     elif ctype == "hbar":
         chart = BarChart()
-        chart.type = "bar"
+        chart.type     = "bar"
         chart.grouping = "clustered"
     elif ctype == "stacked":
         chart = BarChart()
-        chart.type = "col"
+        chart.type     = "col"
         chart.grouping = "stacked"
+        chart.overlap  = 100
     elif ctype == "grouped":
         chart = BarChart()
-        chart.type = "col"
+        chart.type     = "col"
         chart.grouping = "clustered"
-    elif ctype == "doughnut":
-        chart = DoughnutChart()
-        chart.style = 10
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(cats)
-        chart.width, chart.height = 18, 12
-        ws.add_chart(chart, anchor)
-        return
-    else:  # vbar, histogram, waterfall, default
+    else:
         chart = BarChart()
-        chart.type = "col"
+        chart.type     = "col"
         chart.grouping = "clustered"
 
-    chart.style = 10
+    chart.style = 2
+    chart.title = chart_title or " · ".join(_human_label(c) for c in num)
     chart.add_data(data, titles_from_data=True)
     chart.set_categories(cats)
-    chart.width, chart.height = 20, 12
+    _apply_series_colors(chart, len(num))
+
+    # Axis titles and formatting
+    chart.x_axis.title  = _human_label(lbl)
+    chart.y_axis.title  = " / ".join(_human_label(c) for c in num[:2])
+    chart.y_axis.numFmt = _y_num_fmt(num)
+    chart.y_axis.delete = False
+
+    # Data labels only when few categories (keeps chart readable)
+    if plot_rows <= 12 and len(num) == 1:
+        chart.dLbls = _data_labels()
+
+    chart.legend = _chart_legend(len(num), "b")
+
+    # Size: hbar needs more height; stacked/grouped with many series needs width
+    if ctype == "hbar":
+        chart.width, chart.height = 20, max(10, min(plot_rows * 0.4 + 4, 18))
+    else:
+        chart.width, chart.height = 22, 13
+
     ws.add_chart(chart, anchor)
 
 
@@ -343,7 +470,8 @@ def _write_data_sheet(wb: Workbook, result: Dict, idx: int) -> Dict:
     # Chart (anchored below data with a gap row)
     cfg = _detect_chart(cols, rows)
     if cfg:
-        _add_chart(ws, cols, rows, cfg, data_row=3, n_rows=nr, anchor=f"A{nr + 5}")
+        _add_chart(ws, cols, rows, cfg, data_row=3, n_rows=nr,
+                   anchor=f"A{nr + 5}", chart_title=desc)
 
     # Pivot sheet when shape allows
     _maybe_pivot(wb, cols, rows, name)

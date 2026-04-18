@@ -160,7 +160,39 @@ CURRENT DATE/TIME : DATE('now'), DATETIME('now')  — do NOT use NOW() or GETDAT
 UNSUPPORTED       : FULL OUTER JOIN, PIVOT, PERCENTILE_CONT, PERCENTILE_DISC,
                     GENERATE_SERIES, ANY/ALL subquery operators, ILIKE"""
 
-    if db in ("postgres", "postgresql", "redshift"):
+    if db == "redshift":
+        return """\
+ROW LIMITING      : LIMIT N at the end  (e.g. SELECT col FROM t LIMIT 100)
+TOP-N QUERIES     : ORDER BY col DESC LIMIT N
+CASE-INSENSITIVE  : col ILIKE '%term%'   — preferred; or LOWER(col) LIKE LOWER('%term%')
+DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
+                    DATE_TRUNC('month', date_col)
+DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
+                    date_col >= '2024-01-01'::date
+STRING CONCAT     : col1 || col2   or   CONCAT(col1, col2)
+IDENTIFIER QUOTING: double-quotes "col name" only when needed; never backticks
+PERCENTILES       : PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) AS median
+                    PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY col) AS q1
+PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
+                    ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Pct
+NULL HANDLING     : COALESCE(col, 0)
+TYPE CASTING      : value::integer, value::numeric, value::text  (:: casting IS supported)
+CURRENT DATE/TIME : NOW() or CURRENT_TIMESTAMP
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
+                    ALL navigation/offset functions MUST have ORDER BY inside OVER():
+                      LAG(col) OVER (PARTITION BY x ORDER BY period_col)  ← correct
+                      LAG(col) OVER (PARTITION BY x)                      ← ERROR
+STRING AGGREGATION: LISTAGG(col, ', ') WITHIN GROUP (ORDER BY col)
+                    — do NOT use STRING_AGG (PostgreSQL-only, NOT supported in Redshift)
+ARRAY AGG         : array_agg(col)  — ORDER BY inside array_agg() is NOT supported in Redshift
+                    WRONG: array_agg(col ORDER BY col)
+                    RIGHT: array_agg(col)
+LATERAL JOINS     : LATERAL keyword is NOT supported in Redshift — use subqueries instead
+GENERATE_SERIES   : NOT supported in Redshift — use a numbers table or VALUES list
+UNSUPPORTED       : STRING_AGG, LATERAL, GENERATE_SERIES, array_agg(ORDER BY),
+                    CREATE TABLE AS SELECT with DISTSTYLE/SORTKEY requires Redshift DDL"""
+
+    if db in ("postgres", "postgresql"):
         return """\
 ROW LIMITING      : LIMIT N at the end  (e.g. SELECT col FROM t LIMIT 100)
 TOP-N QUERIES     : ORDER BY col DESC LIMIT N
@@ -2891,6 +2923,42 @@ def _fix_dialect_syntax(sql: str, db_type: str) -> str:
     if dtype in ("sqlserver", "mssql", "sql server"):
         # Only rewrite standalone LENGTH( — not CHAR_LENGTH or BIT_LENGTH
         sql = re.sub(r'(?<![A-Z_])LENGTH\s*\(', 'LEN(', sql, flags=re.IGNORECASE)
+
+    # ── 5b. Redshift-specific rewrites ───────────────────────────────────────
+    if dtype == "redshift":
+        # STRING_AGG(col, sep ORDER BY ...) → LISTAGG(col, sep) WITHIN GROUP (ORDER BY ...)
+        # Handles: STRING_AGG(col, 'sep' ORDER BY sort_col)
+        def _string_agg_to_listagg(m: re.Match) -> str:
+            col  = m.group(1).strip()
+            sep  = m.group(2).strip()
+            rest = m.group(3).strip()  # may be empty or "ORDER BY ..."
+            if re.match(r'ORDER\s+BY\b', rest, re.IGNORECASE):
+                result = f"LISTAGG({col}, {sep}) WITHIN GROUP ({rest})"
+            else:
+                order_part = f"ORDER BY {rest}" if rest else "ORDER BY 1"
+                result = f"LISTAGG({col}, {sep}) WITHIN GROUP ({order_part})"
+            logger.info("plan_node: rewrote STRING_AGG → LISTAGG for Redshift")
+            return result
+
+        sql = re.sub(
+            r'\bSTRING_AGG\s*\(\s*([^,]+?)\s*,\s*([\'"][^\'\"]*[\'"])\s*(?:,\s*|\s+)?((?:ORDER\s+BY\s+[^)]+)?)\s*\)',
+            _string_agg_to_listagg,
+            sql,
+            flags=re.IGNORECASE,
+        )
+
+        # array_agg(col ORDER BY ...) → array_agg(col)  — strip unsupported ORDER BY
+        def _array_agg_strip_order(m: re.Match) -> str:
+            col = m.group(1).strip()
+            logger.info("plan_node: stripped ORDER BY from array_agg() for Redshift")
+            return f"array_agg({col})"
+
+        sql = re.sub(
+            r'\barray_agg\s*\(\s*([^)]+?)\s+ORDER\s+BY\s+[^)]+\)',
+            _array_agg_strip_order,
+            sql,
+            flags=re.IGNORECASE,
+        )
 
     # ── 6. LIMIT N at top-level for Oracle → FETCH FIRST N ROWS ONLY ─────────
     # _enforce_sql_limits already handles this, but if the LLM re-added a LIMIT

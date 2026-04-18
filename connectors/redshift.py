@@ -73,6 +73,40 @@ class RedshiftConnector(PostgresConnector):
         )
         return [r["column_name"] for r in dist]
 
+    def get_indexes(self, schema: str, table: str) -> List[Dict[str, Any]]:
+        # Redshift doesn't support array_agg(ORDER BY) or LATERAL/WITH ORDINALITY.
+        # Use pg_index + pg_attribute with a subquery join instead.
+        schema = schema or "public"
+        rows = self.execute(
+            "SELECT i.relname AS index_name, "
+            "  a.attname AS column_name, "
+            "  ix.indisunique AS is_unique, "
+            "  ix.indisprimary AS is_primary "
+            "FROM pg_class t "
+            "JOIN pg_index ix ON t.oid = ix.indrelid "
+            "JOIN pg_class i  ON i.oid  = ix.indexrelid "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            "JOIN pg_attribute a ON a.attrelid = t.oid "
+            "  AND a.attnum = ANY(ix.indkey) "
+            "WHERE n.nspname = %s AND t.relname = %s "
+            "ORDER BY i.relname, a.attname",
+            (schema, table),
+        )
+        # Collapse multiple rows per index into one record
+        seen: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            name = r["index_name"]
+            if name not in seen:
+                seen[name] = {
+                    "index_name": name,
+                    "columns":    [r["column_name"]],
+                    "is_unique":  r["is_unique"],
+                    "is_primary": r["is_primary"],
+                }
+            else:
+                seen[name]["columns"].append(r["column_name"])
+        return list(seen.values())
+
     def _sample_clause(self, n: int) -> str:
         # Redshift supports LIMIT but not TABLESAMPLE
         return f"LIMIT {n}"

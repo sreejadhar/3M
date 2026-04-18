@@ -59,16 +59,15 @@ class RedshiftConnector(PostgresConnector):
         return int(val) if val else None
 
     def get_partition_columns(self, schema: str, table: str) -> List[str]:
+        # Return DISTKEY columns via pg_attribute (reliable across all Redshift versions).
         schema = schema or "public"
-        rows = self.execute(
-            "SELECT \"column\" FROM svv_table_info "
-            f"WHERE schema = '{schema}' AND \"table\" = '{table}'"
-        )
-        # Redshift doesn't expose sort/dist keys the same way; return dist key
         dist = self.execute(
-            "SELECT column_name FROM svv_columns "
-            "WHERE table_schema = %s AND table_name = %s "
-            "AND distkey = 'true'",
+            "SELECT a.attname AS column_name "
+            "FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relname = %s "
+            "  AND a.attisdistkey = true AND a.attnum > 0",
             (schema, table),
         )
         return [r["column_name"] for r in dist]

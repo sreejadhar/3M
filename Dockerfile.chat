@@ -15,6 +15,7 @@ COPY --from=builder /install /usr/local
 
 # Copy the orchestrator API, metadata catalog, and the static chat UI
 COPY orchestrator_api.py .
+COPY excel_export.py .
 COPY metadata_catalog.py .
 COPY kpi_store.py .
 COPY kg_store.py .

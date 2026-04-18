@@ -51,28 +51,45 @@ _PALETTE = [
 
 # ── Chart helpers ──────────────────────────────────────────────────────────────
 
-def _y_num_fmt(col_names: List[str]) -> str:
-    """Pick y-axis number format based on column semantics."""
+def _y_num_fmt(col_names: List[str], max_val: float = 0) -> str:
+    """
+    Pick y-axis number format. Uses locale-independent K/M abbreviations
+    for large values so Indian-locale Excel doesn't render 18,00,000.
+    """
     combined = " ".join(col_names).lower()
     if re.search(r"pct|percent|rate|ratio|share|%", combined):
         return "0.0%"
-    if re.search(r"revenue|sales|cost|price|amount|spend|budget|profit|earn|\$|usd|inr|gbp|eur", combined):
-        return '#,##0'
+    # K / M abbreviations for large numbers (locale-independent)
+    if max_val >= 1_000_000:
+        return '[>=1000000]0.0,,"M";[>=1000]0.0,"K";0'
+    if max_val >= 10_000:
+        return '[>=1000]0.0,"K";0'
     return '#,##0'
+
+def _max_val(rows: List[Dict], col_names: List[str]) -> float:
+    best = 0.0
+    for r in rows:
+        for c in col_names:
+            try:
+                v = float(r.get(c) or 0)
+                if v > best:
+                    best = v
+            except (TypeError, ValueError):
+                pass
+    return best
 
 def _human_label(col: str) -> str:
     return col.replace("_", " ").title()
 
 def _chart_legend(n_series: int, position: str = "b") -> Optional[Legend]:
     if n_series <= 1:
-        return None  # no legend for single series
+        return None
     lgd = Legend()
     lgd.position = position
     lgd.overlay  = False
     return lgd
 
 def _apply_series_colors(chart, n: int):
-    """Apply palette colours to the first n series after add_data()."""
     for i, series in enumerate(chart.series):
         color = _PALETTE[i % len(_PALETTE)]
         try:
@@ -80,6 +97,34 @@ def _apply_series_colors(chart, n: int):
             series.graphicalProperties.line.solidFill = color
         except Exception:
             pass
+
+def _write_composite_labels(ws, rows: List[Dict], lbl_col: str, sec_col: str,
+                             data_row: int, n_rows: int, helper_col_idx: int):
+    """
+    Write "PrimaryLabel · SecondaryLabel" into a hidden helper column so the
+    chart can use unique, meaningful X-axis labels when the primary label column
+    has duplicate values (e.g. same station appearing multiple times).
+    Returns a Reference pointing to the helper column's data cells (no header).
+    """
+    # Header (row above data row)
+    ws.cell(data_row - 1, helper_col_idx, f"{lbl_col} · {sec_col}")
+    ws.cell(data_row - 1, helper_col_idx).font = Font(size=8, color=_MUTE)
+
+    for i, row in enumerate(rows[:n_rows]):
+        primary = str(row.get(lbl_col, "")).strip()
+        secondary = str(row.get(sec_col, "")).strip()
+        # Truncate long secondary labels so chart ticks stay readable
+        if len(secondary) > 22:
+            secondary = secondary[:20] + "…"
+        ws.cell(data_row + i, helper_col_idx, f"{primary} · {secondary}")
+
+    # Hide the helper column — it's only used by the chart
+    col_letter = get_column_letter(helper_col_idx)
+    ws.column_dimensions[col_letter].hidden = True
+    ws.column_dimensions[col_letter].width  = 30
+
+    return Reference(ws, min_col=helper_col_idx,
+                     min_row=data_row, max_row=data_row + n_rows - 1)
 
 def _data_labels(show_pct: bool = False) -> DataLabelList:
     d = DataLabelList()
@@ -195,7 +240,8 @@ def _detect_chart(cols: List[str], rows: List[Dict]) -> Optional[Dict]:
 # ── Chart rendering ────────────────────────────────────────────────────────────
 
 def _add_chart(ws, cols: List[str], rows: List[Dict], cfg: Dict,
-               data_row: int, n_rows: int, anchor: str, chart_title: str = ""):
+               data_row: int, n_rows: int, anchor: str, chart_title: str = "",
+               cats_ref=None, max_val: float = 0):
     ctype   = cfg["type"]
     # Cap chart data at 100 rows so busy datasets stay readable
     plot_rows = min(n_rows, 100)
@@ -233,20 +279,24 @@ def _add_chart(ws, cols: List[str], rows: List[Dict], cfg: Dict,
     ni_min = min(cols.index(c) + 1 for c in num)
     ni_max = max(cols.index(c) + 1 for c in num)
 
-    cats = Reference(ws, min_col=li,     min_row=data_row,     max_row=data_row + plot_rows - 1)
+    # Use composite label reference if provided (duplicate label col case)
+    cats = cats_ref if cats_ref is not None else \
+           Reference(ws, min_col=li, min_row=data_row, max_row=data_row + plot_rows - 1)
     data = Reference(ws, min_col=ni_min, max_col=ni_max,
                      min_row=data_row - 1, max_row=data_row + plot_rows - 1)
+
+    yfmt = _y_num_fmt(num, max_val)
 
     # ── Doughnut ──────────────────────────────────────────────────────────────
     if ctype == "doughnut":
         chart = DoughnutChart()
-        chart.style  = 2
-        chart.title  = chart_title or _human_label(num[0])
+        chart.style    = 2
+        chart.title    = chart_title or _human_label(num[0])
         chart.holeSize = 50
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
-        chart.dLbls          = _data_labels(show_pct=True)
-        chart.legend         = _chart_legend(2, "r")  # always show legend for doughnut
+        chart.dLbls  = _data_labels(show_pct=True)
+        chart.legend = _chart_legend(2, "r")
         chart.width, chart.height = 16, 13
         ws.add_chart(chart, anchor)
         return
@@ -260,17 +310,15 @@ def _add_chart(ws, cols: List[str], rows: List[Dict], cfg: Dict,
         chart.add_data(data, titles_from_data=True)
         chart.set_categories(cats)
         _apply_series_colors(chart, len(num))
-        # Smooth lines + circular markers per series
         for i, s in enumerate(chart.series):
             s.smooth = True
             s.marker = Marker(symbol="circle", size=4)
             color = _PALETTE[i % len(_PALETTE)]
-            s.marker.graphicalProperties.solidFill     = color
+            s.marker.graphicalProperties.solidFill      = color
             s.marker.graphicalProperties.line.solidFill = color
         chart.x_axis.title  = _human_label(lbl)
         chart.y_axis.title  = " / ".join(_human_label(c) for c in num[:2])
-        chart.y_axis.numFmt = _y_num_fmt(num)
-        chart.y_axis.majorGridlines = chart.y_axis.majorGridlines  # keep
+        chart.y_axis.numFmt = yfmt
         chart.legend        = _chart_legend(len(num), "b")
         chart.width, chart.height = 22, 13
         ws.add_chart(chart, anchor)
@@ -305,21 +353,19 @@ def _add_chart(ws, cols: List[str], rows: List[Dict], cfg: Dict,
     chart.set_categories(cats)
     _apply_series_colors(chart, len(num))
 
-    # Axis titles and formatting
     chart.x_axis.title  = _human_label(lbl)
     chart.y_axis.title  = " / ".join(_human_label(c) for c in num[:2])
-    chart.y_axis.numFmt = _y_num_fmt(num)
+    chart.y_axis.numFmt = yfmt
     chart.y_axis.delete = False
 
-    # Data labels only when few categories (keeps chart readable)
+    # Data labels for small single-series bar charts
     if plot_rows <= 12 and len(num) == 1:
         chart.dLbls = _data_labels()
 
     chart.legend = _chart_legend(len(num), "b")
 
-    # Size: hbar needs more height; stacked/grouped with many series needs width
     if ctype == "hbar":
-        chart.width, chart.height = 20, max(10, min(plot_rows * 0.4 + 4, 18))
+        chart.width, chart.height = 22, max(10, min(plot_rows * 0.45 + 4, 20))
     else:
         chart.width, chart.height = 22, 13
 
@@ -467,11 +513,34 @@ def _write_data_sheet(wb: Workbook, result: Dict, idx: int) -> Dict:
     ws.freeze_panes = "A3"
     ws.sheet_view.showGridLines = False
 
-    # Chart (anchored below data with a gap row)
+    # Chart — detect type, build composite labels if needed, render
     cfg = _detect_chart(cols, rows)
     if cfg:
+        cats_ref  = None
+        chart_max = _max_val(rows, cfg.get("num", []))
+        lbl_col   = cfg.get("lbl")
+        num_list  = list(nums)
+        cat_list  = [c for c in cols if c not in num_list]
+
+        if lbl_col:
+            lbl_vals = [str(r.get(lbl_col, "")) for r in rows]
+            has_dups = len(lbl_vals) != len(set(lbl_vals))
+            other_cats = [c for c in cat_list if c != lbl_col]
+
+            if has_dups and other_cats:
+                # Write composite "Station · Category" labels to a hidden helper column
+                helper_col = nc + 1
+                cats_ref = _write_composite_labels(
+                    ws, rows, lbl_col, other_cats[0],
+                    data_row=3, n_rows=nr, helper_col_idx=helper_col
+                )
+                # Composite labels are long → force horizontal bar for readability
+                if cfg["type"] in ("vbar", "grouped", "stacked"):
+                    cfg = {**cfg, "type": "hbar"}
+
         _add_chart(ws, cols, rows, cfg, data_row=3, n_rows=nr,
-                   anchor=f"A{nr + 5}", chart_title=desc)
+                   anchor=f"A{nr + 5}", chart_title=desc,
+                   cats_ref=cats_ref, max_val=chart_max)
 
     # Pivot sheet when shape allows
     _maybe_pivot(wb, cols, rows, name)

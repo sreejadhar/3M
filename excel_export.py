@@ -459,10 +459,19 @@ def _write_dashboard(wb: Workbook, meta_list: List[Dict], title: str):
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
+def _normalise_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert list-style rows [[v1,v2,...]] → dict rows [{col: v,...}]."""
+    cols = result.get("columns") or []
+    rows = result.get("rows") or []
+    if rows and isinstance(rows[0], (list, tuple)):
+        rows = [dict(zip(cols, row)) for row in rows]
+    return {**result, "columns": cols, "rows": rows}
+
+
 def build_excel_report(results: List[Dict[str, Any]], title: str = "DataNanite Insight Report") -> bytes:
     """
     Build a multi-tab Excel workbook from query result dicts.
-    Each result: {description, columns: [str], rows: [dict], ...}
+    Each result: {description, columns: [str], rows: [dict | list], ...}
     Returns raw .xlsx bytes.
     """
     wb   = Workbook()
@@ -470,7 +479,7 @@ def build_excel_report(results: List[Dict[str, Any]], title: str = "DataNanite I
     if stub is not None:
         wb.remove(stub)
 
-    valid = [r for r in results if r.get("columns") and r.get("rows")]
+    valid = [_normalise_result(r) for r in results if r.get("columns") and r.get("rows")]
     meta_list = [_write_data_sheet(wb, r, i) for i, r in enumerate(valid)]
 
     if meta_list:

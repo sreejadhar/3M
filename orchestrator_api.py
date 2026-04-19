@@ -1106,37 +1106,222 @@ _FUNCTION_SIGNALS: List[tuple] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Sample-value signals: distinct categorical values that uniquely identify a
+# domain.  Matched against the actual top_values sampled from each column.
+# Scored at 0.5× the weight of name tokens so they supplement but never
+# override strong schema-name evidence.
+# ---------------------------------------------------------------------------
+_INDUSTRY_SAMPLE_SIGNALS: Dict[str, set] = {
+    "Aviation": {
+        # Aircraft type codes
+        "b737", "a320", "b777", "a330", "b787", "a380", "e190", "crj9", "dh8d",
+        "b738", "a321", "a319", "b772", "b788", "a220", "a350", "b767", "b757",
+        "atr72", "q400", "atr42",
+        # Cabin / booking class
+        "business class", "economy class", "first class", "premium economy",
+        # Flight status values
+        "departed", "arrived", "cancelled", "diverted", "airborne",
+        # Crew ranks
+        "captain", "first officer", "senior first officer", "purser",
+        "senior cabin crew", "cabin crew",
+        # Delay category descriptions
+        "technical", "reactionary", "weather delay", "atc delay",
+        # Operations type
+        "domestic flight", "international flight",
+    },
+    "Banking": {
+        # NPA / asset quality buckets
+        "standard", "sub-standard", "doubtful", "loss asset",
+        "non-performing", "restructured",
+        # Loan product names
+        "home loan", "personal loan", "auto loan", "vehicle loan",
+        "business loan", "gold loan", "education loan", "lap", "msme loan",
+        # Deposit products
+        "savings account", "current account", "fixed deposit",
+        "recurring deposit", "nre account", "nro account",
+        # DPD / overdue buckets
+        "0-30 days", "31-60 days", "61-90 days", "91-180 days", ">180 days",
+        # Credit rating values
+        "aaa", "aa+", "aa", "a+", "a", "bbb+", "bbb",
+        # Account status
+        "dormant", "active", "frozen", "closed",
+    },
+    "LS": {
+        # Clinical trial phases
+        "phase i", "phase ii", "phase iii", "phase iv",
+        "phase 1", "phase 2", "phase 3", "phase 4",
+        # Trial / subject status
+        "enrolled", "randomised", "randomized", "screen failure",
+        "discontinued", "completed", "withdrawn", "lost to follow-up",
+        # AE severity
+        "mild", "moderate", "severe", "life-threatening", "fatal",
+        # Dosage form
+        "tablet", "capsule", "injection", "infusion", "oral solution",
+        "suspension", "patch", "inhaler",
+        # Route of administration
+        "oral", "intravenous", "subcutaneous", "intramuscular", "topical",
+        # Regulatory submission types
+        "nda", "anda", "bla", "ind",
+    },
+    "Insurance": {
+        # Policy / product types
+        "term life", "whole life", "endowment", "ulip", "money back",
+        "health insurance", "motor insurance", "fire insurance",
+        "marine insurance", "group health", "personal accident",
+        # Claim status
+        "intimated", "under investigation", "settled", "repudiated",
+        "partially settled", "closed", "reopened",
+        # Premium payment mode
+        "annual", "semi-annual", "quarterly", "single premium",
+        # Distribution channel
+        "bancassurance", "agency", "direct", "online", "broker",
+        # Policy status
+        "in force", "lapsed", "surrendered", "matured", "free look",
+    },
+    "Manufacturing": {
+        # Defect / rejection types
+        "scratch", "dent", "burr", "flash", "porosity", "crack",
+        "dimensional defect", "surface defect", "weld defect",
+        # Shift identifiers
+        "morning shift", "afternoon shift", "evening shift", "night shift",
+        "shift a", "shift b", "shift c", "shift i", "shift ii", "shift iii",
+        # Machine / equipment status
+        "breakdown", "planned maintenance", "unplanned downtime",
+        "idle", "changeover", "setup",
+        # Production order status
+        "released", "in process", "partially completed", "goods receipt",
+        # Quality disposition
+        "accept", "reject", "rework", "hold", "scrap",
+        # Standards / certification
+        "iso 9001", "iatf 16949", "as9100",
+    },
+    "Agriculture": {
+        # Crop names
+        "wheat", "rice", "paddy", "maize", "cotton", "sugarcane",
+        "soybean", "groundnut", "sorghum", "bajra", "jowar",
+        "potato", "onion", "tomato", "mustard", "sunflower",
+        "chickpea", "lentil", "arhar", "moong",
+        # Crop seasons
+        "kharif", "rabi", "zaid",
+        # Irrigation methods
+        "drip irrigation", "sprinkler", "canal irrigation",
+        "rainfed", "flood irrigation", "micro irrigation",
+        # Soil classification
+        "alluvial", "black soil", "red soil", "laterite", "sandy loam",
+        "clay loam", "loamy sand",
+        # Fertilizer / input types
+        "urea", "dap", "mop", "npk", "compost", "vermicompost",
+    },
+    "CPG": {
+        # Pack types
+        "pet bottle", "glass bottle", "tetra pack", "sachet", "pouch",
+        "can", "tin", "carton", "blister pack",
+        # Trade channels
+        "modern trade", "general trade", "horeca", "e-commerce",
+        "supermarket", "hypermarket", "convenience store", "wholesale",
+        # SKU lifecycle
+        "active", "new launch", "discontinued", "seasonal", "limited edition",
+        # Volume / value flag
+        "volume", "value", "tonnage",
+    },
+    "Telecom": {
+        # Technology generation
+        "2g", "3g", "4g", "5g", "lte", "volte",
+        # Subscription type
+        "prepaid", "postpaid",
+        # Services
+        "voice", "data", "sms", "roaming", "vas", "broadband",
+        # Churn reason
+        "porting out", "voluntary deactivation", "non-payment",
+        # Network event types
+        "call drop", "network failure", "planned outage",
+    },
+    "Healthcare": {
+        # Encounter / visit type
+        "inpatient", "outpatient", "emergency", "day surgery",
+        "observation", "telehealth",
+        # Payer type
+        "medicare", "medicaid", "commercial", "self-pay", "uninsured",
+        # Clinical status
+        "acute", "chronic", "preventive", "follow-up",
+        # Disposition
+        "discharged", "transferred", "expired", "absconded",
+    },
+    "Retail": {
+        # Store format
+        "hypermarket", "supermarket", "convenience", "express",
+        "flagship", "kiosk", "warehouse store",
+        # Loyalty tier
+        "gold", "silver", "platinum", "bronze",
+        # Markdown type
+        "clearance", "seasonal sale", "promo", "everyday low price",
+        # Inventory status
+        "in stock", "out of stock", "on order", "discontinued",
+    },
+}
+
+
 def _infer_domain_from_report(report: Dict) -> str:
     """
-    Scan all table names and column names in the extraction report and return
-    a compound domain label "Industry/Function" (e.g. "CPG/FP&A",
-    "LS/Supply Chain") when both tiers fire, or a single label when only one
-    tier fires.
+    Scan table names, column names, AND sampled column values in the extraction
+    report and return a compound domain label "Industry/Function" (e.g.
+    "Aviation/FP&A", "Banking/FS") when both tiers fire, or a single label
+    when only one tier fires.
+
+    Scoring:
+      • name tokens (table + column names split on _): weight 1.0
+      • sample value tokens (top_values from each column): weight 0.5
+        — supplements schema-name evidence without overriding it.
 
     Falls back to "" when no signals match so the caller can detect the
     no-match case and preserve the admin-provided domain.
     """
     tables: Dict = report.get("tables") or {}
 
-    # Build a flat set of all lowercase tokens from table + column names
-    tokens: set = set()
+    # Build name tokens and sample tokens separately
+    name_tokens: set = set()
+    sample_tokens: set = set()
+
     for table_name, table_meta in tables.items():
         tl = table_name.lower()
-        tokens.add(tl)
-        tokens.update(tl.split("_"))
-        if isinstance(table_meta, dict):
-            for col in table_meta.get("columns") or []:
-                if isinstance(col, dict):
-                    cl = col.get("name", "").lower()
-                    tokens.add(cl)
-                    tokens.update(cl.split("_"))
+        name_tokens.add(tl)
+        name_tokens.update(tl.split("_"))
+
+        if not isinstance(table_meta, dict):
+            continue
+
+        for col in table_meta.get("columns") or []:
+            if not isinstance(col, dict):
+                continue
+
+            cl = col.get("name", "").lower()
+            name_tokens.add(cl)
+            name_tokens.update(cl.split("_"))
+
+            # Collect sample values — add full lowercased value AND
+            # individual word tokens (skip tokens ≤2 chars to reduce noise)
+            for val in col.get("top_values") or []:
+                if val is None:
+                    continue
+                vl = str(val).lower().strip()
+                if not vl or len(vl) <= 1:
+                    continue
+                sample_tokens.add(vl)
+                for word in vl.split():
+                    if len(word) > 2:
+                        sample_tokens.add(word)
 
     def _best(signal_list: List[tuple]) -> Optional[tuple]:
-        scores: Dict[str, int] = {}
-        for label, signals in signal_list:
-            hit = len(tokens & signals)
-            if hit:
-                scores[label] = hit
+        scores: Dict[str, float] = {}
+        for label, name_signals in signal_list:
+            name_hits  = len(name_tokens & name_signals)
+            # Sample signals only defined for industry tier
+            samp_signals = _INDUSTRY_SAMPLE_SIGNALS.get(label, set())
+            samp_hits  = len(sample_tokens & samp_signals)
+            total = name_hits + 0.5 * samp_hits
+            if total > 0:
+                scores[label] = total
         if not scores:
             return None
         best_label = max(scores, key=lambda d: scores[d])
@@ -1153,8 +1338,6 @@ def _infer_domain_from_report(report: Dict) -> str:
     if industry_result and function_result:
         ind_label, ind_score, _ = industry_result
         fn_label,  fn_score,  _ = function_result
-        # Only combine when both tiers have meaningful signal
-        # (at least 1 hit each); prefer higher-scoring tier when they conflict
         return f"{ind_label}/{fn_label}"
 
     if industry_result:

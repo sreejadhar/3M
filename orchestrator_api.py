@@ -3036,10 +3036,40 @@ async def enrich_source_taxonomy(source_id: str, background_tasks: BackgroundTas
             logger.info("Enrich: LLM taxonomy %d columns for %s", n_llm, sid[:8])
         except Exception as exc:
             logger.warning("Enrich: LLM taxonomy failed for %s: %s", sid[:8], exc)
+        # Step 3: PII classification (deterministic + LLM)
+        try:
+            n_pii = _mc.classify_pii(sid)
+            logger.info("Enrich: PII classification %d columns for %s", n_pii, sid[:8])
+        except Exception as exc:
+            logger.warning("Enrich: PII classification failed for %s: %s", sid[:8], exc)
 
     background_tasks.add_task(_run_enrichment, source_id)
     return {"status": "accepted", "source_id": source_id,
             "message": "Taxonomy enrichment started in background"}
+
+
+@app.post("/metadata/sources/{source_id}/classify-pii", status_code=202)
+async def classify_source_pii(source_id: str, background_tasks: BackgroundTasks):
+    """
+    Run PII classification for all columns of a metadata source.
+    Stage 1: deterministic regex on column names and sample values.
+    Stage 2: LLM review for ambiguous columns that have sample data.
+    Runs in background; returns immediately.
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    async def _run_pii(sid: str) -> None:
+        try:
+            n = _mc.classify_pii(sid)
+            logger.info("PII classify: %d columns for %s", n, sid[:8])
+        except Exception as exc:
+            logger.warning("PII classify failed for %s: %s", sid[:8], exc)
+
+    background_tasks.add_task(_run_pii, source_id)
+    return {"status": "accepted", "source_id": source_id,
+            "message": "PII classification started in background"}
 
 
 @app.get("/metadata/redundancies")

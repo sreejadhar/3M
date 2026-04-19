@@ -227,6 +227,8 @@ CREATE TABLE IF NOT EXISTS md_attributes (
     statistical_type     TEXT NOT NULL DEFAULT '',
     semantic_role        TEXT NOT NULL DEFAULT '',
     taxonomy_tree        TEXT NOT NULL DEFAULT '[]',
+    pii_flag             TEXT NOT NULL DEFAULT '',
+    pii_type             TEXT NOT NULL DEFAULT '',
     is_golden_record     INTEGER NOT NULL DEFAULT 0,
     deleted_from_source  INTEGER NOT NULL DEFAULT 0,
     created_at           TEXT NOT NULL,
@@ -259,6 +261,8 @@ CREATE TABLE IF NOT EXISTS md_attributes (
     statistical_type     TEXT NOT NULL DEFAULT '',
     semantic_role        TEXT NOT NULL DEFAULT '',
     taxonomy_tree        TEXT NOT NULL DEFAULT '[]',
+    pii_flag             TEXT NOT NULL DEFAULT '',
+    pii_type             TEXT NOT NULL DEFAULT '',
     is_golden_record     BOOLEAN NOT NULL DEFAULT FALSE,
     deleted_from_source  BOOLEAN NOT NULL DEFAULT FALSE,
     created_at           TEXT NOT NULL,
@@ -392,6 +396,14 @@ def _ensure(cur: Any) -> None:
                 "ALTER TABLE md_attributes ADD COLUMN IF NOT EXISTS "
                 "taxonomy_tree TEXT NOT NULL DEFAULT '[]'"
             )
+            cur.execute(
+                "ALTER TABLE md_attributes ADD COLUMN IF NOT EXISTS "
+                "pii_flag TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE md_attributes ADD COLUMN IF NOT EXISTS "
+                "pii_type TEXT NOT NULL DEFAULT ''"
+            )
             _schema_migrated = True
     else:
         cur.ddl(
@@ -423,6 +435,14 @@ def _ensure(cur: Any) -> None:
             if "taxonomy_tree" not in cols_a:
                 cur.execute(
                     "ALTER TABLE md_attributes ADD COLUMN taxonomy_tree TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "pii_flag" not in cols_a:
+                cur.execute(
+                    "ALTER TABLE md_attributes ADD COLUMN pii_flag TEXT NOT NULL DEFAULT ''"
+                )
+            if "pii_type" not in cols_a:
+                cur.execute(
+                    "ALTER TABLE md_attributes ADD COLUMN pii_type TEXT NOT NULL DEFAULT ''"
                 )
             _schema_migrated = True
 
@@ -995,9 +1015,10 @@ def _coerce_attr(row: Dict) -> Dict:
             r[f] = json.loads(r.get(f) or "[]")
         except Exception:
             r[f] = []
-    # Ensure taxonomy fields have defaults if missing from older rows
     r.setdefault("statistical_type", "")
     r.setdefault("semantic_role", "")
+    r.setdefault("pii_flag", "")
+    r.setdefault("pii_type", "")
     return r
 
 
@@ -1018,6 +1039,271 @@ def _coerce_change(row: Dict) -> Dict:
     except Exception:
         r["changed_fields"] = {}
     return r
+
+
+# ── PII classification ─────────────────────────────────────────────────────────
+#
+# Two-stage pipeline:
+#   Stage 1 — deterministic: column-name regex + sample-value regex → instant,
+#             no LLM cost; covers >90% of obvious cases.
+#   Stage 2 — LLM: only for columns that Stage 1 left undecided (flag="") AND
+#             that have ≥1 non-null sample value worth inspecting.
+#
+# pii_flag values: "PII" | "Non-PII"
+# pii_type values: a short label like "email" | "phone" | "name" | "ssn" | …
+#                  or "" when pii_flag is "Non-PII"
+
+# ── Stage 1a: column-name patterns ───────────────────────────────────────────
+# Each entry: (compiled_regex, pii_type)
+# Applied to the lowercased column name.  First match wins.
+_PII_NAME_RULES: List[tuple] = [
+    # Full name / person name
+    (re.compile(r'\b(full_?name|person_?name|passenger_?name|employee_?name|customer_?name|client_?name|user_?name(?!_?id))\b', re.I), "name"),
+    (re.compile(r'\b(first_?name|given_?name|fname|last_?name|surname|family_?name|lname|middle_?name)\b', re.I), "name"),
+    # Email
+    (re.compile(r'\b(email|e_?mail|email_?address|contact_?email|work_?email|personal_?email)\b', re.I), "email"),
+    # Phone / mobile
+    (re.compile(r'\b(phone|mobile|cell|telephone|contact_?no|contact_?number|phone_?no|mobile_?no|tel_?no|msisdn)\b', re.I), "phone"),
+    # Date of birth / age (DOB is direct PII; age is quasi-PII)
+    (re.compile(r'\b(date_?of_?birth|dob|birth_?date|birthdate|birth_?day)\b', re.I), "date_of_birth"),
+    (re.compile(r'\b(age(?!_?group|_?band|_?range|_?bucket))\b', re.I), "age"),
+    # National ID / SSN / Tax ID
+    (re.compile(r'\b(ssn|social_?security|national_?id|national_?id_?no|nid)\b', re.I), "national_id"),
+    (re.compile(r'\b(aadhar|aadhaar|aadhar_?no|aadhaar_?no|aadhar_?number)\b', re.I), "aadhar"),
+    (re.compile(r'\b(pan_?no|pan_?number|pan_?card|income_?tax_?id)\b', re.I), "tax_id"),
+    (re.compile(r'\b(passport|passport_?no|passport_?number)\b', re.I), "passport"),
+    (re.compile(r'\b(driver_?licen[sc]e|driving_?licen[sc]e|dl_?no|dl_?number|license_?no)\b', re.I), "drivers_license"),
+    (re.compile(r'\b(voter_?id|voter_?no|election_?id)\b', re.I), "voter_id"),
+    # Address components
+    (re.compile(r'\b(address|street|addr|street_?address|mailing_?address|residence|home_?address)\b', re.I), "address"),
+    (re.compile(r'\b(zip_?code|zipcode|postal_?code|pin_?code|pincode|postcode)\b', re.I), "postal_code"),
+    # Financial identifiers
+    (re.compile(r'\b(credit_?card|card_?number|card_?no|cc_?no|ccnum)\b', re.I), "credit_card"),
+    (re.compile(r'\b(bank_?account|account_?no(?!_?type)|account_?number|iban|bban)\b', re.I), "bank_account"),
+    (re.compile(r'\b(cvv|cvc|card_?verification)\b', re.I), "credit_card"),
+    # Network / device identifiers
+    (re.compile(r'\b(ip_?address|ip_?addr|ipv4|ipv6|client_?ip|source_?ip)\b', re.I), "ip_address"),
+    (re.compile(r'\b(mac_?address|mac_?addr|device_?id(?!_?type)|imei|imsi)\b', re.I), "device_id"),
+    # Biometric / sensitive
+    (re.compile(r'\b(fingerprint|face_?image|biometric|retina|iris_?scan)\b', re.I), "biometric"),
+    (re.compile(r'\b(gender|sex(?!_?ratio|_?ual|ual))\b', re.I), "gender"),
+    (re.compile(r'\b(race|ethnicity|religion|caste|nationality)\b', re.I), "sensitive_demographic"),
+    (re.compile(r'\b(salary|compensation|ctc|annual_?income|gross_?salary|net_?salary|take_?home)\b', re.I), "financial_sensitive"),
+    # Location (precise)
+    (re.compile(r'\b(latitude|longitude|geo_?lat|geo_?lon|gps_?lat|gps_?lon|lat_?lon)\b', re.I), "geolocation"),
+    # Medical
+    (re.compile(r'\b(diagnosis|medical_?record|patient_?id(?!_?type)|mrn|health_?id)\b', re.I), "medical"),
+]
+
+# ── Stage 1b: sample-value regex patterns ─────────────────────────────────────
+# Each entry: (compiled_regex, pii_type)
+# Applied to each string sample value.  First matching pattern across all
+# sample values wins (we take the most-specific match).
+_PII_VALUE_PATTERNS: List[tuple] = [
+    (re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'), "email"),
+    (re.compile(r'\b(\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}\b'), "phone"),
+    (re.compile(r'\b\d{3}-\d{2}-\d{4}\b'), "national_id"),       # US SSN
+    (re.compile(r'\b[2-9]\d{3}\s?\d{4}\s?\d{4}\b'), "aadhar"),   # Aadhaar (12 digits starting 2-9)
+    (re.compile(r'\b[A-Z]{5}\d{4}[A-Z]\b'), "tax_id"),           # India PAN
+    (re.compile(r'\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b'), "credit_card"),
+    (re.compile(r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b'), "bank_account"),  # IBAN
+    (re.compile(r'\b(\d{1,3}\.){3}\d{1,3}\b'), "ip_address"),
+    (re.compile(r'\b([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}\b'), "device_id"),  # MAC
+    (re.compile(r'\b\d{4}-\d{2}-\d{2}\b'), "date_of_birth"),     # ISO date — only treated as PII if col name suggests it
+    (re.compile(r'\b-?\d{1,3}\.\d{4,}\b'), "geolocation"),       # lat/lon precision
+]
+
+_PII_LLM_SYSTEM = """\
+You are a data privacy expert. Given a database table with column names, data types, and sample values,
+identify which columns contain Personally Identifiable Information (PII) or sensitive personal data.
+
+PII includes: name, email, phone, date of birth, age, national ID (SSN, Aadhaar, PAN, passport),
+address, postal code, credit card number, bank account, IP address, device ID (IMEI/MAC),
+geolocation, gender, race/ethnicity/religion, medical/health data, salary/compensation.
+
+For each column return:
+  pii_flag: "PII" or "Non-PII"
+  pii_type: one of [name, email, phone, date_of_birth, age, national_id, aadhar, tax_id,
+            passport, drivers_license, voter_id, address, postal_code, credit_card,
+            bank_account, ip_address, device_id, biometric, gender, sensitive_demographic,
+            financial_sensitive, medical, geolocation, other_pii] — or "" when Non-PII.
+
+Return ONLY a JSON object, no prose, no markdown fences.
+
+OUTPUT FORMAT:
+{
+  "columns": [
+    {"name": "<column_name>", "pii_flag": "PII"|"Non-PII", "pii_type": "<type_or_empty>"}
+  ]
+}
+"""
+
+
+def _call_pii_llm(table_name: str, col_specs: List[Dict], model: str) -> List[Dict]:
+    """Call LLM to classify PII for a batch of columns."""
+    import anthropic as _ant
+
+    lines = []
+    for c in col_specs:
+        sv = c.get("sample_values") or []
+        sv_str = ", ".join(repr(v) for v in sv[:10]) if sv else "(no samples)"
+        lines.append(f"  {c['name']} ({c['data_type']}): samples=[{sv_str}]")
+    user_msg = (
+        f"Table: {table_name}\nColumns:\n" + "\n".join(lines)
+        + "\n\nClassify each column for PII."
+    )
+    try:
+        client = _ant.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = client.messages.create(
+            model=model, max_tokens=1024, temperature=0.0,
+            system=_PII_LLM_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = msg.content[0].text if msg.content else ""
+    except Exception as exc:
+        logger.warning("classify_pii: LLM call failed for table %r — %s", table_name, exc)
+        return []
+
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+    try:
+        return json.loads(cleaned).get("columns", [])
+    except json.JSONDecodeError:
+        s, e = cleaned.find("{"), cleaned.rfind("}")
+        if s != -1 and e != -1:
+            try:
+                return json.loads(cleaned[s:e + 1]).get("columns", [])
+            except json.JSONDecodeError:
+                pass
+    logger.warning("classify_pii: could not parse LLM JSON for table %r", table_name)
+    return []
+
+
+def classify_pii(source_id: str, model: Optional[str] = None) -> int:
+    """
+    Two-stage PII classification for every column of every entity in source_id.
+
+    Stage 1 — deterministic (always runs):
+      a) Column-name regex rules (_PII_NAME_RULES)
+      b) Sample-value regex patterns (_PII_VALUE_PATTERNS) for columns Stage 1a
+         left undecided but that have string-like sample values.
+
+    Stage 2 — LLM (only for columns still undecided after Stage 1 that have
+      sample values — avoids LLM cost on obviously non-PII numeric columns):
+      Batches undecided columns per table and calls Claude once per table.
+
+    Writes pii_flag ("PII"/"Non-PII") and pii_type to md_attributes.
+    Returns the number of attributes updated.
+    """
+    model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5-20251001")
+    now = _now()
+    updated = 0
+
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+
+        entities = cur.execute(
+            "SELECT metadata_id, table_name FROM md_entities "
+            "WHERE source_id=? AND deleted_from_source=?",
+            (source_id, _enc_bool(False)),
+        ).fetchall()
+
+        for ent in entities:
+            mid        = ent["metadata_id"]
+            table_name = ent["table_name"]
+
+            attrs = cur.execute(
+                "SELECT attr_id, column_name, data_type, top_values FROM md_attributes "
+                "WHERE metadata_id=? AND deleted_from_source=?",
+                (mid, _enc_bool(False)),
+            ).fetchall()
+
+            if not attrs:
+                continue
+
+            results: Dict[str, Dict] = {}  # attr_id → {pii_flag, pii_type}
+            llm_batch: List[Dict]    = []  # columns needing LLM review
+
+            for a in attrs:
+                col   = (a["column_name"] or "").lower()
+                dtype = (a["data_type"] or "").lower()
+                try:
+                    top_vals = json.loads(a["top_values"] or "[]")
+                except Exception:
+                    top_vals = []
+                str_samples = [str(v) for v in top_vals if v is not None and str(v).strip()]
+
+                pii_type = ""
+                decided  = False
+
+                # ── Stage 1a: column name rules ───────────────────────────
+                for pattern, pt in _PII_NAME_RULES:
+                    if pattern.search(col):
+                        pii_type = pt
+                        decided  = True
+                        break
+
+                # ── Stage 1b: sample value regex ──────────────────────────
+                if not decided and str_samples:
+                    for pattern, pt in _PII_VALUE_PATTERNS:
+                        if any(pattern.search(sv) for sv in str_samples):
+                            # Extra guard: date pattern only counts as PII if
+                            # column name also hints at personal dates
+                            if pt == "date_of_birth" and not re.search(
+                                r'\b(birth|dob|born|age)\b', col, re.I
+                            ):
+                                continue
+                            pii_type = pt
+                            decided  = True
+                            break
+
+                if decided:
+                    results[a["attr_id"]] = {"pii_flag": "PII", "pii_type": pii_type}
+                else:
+                    # Skip LLM for clearly non-PII numeric/boolean columns with no
+                    # string samples — waste of tokens.
+                    is_numeric = re.search(
+                        r'\b(int|integer|bigint|smallint|numeric|decimal|float|double|real|bool)\b',
+                        dtype, re.I,
+                    )
+                    has_strings = bool(str_samples)
+                    if has_strings or not is_numeric:
+                        llm_batch.append({
+                            "attr_id":      a["attr_id"],
+                            "name":         a["column_name"],
+                            "data_type":    a["data_type"] or "",
+                            "sample_values": str_samples[:10],
+                        })
+                    else:
+                        results[a["attr_id"]] = {"pii_flag": "Non-PII", "pii_type": ""}
+
+            # ── Stage 2: LLM for undecided columns ────────────────────────
+            if llm_batch:
+                col_specs = [{"name": c["name"], "data_type": c["data_type"],
+                              "sample_values": c["sample_values"]} for c in llm_batch]
+                annotations = _call_pii_llm(table_name, col_specs, model)
+                ann_by_name = {a["name"]: a for a in annotations if "name" in a}
+
+                for c in llm_batch:
+                    ann = ann_by_name.get(c["name"])
+                    if ann:
+                        results[c["attr_id"]] = {
+                            "pii_flag": ann.get("pii_flag", "Non-PII"),
+                            "pii_type": ann.get("pii_type", "") if ann.get("pii_flag") == "PII" else "",
+                        }
+                    else:
+                        results[c["attr_id"]] = {"pii_flag": "Non-PII", "pii_type": ""}
+
+            # ── Write results ─────────────────────────────────────────────
+            for attr_id, res in results.items():
+                cur.execute(
+                    "UPDATE md_attributes SET pii_flag=?, pii_type=?, updated_at=? "
+                    "WHERE attr_id=?",
+                    (res["pii_flag"], res["pii_type"], now, attr_id),
+                )
+                updated += 1
+
+    logger.info("classify_pii: source=%s classified %d attributes", source_id, updated)
+    return updated
 
 
 # ── Taxonomy enrichment ────────────────────────────────────────────────────────

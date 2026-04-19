@@ -356,6 +356,29 @@ async function enrichTaxonomy() {
   } catch (e) { toast('Enrich failed: ' + e.message, 'error'); }
 }
 
+async function classifyPII() {
+  if (!_selectedSrc) { toast('Select a source first', 'warn'); return; }
+  try {
+    await apiFetch(`/metadata/sources/${_selectedSrc}/classify-pii`, { method: 'POST' });
+    toast('PII classification queued — reload table to see results', 'success');
+  } catch (e) { toast('PII classify failed: ' + e.message, 'error'); }
+}
+
+let _piiFilterActive = false;
+function togglePIIFilter() {
+  _piiFilterActive = !_piiFilterActive;
+  const btn = document.getElementById('btn-pii-filter');
+  if (_piiFilterActive) {
+    btn.style.background = '#ff4d4d';
+    btn.style.color = '#fff';
+    renderCatalogColumns(_catalogAttrs.filter(a => a.pii_flag === 'PII'));
+  } else {
+    btn.style.background = 'transparent';
+    btn.style.color = '#ff4d4d';
+    renderCatalogColumns(_catalogAttrs);
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Add Source Modal
 // ─────────────────────────────────────────────────────────────────────────────
@@ -819,6 +842,10 @@ async function loadCatalogTable(metadataId) {
   try {
     const full = await apiFetch(`/metadata/entities/${metadataId}`);
     _catalogAttrs = full.attributes || [];
+    // Reset PII filter when switching tables
+    _piiFilterActive = false;
+    const piiBtn = document.getElementById('btn-pii-filter');
+    if (piiBtn) { piiBtn.style.background = 'transparent'; piiBtn.style.color = '#ff4d4d'; }
 
     const tblName = entity.schema_name ? `${entity.schema_name}.${entity.table_name}` : entity.table_name;
     document.getElementById('catalog-tbl-name').textContent = tblName;
@@ -864,6 +891,12 @@ function _colRow(a) {
   if (a.nullable === false) flags.push(`<span class="badge badge-gray">NOT NULL</span>`);
   if (a.is_golden_record) flags.push(`<span class="badge badge-green">Golden</span>`);
   if (a.deleted_from_source) flags.push(`<span class="badge badge-red">Deleted</span>`);
+  if (a.pii_flag === 'PII') {
+    const piiLabel = a.pii_type ? `PII · ${a.pii_type.replace(/_/g,' ')}` : 'PII';
+    flags.push(`<span class="badge badge-pii" title="${_esc(piiLabel)}" style="background:#ff4d4d;color:#fff;font-weight:700;letter-spacing:.3px">🔒 ${_esc(piiLabel)}</span>`);
+  } else if (a.pii_flag === 'Non-PII') {
+    flags.push(`<span class="badge badge-gray" title="Not PII" style="opacity:.55">Non-PII</span>`);
+  }
 
   const topVals = (a.top_values || []).slice(0, 5);
   const valChips = topVals.map(v => `<span class="top-val-chip">${_esc(String(v))}</span>`).join('');

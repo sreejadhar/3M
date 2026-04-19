@@ -1421,7 +1421,7 @@ async def _index_source(source_id: str) -> None:
             # Run deterministic taxonomy inference immediately after persist
             # so taxonomy fields are populated even before the KG / LLM steps run.
             try:
-                n_inf = _mc.infer_taxonomy(source_id)
+                n_inf = _mc.infer_taxonomy(source_id, domain=src.get("domain", ""))
                 if n_inf:
                     _push_index_event(source_id, "taxonomy", "done",
                                       f"Taxonomy inferred — {n_inf} columns classified (pattern-based)")
@@ -2840,15 +2840,16 @@ async def enrich_source_taxonomy(source_id: str, background_tasks: BackgroundTas
     Runs in the background; returns immediately with a status message.
     """
     async def _run_enrichment(sid: str) -> None:
+        src_domain = (_sources.get(sid) or {}).get("domain", "")
         # Step 1: deterministic pattern-based inference (no LLM, always runs)
         try:
-            n_pat = _mc.infer_taxonomy(sid)
+            n_pat = _mc.infer_taxonomy(sid, domain=src_domain)
             logger.info("Enrich: pattern taxonomy %d columns for %s", n_pat, sid[:8])
         except Exception as exc:
             logger.warning("Enrich: pattern taxonomy failed for %s: %s", sid[:8], exc)
         # Step 2: LLM enrichment — overwrites/improves the pattern classifications
         try:
-            n_llm = _mc.enrich_taxonomy(sid)
+            n_llm = _mc.enrich_taxonomy(sid, domain=src_domain)
             logger.info("Enrich: LLM taxonomy %d columns for %s", n_llm, sid[:8])
         except Exception as exc:
             logger.warning("Enrich: LLM taxonomy failed for %s: %s", sid[:8], exc)

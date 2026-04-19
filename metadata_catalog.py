@@ -1080,8 +1080,208 @@ OUTPUT FORMAT:
 }
 """
 
+# Domain-specific hints injected into the LLM prompt to resolve ambiguous terms.
+# Key is the base industry label (first part of "Aviation/FP&A", "Banking/FS", etc.)
+_DOMAIN_LLM_HINTS: Dict[str, str] = {
+    "Aviation": """\
+Domain context: AVIATION / AIRLINE OPERATIONS
+Resolve ambiguous terms as follows:
+  • station, airport, gate, terminal → geography (airport location), categorical
+  • sector, leg, route, segment, rotation, pairing → flight operational dimension, categorical
+  • carrier, airline, operator → org_unit, categorical
+  • tail, registration → aircraft identifier, identifier
+  • class (cabin_class, booking_class, fare_class) → product_category, categorical
+  • crew, pilot, captain, officer, purser, attendant → org_unit, categorical
+  • delay, delay_code, delay_reason → categorical (IATA delay codes)
+  • yield, rask, cask, ask, rpk, load_factor, otp, block_time → continuous measure
+  • duty, duty_time, rest_period → continuous measure (crew hours)
+  • pax, booked, no_show → continuous measure (passenger counts)
+""",
+    "Banking": """\
+Domain context: BANKING / FINANCIAL SERVICES
+Resolve ambiguous terms as follows:
+  • sector, segment, class, industry → product_category (loan/customer segment), categorical
+  • branch, region, zone, circle → geography, categorical
+  • tenor, tenure, maturity, term → ordinal (loan/deposit duration)
+  • npa, gnpa, nnpa, dpd → continuous measure (asset quality metrics)
+  • account, loan_id, policy_number → identifier
+  • product, scheme, facility → product_category, categorical
+  • premium (in bancassurance) → continuous measure
+""",
+    "LS": """\
+Domain context: LIFE SCIENCES / PHARMA
+Resolve ambiguous terms as follows:
+  • batch, lot, lot_number, batch_number → identifier (manufacturing batch)
+  • trial, protocol, study → categorical (clinical study identifier/name)
+  • arm, cohort, group → categorical (study arm / patient cohort)
+  • phase, stage → ordinal (clinical phase I/II/III/IV or disease stage)
+  • dose, dosage, strength → continuous measure
+  • indication, therapy_area, disease → product_category, categorical
+  • site, centre, investigator → geography / org_unit, categorical
+  • ae, sae, adverse_event → categorical (safety event type)
+  • visit, visit_number → ordinal (study visit sequence)
+""",
+    "Insurance": """\
+Domain context: INSURANCE
+Resolve ambiguous terms as follows:
+  • policy, policy_number → identifier
+  • claim, claim_number, claim_id → identifier
+  • premium, sum_assured, coverage, benefit → continuous measure
+  • lob, line_of_business, product_line, class → product_category, categorical
+  • term, policy_term, tenure → ordinal (policy duration in years)
+  • agent, broker, channel, intermediary → org_unit, categorical
+  • loss_ratio, combined_ratio, claims_ratio → continuous measure (%)
+  • status (policy/claim status) → categorical
+""",
+    "Manufacturing": """\
+Domain context: MANUFACTURING / INDUSTRIALS
+Resolve ambiguous terms as follows:
+  • lot, batch, work_order, production_order, job_order → identifier
+  • shift, plant, line, cell, workcenter → org_unit, categorical
+  • machine, equipment, asset → identifier / categorical (asset dimension)
+  • operation, process, step, stage → categorical (routing step)
+  • yield, oee, throughput, cycle_time, takt_time → continuous measure
+  • defect, rejection, rework, scrap → continuous measure (quality counts)
+  • downtime, mtbf, mttr → continuous measure (hours/minutes)
+  • customer (internal customer / next-station) → customer_dimension_key, categorical
+""",
+    "Agriculture": """\
+Domain context: AGRICULTURE / AGRI-BUSINESS
+Resolve ambiguous terms as follows:
+  • crop, variety, hybrid, seed_type → product_category, categorical
+  • farm, field, plot, parcel, survey_no → geography / identifier
+  • season, kharif, rabi, zaid → categorical (crop season)
+  • district, taluka, village, block → geography, categorical
+  • yield, production, harvest_qty, offtake → continuous measure
+  • farmer, farmer_id, fpo → customer_dimension_key, categorical / identifier
+  • commodity, produce (wheat, rice, cotton) → product_category, categorical
+  • soil_type, irrigation_type → categorical
+  • area, acreage, hectare → continuous measure (cultivated area)
+""",
+    "CPG": """\
+Domain context: CONSUMER PACKAGED GOODS (CPG / FMCG)
+Resolve ambiguous terms as follows:
+  • category, sub_category, segment → product_category, categorical
+  • brand, sub_brand, variant → product_dimension_key, categorical
+  • channel, trade_channel → org_unit / customer_dimension_key, categorical
+  • sku, pack_size, pack_type → product_dimension_key, categorical
+  • rsv, gsv, nrv, nsv → continuous measure (revenue metrics)
+  • volume, offtake → continuous measure
+  • retailer, customer_group, key_account, distributor → customer_dimension_key, categorical
+""",
+    "Telecom": """\
+Domain context: TELECOM / TELCO
+Resolve ambiguous terms as follows:
+  • subscriber, msisdn, imsi → identifier
+  • circle, region, zone → geography, categorical
+  • plan, bundle, pack, vas → product_category, categorical
+  • arpu, mou, data_usage, revenue_per_user → continuous measure
+  • churn, churn_rate, deactivation → continuous measure (%)
+  • prepaid, postpaid → categorical (subscription type)
+  • operator, network → categorical
+""",
+    "Retail": """\
+Domain context: RETAIL
+Resolve ambiguous terms as follows:
+  • store, store_id, outlet → geography / identifier
+  • format, store_format → categorical (store type)
+  • basket, transaction → identifier / continuous measure
+  • category, department → product_category, categorical
+  • sell_through, stock_turn → continuous measure (%)
+  • footfall, traffic → continuous measure (visitor count)
+""",
+    "Healthcare": """\
+Domain context: HEALTHCARE / PROVIDER / PAYER
+Resolve ambiguous terms as follows:
+  • member, beneficiary → customer_dimension_key, identifier
+  • drg, icd, cpt_code → categorical (clinical code)
+  • los, length_of_stay → continuous measure (days)
+  • admission, discharge → date / categorical (event type)
+  • payer, insurer, network → categorical (payer dimension)
+  • plan, benefit_plan → product_category, categorical
+""",
+}
 
-def _call_enrich_llm(table_name: str, col_specs: List[Dict], model: str) -> List[Dict]:
+
+# Domain-specific column-name rules for deterministic inference.
+# Applied BEFORE the generic _NAME_RULES when a domain is known.
+# Each entry: (compiled_regex, statistical_type, semantic_role)
+_DOMAIN_NAME_RULES: Dict[str, List] = {
+    "Aviation": [
+        (re.compile(r'\b(station|airport|gate|terminal|apron|hub)\b', re.I),     "categorical", "geography"),
+        (re.compile(r'\b(carrier|airline|operator|marketing_carrier)\b', re.I),  "categorical", "org_unit"),
+        (re.compile(r'\b(sector|leg|route|segment|rotation|pairing)\b', re.I),   "categorical", "other"),
+        (re.compile(r'\b(tail|tail_no|tail_number|registration)\b', re.I),       "identifier",  "identifier"),
+        (re.compile(r'\b(cabin_class|booking_class|fare_class)\b', re.I),        "categorical", "product_category"),
+        (re.compile(r'\b(crew_type|crew_role|rank|crew_base)\b', re.I),          "categorical", "org_unit"),
+        (re.compile(r'\b(delay_code|delay_reason|delay_category)\b', re.I),      "categorical", "other"),
+        (re.compile(r'\b(rask|cask|ask|rpk|atk|rtk|load_factor|otp)\b', re.I),  "continuous",  "measure"),
+        (re.compile(r'\b(duty_time|block_time|flight_time|rest_period)\b', re.I),"continuous",  "measure"),
+        (re.compile(r'\b(pax|booked|no_show|seats_available)\b', re.I),          "continuous",  "measure"),
+    ],
+    "Banking": [
+        (re.compile(r'\b(sector|industry_segment|loan_class)\b', re.I),          "categorical", "product_category"),
+        (re.compile(r'\b(branch|circle|zone_name)\b', re.I),                     "categorical", "geography"),
+        (re.compile(r'\b(tenor|tenure|maturity_bucket|term_bucket)\b', re.I),    "ordinal",     "time_period"),
+        (re.compile(r'\b(gnpa|nnpa|npa_amount|dpd_bucket|overdue)\b', re.I),     "continuous",  "measure"),
+        (re.compile(r'\b(product_type|facility_type|scheme)\b', re.I),           "categorical", "product_category"),
+    ],
+    "LS": [
+        (re.compile(r'\b(batch|lot|lot_no|batch_no|lot_number|batch_number)\b', re.I), "identifier", "identifier"),
+        (re.compile(r'\b(trial_id|protocol_id|study_id)\b', re.I),               "identifier",  "identifier"),
+        (re.compile(r'\b(trial|protocol|study_name)\b', re.I),                   "categorical", "other"),
+        (re.compile(r'\b(arm|cohort|treatment_group)\b', re.I),                  "categorical", "other"),
+        (re.compile(r'\b(trial_phase|clinical_phase)\b', re.I),                  "ordinal",     "time_period"),
+        (re.compile(r'\b(indication|therapy_area|disease_area)\b', re.I),        "categorical", "product_category"),
+        (re.compile(r'\b(investigator_site|study_site|site_name)\b', re.I),      "categorical", "geography"),
+        (re.compile(r'\b(visit_number|visit_seq|visit_name)\b', re.I),           "ordinal",     "time_period"),
+    ],
+    "Insurance": [
+        (re.compile(r'\b(policy_no|policy_number|pol_id)\b', re.I),              "identifier",  "identifier"),
+        (re.compile(r'\b(claim_no|claim_number|claim_id)\b', re.I),              "identifier",  "identifier"),
+        (re.compile(r'\b(lob|line_of_business|product_line|ins_class)\b', re.I), "categorical", "product_category"),
+        (re.compile(r'\b(policy_term|tenure_years|term_years)\b', re.I),         "ordinal",     "time_period"),
+        (re.compile(r'\b(agent_code|broker_code|intermediary)\b', re.I),         "categorical", "org_unit"),
+        (re.compile(r'\b(loss_ratio|combined_ratio|claims_ratio)\b', re.I),      "continuous",  "measure"),
+    ],
+    "Manufacturing": [
+        (re.compile(r'\b(work_order|wo_number|production_order|job_order)\b', re.I), "identifier", "identifier"),
+        (re.compile(r'\b(lot_number|batch_number|lot_no|batch_no)\b', re.I),     "identifier",  "identifier"),
+        (re.compile(r'\b(shift_name|shift_type|shift_code)\b', re.I),            "categorical", "org_unit"),
+        (re.compile(r'\b(plant_code|plant_name|plant_id)\b', re.I),              "categorical", "org_unit"),
+        (re.compile(r'\b(machine_id|equipment_id|asset_id)\b', re.I),            "identifier",  "identifier"),
+        (re.compile(r'\b(operation|process_step|routing_step)\b', re.I),         "categorical", "other"),
+        (re.compile(r'\b(oee|throughput|takt_time|cycle_time)\b', re.I),         "continuous",  "measure"),
+        (re.compile(r'\b(defect_qty|rejection_qty|scrap_qty|rework_qty)\b', re.I),"continuous", "measure"),
+    ],
+    "Agriculture": [
+        (re.compile(r'\b(crop_name|crop_type|variety|hybrid)\b', re.I),          "categorical", "product_category"),
+        (re.compile(r'\b(farm_id|field_id|plot_id|parcel_id)\b', re.I),          "identifier",  "identifier"),
+        (re.compile(r'\b(farm_name|field_name|survey_no)\b', re.I),              "categorical", "geography"),
+        (re.compile(r'\b(crop_season|season_name|kharif|rabi|zaid)\b', re.I),    "categorical", "time_period"),
+        (re.compile(r'\b(district|taluka|village|block_name)\b', re.I),          "categorical", "geography"),
+        (re.compile(r'\b(yield_per|production_qty|harvest_qty)\b', re.I),        "continuous",  "measure"),
+        (re.compile(r'\b(farmer_id|grower_id)\b', re.I),                         "identifier",  "identifier"),
+        (re.compile(r'\b(farmer_name|grower_name|fpo_name)\b', re.I),            "categorical", "customer_dimension_key"),
+        (re.compile(r'\b(soil_type|irrigation_type|land_type)\b', re.I),         "categorical", "other"),
+        (re.compile(r'\b(acreage|cultivated_area|sown_area)\b', re.I),           "continuous",  "measure"),
+    ],
+    "CPG": [
+        (re.compile(r'\b(sub_category|subcategory)\b', re.I),                    "categorical", "product_sub_category"),
+        (re.compile(r'\b(category|segment|vertical)\b', re.I),                   "categorical", "product_category"),
+        (re.compile(r'\b(trade_channel|channel_type|outlet_type)\b', re.I),      "categorical", "org_unit"),
+        (re.compile(r'\b(key_account|distributor|customer_group)\b', re.I),      "categorical", "customer_dimension_key"),
+    ],
+    "Telecom": [
+        (re.compile(r'\b(msisdn|imsi|imei|subscriber_id)\b', re.I),              "identifier",  "identifier"),
+        (re.compile(r'\b(circle|telecom_circle|service_area)\b', re.I),          "categorical", "geography"),
+        (re.compile(r'\b(plan_name|bundle_name|pack_name|vas_name)\b', re.I),    "categorical", "product_category"),
+    ],
+}
+
+
+def _call_enrich_llm(table_name: str, col_specs: List[Dict], model: str,
+                     domain: str = "") -> List[Dict]:
     """Call LLM to classify columns and return taxonomy annotations."""
     import anthropic
     import re
@@ -1091,7 +1291,18 @@ def _call_enrich_llm(table_name: str, col_specs: List[Dict], model: str) -> List
         sv = c.get("sample_values") or []
         sv_str = ", ".join(repr(v) for v in sv[:20]) if sv else "(no samples)"
         lines.append(f"  {c['name']} ({c['data_type']}): samples=[{sv_str}]")
-    user_msg = f"Table: {table_name}\nColumns:\n" + "\n".join(lines) + "\n\nClassify each column."
+
+    # Resolve base industry label ("Aviation/FP&A" → "Aviation", "Banking/FS" → "Banking")
+    base_domain = (domain or "").split("/")[0].strip()
+    domain_hint = _DOMAIN_LLM_HINTS.get(base_domain, "")
+
+    domain_prefix = f"{domain_hint}\n" if domain_hint else ""
+    user_msg = (
+        f"{domain_prefix}"
+        f"Table: {table_name}\nColumns:\n"
+        + "\n".join(lines)
+        + "\n\nClassify each column."
+    )
 
     try:
         client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
@@ -1120,7 +1331,7 @@ def _call_enrich_llm(table_name: str, col_specs: List[Dict], model: str) -> List
     return []
 
 
-def infer_taxonomy(source_id: str) -> int:
+def infer_taxonomy(source_id: str, domain: str = "") -> int:
     """
     Deterministic (no LLM) taxonomy inference using data_type, column name patterns,
     and sample values already stored in top_values.
@@ -1128,6 +1339,9 @@ def infer_taxonomy(source_id: str) -> int:
     Runs immediately after persist() so taxonomy is populated even if the KG pipeline
     or LLM enrichment hasn't run yet.  Does NOT overwrite columns that already have
     a statistical_type set (LLM/KG annotations take precedence).
+
+    domain: industry label (e.g. "Aviation", "Banking/FS") — domain-specific rules
+            are applied before the generic rules to resolve ambiguous column names.
 
     Returns the number of attributes updated.
     """
@@ -1183,6 +1397,10 @@ def infer_taxonomy(source_id: str) -> int:
 
     _CATEGORICAL_MAX_UNIQUE = 50
 
+    # Pick domain-specific rules (base label only: "Aviation/FP&A" → "Aviation")
+    base_domain = (domain or "").split("/")[0].strip()
+    _domain_rules = _DOMAIN_NAME_RULES.get(base_domain, [])
+
     now = _now()
     updated = 0
 
@@ -1229,13 +1447,24 @@ def infer_taxonomy(source_id: str) -> int:
                         sem_role  = sr
                         break
 
+                if not stat_type and _domain_rules:
+                    # 2a. Domain-specific rules — applied before generic rules to
+                    #     resolve ambiguous column names (e.g. "station" → geography
+                    #     in Aviation vs org_unit in other domains; "batch" →
+                    #     identifier in LS/Manufacturing vs generic text elsewhere).
+                    for pattern, st, sr in _domain_rules:
+                        if pattern.search(col):
+                            stat_type = st
+                            sem_role  = sr
+                            break
+
                 if not stat_type:
-                    # 2. Remaining column-name rules (time, geography, product, etc.)
-                    #    checked BEFORE dtype rules so that period columns stored as
-                    #    integers (e.g. year_month INTEGER = 202412) are correctly
-                    #    classified as "ordinal/time_period" rather than
-                    #    "continuous/measure", ensuring their top_values are surfaced
-                    #    as sample hints in the planning prompt.
+                    # 2b. Generic column-name rules (time, geography, product, etc.)
+                    #     checked BEFORE dtype rules so that period columns stored as
+                    #     integers (e.g. year_month INTEGER = 202412) are correctly
+                    #     classified as "ordinal/time_period" rather than
+                    #     "continuous/measure", ensuring their top_values are surfaced
+                    #     as sample hints in the planning prompt.
                     for pattern, st, sr in _NAME_RULES[2:]:
                         if pattern.search(col):
                             stat_type = st
@@ -1279,13 +1508,17 @@ def infer_taxonomy(source_id: str) -> int:
     return updated
 
 
-def enrich_taxonomy(source_id: str, model: Optional[str] = None) -> int:
+def enrich_taxonomy(source_id: str, model: Optional[str] = None,
+                    domain: str = "") -> int:
     """
     LLM-classify every column of every entity in source_id and write:
       statistical_type, semantic_role, taxonomy_tree (JSON array of distinct values)
 
     Also detects parent-child categorical pairs (category → sub_category) and stores
     the child values grouped by parent in the parent column's taxonomy_tree as a dict.
+
+    domain: industry label (e.g. "Aviation", "Banking/FS") — passed to the LLM
+            as a disambiguation hint so ambiguous column names are resolved correctly.
 
     Returns the number of attributes updated.
     """
@@ -1328,7 +1561,7 @@ def enrich_taxonomy(source_id: str, model: Optional[str] = None) -> int:
                     "sample_values": sv,
                 })
 
-            annotations = _call_enrich_llm(table_name, col_specs, model)
+            annotations = _call_enrich_llm(table_name, col_specs, model, domain=domain)
             ann_by_name = {a["name"]: a for a in annotations if "name" in a}
 
             # Build name → attr_id map

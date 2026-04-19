@@ -837,59 +837,199 @@ _INDUSTRY_SIGNALS: List[tuple] = [
     }),
     # Life Sciences / Pharma
     ("LS", {
-        "clinical_trial", "adverse_event", "iqvia", "ndc", "formulary",
-        "rx", "otc", "molecule", "drug", "prescription", "patient",
-        "diagnosis", "procedure_code", "hospital", "physician",
-        "therapy_area", "indication", "dosage", "biomarker",
+        # Clinical / trial
+        "clinical_trial", "trial", "protocol", "cohort", "arm", "randomised",
+        "placebo", "double_blind", "phase", "trial_phase", "enrollment",
+        "site", "investigator", "irb", "ethics_committee",
+        # Drug / molecule
+        "molecule", "drug", "compound", "active_ingredient", "excipient",
+        "formulation", "dosage", "dose", "strength", "route_of_administration",
+        "ndc", "anda", "nda", "bla", "inn", "atc_code",
+        # Regulatory / safety
+        "adverse_event", "ae", "sae", "serious_adverse", "pharmacovigilance",
+        "signal_detection", "post_market", "recall", "fda", "ema", "cdsco",
+        "510k", "pma", "regulatory_submission", "label",
+        # Patient / clinical data
+        "patient", "subject", "participant", "diagnosis", "indication",
+        "icd10", "icd_code", "procedure_code", "comorbidity", "biomarker",
+        "genomic", "genotype", "phenotype", "lab_result", "vital_sign",
+        # Commercial / market access
+        "formulary", "iqvia", "ims", "rx", "otc", "prescription",
+        "market_access", "payer_mix", "rebate", "gross_to_net",
+        "therapy_area", "physician", "hospital", "hcp", "specialty",
+        # Manufacturing / quality (pharma-specific)
+        "batch", "lot_number", "expiry", "shelf_life", "gmp", "capa",
+        "deviation", "oos", "out_of_spec", "release_testing",
     }),
     # Healthcare (non-pharma / payer / provider)
     ("Healthcare", {
-        "length_of_stay", "bed_occupancy", "claims_paid", "denial_rate",
-        "readmission", "cost_per_patient", "icd", "cpt_code",
-        "admission", "discharge", "inpatient", "outpatient", "payer",
+        "length_of_stay", "los", "bed_occupancy", "bed_days", "census",
+        "claims_paid", "denial_rate", "readmission", "readmit",
+        "cost_per_patient", "cost_per_episode", "drg", "icd", "cpt_code",
+        "admission", "discharge", "inpatient", "outpatient", "ed_visit",
+        "emergency", "icu", "nicu", "payer", "insurer", "hmo", "ppo",
+        "member", "beneficiary", "eligibility", "prior_auth",
+        "network", "in_network", "out_of_network", "copay", "deductible",
+        "ehr", "emr", "fhir", "hl7", "hipaa",
     }),
     # Telecom / Telco
     ("Telecom", {
-        "arpu", "mou", "data_usage", "subscriber", "churn_rate",
-        "prepaid", "postpaid", "sim", "roaming", "spectrum",
-        "minutes_of_use", "cell_tower", "bandwidth", "network_quality",
+        "arpu", "mou", "data_usage", "subscriber", "subscription",
+        "churn_rate", "churn", "prepaid", "postpaid", "sim", "msisdn",
+        "imei", "imsi", "roaming", "spectrum", "frequency_band",
+        "minutes_of_use", "cell_tower", "cell_site", "bts", "enb",
+        "bandwidth", "network_quality", "dropped_call", "call_setup",
+        "data_plan", "recharge", "top_up", "bundle", "vas",
+        "mnp", "number_portability", "operator", "mvno",
+        "fiber", "broadband", "dsl", "ftth", "last_mile",
+        "revenue_per_user", "blended_arpu", "voice_revenue", "data_revenue",
     }),
     # Banking / Financial Services
     ("Banking/FS", {
-        "nii", "nim", "casa", "gnpa", "nnpa", "crar", "slr", "crr",
-        "net_interest", "loan_book", "deposit", "borrowing",
-        "credit_risk", "provisioning", "capital_adequacy",
-        "return_on_assets", "cost_to_income",
+        # Balance sheet / P&L
+        "nii", "nim", "net_interest_income", "net_interest_margin",
+        "casa", "current_account", "savings_account", "fixed_deposit",
+        "gnpa", "nnpa", "npa", "non_performing", "provision_coverage",
+        "crar", "capital_adequacy", "tier1", "tier2", "slr", "crr",
+        "net_interest", "loan_book", "loan_portfolio", "advances",
+        "deposit", "borrowing", "liability", "asset_quality",
+        "credit_risk", "provisioning", "write_off", "write_back",
+        "return_on_assets", "roa", "roe", "cost_to_income",
+        # Lending
+        "loan", "mortgage", "home_loan", "auto_loan", "personal_loan",
+        "emi", "disbursement", "sanction", "outstanding", "overdue",
+        "dpd", "days_past_due", "delinquency", "restructured",
+        "credit_score", "bureau_score", "cibil", "ltv_ratio",
+        # Products / channels
+        "account", "account_number", "ifsc", "bic", "swift",
+        "transaction", "txn", "debit", "credit", "transfer",
+        "branch", "atm", "digital_banking", "mobile_banking",
+        "card", "credit_card", "debit_card", "pos", "merchant",
+        # Treasury / markets
+        "bond", "yield_curve", "duration", "convexity", "alm",
+        "forex", "fx_rate", "treasury", "investment_portfolio",
     }),
     # Insurance
     ("Insurance", {
-        "premium", "claim", "loss_ratio", "combined_ratio",
-        "policy", "underwriting", "reinsurance", "actuarial",
-        "incurred_loss", "earned_premium", "lapse_rate",
+        # Core policy / premium
+        "premium", "gross_premium", "net_premium", "earned_premium",
+        "written_premium", "single_premium", "renewal_premium",
+        "policy", "policy_number", "policy_term", "policy_holder",
+        "insured", "beneficiary", "nominee", "sum_assured",
+        # Claims
+        "claim", "claim_number", "claim_date", "claim_amount",
+        "incurred_loss", "paid_loss", "ibnr", "ibner",
+        "loss_ratio", "claims_ratio", "combined_ratio",
+        "claims_settled", "claims_repudiated", "claims_pending",
+        # Underwriting
+        "underwriting", "risk_assessment", "risk_class", "risk_score",
+        "proposal", "quote", "endorsement", "exclusion", "deductible",
+        "sub_limit", "co_insurance", "reinsurance", "cedant",
+        "treaty", "facultative", "retrocession",
+        # Actuarial
+        "actuarial", "mortality", "morbidity", "lapse_rate",
+        "persistency", "surrender", "maturity", "annuity",
+        "reserve", "liability_reserve", "unearned_premium",
+        # Lines of business
+        "life", "health", "motor", "fire", "marine", "liability",
+        "property", "casualty", "p_and_c", "general_insurance",
+        "term", "ulip", "endowment", "whole_life",
+        # Channels / distribution
+        "agent", "broker", "bancassurance", "direct", "online_sale",
+        "agency_code", "pos_agent", "intermediary",
     }),
     # Retail (physical)
     ("Retail", {
-        "store_sales", "same_store", "comp_sales", "footfall",
-        "basket", "shrinkage", "planogram", "assortment",
-        "markdown", "sell_through", "stock_turn",
+        "store_sales", "same_store", "comp_sales", "footfall", "traffic",
+        "basket", "basket_size", "shrinkage", "planogram", "assortment",
+        "markdown", "sell_through", "stock_turn", "stock_turnover",
+        "store", "store_id", "store_format", "hypermarket", "supermarket",
+        "pos_transaction", "till", "checkout_lane",
+        "loyalty", "loyalty_card", "points_earned", "redemption",
+        "private_label", "own_brand", "national_brand",
+        "replenishment", "out_of_stock", "on_shelf_availability",
+        "promotion", "price_cut", "feature", "display",
     }),
     # E-commerce
     ("E-commerce", {
-        "gmv", "aov", "cac", "ltv", "roas", "cart",
+        "gmv", "aov", "cac", "ltv", "roas", "cart", "cart_abandonment",
         "conversion_rate", "basket_size", "add_to_cart",
         "checkout", "order_value", "return_rate", "refund",
+        "marketplace", "seller", "listing", "sku_listing",
+        "session", "visit", "bounce_rate", "page_view",
+        "search_rank", "sponsored", "ad_spend",
+        "fulfillment", "last_mile", "ndr", "rto",
+        "review", "rating", "star_rating",
     }),
     # Manufacturing / Industrials
     ("Manufacturing", {
-        "oee", "scrap_rate", "yield_pct", "downtime", "mtbf",
-        "cycle_time", "throughput", "defect_rate", "work_in_progress",
-        "machine_utilisation", "production_order", "quality_inspection",
+        # Efficiency / quality
+        "oee", "oee_availability", "oee_performance", "oee_quality",
+        "scrap_rate", "scrap", "rework", "rejection_rate", "defect_rate",
+        "yield_pct", "first_pass_yield", "fpy", "quality_inspection",
+        "downtime", "planned_downtime", "unplanned_downtime",
+        "mtbf", "mttr", "mttf", "reliability",
+        # Production
+        "cycle_time", "takt_time", "throughput", "production_order",
+        "work_order", "work_in_progress", "wip", "finished_goods",
+        "production_schedule", "planned_qty", "actual_qty",
+        "shift", "shift_output", "line_efficiency",
+        # Equipment / assets
+        "machine", "machine_id", "equipment", "asset_id",
+        "spindle", "press", "mould", "tooling", "fixture",
+        "preventive_maintenance", "pm_schedule", "breakdown",
+        "plant", "shop_floor", "cell", "workcenter",
+        # Materials
+        "bom", "bill_of_materials", "raw_material", "component",
+        "sub_assembly", "assembly", "routing", "operation_sequence",
+        "material_consumption", "standard_cost", "actual_cost",
+        # Standards
+        "iso", "iatf", "as9100", "spc", "cpk", "ppk", "control_chart",
+    }),
+    # Agriculture / Agri-business
+    ("Agriculture", {
+        # Crops & cultivation
+        "crop", "crop_type", "crop_variety", "variety", "hybrid",
+        "seed", "seed_rate", "germination", "sowing", "planting",
+        "harvest", "harvesting", "yield_per_acre", "yield_per_hectare",
+        "acreage", "hectare", "farm", "field", "plot", "parcel",
+        "kharif", "rabi", "zaid", "season", "growing_season",
+        # Soil & agronomy
+        "soil", "soil_type", "soil_health", "ph_level", "organic_matter",
+        "fertilizer", "urea", "dap", "potash", "micronutrient",
+        "pesticide", "herbicide", "fungicide", "insecticide",
+        "irrigation", "drip", "sprinkler", "canal", "groundwater",
+        # Livestock & dairy
+        "livestock", "cattle", "buffalo", "poultry", "sheep", "goat",
+        "milk_yield", "milk_production", "fat_content", "snf",
+        "animal_id", "tag_id", "breed", "lactation", "calving",
+        "feed", "fodder", "dry_matter",
+        # Supply chain / market
+        "mandi", "apmc", "procurement_centre", "farmer",
+        "farmer_id", "fpo", "cooperative", "agri_input",
+        "minimum_support_price", "msp", "procurement_price",
+        "storage", "cold_storage", "warehouse", "silo",
+        "commodity", "agri_commodity", "produce", "grain",
+        "wheat", "rice", "paddy", "maize", "soybean", "cotton",
+        "sugarcane", "pulses", "oilseed",
+        # Weather / geo
+        "rainfall", "temperature", "humidity", "evapotranspiration",
+        "geo_lat", "geo_lon", "district", "taluka", "village",
+        "land_parcel", "cadastral",
+        # Finance / schemes
+        "kcc", "kisan_credit", "crop_insurance", "pmfby",
+        "subsidy", "input_cost", "cost_of_cultivation",
     }),
     # SaaS / Technology
     ("SaaS", {
         "dau", "mau", "mrr", "arr", "expansion_revenue",
         "activation_rate", "feature_adoption", "session_duration",
         "retention_rate", "nrr", "logo_churn", "saas",
+        "trial", "freemium", "paid_conversion", "upgrade",
+        "seat", "license", "subscription_tier", "plan",
+        "api_call", "api_usage", "endpoint", "latency",
+        "uptime", "sla", "incident", "p1", "p2",
+        "onboarding", "time_to_value", "ttv", "health_score",
     }),
 ]
 

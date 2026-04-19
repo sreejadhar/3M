@@ -772,13 +772,57 @@ _FILE_BASED_TYPES = {"sqlite", "csv", "excel"}
 # one tier fires the single label is returned (e.g. "Telecom", "Supply Chain").
 
 _INDUSTRY_SIGNALS: List[tuple] = [
+    # Aviation / Airlines
+    ("Aviation", {
+        # Aircraft & fleet
+        "aircraft", "aircraft_type", "tail_number", "tail_no", "registration",
+        "fleet", "fleet_type", "wide_body", "narrow_body", "turboprop",
+        # Flight operations
+        "flight", "flight_number", "flight_no", "flt", "sector", "flight_leg",
+        "leg", "rotation", "block_time", "flight_time", "air_time",
+        "departure", "arrival", "origin", "destination",
+        "scheduled_departure", "actual_departure", "scheduled_arrival", "actual_arrival",
+        "dep_time", "arr_time", "etd", "eta", "atd", "ata",
+        # Airport & station
+        "airport", "station", "icao", "iata", "faa",
+        "gate", "terminal", "runway", "apron", "taxiway", "hangar",
+        "slot", "slot_time",
+        # Crew
+        "crew", "pilot", "copilot", "co_pilot", "captain", "first_officer",
+        "cabin_crew", "flight_attendant", "purser", "crew_id",
+        "crew_ot", "overtime", "duty_time", "rest_period", "pairing",
+        "crew_complement", "deadhead",
+        # Passengers & load
+        "passenger", "pax", "load_factor", "booked", "seats_available",
+        "cabin_class", "business_class", "economy", "first_class",
+        "boarding", "manifest", "no_show",
+        # Revenue / yield (aviation-specific)
+        "yield", "rask", "cask", "ask", "rpk", "atk", "rtk",
+        "revenue_per_seat", "fare_class", "booking_class",
+        # Cargo & baggage
+        "cargo", "freight", "baggage", "checked_bag", "carry_on",
+        "cargo_weight", "payload",
+        # Delay & OTP
+        "delay", "delay_code", "delay_reason", "on_time", "otp",
+        "on_time_performance", "late", "cancelled", "diverted",
+        # Fuel
+        "fuel", "fuel_burn", "fuel_uplift", "fuel_consumption",
+        # MRO / maintenance
+        "mro", "maintenance", "airworthiness", "aircraft_maintenance",
+        "check_a", "check_b", "check_c", "check_d",
+        # Airline identifiers
+        "airline", "carrier", "codeshare", "alliance", "iata_code",
+        "operating_carrier", "marketing_carrier",
+        # ATC / routing
+        "atc", "ifr", "vfr", "route", "waypoint", "airway",
+    }),
     # Consumer Packaged Goods (CPG / FMCG)
     # Broad product-hierarchy vocabulary that appears in ANY CPG database
     # (supply chain, FP&A, sales, RGM) — not just RGM-specific revenue terms.
     ("CPG", {
         # Product hierarchy (present in virtually every CPG system)
         "sku", "brand", "sub_brand", "pack_size", "pack_type", "upc",
-        "ean", "product_hierarchy", "category", "sub_category",
+        "ean", "product_hierarchy", "sub_category",
         "brand_pack", "flavor", "variant", "ppg", "pog",
         # CPG-specific revenue / trade vocabulary
         "rsv", "gsv", "nrv", "nsv", "tts", "cti",

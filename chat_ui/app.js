@@ -1574,9 +1574,14 @@ const _XLS_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12
 
 function buildInsightActionBar(msgId) {
   const m = _msgStore[msgId] || {};
-  const hasData = (m.results || []).some(r => (r.rows || []).length > 0);
-  const xlsBtn  = hasData
-    ? `<button class="insight-action-btn" id="xls-btn-${msgId}" onclick="downloadInsightExcel('${msgId}')" title="Export to Excel workbook with charts &amp; pivot tables">${_XLS_ICON} Excel</button>`
+  const hasResults = (m.results || []).length > 0;
+  const hasData    = (m.results || []).some(r => (r.rows || []).length > 0);
+  const xlsBtn = hasResults
+    ? `<button class="insight-action-btn" id="xls-btn-${msgId}"
+         onclick="downloadInsightExcel('${msgId}')"
+         title="${hasData ? 'Export to Excel workbook with charts &amp; pivot tables' : 'No data rows to export'}"
+         ${hasData ? '' : 'disabled style="opacity:0.4;cursor:not-allowed"'}>
+         ${_XLS_ICON} Excel</button>`
     : '';
   return `<div class="insight-action-bar">
     <span class="insight-action-label">Export:</span>

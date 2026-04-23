@@ -3059,6 +3059,75 @@ def plan_node(state: DialogState) -> DialogState:
         state["phase"] = "plan"
         return state
 
+    # ── Meta-question detection: discovery / capability questions ─────────────
+    # "What insights can I generate?", "What can I analyse?", "What does this
+    # data tell me?", "What questions can I ask?" etc. have no SQL answer.
+    # Instead of returning [] and a generic error, answer using the schema context.
+    _META_PATTERNS = re.compile(
+        r"\b(what\s+(all\s+)?(insights?|analysis|analyses|questions?|metrics?|kpis?|"
+        r"reports?|stories?|trends?|patterns?|can\s+(?:i|we|be)\s+(?:analyz|generat|explor|ask|answ))"
+        r"|what\s+(?:can|could)\s+(?:i|we|this\s+data)\s+(?:tell|show|analyz|generat|explor)"
+        r"|how\s+(?:can|could)\s+(?:i|we)\s+(?:use|analyz|explor)\s+this"
+        r"|tell\s+me\s+(?:about\s+)?(?:this\s+data(?:set|model)?|what\s+insights?)"
+        r"|(?:explore|discover|understand)\s+(?:this\s+)?(?:data(?:set|model)?|schema)"
+        r"|what\s+is\s+(?:in|available\s+in)\s+(?:this\s+)?(?:data(?:set|model)?|schema))\b",
+        re.IGNORECASE,
+    )
+
+    if _META_PATTERNS.search(natural_query):
+        logger.info("plan_node: meta/discovery question detected — answering from schema context")
+        schema_context_for_meta = state.get("schema_context", "(no schema)")
+        domain  = state.get("domain", "") or ""
+        role    = getattr(state.get("config"), "analyst_role", "") or ""
+
+        _META_SYSTEM = (
+            "You are an expert data analyst. The user is asking what insights or analyses "
+            "are possible from a given data model. Based ONLY on the schema context provided "
+            "(table names, columns, data types, sample values, and relationships), enumerate "
+            "the specific, actionable insights and analyses that can be generated.\n\n"
+            "Structure your response as:\n"
+            "1. A one-sentence summary of what this dataset is about.\n"
+            "2. 5–8 specific insight areas (use bold headers), each with 2–3 example questions "
+            "a business user could ask. Ground every example in the actual column/table names "
+            "visible in the schema — do not invent columns.\n"
+            "3. A brief note on any notable metrics, KPIs, or derived calculations the schema "
+            "supports (e.g. growth rates, share, index, ratio).\n\n"
+            "Keep the language business-friendly — no SQL, no technical jargon."
+        )
+
+        domain_line = f"Domain: {domain}\n" if domain else ""
+        role_line   = f"Analyst role context: {role}\n" if role else ""
+        user_msg    = (
+            f"{domain_line}{role_line}"
+            f"Question: {natural_query}\n\n"
+            f"Schema context:\n{schema_context_for_meta}"
+        )
+
+        try:
+            import anthropic as _anthropic
+            _client = _anthropic.Anthropic()
+            _model  = getattr(config, "plan_llm_model", "claude-haiku-4-5-20251001")
+            _resp   = _client.messages.create(
+                model=_model,
+                max_tokens=1024,
+                system=_META_SYSTEM,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            meta_answer = _resp.content[0].text.strip()
+        except Exception as _e:
+            logger.warning("plan_node: meta-question LLM call failed — %s", _e)
+            meta_answer = (
+                "Based on the available schema, this dataset supports analyses across "
+                "the following areas. Please ask a specific question to get started — "
+                "for example: trends over time, top/bottom performers, period-over-period "
+                "comparisons, distribution by dimension, or contribution to totals."
+            )
+
+        state["plan_explanation"] = meta_answer
+        state["sql_queries"]      = []
+        state["phase"]            = "plan"
+        return state
+
     # File-based sources (SQLite / CSV / Excel) load into in-memory SQLite with no schema
     # prefix.  Force empty schema so the LLM and the safety-net qualify step both use
     # bare table names.

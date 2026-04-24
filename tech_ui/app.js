@@ -28,6 +28,7 @@ function switchView(view) {
     redundancy: ['Redundancies',       'Cross-source schema overlap'],
     sql:        ['SQL Console',        'Query any connected source'],
     cdc:        ['Change Log',         'Structural schema change events'],
+    documents:  ['Document Intelligence', 'Unstructured data — semantic fingerprints & cross-modal links'],
   };
   const [title, sub] = titles[view] || ['', ''];
   document.getElementById('topbar-title').textContent = title;
@@ -39,6 +40,7 @@ function switchView(view) {
   if (view === 'redundancy') loadRedundancies();
   if (view === 'sql')        onViewSQL();
   if (view === 'cdc')        loadCDC();
+  if (view === 'documents')  loadDocSources();
 }
 
 function refreshCurrentView() { switchView(_currentView); }
@@ -1600,6 +1602,60 @@ async function loadCDC() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Catalog Excel export
+// ─────────────────────────────────────────────────────────────────────────────
+async function exportCatalogExcel() {
+  if (!_catalogAttrs.length) { toast('Load a table first', 'warn'); return; }
+
+  const tblName = document.getElementById('catalog-tbl-name')?.textContent || 'Catalog';
+  const columns = ['Column', 'Type', 'Statistical Type', 'Semantic Role',
+                   'Distinct', 'Nulls', 'Sample Values', 'PII', 'Flags'];
+  const rows = _catalogAttrs.map(a => {
+    const flags = [];
+    if (a.is_primary_key) flags.push('PK');
+    if (a.is_foreign_key) flags.push('FK');
+    if (a.nullable === false) flags.push('NOT NULL');
+    if (a.is_golden_record) flags.push('Golden');
+    if (a.deleted_from_source) flags.push('Deleted');
+    const piiLabel = a.pii_flag === 'PII'
+      ? (a.pii_type ? `PII · ${a.pii_type.replace(/_/g,' ')}` : 'PII')
+      : (a.pii_flag || '');
+    return [
+      a.column_name || '',
+      a.data_type || '',
+      a.statistical_type || '',
+      a.semantic_role ? a.semantic_role.replace(/_/g,' ') : '',
+      a.unique_count != null ? a.unique_count : '',
+      a.null_count != null ? a.null_count : '',
+      (a.top_values || []).slice(0, 5).join(', '),
+      piiLabel,
+      flags.join(', '),
+    ];
+  });
+
+  try {
+    const resp = await fetch(`${API}/export-excel`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title:   `${tblName} — Data Catalog`,
+        results: [{ description: tblName, columns, rows }],
+      }),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    const blob = await resp.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `catalog_${tblName.replace(/[^a-z0-9]/gi, '_')}_${new Date().toISOString().slice(0,10)}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (e) { toast('Excel export failed: ' + e.message, 'error'); }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Catalog panel resizer
 // ─────────────────────────────────────────────────────────────────────────────
 (function() {
@@ -1635,3 +1691,283 @@ async function init() {
 }
 
 document.addEventListener('DOMContentLoaded', init);
+
+// =============================================================================
+// DOCUMENTS TAB — Unstructured Data Intelligence
+// =============================================================================
+
+const _UNSTRUCTURED = '/unstructured';
+
+let _docSources       = [];
+let _docSelectedSrcId = null;
+let _docSearchTimer   = null;
+
+// ── Source list ──────────────────────────────────────────────────────────────
+
+async function loadDocSources() {
+  try {
+    const sources = await apiFetch(`${_UNSTRUCTURED}/sources`);
+    _docSources = sources || [];
+    _renderDocSourceList();
+  } catch {
+    _renderDocSourceListError();
+  }
+}
+
+function _renderDocSourceList() {
+  const el = document.getElementById('doc-source-list');
+  if (!el) return;
+  if (!_docSources.length) {
+    el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-2);font-size:12px;">No sources yet.<br>Click <b>Add Source</b>.</div>';
+    return;
+  }
+  el.innerHTML = _docSources.map(s => {
+    const sel = s.source_id === _docSelectedSrcId ? 'selected' : '';
+    const lastIdx = s.last_indexed_at
+      ? new Date(s.last_indexed_at).toLocaleDateString()
+      : 'Never indexed';
+    return `<div class="table-list-item ${sel}" onclick="selectDocSource('${s.source_id}')">
+      <div style="font-weight:600;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${_esc(s.name)}</div>
+      <div style="font-size:10px;color:var(--text-2);margin-top:1px">${_esc(s.source_type)} · ${_esc(lastIdx)}</div>
+    </div>`;
+  }).join('');
+}
+
+function _renderDocSourceListError() {
+  const el = document.getElementById('doc-source-list');
+  if (el) el.innerHTML = '<div style="padding:16px;color:var(--accent);font-size:12px;">Could not reach unstructured service</div>';
+}
+
+async function selectDocSource(sourceId) {
+  _docSelectedSrcId = sourceId;
+  _renderDocSourceList();
+  await loadDocAssets(sourceId);
+}
+
+// ── Asset list ───────────────────────────────────────────────────────────────
+
+async function loadDocAssets(sourceId) {
+  const tbody = document.getElementById('doc-asset-body');
+  const badge = document.getElementById('doc-status-badge');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--text-2);">Loading…</td></tr>';
+  closeDocDetail();
+
+  try {
+    const assets = await apiFetch(`${_UNSTRUCTURED}/assets?source_id=${sourceId}&limit=200`);
+    _renderDocAssets(assets || []);
+    if (badge) badge.textContent = `${(assets || []).length} documents`;
+  } catch (e) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--accent);">${_esc(e.message)}</td></tr>`;
+  }
+}
+
+function _renderDocAssets(assets) {
+  const tbody = document.getElementById('doc-asset-body');
+  if (!tbody) return;
+  if (!assets.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-2);">No documents indexed yet. Click <b>Add Source</b> to register a folder and start indexing.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = assets.map(a => {
+    const topics = (a.topics || []).slice(0, 3).map(t => `<span class="top-val-chip">${_esc(t)}</span>`).join('');
+    const piiDot = a.pii_risk ? '<span class="badge badge-pii" style="background:#ff4d4d;color:#fff;font-size:9px;">PII</span>' : '';
+    const sensColor = { public:'badge-green', internal:'badge-gray', confidential:'badge-amber', restricted:'badge-red' };
+    const sensBadge = `<span class="badge ${sensColor[a.sensitivity] || 'badge-gray'}" style="font-size:9px;">${_esc(a.sensitivity || 'internal')}</span>`;
+    const dt = a.indexed_at ? new Date(a.indexed_at).toLocaleDateString() : '—';
+    return `<tr style="cursor:pointer" onclick="openDocDetail('${a.asset_id}')">
+      <td>
+        <div style="font-weight:600;font-size:12px">${_esc(a.title || a.file_name)}</div>
+        <div style="font-size:10px;color:var(--text-2);margin-top:1px">${_esc(a.file_name)} · ${a.size_bytes ? _fmtBytes(a.size_bytes) : '—'}</div>
+      </td>
+      <td><span class="badge badge-gray" style="font-size:9px;text-transform:uppercase">${_esc(a.file_type || '—')}</span></td>
+      <td style="font-size:11px">${_esc(a.domain || '—')}</td>
+      <td><div style="display:flex;flex-wrap:wrap;gap:2px">${topics || '<span class="text-dim">—</span>'}</div></td>
+      <td>${sensBadge}</td>
+      <td>${piiDot || '<span class="text-dim" style="font-size:10px">—</span>'}</td>
+      <td style="font-size:11px;color:var(--text-2)">${dt}</td>
+    </tr>`;
+  }).join('');
+}
+
+function _fmtBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1048576).toFixed(1) + ' MB';
+}
+
+// ── Asset detail drawer ───────────────────────────────────────────────────────
+
+async function openDocDetail(assetId) {
+  const drawer = document.getElementById('doc-detail-drawer');
+  if (!drawer) return;
+  drawer.style.display = 'block';
+  document.getElementById('doc-detail-title').textContent = 'Loading…';
+  document.getElementById('doc-detail-meta').textContent  = '';
+  document.getElementById('doc-detail-summary').textContent = '';
+  document.getElementById('doc-detail-topics').innerHTML  = '';
+  document.getElementById('doc-detail-entities').innerHTML = '';
+  document.getElementById('doc-detail-links').innerHTML   = 'Loading…';
+
+  try {
+    const [asset, linkData] = await Promise.all([
+      apiFetch(`${_UNSTRUCTURED}/assets/${assetId}`),
+      apiFetch(`${_UNSTRUCTURED}/assets/${assetId}/links`).catch(() => ({ links: [] })),
+    ]);
+
+    document.getElementById('doc-detail-title').textContent =
+      asset.title || asset.file_name;
+    document.getElementById('doc-detail-meta').textContent =
+      [asset.doc_type, asset.domain, asset.language,
+       asset.page_count ? `${asset.page_count} pages` : null,
+       asset.indexed_at ? new Date(asset.indexed_at).toLocaleDateString() : null]
+      .filter(Boolean).join(' · ');
+    document.getElementById('doc-detail-summary').textContent =
+      asset.summary || 'No summary available.';
+
+    // Topics
+    const topicsEl = document.getElementById('doc-detail-topics');
+    topicsEl.innerHTML = (asset.topics || []).length
+      ? asset.topics.map(t => `<span class="top-val-chip">${_esc(t)}</span>`).join('')
+      : '<span class="text-dim">—</span>';
+
+    // Named entities
+    const ents = asset.named_entities || {};
+    const entLines = [];
+    if ((ents.kpis || []).length)           entLines.push(`<b>KPIs:</b> ${_esc(ents.kpis.join(', '))}`);
+    if ((ents.organizations || []).length)  entLines.push(`<b>Orgs:</b> ${_esc(ents.organizations.join(', '))}`);
+    if ((ents.products || []).length)       entLines.push(`<b>Products:</b> ${_esc(ents.products.join(', '))}`);
+    if ((ents.geographies || []).length)    entLines.push(`<b>Geo:</b> ${_esc(ents.geographies.join(', '))}`);
+    if ((ents.people || []).length)         entLines.push(`<b>People:</b> ${_esc(ents.people.join(', '))}`);
+    document.getElementById('doc-detail-entities').innerHTML =
+      entLines.join('<br>') || '<span class="text-dim">—</span>';
+
+    // Cross-modal links
+    const links = (linkData.links || []).filter(l => l.confidence >= 0.6);
+    const linksEl = document.getElementById('doc-detail-links');
+    if (!links.length) {
+      linksEl.innerHTML = '<span class="text-dim">No links detected</span>';
+    } else {
+      linksEl.innerHTML = links.slice(0, 8).map(l => {
+        const conf = Math.round(l.confidence * 100);
+        const color = l.rel_type === 'DESCRIBES_KPI' ? 'badge-blue'
+                    : l.rel_type === 'REFERENCES_TABLE' ? 'badge-amber'
+                    : 'badge-gray';
+        return `<div style="margin-bottom:4px">
+          <span class="badge ${color}" style="font-size:9px;">${_esc(l.rel_type.replace(/_/g,' '))}</span>
+          <span style="font-size:11px;color:var(--text-2);margin-left:4px">${_esc(l.basis.split('→')[1] || l.to_nanite_id || l.to_asset_id || '')} <span style="opacity:.6">${conf}%</span></span>
+        </div>`;
+      }).join('');
+    }
+  } catch (e) {
+    document.getElementById('doc-detail-title').textContent = 'Error loading document';
+    document.getElementById('doc-detail-summary').textContent = e.message;
+  }
+}
+
+function closeDocDetail() {
+  const drawer = document.getElementById('doc-detail-drawer');
+  if (drawer) drawer.style.display = 'none';
+}
+
+// ── Search ────────────────────────────────────────────────────────────────────
+
+function docSearchDebounced(value) {
+  clearTimeout(_docSearchTimer);
+  if (!value || value.length < 2) {
+    if (_docSelectedSrcId) loadDocAssets(_docSelectedSrcId);
+    return;
+  }
+  _docSearchTimer = setTimeout(() => docSearch(value), 400);
+}
+
+async function docSearch(q) {
+  const badge = document.getElementById('doc-status-badge');
+  try {
+    const data = await apiFetch(`${_UNSTRUCTURED}/search?q=${encodeURIComponent(q)}`);
+    _renderDocAssets(data.results || []);
+    if (badge) badge.textContent = `${(data.results || []).length} results for "${q}"`;
+  } catch (e) {
+    toast('Document search failed: ' + e.message, 'error');
+  }
+}
+
+// ── Add Document Source Modal ─────────────────────────────────────────────────
+
+function openAddDocSourceModal() {
+  // Populate nanite source select
+  const sel = document.getElementById('doc-src-nanite-id');
+  if (sel) {
+    sel.innerHTML = '<option value="">— none —</option>' +
+      _sources.map(s => `<option value="${s.id}">${_esc(s.name || s.id)}</option>`).join('');
+  }
+  const overlay = document.getElementById('doc-source-modal-overlay');
+  if (overlay) { overlay.style.display = 'flex'; }
+}
+
+function closeDocSourceModal(e) {
+  if (e && e.target !== document.getElementById('doc-source-modal-overlay')) return;
+  const overlay = document.getElementById('doc-source-modal-overlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function onDocSrcTypeChange(/* type */) {
+  // Future: toggle connection fields per source type
+}
+
+async function submitDocSource() {
+  const name     = document.getElementById('doc-src-name')?.value.trim();
+  const type     = document.getElementById('doc-src-type')?.value || 'local';
+  const path     = document.getElementById('doc-src-path')?.value.trim();
+  const domain   = document.getElementById('doc-src-domain')?.value.trim();
+  const naniteId = document.getElementById('doc-src-nanite-id')?.value || null;
+
+  if (!name)  { toast('Source name is required', 'warn'); return; }
+  if (!path)  { toast('Folder path is required', 'warn');  return; }
+
+  try {
+    const source = await apiFetch(`${_UNSTRUCTURED}/sources`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        source_type: type,
+        connection:  { path },
+        nanite_source_id: naniteId || null,
+        domain: domain || '',
+      }),
+    });
+
+    closeDocSourceModal();
+    toast(`Source "${name}" registered. Starting index…`, 'info');
+    await loadDocSources();
+
+    // Kick off initial index
+    await apiFetch(`${_UNSTRUCTURED}/sources/${source.source_id}/index`, { method: 'POST' });
+    _docSelectedSrcId = source.source_id;
+    _renderDocSourceList();
+    _pollDocJob(source.source_id);
+  } catch (e) {
+    toast('Failed to register source: ' + e.message, 'error');
+  }
+}
+
+async function _pollDocJob(sourceId) {
+  const badge = document.getElementById('doc-status-badge');
+  const start = Date.now();
+  while (Date.now() - start < 300000) {  // max 5 min poll
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const jobs = await apiFetch(`${_UNSTRUCTURED}/sources/${sourceId}/jobs`);
+      const latest = (jobs || [])[0];
+      if (!latest) break;
+      if (badge) badge.textContent = `Indexing… ${latest.processed}/${latest.total_files} files`;
+      if (latest.status === 'done' || latest.status === 'done_with_errors') {
+        const msg = `Indexed ${latest.enriched} documents`;
+        if (badge) badge.textContent = msg;
+        toast(msg + (latest.errors ? ` (${latest.errors} errors)` : ''), latest.errors ? 'warn' : 'info');
+        await loadDocAssets(sourceId);
+        break;
+      }
+    } catch { break; }
+  }
+}

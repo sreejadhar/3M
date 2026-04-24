@@ -218,7 +218,8 @@ METADATA_API = os.environ.get("METADATA_API_URL", "http://localhost:8000")
 ONTOLOGY_API = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001")
 KG_API       = os.environ.get("KG_API_URL",       "http://localhost:8002")
 DIALOG_API   = os.environ.get("DIALOG_API_URL",   "http://localhost:8003")
-SHACL_API    = os.environ.get("SHACL_API_URL",    "http://localhost:8007")
+SHACL_API          = os.environ.get("SHACL_API_URL",          "http://localhost:8007")
+UNSTRUCTURED_API   = os.environ.get("UNSTRUCTURED_API_URL",   "http://localhost:8008")
 
 # ── Neo4j persistence ──────────────────────────────────────────────────────────
 # KG nodes/edges are persisted to Neo4j only in production (APP_ENV=production)
@@ -3470,6 +3471,39 @@ async def export_excel(req: ExcelExportRequest):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ── Unstructured agent proxy routes ──────────────────────────────────────────
+# Two additive routes that forward /unstructured/* to the unstructured service.
+# All other orchestrator routes and data are untouched.
+
+@app.api_route("/unstructured/{path:path}",
+               methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_unstructured(request: Request, path: str):
+    """Forward /unstructured/{path} → UNSTRUCTURED_API/{path}."""
+    body = await request.body()
+    qs   = f"?{request.url.query}" if request.url.query else ""
+    fwd_headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in _HOP_HEADERS and k.lower() != "host"}
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.request(
+                method=request.method,
+                url=f"{UNSTRUCTURED_API}/{path}{qs}",
+                headers=fwd_headers,
+                content=body,
+            )
+        resp_headers = {k: v for k, v in resp.headers.items()
+                        if k.lower() not in _HOP_HEADERS}
+        from fastapi.responses import Response as _Resp
+        return _Resp(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"Unstructured service unavailable: {exc}")
 
 
 # ── /api/* compatibility shim ─────────────────────────────────────────────────

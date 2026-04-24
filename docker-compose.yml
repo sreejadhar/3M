@@ -151,7 +151,8 @@ services:
       ONTOLOGY_API_URL: "http://ontology-api:8001"
       KG_API_URL:       "http://kg-api:8002"
       DIALOG_API_URL:   "http://dialog-api:8003"
-      SHACL_API_URL:    "http://shacl-api:8007"
+      SHACL_API_URL:          "http://shacl-api:8007"
+      UNSTRUCTURED_API_URL:   "http://unstructured-api:8008"
       LOG_LEVEL:        "${LOG_LEVEL:-info}"
       METADATA_DB:      "/data/metadata.db"
       KG_STORE_DB:      "/data/kg_store.db"
@@ -264,11 +265,41 @@ services:
     networks:
       - metadata-net
 
+  unstructured-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.unstructured
+    image: metadata-unstructured-api:latest
+    container_name: metadata-unstructured-api
+    restart: unless-stopped
+    ports:
+      - "${UNSTRUCTURED_PORT:-8008}:8008"
+    volumes:
+      - unstructured_data:/data
+    environment:
+      ANTHROPIC_API_KEY:   "${ANTHROPIC_API_KEY}"
+      UNSTRUCTURED_DB:     "/data/unstructured.db"
+      METADATA_API_URL:    "http://metadata-agent-api:8000"
+      UNSTRUCTURED_PORT:   "8008"
+      UNSTRUCTURED_WORKERS: "${UNSTRUCTURED_WORKERS:-4}"
+      LOG_LEVEL:           "${LOG_LEVEL:-info}"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8008/health', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - metadata-net
+
 # ── Named volume so reports persist across container restarts ─────────────────
 volumes:
   reports_data:
     driver: local
   metadata_catalog_data:
+    driver: local
+  unstructured_data:
     driver: local
 
 # ── Internal network — UI reaches API via service name, not localhost ─────────

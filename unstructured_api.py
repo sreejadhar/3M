@@ -21,6 +21,12 @@ GET  /assets                          list all indexed assets  (?source_id, ?enr
 GET  /assets/{id}                     get asset detail + topics/entities
 GET  /assets/{id}/links               get cross-modal relationships for asset
 GET  /search                          full-text search over title+summary+topics (?q)
+POST /query                           cross-modal query (question + kpi_names)
+
+Google Drive auth (OAuth2)
+--------------------------
+GET  /auth/google/url                 generate OAuth2 consent URL
+POST /auth/google/token               exchange auth code → save token to disk
 
 Environment variables
 ---------------------
@@ -29,6 +35,8 @@ METADATA_API_URL     upstream metadata service  (default: http://localhost:8000)
 ANTHROPIC_API_KEY    required for LLM extraction
 UNSTRUCTURED_PORT    port to bind               (default: 8008)
 UNSTRUCTURED_WORKERS parallel indexing threads  (default: 4)
+GDRIVE_TOKEN_DIR     directory to store OAuth2 tokens (default: data/gdrive_tokens)
+GDRIVE_CLIENT_SECRETS path to OAuth2 client secrets JSON from Google Cloud Console
 """
 from __future__ import annotations
 
@@ -55,9 +63,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_DB_PATH     = os.environ.get("UNSTRUCTURED_DB", "data/unstructured.db")
-_METADATA_API = os.environ.get("METADATA_API_URL", "http://localhost:8000")
-_PORT        = int(os.environ.get("UNSTRUCTURED_PORT", "8008"))
+_DB_PATH          = os.environ.get("UNSTRUCTURED_DB",        "data/unstructured.db")
+_METADATA_API     = os.environ.get("METADATA_API_URL",       "http://localhost:8000")
+_PORT             = int(os.environ.get("UNSTRUCTURED_PORT",  "8008"))
+_GDRIVE_TOKEN_DIR = os.environ.get("GDRIVE_TOKEN_DIR",       "data/gdrive_tokens")
+_GDRIVE_SECRETS   = os.environ.get("GDRIVE_CLIENT_SECRETS",  "")
+
+Path(_GDRIVE_TOKEN_DIR).mkdir(parents=True, exist_ok=True)
 
 store = UnstructuredStore(_DB_PATH)
 
@@ -233,6 +245,119 @@ def search(q: str = Query(..., min_length=2), limit: int = Query(20, le=100)):
         logger.warning("FTS search failed: %s", exc)
         results = []
     return {"query": q, "results": results, "count": len(results)}
+
+
+# ── Google Drive OAuth2 ───────────────────────────────────────────────────────
+
+_GDRIVE_SCOPES    = ["https://www.googleapis.com/auth/drive.readonly"]
+_GDRIVE_AUTH_URI  = "https://accounts.google.com/o/oauth2/auth"
+_GDRIVE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+class GoogleTokenRequest(BaseModel):
+    auth_code:     str
+    redirect_uri:  str = "urn:ietf:wg:oauth:2.0:oob"
+    token_name:    str = "default"   # logical name — token saved as {token_name}.json
+
+
+@app.get("/auth/google/url")
+def gdrive_auth_url(
+    redirect_uri: str = "urn:ietf:wg:oauth:2.0:oob",
+    token_name: str = "default",
+):
+    """
+    Generate a Google OAuth2 consent URL.
+
+    Steps:
+      1. GET /auth/google/url  → copy the 'url' from the response
+      2. Open the URL in a browser, sign in, grant read-only Drive access
+      3. Copy the authorisation code Google shows
+      4. POST /auth/google/token {auth_code, redirect_uri, token_name}
+      5. Register a source with source_type='gdrive',
+         connection.token_path = the path returned by step 4
+    """
+    if not _GDRIVE_SECRETS:
+        raise HTTPException(
+            400,
+            "GDRIVE_CLIENT_SECRETS env var not set. "
+            "Download OAuth2 client secrets JSON from Google Cloud Console and "
+            "set GDRIVE_CLIENT_SECRETS=/path/to/client_secrets.json"
+        )
+    try:
+        from google_auth_oauthlib.flow import Flow  # type: ignore
+    except ImportError:
+        raise HTTPException(500, "google-auth-oauthlib not installed")
+
+    flow = Flow.from_client_secrets_file(
+        _GDRIVE_SECRETS,
+        scopes=_GDRIVE_SCOPES,
+        redirect_uri=redirect_uri,
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    token_path = str(Path(_GDRIVE_TOKEN_DIR) / f"{token_name}.json")
+    return {
+        "url":          auth_url,
+        "instructions": (
+            "1. Open the URL in a browser and sign in with your Google account. "
+            "2. Grant 'View files from Google Drive' access. "
+            "3. Copy the authorisation code shown. "
+            "4. POST /auth/google/token with {auth_code, redirect_uri, token_name}."
+        ),
+        "token_will_be_saved_to": token_path,
+    }
+
+
+@app.post("/auth/google/token")
+def gdrive_exchange_token(req: GoogleTokenRequest):
+    """
+    Exchange an OAuth2 authorisation code for a refresh token and save it.
+    After this call, register a source with:
+      source_type = 'gdrive'
+      connection  = { 'folder_id': '...', 'token_path': '<returned path>' }
+    """
+    if not _GDRIVE_SECRETS:
+        raise HTTPException(400, "GDRIVE_CLIENT_SECRETS env var not set")
+    try:
+        from google_auth_oauthlib.flow import Flow  # type: ignore
+    except ImportError:
+        raise HTTPException(500, "google-auth-oauthlib not installed")
+
+    try:
+        flow = Flow.from_client_secrets_file(
+            _GDRIVE_SECRETS,
+            scopes=_GDRIVE_SCOPES,
+            redirect_uri=req.redirect_uri,
+        )
+        flow.fetch_token(code=req.auth_code)
+        creds = flow.credentials
+    except Exception as exc:
+        raise HTTPException(400, f"Token exchange failed: {exc}")
+
+    token_path = str(Path(_GDRIVE_TOKEN_DIR) / f"{req.token_name}.json")
+    import json
+    with open(token_path, "w") as f:
+        json.dump({
+            "token":         creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri":     creds.token_uri,
+            "client_id":     creds.client_id,
+            "client_secret": creds.client_secret,
+            "scopes":        list(creds.scopes or _GDRIVE_SCOPES),
+        }, f)
+
+    return {
+        "status":     "token saved",
+        "token_path": token_path,
+        "next_step":  (
+            f"Register a source: POST /sources with "
+            f"source_type='gdrive', "
+            f"connection={{folder_id:'<your folder id>',token_path:'{token_path}'}}"
+        ),
+    }
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────

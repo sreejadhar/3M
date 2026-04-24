@@ -131,6 +131,10 @@ def run_index_job(job_id: str, source_id: str, store: UnstructuredStore,
         for _ in as_completed(futures):
             pass  # progress tracked inside _process_one
 
+    # Clean up temp files created by cloud connectors (e.g. gdrive downloads)
+    if hasattr(connector, "cleanup"):
+        connector.cleanup()
+
     store.touch_source_indexed(source_id)
     store.update_job(
         job_id,

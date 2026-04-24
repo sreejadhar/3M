@@ -3,16 +3,25 @@ File connectors for the unstructured data intelligence agent.
 
 Each connector enumerates a source, produces FileManifest records,
 and computes content-based checksums for change detection.
+
+Supported connectors:
+  local      — local filesystem / NFS mount
+  gdrive     — Google Drive folder (OAuth2 or Service Account)
 """
 from __future__ import annotations
 
 import hashlib
+import io
+import logging
 import mimetypes
 import os
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -128,5 +137,257 @@ def make_connector(source_type: str, connection: dict):
             max_size_mb=connection.get("max_size_mb", 200),
             extensions=connection.get("extensions"),
         )
-    raise ValueError(f"Unsupported source type: {source_type!r}. "
-                     "Supported: local. (s3/gcs/azure in a future release)")
+    if source_type == "gdrive":
+        return GoogleDriveConnector(
+            folder_id=connection["folder_id"],
+            token_path=connection.get("token_path"),
+            service_account_json=connection.get("service_account_json"),
+            max_size_mb=connection.get("max_size_mb", 200),
+        )
+    raise ValueError(
+        f"Unsupported source type: {source_type!r}. Supported: local, gdrive."
+    )
+
+
+# ── Google Drive connector ────────────────────────────────────────────────────
+
+# Google Drive MIME types that map to exportable Office formats
+_GDRIVE_EXPORT_MAP = {
+    "application/vnd.google-apps.document":
+        ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"),
+    "application/vnd.google-apps.presentation":
+        ("application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"),
+    "application/vnd.google-apps.spreadsheet":
+        ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"),
+}
+
+# Native Drive MIME → extension
+_GDRIVE_NATIVE_EXT = {
+    "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "text/plain": ".txt",
+    "text/html": ".html",
+    "text/markdown": ".md",
+    "text/csv": ".csv",
+}
+
+_GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+
+def _build_gdrive_creds(token_path: Optional[str],
+                         service_account_json: Optional[str]):
+    """
+    Build Google API credentials from either:
+      - service_account_json: path to a service account key JSON file
+      - token_path: path to an OAuth2 token JSON file (generated via auth flow)
+    """
+    try:
+        from google.oauth2 import service_account
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+    except ImportError:
+        raise ImportError(
+            "google-api-python-client and google-auth are required for Google Drive. "
+            "Run: pip install google-api-python-client google-auth google-auth-oauthlib"
+        )
+
+    if service_account_json:
+        return service_account.Credentials.from_service_account_file(
+            service_account_json, scopes=_GDRIVE_SCOPES
+        )
+
+    if token_path and Path(token_path).exists():
+        import json
+        with open(token_path) as f:
+            token_data = json.load(f)
+        creds = Credentials(
+            token=token_data.get("token"),
+            refresh_token=token_data.get("refresh_token"),
+            token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+            client_id=token_data.get("client_id"),
+            client_secret=token_data.get("client_secret"),
+            scopes=token_data.get("scopes", _GDRIVE_SCOPES),
+        )
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            # Persist refreshed token
+            _save_token(token_path, creds)
+        return creds
+
+    raise ValueError(
+        "Google Drive connector requires either 'service_account_json' or "
+        "'token_path' in the connection config."
+    )
+
+
+def _save_token(token_path: str, creds) -> None:
+    import json
+    data = {
+        "token":         creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri":     creds.token_uri,
+        "client_id":     creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes":        list(creds.scopes or _GDRIVE_SCOPES),
+    }
+    with open(token_path, "w") as f:
+        json.dump(data, f)
+
+
+class GoogleDriveConnector:
+    """
+    Enumerates files from a Google Drive folder recursively.
+
+    Change detection uses md5Checksum from Drive API metadata — no content
+    download needed to detect unchanged files.
+
+    Files are downloaded to a NamedTemporaryFile during enumeration; the
+    temp file path is returned in FileManifest.path and is valid for the
+    duration of the pipeline run. The pipeline must NOT cache these paths
+    across runs.
+
+    Authentication:
+      service_account_json — path to GCP service account key JSON
+                             (best for shared drives / workspace)
+      token_path           — path to OAuth2 token JSON
+                             (for personal Google Drive)
+    """
+
+    def __init__(self, folder_id: str,
+                 token_path: Optional[str] = None,
+                 service_account_json: Optional[str] = None,
+                 max_size_mb: int = 200) -> None:
+        self.folder_id       = folder_id
+        self.token_path      = token_path
+        self.service_account_json = service_account_json
+        self.max_size_bytes  = max_size_mb * 1024 * 1024
+        self._tmp_files: List[str] = []   # track for cleanup
+
+    def enumerate(self) -> Generator[FileManifest, None, None]:
+        try:
+            from googleapiclient.discovery import build
+            from googleapiclient.http import MediaIoBaseDownload
+        except ImportError:
+            raise ImportError(
+                "google-api-python-client required. "
+                "Run: pip install google-api-python-client google-auth google-auth-oauthlib"
+            )
+
+        creds   = _build_gdrive_creds(self.token_path, self.service_account_json)
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        yield from self._enumerate_folder(service, self.folder_id)
+
+    def _enumerate_folder(self, service, folder_id: str,
+                           ) -> Generator[FileManifest, None, None]:
+        """Recursively enumerate a Drive folder."""
+        from googleapiclient.http import MediaIoBaseDownload
+
+        page_token = None
+        while True:
+            resp = service.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                spaces="drive",
+                fields="nextPageToken, files(id,name,mimeType,size,md5Checksum,"
+                       "createdTime,modifiedTime)",
+                pageToken=page_token,
+                pageSize=100,
+            ).execute()
+
+            for item in resp.get("files", []):
+                mime   = item.get("mimeType", "")
+                name   = item.get("name", "")
+
+                # Recurse into subfolders
+                if mime == "application/vnd.google-apps.folder":
+                    yield from self._enumerate_folder(service, item["id"])
+                    continue
+
+                if _is_junk(name):
+                    continue
+
+                size = int(item.get("size") or 0)
+                if size > self.max_size_bytes:
+                    logger.debug("gdrive: skip large file %s (%d bytes)", name, size)
+                    continue
+
+                # Determine download MIME and extension
+                if mime in _GDRIVE_EXPORT_MAP:
+                    dl_mime, ext = _GDRIVE_EXPORT_MAP[mime]
+                    is_export = True
+                elif mime in _GDRIVE_NATIVE_EXT:
+                    dl_mime = mime
+                    ext = _GDRIVE_NATIVE_EXT[mime]
+                    is_export = False
+                else:
+                    # Try to infer extension from filename
+                    ext = Path(name).suffix.lower()
+                    if ext not in _SUPPORTED_EXTENSIONS:
+                        logger.debug("gdrive: skip unsupported mime %s for %s", mime, name)
+                        continue
+                    dl_mime = mime
+                    is_export = False
+
+                # Use Drive md5Checksum as change-detection hash (free — no download)
+                checksum = "md5:" + item.get("md5Checksum", item["id"])
+
+                # Download to temp file
+                try:
+                    tmp = self._download(
+                        service, item["id"], dl_mime, is_export, ext
+                    )
+                except Exception as exc:
+                    logger.warning("gdrive: download failed for %s: %s", name, exc)
+                    continue
+
+                fname = Path(name).stem + ext  # normalise extension
+                yield FileManifest(
+                    path=tmp,
+                    source_type="gdrive",
+                    file_name=fname,
+                    size_bytes=os.path.getsize(tmp),
+                    mime_type=dl_mime,
+                    checksum=checksum,
+                    created_at=item.get("createdTime"),
+                    modified_at=item.get("modifiedTime"),
+                )
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    def _download(self, service, file_id: str, mime: str,
+                  is_export: bool, ext: str) -> str:
+        """Download a Drive file to a named temp file. Returns the temp path."""
+        from googleapiclient.http import MediaIoBaseDownload
+
+        buf = io.BytesIO()
+        if is_export:
+            req = service.files().export_media(fileId=file_id, mimeType=mime)
+        else:
+            req = service.files().get_media(fileId=file_id)
+
+        dl = MediaIoBaseDownload(buf, req, chunksize=4 * 1024 * 1024)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+
+        suffix = ext if ext.startswith(".") else f".{ext}"
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=suffix, prefix="nanite_gdrive_"
+        )
+        tmp.write(buf.getvalue())
+        tmp.close()
+        self._tmp_files.append(tmp.name)
+        return tmp.name
+
+    def cleanup(self) -> None:
+        """Delete temp files created during enumeration."""
+        for path in self._tmp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._tmp_files.clear()

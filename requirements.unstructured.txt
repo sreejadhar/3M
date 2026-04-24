@@ -17,4 +17,10 @@ lxml>=5.0.0                   # fast HTML parser backend for BeautifulSoup
 # pdf2image>=1.16.0           # converts PDF pages to images (requires poppler)
 # pytesseract>=0.3.10         # OCR wrapper for Tesseract (requires tesseract-ocr system package)
 
+# Google Drive connector
+google-api-python-client>=2.100.0
+google-auth>=2.22.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.2.0
+
 # SQLite is stdlib — no extra driver needed

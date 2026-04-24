@@ -62,6 +62,7 @@ class DialogState(TypedDict, total=False):
     # Output
     insights: str                      # LLM-derived narrative
     plan_explanation: str              # prose from plan LLM when it returns [] (unanswerable)
+    doc_context: str                   # supporting document context from unstructured service
 
     errors: List[str]
     phase: str                         # understand | plan | execute | synthesize | done | error

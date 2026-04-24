@@ -92,8 +92,9 @@ services:
     volumes:
       - reports_data:/data/reports
     environment:
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
-      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      ANTHROPIC_API_KEY:      "${ANTHROPIC_API_KEY}"
+      LOG_LEVEL:              "${LOG_LEVEL:-info}"
+      UNSTRUCTURED_API_URL:   "http://unstructured-api:8008"
       # Controls which LLM synthesize_node uses for insight generation:
       #   development → claude-haiku (cheap, fast iteration)
       #   production  → claude-sonnet (quality, default)

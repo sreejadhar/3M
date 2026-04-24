@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from unstructured_agent.store import UnstructuredStore
 from unstructured_agent.pipeline import run_index_job
+from unstructured_agent.query import query_for_context
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -85,6 +86,11 @@ class CreateSourceRequest(BaseModel):
     connection: Dict[str, Any] = {}    # source_type-specific config
     nanite_source_id: Optional[str] = None
     domain: str = ""
+
+
+class QueryRequest(BaseModel):
+    question: str
+    kpi_names: List[str] = []          # KPI names extracted from the structured answer
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -185,6 +191,36 @@ def get_asset_links(asset_id: str):
         "title":    asset.get("title", ""),
         "links":    store.get_relationships(asset_id),
     }
+
+
+# ── Cross-modal query ─────────────────────────────────────────────────────────
+
+@app.post("/query")
+def cross_modal_query(req: QueryRequest):
+    """
+    Given a natural-language question and optional KPI names from a structured
+    answer, return the most relevant document context as a formatted markdown
+    block. Used by synthesize_node to enrich structured insights with document
+    evidence.
+
+    Returns {"doc_context": "<markdown>", "doc_count": N} or
+            {"doc_context": null, "doc_count": 0} when nothing relevant found.
+    """
+    if not req.question.strip():
+        raise HTTPException(400, "question must not be empty")
+    try:
+        ctx = query_for_context(
+            question=req.question,
+            kpi_names=req.kpi_names,
+            store=store,
+        )
+    except Exception as exc:
+        logger.warning("cross_modal_query failed: %s", exc)
+        ctx = None
+
+    # Count how many doc blocks are in the context (each ends with a blank line)
+    doc_count = ctx.count("\n\n") + 1 if ctx else 0
+    return {"doc_context": ctx, "doc_count": doc_count}
 
 
 # ── Search ────────────────────────────────────────────────────────────────────

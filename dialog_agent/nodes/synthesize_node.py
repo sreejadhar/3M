@@ -43,8 +43,12 @@ import os
 import re
 from typing import List, Optional
 
+import httpx
+
 from ..state import DialogState, QueryResult
 from ..token_guard import estimate_tokens, guard_synth_sections
+
+_UNSTRUCTURED_API = os.environ.get("UNSTRUCTURED_API_URL", "http://localhost:8008")
 
 logger = logging.getLogger(__name__)
 
@@ -473,6 +477,51 @@ def _log_cost(node: str, model: str, usage) -> None:
     )
 
 
+def _extract_kpi_names(state: DialogState) -> List[str]:
+    """
+    Collect KPI names relevant to this query from two sources:
+      1. active_kpis loaded for this session
+      2. Column names from query results that look like metrics
+    """
+    names: List[str] = []
+    for kpi in (state.get("active_kpis") or []):
+        name = kpi.get("kpi_name") or kpi.get("name") or ""
+        if name:
+            names.append(name)
+    for qr in (state.get("query_results") or []):
+        for col in (qr.get("columns") or []):
+            col_str = str(col).lower()
+            # Heuristic: metric column names contain common KPI keywords
+            if any(kw in col_str for kw in (
+                "revenue", "rsv", "gsv", "nsv", "nsr", "margin", "spend",
+                "volume", "price", "discount", "trade", "promo", "lift",
+                "growth", "share", "rate", "ratio", "index", "nii", "nii",
+                "profit", "cost", "income", "sales", "ebitda", "roi",
+            )):
+                names.append(str(col))
+    return list(dict.fromkeys(names))  # deduplicate preserving order
+
+
+def _fetch_doc_context(question: str, kpi_names: List[str]) -> Optional[str]:
+    """
+    Call the unstructured service /query endpoint.
+    Returns the formatted markdown context string, or None if unavailable.
+    Silently suppresses all errors — the structured answer is never degraded.
+    """
+    try:
+        resp = httpx.post(
+            f"{_UNSTRUCTURED_API}/query",
+            json={"question": question, "kpi_names": kpi_names},
+            timeout=5.0,
+        )
+        if resp.is_success:
+            data = resp.json()
+            return data.get("doc_context")
+    except Exception as exc:
+        logger.debug("synthesize_node: unstructured query skipped — %s", exc)
+    return None
+
+
 def _call_llm(system: str, user: str, model: str, temperature: float) -> str:
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
@@ -582,10 +631,23 @@ def synthesize_node(state: DialogState) -> DialogState:
         state["errors"].append(f"synthesize_node: {exc}")
 
     # ── Append programmatic ## Data section ───────────────────────────────────
-    # Ensures data tables are always present, consistently formatted, and
-    # independently of what the LLM chose to include in its prose.
     data_section = _build_data_section(query_results)
     insights = llm_output.rstrip() + data_section
+
+    # ── Cross-modal: fetch supporting document context ─────────────────────
+    # Runs after structured synthesis; never delays or degrades the answer.
+    kpi_names   = _extract_kpi_names(state)
+    doc_context = _fetch_doc_context(natural_query, kpi_names)
+    if doc_context:
+        insights = (
+            insights.rstrip()
+            + "\n\n---\n## Supporting Context from Documents\n"
+            + doc_context
+        )
+        state["doc_context"] = doc_context
+        logger.info("synthesize_node: appended document context (%d chars)", len(doc_context))
+    else:
+        state["doc_context"] = ""
 
     state["insights"] = insights
     state["phase"] = "synthesize"

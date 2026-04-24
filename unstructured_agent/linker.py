@@ -23,6 +23,8 @@ from .store import UnstructuredStore
 
 logger = logging.getLogger(__name__)
 
+import time
+
 _METADATA_API = "http://localhost:8000"   # override via METADATA_API_URL env var
 
 # Confidence thresholds
@@ -30,6 +32,16 @@ _KG_WRITE_THRESHOLD   = 0.80   # written to KG immediately
 _STORE_THRESHOLD      = 0.60   # stored in SQLite for review, not in KG
 _DOC_SIM_THRESHOLD    = 0.85   # cosine similarity for SIMILAR_TOPIC edges
 _DOC_SIM_WEAK         = 0.70   # stored as WEAKLY_SIMILAR (not surfaced in UI)
+
+# Metric semantic roles that qualify as KPI candidates when KPI store is empty
+_METRIC_ROLES = frozenset({
+    "measure", "metric", "kpi", "measure_calculated",
+    "calculated_measure", "fact", "amount",
+})
+
+# Module-level cache: avoids N+1 attribute fetches on every document in a run
+_attr_cache: Dict[str, Any] = {}   # key: metadata_api url → {ts, kpis}
+_CACHE_TTL = 300                   # seconds — one indexing run shares one fetch
 
 
 # ── Fuzzy match (same 3-strategy algorithm as resolve_node.py) ────────────────
@@ -97,22 +109,99 @@ def _fuzzy_score(candidate: str, query_tokens: List[str]) -> float:
 
 # ── KPI link detection ────────────────────────────────────────────────────────
 
+def _fetch_kpi_candidates(metadata_api: str) -> List[Dict]:
+    """
+    Build a unified KPI candidate list from two sources:
+      1. KPI store  (GET /kpis)              — explicitly defined business KPIs
+      2. Metric attributes (GET /metadata/entities + detail) — columns whose
+         semantic_role is measure/metric/kpi, inferred by taxonomy enrichment
+
+    Result is cached for _CACHE_TTL seconds so all documents in one indexing
+    run share a single round of API calls (avoids N+1 per document).
+
+    Each candidate:
+      {"kpi_id": str, "kpi_name": str, "nl_formula": str, "source": "kpi_store"|"attribute"}
+    """
+    cached = _attr_cache.get(metadata_api)
+    if cached and (time.time() - cached["ts"]) < _CACHE_TTL:
+        return cached["kpis"]
+
+    candidates: List[Dict] = []
+
+    # Source 1 — KPI store
+    try:
+        resp = httpx.get(f"{metadata_api}/kpis", timeout=5)
+        if resp.is_success:
+            for k in (resp.json() or []):
+                candidates.append({
+                    "kpi_id":    str(k.get("kpi_id", "")),
+                    "kpi_name":  k.get("kpi_name", ""),
+                    "nl_formula": k.get("nl_formula", "") or k.get("description", ""),
+                    "source":    "kpi_store",
+                })
+    except Exception as exc:
+        logger.debug("KPI store fetch failed: %s", exc)
+
+    # Source 2 — metric attributes from catalog (fallback when KPI store empty,
+    # or always — both sources are merged and deduplicated)
+    try:
+        ent_resp = httpx.get(f"{metadata_api}/metadata/entities", timeout=5)
+        entities = ent_resp.json() if ent_resp.is_success else []
+        for entity in entities:
+            eid = entity.get("metadata_id") or entity.get("entity_id", "")
+            tbl = entity.get("table_name", "")
+            try:
+                detail = httpx.get(
+                    f"{metadata_api}/metadata/entities/{eid}", timeout=5
+                ).json()
+                for attr in (detail.get("attributes") or []):
+                    role = (attr.get("semantic_role") or "").lower()
+                    if role not in _METRIC_ROLES:
+                        continue
+                    col   = attr.get("column_name", "")
+                    desc  = attr.get("description", "")
+                    aid   = str(attr.get("attr_id", f"{eid}:{col}"))
+                    # Avoid duplicating what KPI store already has
+                    if any(c["kpi_name"].lower() == col.lower()
+                           for c in candidates):
+                        continue
+                    candidates.append({
+                        "kpi_id":    aid,
+                        "kpi_name":  col,
+                        "nl_formula": desc or f"{col} from {tbl}",
+                        "source":    "attribute",
+                    })
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.debug("Metric attribute fetch failed: %s", exc)
+
+    _attr_cache[metadata_api] = {"ts": time.time(), "kpis": candidates}
+    logger.info("linker: %d KPI candidates loaded (%d from kpi_store, %d from attributes)",
+                len(candidates),
+                sum(1 for c in candidates if c["source"] == "kpi_store"),
+                sum(1 for c in candidates if c["source"] == "attribute"))
+    return candidates
+
+
 def detect_kpi_links(asset_id: str, kpis_from_doc: List[str],
                      store: UnstructuredStore,
                      metadata_api: str = _METADATA_API) -> List[Dict]:
     """
-    Match KPI names extracted from the document against the Nanite KPI store
-    and attribute semantic_roles.
+    Match KPI names extracted from the document against:
+      - Nanite KPI store (explicitly defined business KPIs)
+      - Metric-role attributes from the metadata catalog (always available
+        after taxonomy enrichment, even when KPI store is empty)
+
     Returns list of relationship records ready for store.save_relationship().
     """
     if not kpis_from_doc:
         return []
 
-    try:
-        resp = httpx.get(f"{metadata_api}/kpis", timeout=5)
-        nanite_kpis = resp.json() if resp.is_success else []
-    except Exception:
-        nanite_kpis = []
+    nanite_kpis = _fetch_kpi_candidates(metadata_api)
+    if not nanite_kpis:
+        logger.debug("detect_kpi_links: no KPI candidates available — skipping")
+        return []
 
     links = []
     for doc_kpi in kpis_from_doc:
@@ -124,18 +213,17 @@ def detect_kpi_links(asset_id: str, kpis_from_doc: List[str],
         best_name  = None
 
         for kpi in nanite_kpis:
-            kpi_name = kpi.get("kpi_name", "")
+            kpi_name   = kpi.get("kpi_name", "")
             nl_formula = kpi.get("nl_formula", "")
             score = max(
                 _fuzzy_score(kpi_name, query_tokens),
                 _fuzzy_score(nl_formula, query_tokens),
             )
-            # Exact match shortcut
             if doc_kpi.lower() == kpi_name.lower():
                 score = 1.0
             if score > best_score:
                 best_score = score
-                best_id    = str(kpi.get("kpi_id", ""))
+                best_id    = kpi["kpi_id"]
                 best_name  = kpi_name
 
         if best_score >= _STORE_THRESHOLD and best_id:

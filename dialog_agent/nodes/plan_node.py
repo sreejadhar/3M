@@ -1061,7 +1061,7 @@ SCHEMA CONTEXT:
 
 TARGET DATABASE TYPE: {db_type}
 {schema_line}
-{history_section}{multi_kg_section}{kpi_section}{resolution_section}NATURAL LANGUAGE QUESTION:
+{history_section}{multi_kg_section}{glossary_section}{kpi_section}{resolution_section}NATURAL LANGUAGE QUESTION:
 {natural_query}
 
 CRITICAL REMINDERS:
@@ -3237,6 +3237,35 @@ def plan_node(state: DialogState) -> DialogState:
     else:
         multi_kg_section = ""
 
+    # Build glossary section from terms loaded by understand_node
+    glossary_terms = state.get("glossary_terms") or []
+    if glossary_terms:
+        gl_lines = [
+            "BUSINESS GLOSSARY — TERM DEFINITIONS & SYNONYMS",
+            "=" * 60,
+            "These are approved business definitions. When the user's question uses any",
+            "of these terms (or their synonyms), interpret them using the definition below.",
+            "",
+        ]
+        for term in glossary_terms:
+            gl_lines.append(f"  Term        : {term['name']}")
+            if term.get("domain"):
+                gl_lines.append(f"  Domain      : {term['domain']}")
+            if term.get("definition"):
+                gl_lines.append(f"  Definition  : {term['definition']}")
+            if term.get("formula"):
+                gl_lines.append(f"  Formula     : {term['formula']}")
+            if term.get("sql_hint"):
+                gl_lines.append(f"  SQL hint    : {term['sql_hint']}")
+            syns = [s["synonym"] for s in (term.get("synonyms") or [])]
+            if syns:
+                gl_lines.append(f"  Synonyms    : {', '.join(syns)}")
+            gl_lines.append("")
+        gl_lines.append("=" * 60)
+        glossary_section = "\n".join(gl_lines) + "\n\n"
+    else:
+        glossary_section = ""
+
     # Build KPI section from active KPI definitions loaded by understand_node
     active_kpis = state.get("active_kpis") or []
     compiled_kpis = [k for k in active_kpis if k.get("sql_expression")]
@@ -3316,6 +3345,7 @@ def plan_node(state: DialogState) -> DialogState:
         schema_line=schema_line,
         history_section=history_section,
         multi_kg_section=multi_kg_section,
+        glossary_section=glossary_section,
         kpi_section=kpi_section,
         resolution_section=resolution_section,
         natural_query=natural_query,

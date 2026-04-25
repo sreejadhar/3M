@@ -634,6 +634,44 @@ def synthesize_node(state: DialogState) -> DialogState:
     data_section = _build_data_section(query_results)
     insights = llm_output.rstrip() + data_section
 
+    # ── Glossary threshold context ────────────────────────────────────────────
+    # Append a threshold/benchmark callout for any glossary term whose name
+    # appears in the answer. Non-blocking — skipped silently if unavailable.
+    try:
+        import glossary_store as _gl_store
+        glossary_terms = state.get("glossary_terms") or []
+        threshold_lines = []
+        answer_lower = insights.lower()
+        for term in glossary_terms:
+            thr = term.get("threshold")
+            if not thr:
+                continue
+            term_name = term.get("name", "")
+            # Check if this term or any synonym appears in the answer
+            all_names = [term_name] + [s["synonym"] for s in (term.get("synonyms") or [])]
+            if not any(n.lower() in answer_lower for n in all_names if n):
+                continue
+            parts = []
+            unit = thr.get("unit", "")
+            direction = thr.get("direction", "higher_is_better")
+            benchmark = thr.get("benchmark_value")
+            red = thr.get("threshold_red")
+            amber = thr.get("threshold_amber")
+            if red is not None:
+                parts.append(f"red < {red}{unit}")
+            if amber is not None:
+                parts.append(f"amber < {amber}{unit}")
+            if benchmark is not None:
+                src = thr.get("benchmark_source", "industry")
+                parts.append(f"{src} benchmark {benchmark}{unit}")
+            if parts:
+                arrow = "↑ higher is better" if direction == "higher_is_better" else "↓ lower is better"
+                threshold_lines.append(f"**{term_name}** thresholds: {' · '.join(parts)} ({arrow})")
+        if threshold_lines:
+            insights = insights.rstrip() + "\n\n> **Thresholds & Benchmarks**  \n> " + "  \n> ".join(threshold_lines)
+    except Exception:
+        pass
+
     # ── Cross-modal: fetch supporting document context ─────────────────────
     # Runs after structured synthesis; never delays or degrades the answer.
     kpi_names   = _extract_kpi_names(state)

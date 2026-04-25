@@ -1092,9 +1092,20 @@ def understand_node(state: DialogState) -> DialogState:
         except Exception as exc:
             logger.warning("understand_node: failed to load KPIs for source %s — %s", source_id[:8], exc)
 
+    # Load business glossary terms (all approved terms — not source-scoped)
+    glossary_terms: List[Dict] = []
+    try:
+        import glossary_store as _gl_store
+        glossary_terms = _gl_store.list_terms(approved_only=True)
+        if glossary_terms:
+            logger.info("understand_node: loaded %d glossary term(s)", len(glossary_terms))
+    except Exception as exc:
+        logger.debug("understand_node: glossary not available — %s", exc)
+
     state["schema_context"]      = schema_context
     state["categorical_columns"] = categorical_columns
     state["column_hierarchy"]    = hierarchy or {}
     state["active_kpis"]         = active_kpis
+    state["glossary_terms"]      = glossary_terms
     state["phase"]               = "understand"
     return state

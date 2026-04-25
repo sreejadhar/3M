@@ -85,6 +85,10 @@ class DialogState(TypedDict, total=False):
     # [{"kpi_id": "...", "name": "RSV Growth", "nl_formula": "...", "sql_expression": "...", ...}]
     active_kpis: List[Dict[str, Any]]
 
+    # Business glossary terms (loaded by understand_node from glossary_store)
+    # [{"term_id": "...", "name": "Gross Margin", "definition": "...", "synonyms": [...], ...}]
+    glossary_terms: List[Dict[str, Any]]
+
     # Multi-KG federation (empty = single-KG mode)
     active_kg_ids: List[str]           # KG ids selected by router
     kg_bridges_active: List[Dict[str, Any]]  # bridges between active KGs

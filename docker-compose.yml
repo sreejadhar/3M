@@ -17,6 +17,7 @@ services:
       # Anthropic key — set in .env or shell before running
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
       DATA_DIR: /data/reports
+      GLOSSARY_DB:  "/data/reports/glossary.db"
       # Tune log verbosity: debug | info | warning
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     healthcheck:
@@ -95,6 +96,7 @@ services:
       ANTHROPIC_API_KEY:      "${ANTHROPIC_API_KEY}"
       LOG_LEVEL:              "${LOG_LEVEL:-info}"
       UNSTRUCTURED_API_URL:   "http://unstructured-api:8008"
+      GLOSSARY_DB:            "/data/reports/glossary.db"
       # Controls which LLM synthesize_node uses for insight generation:
       #   development → claude-haiku (cheap, fast iteration)
       #   production  → claude-sonnet (quality, default)

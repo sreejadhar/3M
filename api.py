@@ -807,3 +807,101 @@ def search_metadata(q: str, scope: str = "all", db_type: str = "all"):
                     })
 
     return results[:100]
+
+
+# ── Business Glossary ──────────────────────────────────────────────────────────
+
+import glossary_store as _gl  # noqa: E402  (module-level after app init)
+
+
+class _GlossaryTermIn(BaseModel):
+    name:       str
+    definition: str = ""
+    formula:    str = ""
+    sql_hint:   str = ""
+    domain:     str = ""
+    owner:      str = ""
+    approved:   bool = True
+
+
+class _GlossarySynonymIn(BaseModel):
+    synonym:      str
+    domain_scope: str = ""
+
+
+class _GlossaryThresholdIn(BaseModel):
+    threshold_red:    Optional[float] = None
+    threshold_amber:  Optional[float] = None
+    benchmark_value:  Optional[float] = None
+    benchmark_source: str = ""
+    direction:        str = "higher_is_better"
+    unit:             str = ""
+
+
+@app.get("/glossary/terms")
+def glossary_list(domain: str = "", approved_only: bool = False):
+    return _gl.list_terms(domain=domain, approved_only=approved_only)
+
+
+@app.post("/glossary/terms", status_code=201)
+def glossary_create(req: _GlossaryTermIn):
+    try:
+        return _gl.create_term(**req.model_dump())
+    except Exception as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/glossary/terms/{term_id}")
+def glossary_get(term_id: str):
+    t = _gl.get_term(term_id)
+    if not t:
+        raise HTTPException(404, f"Term {term_id!r} not found")
+    return t
+
+
+@app.put("/glossary/terms/{term_id}")
+def glossary_update(term_id: str, req: _GlossaryTermIn):
+    if not _gl.update_term(term_id, **req.model_dump()):
+        raise HTTPException(404, f"Term {term_id!r} not found")
+    return _gl.get_term(term_id)
+
+
+@app.delete("/glossary/terms/{term_id}", status_code=204)
+def glossary_delete(term_id: str):
+    if not _gl.delete_term(term_id):
+        raise HTTPException(404, f"Term {term_id!r} not found")
+
+
+@app.get("/glossary/search")
+def glossary_search(q: str, domain: str = "", limit: int = 20):
+    if not q.strip():
+        raise HTTPException(400, "q must not be empty")
+    return _gl.search_terms(q=q, domain=domain, limit=min(limit, 50))
+
+
+@app.post("/glossary/terms/{term_id}/synonyms", status_code=201)
+def glossary_add_synonym(term_id: str, req: _GlossarySynonymIn):
+    if not _gl.get_term(term_id):
+        raise HTTPException(404, f"Term {term_id!r} not found")
+    return _gl.add_synonym(term_id, req.synonym, req.domain_scope)
+
+
+@app.delete("/glossary/synonyms/{synonym_id}", status_code=204)
+def glossary_remove_synonym(synonym_id: str):
+    if not _gl.remove_synonym(synonym_id):
+        raise HTTPException(404, f"Synonym {synonym_id!r} not found")
+
+
+@app.put("/glossary/terms/{term_id}/threshold")
+def glossary_upsert_threshold(term_id: str, req: _GlossaryThresholdIn):
+    if not _gl.get_term(term_id):
+        raise HTTPException(404, f"Term {term_id!r} not found")
+    return _gl.upsert_threshold(term_id, **req.model_dump())
+
+
+@app.get("/glossary/terms/{term_id}/threshold")
+def glossary_get_threshold(term_id: str):
+    t = _gl.get_threshold(term_id)
+    if not t:
+        raise HTTPException(404, f"No threshold set for term {term_id!r}")
+    return t

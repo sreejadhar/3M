@@ -41,6 +41,7 @@ function switchView(view) {
   if (view === 'sql')        onViewSQL();
   if (view === 'cdc')        loadCDC();
   if (view === 'documents')  loadDocSources();
+  if (view === 'glossary')   loadGlossaryTerms();
 }
 
 function refreshCurrentView() { switchView(_currentView); }
@@ -2112,5 +2113,199 @@ async function _pollDocJob(sourceId) {
         break;
       }
     } catch { break; }
+  }
+}
+
+
+// ── Business Glossary ─────────────────────────────────────────────────────────
+
+const _GLOSSARY = '/metadata/glossary';
+let _glossaryTerms = [];
+let _glossaryEditSynonyms = [];  // synonyms for the term currently being edited
+
+const glossarySearchDebounced = _debounce(q => loadGlossaryTerms(q), 350);
+
+async function loadGlossaryTerms(q = '') {
+  const domain = document.getElementById('glossary-domain-filter')?.value || '';
+  const searchQ = q || document.getElementById('glossary-search-input')?.value || '';
+  try {
+    let url = searchQ.trim()
+      ? `${_GLOSSARY}/search?q=${encodeURIComponent(searchQ)}&domain=${encodeURIComponent(domain)}&limit=50`
+      : `${_GLOSSARY}/terms?domain=${encodeURIComponent(domain)}`;
+    _glossaryTerms = await apiFetch(url) || [];
+  } catch {
+    _glossaryTerms = [];
+  }
+  _renderGlossaryTerms();
+}
+
+function _renderGlossaryTerms() {
+  const list = document.getElementById('glossary-term-list');
+  const empty = document.getElementById('glossary-empty');
+  if (!list) return;
+  if (!_glossaryTerms.length) {
+    list.innerHTML = '';
+    if (empty) empty.style.display = '';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  list.innerHTML = _glossaryTerms.map(t => {
+    const thr = t.threshold;
+    const thrBadge = thr ? `<span style="font-size:10px;color:#f59e0b;margin-left:6px;">⚡ thresholds</span>` : '';
+    const synTags = (t.synonyms || []).map(s =>
+      `<span style="font-size:10px;background:var(--bg-1);border:1px solid var(--border);border-radius:10px;padding:1px 7px;">${_esc(s.synonym)}</span>`
+    ).join('');
+    return `<div class="catalog-card" style="cursor:pointer;" onclick="openGlossaryModal(${JSON.stringify(t.term_id)})">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+        <div>
+          <div style="font-weight:600;font-size:13px;">${_esc(t.name)}${thrBadge}</div>
+          ${t.domain ? `<div style="font-size:10px;color:var(--accent);margin-top:1px;">${_esc(t.domain)}</div>` : ''}
+        </div>
+        ${t.approved ? '' : '<span style="font-size:10px;color:#f87171;">draft</span>'}
+      </div>
+      ${t.definition ? `<div style="font-size:12px;color:var(--text-2);margin-top:6px;line-height:1.4;">${_esc(t.definition)}</div>` : ''}
+      ${t.formula ? `<div style="font-size:11px;color:var(--text-2);margin-top:4px;font-style:italic;">${_esc(t.formula)}</div>` : ''}
+      ${synTags ? `<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:8px;">${synTags}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+async function openGlossaryModal(termId = null) {
+  _resetGlossaryModal();
+  if (termId) {
+    document.getElementById('glossary-modal-title').textContent = 'Edit Business Term';
+    document.getElementById('glossary-edit-id').value = termId;
+    try {
+      const t = await apiFetch(`${_GLOSSARY}/terms/${termId}`);
+      document.getElementById('glossary-name').value       = t.name || '';
+      document.getElementById('glossary-domain').value     = t.domain || '';
+      document.getElementById('glossary-definition').value = t.definition || '';
+      document.getElementById('glossary-formula').value    = t.formula || '';
+      document.getElementById('glossary-sql-hint').value   = t.sql_hint || '';
+      document.getElementById('glossary-owner').value      = t.owner || '';
+      document.getElementById('glossary-approved').checked = !!t.approved;
+      _glossaryEditSynonyms = [...(t.synonyms || [])];
+      _renderEditSynonyms();
+      const thr = t.threshold || {};
+      document.getElementById('glossary-thr-red').value       = thr.threshold_red ?? '';
+      document.getElementById('glossary-thr-amber').value     = thr.threshold_amber ?? '';
+      document.getElementById('glossary-thr-benchmark').value = thr.benchmark_value ?? '';
+      document.getElementById('glossary-thr-unit').value      = thr.unit || '';
+      document.getElementById('glossary-thr-source').value    = thr.benchmark_source || '';
+      document.getElementById('glossary-thr-direction').value = thr.direction || 'higher_is_better';
+    } catch (e) { toast('Could not load term: ' + e.message, 'error'); return; }
+  }
+  document.getElementById('glossary-modal-overlay').style.display = 'flex';
+}
+
+function closeGlossaryModal(e) {
+  if (e && e.target !== document.getElementById('glossary-modal-overlay')) return;
+  document.getElementById('glossary-modal-overlay').style.display = 'none';
+}
+
+function _resetGlossaryModal() {
+  document.getElementById('glossary-modal-title').textContent = 'Add Business Term';
+  document.getElementById('glossary-edit-id').value = '';
+  ['glossary-name','glossary-formula','glossary-sql-hint','glossary-owner',
+   'glossary-thr-red','glossary-thr-amber','glossary-thr-benchmark',
+   'glossary-thr-unit','glossary-thr-source'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  document.getElementById('glossary-definition').value = '';
+  document.getElementById('glossary-domain').value = '';
+  document.getElementById('glossary-approved').checked = true;
+  document.getElementById('glossary-thr-direction').value = 'higher_is_better';
+  _glossaryEditSynonyms = [];
+  _renderEditSynonyms();
+}
+
+function _renderEditSynonyms() {
+  const el = document.getElementById('glossary-synonyms-list');
+  if (!el) return;
+  el.innerHTML = _glossaryEditSynonyms.map((s, i) =>
+    `<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px;background:var(--bg-1);border:1px solid var(--border);border-radius:10px;padding:2px 8px;">
+      ${_esc(s.synonym)}
+      <button onclick="removeGlossarySynonymLocal(${i})" style="background:none;border:none;color:var(--text-2);cursor:pointer;font-size:12px;padding:0;line-height:1;">×</button>
+    </span>`
+  ).join('');
+}
+
+function addGlossarySynonym() {
+  const inp = document.getElementById('glossary-new-synonym');
+  const val = inp?.value.trim();
+  if (!val) return;
+  _glossaryEditSynonyms.push({ synonym: val, domain_scope: '', synonym_id: null });
+  _renderEditSynonyms();
+  inp.value = '';
+}
+
+function removeGlossarySynonymLocal(idx) {
+  _glossaryEditSynonyms.splice(idx, 1);
+  _renderEditSynonyms();
+}
+
+async function submitGlossaryTerm() {
+  const name = document.getElementById('glossary-name')?.value.trim();
+  if (!name) { toast('Term name is required', 'warn'); return; }
+
+  const termId = document.getElementById('glossary-edit-id')?.value || null;
+  const body = {
+    name,
+    definition:  document.getElementById('glossary-definition')?.value.trim() || '',
+    formula:     document.getElementById('glossary-formula')?.value.trim() || '',
+    sql_hint:    document.getElementById('glossary-sql-hint')?.value.trim() || '',
+    domain:      document.getElementById('glossary-domain')?.value || '',
+    owner:       document.getElementById('glossary-owner')?.value.trim() || '',
+    approved:    document.getElementById('glossary-approved')?.checked ?? true,
+  };
+
+  try {
+    let saved;
+    if (termId) {
+      saved = await apiFetch(`${_GLOSSARY}/terms/${termId}`, { method: 'PUT', body: JSON.stringify(body) });
+    } else {
+      saved = await apiFetch(`${_GLOSSARY}/terms`, { method: 'POST', body: JSON.stringify(body) });
+    }
+    const savedId = saved.term_id;
+
+    // Sync synonyms: delete removed ones, add new ones
+    const existingSynIds = (saved.synonyms || []).map(s => s.synonym_id);
+    const keepIds = _glossaryEditSynonyms.filter(s => s.synonym_id).map(s => s.synonym_id);
+    for (const sid of existingSynIds) {
+      if (!keepIds.includes(sid)) {
+        await apiFetch(`${_GLOSSARY}/synonyms/${sid}`, { method: 'DELETE' }).catch(() => {});
+      }
+    }
+    for (const s of _glossaryEditSynonyms) {
+      if (!s.synonym_id) {
+        await apiFetch(`${_GLOSSARY}/terms/${savedId}/synonyms`, {
+          method: 'POST', body: JSON.stringify({ synonym: s.synonym, domain_scope: s.domain_scope || '' })
+        }).catch(() => {});
+      }
+    }
+
+    // Save thresholds if any value set
+    const red   = document.getElementById('glossary-thr-red')?.value;
+    const amber = document.getElementById('glossary-thr-amber')?.value;
+    const bmark = document.getElementById('glossary-thr-benchmark')?.value;
+    if (red || amber || bmark) {
+      await apiFetch(`${_GLOSSARY}/terms/${savedId}/threshold`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          threshold_red:    red   ? parseFloat(red)   : null,
+          threshold_amber:  amber ? parseFloat(amber) : null,
+          benchmark_value:  bmark ? parseFloat(bmark) : null,
+          benchmark_source: document.getElementById('glossary-thr-source')?.value || '',
+          direction:        document.getElementById('glossary-thr-direction')?.value || 'higher_is_better',
+          unit:             document.getElementById('glossary-thr-unit')?.value || '',
+        }),
+      }).catch(() => {});
+    }
+
+    toast(termId ? 'Term updated' : 'Term created', 'info');
+    document.getElementById('glossary-modal-overlay').style.display = 'none';
+    await loadGlossaryTerms();
+  } catch (e) {
+    toast('Save failed: ' + e.message, 'error');
   }
 }

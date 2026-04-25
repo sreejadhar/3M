@@ -7,6 +7,9 @@ and computes content-based checksums for change detection.
 Supported connectors:
   local      — local filesystem / NFS mount
   gdrive     — Google Drive folder (OAuth2 or Service Account)
+  s3         — Amazon S3 bucket/prefix
+  sharepoint — SharePoint Online document library (Microsoft Graph API)
+  onedrive   — OneDrive for Business / Personal (Microsoft Graph API)
 """
 from __future__ import annotations
 
@@ -156,8 +159,30 @@ def make_connector(source_type: str, connection: dict):
             max_size_mb=connection.get("max_size_mb", 200),
             extensions=connection.get("extensions"),
         )
+    if source_type == "sharepoint":
+        return SharePointConnector(
+            site_url=connection["site_url"],
+            tenant_id=connection["tenant_id"],
+            client_id=connection["client_id"],
+            client_secret=connection["client_secret"],
+            library=connection.get("library", "Documents"),
+            folder_path=connection.get("folder_path", ""),
+            max_size_mb=connection.get("max_size_mb", 200),
+            extensions=connection.get("extensions"),
+        )
+    if source_type == "onedrive":
+        return OneDriveConnector(
+            tenant_id=connection["tenant_id"],
+            client_id=connection["client_id"],
+            client_secret=connection["client_secret"],
+            user_email=connection.get("user_email", ""),
+            folder_path=connection.get("folder_path", ""),
+            max_size_mb=connection.get("max_size_mb", 200),
+            extensions=connection.get("extensions"),
+        )
     raise ValueError(
-        f"Unsupported source type: {source_type!r}. Supported: local, gdrive, s3."
+        f"Unsupported source type: {source_type!r}. "
+        "Supported: local, gdrive, s3, sharepoint, onedrive."
     )
 
 
@@ -532,6 +557,305 @@ class GoogleDriveConnector:
 
     def cleanup(self) -> None:
         """Delete temp files created during enumeration."""
+        for path in self._tmp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._tmp_files.clear()
+
+
+# ── Microsoft Graph shared helpers ────────────────────────────────────────────
+
+_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def _ms_token(tenant_id: str, client_id: str, client_secret: str) -> str:
+    """Acquire an app-only access token via MSAL client credentials flow."""
+    try:
+        import msal  # type: ignore
+    except ImportError:
+        raise RuntimeError("msal not installed — pip install msal")
+
+    app = msal.ConfidentialClientApplication(
+        client_id,
+        authority=f"https://login.microsoftonline.com/{tenant_id}",
+        client_credential=client_secret,
+    )
+    result = app.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
+    if "access_token" not in result:
+        raise RuntimeError(
+            f"MSAL token acquisition failed: {result.get('error_description', result)}"
+        )
+    return result["access_token"]
+
+
+def _graph_get(token: str, path: str, **params) -> dict:
+    import httpx
+    resp = httpx.get(
+        f"{_GRAPH_BASE}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params,
+        timeout=30,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _graph_download(token: str, path: str, suffix: str, prefix: str) -> str:
+    """Stream a Graph API /content URL to a named temp file. Returns path."""
+    import httpx
+    with httpx.stream(
+        "GET",
+        f"{_GRAPH_BASE}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=120,
+        follow_redirects=True,
+    ) as resp:
+        resp.raise_for_status()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, prefix=prefix)
+        for chunk in resp.iter_bytes(chunk_size=1 << 20):
+            tmp.write(chunk)
+        tmp.close()
+        return tmp.name
+
+
+def _graph_enumerate_folder(token: str, drive_id: str, item_id: str,
+                             extensions: set, max_bytes: int,
+                             tmp_files: list, prefix: str) -> Generator:
+    """Recursively yield FileManifest for all supported files in a Graph drive folder."""
+    next_url: Optional[str] = (
+        f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/children"
+        "?$select=id,name,size,file,folder,lastModifiedDateTime,eTag"
+        "&$top=200"
+    )
+    import httpx
+
+    while next_url:
+        resp = httpx.get(
+            next_url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        for item in data.get("value", []):
+            name = item.get("name", "")
+            if _is_junk(name):
+                continue
+
+            if "folder" in item:
+                yield from _graph_enumerate_folder(
+                    token, drive_id, item["id"], extensions, max_bytes, tmp_files, prefix
+                )
+                continue
+
+            if "file" not in item:
+                continue
+
+            ext = Path(name).suffix.lower()
+            if ext not in extensions:
+                continue
+
+            size = item.get("size", 0)
+            if size == 0 or size > max_bytes:
+                logger.debug("msgraph: skip %s (size=%d)", name, size)
+                continue
+
+            etag = item.get("eTag", item["id"]).strip('"')
+            checksum = f"etag:{etag}"
+            modified_at = item.get("lastModifiedDateTime")
+
+            try:
+                tmp_path = _graph_download(
+                    token,
+                    f"/drives/{drive_id}/items/{item['id']}/content",
+                    suffix=ext,
+                    prefix=prefix,
+                )
+            except Exception as exc:
+                logger.warning("msgraph: download failed for %s: %s", name, exc)
+                continue
+
+            tmp_files.append(tmp_path)
+            yield FileManifest(
+                path=tmp_path,
+                source_type="msgraph",
+                file_name=name,
+                size_bytes=os.path.getsize(tmp_path),
+                mime_type=_mime(name),
+                checksum=checksum,
+                created_at=None,
+                modified_at=modified_at,
+                remote_path=f"{drive_id}:{item['id']}",
+            )
+
+        next_url = data.get("@odata.nextLink")
+
+
+# ── SharePoint connector ───────────────────────────────────────────────────────
+
+class SharePointConnector:
+    """
+    Enumerates files from a SharePoint Online document library using the
+    Microsoft Graph API with app-only (client credentials) authentication.
+
+    Azure AD app requires:
+      - Sites.Read.All  (application permission)
+      - Files.Read.All  (application permission)
+
+    Connection keys:
+      site_url      — full SharePoint site URL, e.g.
+                      https://contoso.sharepoint.com/sites/SupplyChain
+      tenant_id     — Azure AD tenant ID (GUID or domain)
+      client_id     — Azure AD app (client) ID
+      client_secret — Azure AD app client secret
+      library       — document library display name (default: "Documents")
+      folder_path   — sub-folder path within the library (default: root)
+      max_size_mb   — skip files larger than this (default: 200)
+    """
+
+    def __init__(
+        self,
+        site_url: str,
+        tenant_id: str,
+        client_id: str,
+        client_secret: str,
+        library: str = "Documents",
+        folder_path: str = "",
+        max_size_mb: int = 200,
+        extensions: Optional[List[str]] = None,
+    ):
+        from urllib.parse import urlparse
+        parsed = urlparse(site_url.rstrip("/"))
+        self._hostname   = parsed.netloc                   # contoso.sharepoint.com
+        self._site_path  = parsed.path                     # /sites/SupplyChain
+        self._tenant_id  = tenant_id
+        self._client_id  = client_id
+        self._client_secret = client_secret
+        self._library    = library
+        self._folder_path = folder_path.strip("/")
+        self._max_bytes  = max_size_mb * 1024 * 1024
+        self._extensions = set(extensions) if extensions else _SUPPORTED_EXTENSIONS
+        self._tmp_files: List[str] = []
+
+    def enumerate(self) -> Generator:
+        token = _ms_token(self._tenant_id, self._client_id, self._client_secret)
+
+        # Resolve site ID from hostname + path
+        site = _graph_get(token, f"/sites/{self._hostname}:{self._site_path}")
+        site_id = site["id"]
+        logger.info("sharepoint: resolved site_id=%s", site_id)
+
+        # Find the target document library drive by display name
+        drives = _graph_get(token, f"/sites/{site_id}/drives").get("value", [])
+        drive = next((d for d in drives if d.get("name") == self._library), None)
+        if drive is None:
+            available = [d.get("name") for d in drives]
+            raise ValueError(
+                f"SharePoint library {self._library!r} not found. "
+                f"Available: {available}"
+            )
+        drive_id = drive["id"]
+        logger.info("sharepoint: using drive %s (%s)", self._library, drive_id)
+
+        # Resolve starting folder
+        if self._folder_path:
+            item = _graph_get(
+                token, f"/drives/{drive_id}/root:/{self._folder_path}"
+            )
+            root_item_id = item["id"]
+        else:
+            root_item_id = "root"
+
+        yield from _graph_enumerate_folder(
+            token, drive_id, root_item_id,
+            self._extensions, self._max_bytes,
+            self._tmp_files, "nanite_sp_",
+        )
+
+    def cleanup(self) -> None:
+        for path in self._tmp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._tmp_files.clear()
+
+
+# ── OneDrive connector ────────────────────────────────────────────────────────
+
+class OneDriveConnector:
+    """
+    Enumerates files from OneDrive for Business (or a shared drive) using
+    the Microsoft Graph API with app-only (client credentials) authentication.
+
+    Azure AD app requires:
+      - Files.Read.All  (application permission)
+      - User.Read.All   (application permission — needed to look up user drives)
+
+    Connection keys:
+      tenant_id     — Azure AD tenant ID
+      client_id     — Azure AD app (client) ID
+      client_secret — Azure AD app client secret
+      user_email    — UPN of the user whose OneDrive to index, e.g.
+                      john.doe@contoso.com  (leave blank for the app's own drive)
+      folder_path   — sub-folder path within OneDrive (default: root)
+      max_size_mb   — skip files larger than this (default: 200)
+    """
+
+    def __init__(
+        self,
+        tenant_id: str,
+        client_id: str,
+        client_secret: str,
+        user_email: str = "",
+        folder_path: str = "",
+        max_size_mb: int = 200,
+        extensions: Optional[List[str]] = None,
+    ):
+        self._tenant_id    = tenant_id
+        self._client_id    = client_id
+        self._client_secret = client_secret
+        self._user_email   = user_email.strip()
+        self._folder_path  = folder_path.strip("/")
+        self._max_bytes    = max_size_mb * 1024 * 1024
+        self._extensions   = set(extensions) if extensions else _SUPPORTED_EXTENSIONS
+        self._tmp_files: List[str] = []
+
+    def enumerate(self) -> Generator:
+        token = _ms_token(self._tenant_id, self._client_id, self._client_secret)
+
+        # Resolve drive
+        if self._user_email:
+            drive = _graph_get(token, f"/users/{self._user_email}/drive")
+        else:
+            drive = _graph_get(token, "/me/drive")
+        drive_id = drive["id"]
+        logger.info("onedrive: using drive %s for %s", drive_id,
+                    self._user_email or "app")
+
+        # Resolve starting folder
+        if self._folder_path:
+            item = _graph_get(
+                token, f"/drives/{drive_id}/root:/{self._folder_path}"
+            )
+            root_item_id = item["id"]
+        else:
+            root_item_id = "root"
+
+        yield from _graph_enumerate_folder(
+            token, drive_id, root_item_id,
+            self._extensions, self._max_bytes,
+            self._tmp_files, "nanite_od_",
+        )
+
+    def cleanup(self) -> None:
         for path in self._tmp_files:
             try:
                 os.unlink(path)

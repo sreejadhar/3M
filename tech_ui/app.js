@@ -1907,7 +1907,12 @@ function openAddDocSourceModal() {
   ['doc-src-name','doc-src-path','doc-src-domain',
    'doc-src-s3-bucket','doc-src-s3-prefix','doc-src-s3-region',
    'doc-src-s3-key','doc-src-s3-secret',
-   'doc-src-gdrive-folder'].forEach(id => {
+   'doc-src-gdrive-folder',
+   'doc-src-sp-site-url','doc-src-sp-library','doc-src-sp-folder',
+   'doc-src-sp-tenant','doc-src-sp-client-id','doc-src-sp-client-secret',
+   'doc-src-od-user','doc-src-od-folder',
+   'doc-src-od-tenant','doc-src-od-client-id','doc-src-od-client-secret',
+  ].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });
@@ -1933,11 +1938,11 @@ function onDocSrcTypeChange(type) {
   });
 
   // Show / hide field panels
-  document.getElementById('doc-src-fields-local').style.display  = type === 'local'  ? '' : 'none';
-  document.getElementById('doc-src-fields-s3').style.display     = type === 's3'     ? '' : 'none';
-  document.getElementById('doc-src-fields-gdrive').style.display = type === 'gdrive' ? '' : 'none';
+  ['local','s3','gdrive','sharepoint','onedrive'].forEach(t => {
+    const el = document.getElementById(`doc-src-fields-${t}`);
+    if (el) el.style.display = t === type ? '' : 'none';
+  });
 
-  // For gdrive: check auth token status
   if (type === 'gdrive') _checkGdriveTokenStatus();
 }
 
@@ -2011,6 +2016,38 @@ function _buildConnection() {
       folder_id:  folderId,
       token_path: `data/gdrive_tokens/${tokenName}.json`,
     };
+  }
+
+  if (_docSrcType === 'sharepoint') {
+    const siteUrl  = document.getElementById('doc-src-sp-site-url')?.value.trim();
+    const tenantId = document.getElementById('doc-src-sp-tenant')?.value.trim();
+    const clientId = document.getElementById('doc-src-sp-client-id')?.value.trim();
+    const secret   = document.getElementById('doc-src-sp-client-secret')?.value.trim();
+    if (!siteUrl)  { toast('SharePoint site URL is required', 'warn'); return null; }
+    if (!tenantId) { toast('Tenant ID is required', 'warn'); return null; }
+    if (!clientId) { toast('Client ID is required', 'warn'); return null; }
+    if (!secret)   { toast('Client Secret is required', 'warn'); return null; }
+    const conn = { site_url: siteUrl, tenant_id: tenantId, client_id: clientId, client_secret: secret };
+    const library = document.getElementById('doc-src-sp-library')?.value.trim();
+    const folder  = document.getElementById('doc-src-sp-folder')?.value.trim();
+    if (library) conn.library     = library;
+    if (folder)  conn.folder_path = folder;
+    return conn;
+  }
+
+  if (_docSrcType === 'onedrive') {
+    const tenantId = document.getElementById('doc-src-od-tenant')?.value.trim();
+    const clientId = document.getElementById('doc-src-od-client-id')?.value.trim();
+    const secret   = document.getElementById('doc-src-od-client-secret')?.value.trim();
+    const user     = document.getElementById('doc-src-od-user')?.value.trim();
+    if (!tenantId) { toast('Tenant ID is required', 'warn'); return null; }
+    if (!clientId) { toast('Client ID is required', 'warn'); return null; }
+    if (!secret)   { toast('Client Secret is required', 'warn'); return null; }
+    if (!user)     { toast('User email is required', 'warn'); return null; }
+    const conn = { tenant_id: tenantId, client_id: clientId, client_secret: secret, user_email: user };
+    const folder = document.getElementById('doc-src-od-folder')?.value.trim();
+    if (folder) conn.folder_path = folder;
+    return conn;
   }
 
   return null;

@@ -26,4 +26,7 @@ google-auth>=2.22.0
 google-auth-oauthlib>=1.1.0
 google-auth-httplib2>=0.2.0
 
+# SharePoint / OneDrive connector (Microsoft Graph API)
+msal>=1.28.0
+
 # SQLite is stdlib — no extra driver needed

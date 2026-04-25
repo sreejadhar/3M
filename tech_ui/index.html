@@ -641,7 +641,7 @@
     <!-- Source Type selector with icons -->
     <div class="form-row">
       <label>Source Type</label>
-      <div style="display:flex;gap:8px;margin-top:4px;">
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px;">
         <div class="doc-src-type-card active" data-type="local" onclick="onDocSrcTypeChange('local')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;display:block;margin:0 auto 4px"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
           Local / NFS
@@ -653,6 +653,14 @@
         <div class="doc-src-type-card" data-type="gdrive" onclick="onDocSrcTypeChange('gdrive')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;display:block;margin:0 auto 4px"><path d="M12 2L2 19h20L12 2z"/><path d="M12 2l5 17H7L12 2z" style="opacity:.4"/></svg>
           Google Drive
+        </div>
+        <div class="doc-src-type-card" data-type="sharepoint" onclick="onDocSrcTypeChange('sharepoint')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;display:block;margin:0 auto 4px"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="M2 9h20M9 9v12"/></svg>
+          SharePoint
+        </div>
+        <div class="doc-src-type-card" data-type="onedrive" onclick="onDocSrcTypeChange('onedrive')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;display:block;margin:0 auto 4px"><path d="M3 16.5A4.5 4.5 0 0 1 7.5 12a4.5 4.5 0 0 1 4-2.45A5 5 0 0 1 21 13.5a3.5 3.5 0 0 1-3.5 3.5H6A3 3 0 0 1 3 14z"/></svg>
+          OneDrive
         </div>
       </div>
     </div>
@@ -707,6 +715,70 @@
         <div style="font-size:10px;color:var(--text-2);margin-top:3px;">Must have completed OAuth flow via <b>GET /auth/google/url</b></div>
       </div>
       <div id="doc-src-gdrive-auth-status" style="font-size:11px;margin-top:4px;"></div>
+    </div>
+
+    <!-- SharePoint fields -->
+    <div id="doc-src-fields-sharepoint" style="display:none;">
+      <div class="form-row">
+        <label>SharePoint Site URL</label>
+        <input type="text" id="doc-src-sp-site-url" placeholder="https://contoso.sharepoint.com/sites/SupplyChain">
+      </div>
+      <div class="form-row">
+        <label>Document Library <span style="color:var(--text-2);font-weight:400;">(default: Documents)</span></label>
+        <input type="text" id="doc-src-sp-library" placeholder="Documents">
+      </div>
+      <div class="form-row">
+        <label>Sub-folder Path <span style="color:var(--text-2);font-weight:400;">(optional)</span></label>
+        <input type="text" id="doc-src-sp-folder" placeholder="Reports/2024">
+      </div>
+      <details style="margin:6px 0;" open>
+        <summary style="font-size:11px;color:var(--text-2);cursor:pointer;">Azure AD App Credentials</summary>
+        <div style="padding:8px 0 0;">
+          <div class="form-row">
+            <label>Tenant ID</label>
+            <input type="text" id="doc-src-sp-tenant" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+          </div>
+          <div class="form-row">
+            <label>Client ID</label>
+            <input type="text" id="doc-src-sp-client-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+          </div>
+          <div class="form-row">
+            <label>Client Secret</label>
+            <input type="password" id="doc-src-sp-client-secret" placeholder="••••••••" autocomplete="off">
+          </div>
+          <div style="font-size:10px;color:var(--text-2);margin-top:4px;">Azure AD app requires <b>Sites.Read.All</b> and <b>Files.Read.All</b> application permissions.</div>
+        </div>
+      </details>
+    </div>
+
+    <!-- OneDrive fields -->
+    <div id="doc-src-fields-onedrive" style="display:none;">
+      <div class="form-row">
+        <label>User Email <span style="color:var(--text-2);font-weight:400;">(UPN of the OneDrive owner)</span></label>
+        <input type="text" id="doc-src-od-user" placeholder="john.doe@contoso.com">
+      </div>
+      <div class="form-row">
+        <label>Folder Path <span style="color:var(--text-2);font-weight:400;">(optional — leave blank for full drive)</span></label>
+        <input type="text" id="doc-src-od-folder" placeholder="Supply Chain/Policies">
+      </div>
+      <details style="margin:6px 0;" open>
+        <summary style="font-size:11px;color:var(--text-2);cursor:pointer;">Azure AD App Credentials</summary>
+        <div style="padding:8px 0 0;">
+          <div class="form-row">
+            <label>Tenant ID</label>
+            <input type="text" id="doc-src-od-tenant" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+          </div>
+          <div class="form-row">
+            <label>Client ID</label>
+            <input type="text" id="doc-src-od-client-id" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autocomplete="off">
+          </div>
+          <div class="form-row">
+            <label>Client Secret</label>
+            <input type="password" id="doc-src-od-client-secret" placeholder="••••••••" autocomplete="off">
+          </div>
+          <div style="font-size:10px;color:var(--text-2);margin-top:4px;">Azure AD app requires <b>Files.Read.All</b> and <b>User.Read.All</b> application permissions.</div>
+        </div>
+      </details>
     </div>
 
     <!-- Common fields -->

@@ -260,6 +260,28 @@ def download_asset(asset_id: str):
         drive_url = f"https://drive.google.com/uc?export=download&id={remote_path}"
         return RedirectResponse(drive_url)
 
+    if src_type in ("sharepoint", "onedrive"):
+        remote_path = asset.get("remote_path")
+        if not remote_path or ":" not in remote_path:
+            raise HTTPException(404, "Graph drive/item ID not recorded — re-index the source")
+        from unstructured_agent.connectors import _ms_token, _GRAPH_BASE
+        drive_id, item_id = remote_path.split(":", 1)
+        token = _ms_token(
+            connection["tenant_id"],
+            connection["client_id"],
+            connection["client_secret"],
+        )
+        # Graph returns a redirect to the actual download URL — follow it
+        import httpx as _httpx
+        resp = _httpx.get(
+            f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/content",
+            headers={"Authorization": f"Bearer {token}"},
+            follow_redirects=False,
+            timeout=10,
+        )
+        location = resp.headers.get("location") or str(resp.url)
+        return RedirectResponse(location)
+
     raise HTTPException(400, f"Download not supported for source type '{src_type}'")
 
 

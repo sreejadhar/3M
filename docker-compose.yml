@@ -277,6 +277,7 @@ services:
       - "${UNSTRUCTURED_PORT:-8008}:8008"
     volumes:
       - unstructured_data:/data
+      - ${GDRIVE_SECRETS_DIR:-/home/ubuntu/metadataextractor/data}:/secrets:ro
     environment:
       ANTHROPIC_API_KEY:   "${ANTHROPIC_API_KEY}"
       UNSTRUCTURED_DB:     "/data/unstructured.db"
@@ -284,6 +285,8 @@ services:
       UNSTRUCTURED_PORT:   "8008"
       UNSTRUCTURED_WORKERS: "${UNSTRUCTURED_WORKERS:-4}"
       LOG_LEVEL:           "${LOG_LEVEL:-info}"
+      GDRIVE_CLIENT_SECRETS: "/data/client_secrets.json"
+      GDRIVE_CLIENT_SECRETS: "/secrets/client_secrets.json"
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8008/health', timeout=4)"]

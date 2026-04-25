@@ -286,6 +286,7 @@ services:
       UNSTRUCTURED_WORKERS: "${UNSTRUCTURED_WORKERS:-4}"
       LOG_LEVEL:           "${LOG_LEVEL:-info}"
       GDRIVE_CLIENT_SECRETS: "/data/client_secrets.json"
+      UNSTRUCTURED_PUBLIC_URL: "${UNSTRUCTURED_PUBLIC_URL:-http://localhost:8008}"
       GDRIVE_CLIENT_SECRETS: "/secrets/client_secrets.json"
     healthcheck:
       test: ["CMD", "python", "-c",

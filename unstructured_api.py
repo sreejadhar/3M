@@ -68,6 +68,7 @@ _METADATA_API     = os.environ.get("METADATA_API_URL",       "http://localhost:8
 _PORT             = int(os.environ.get("UNSTRUCTURED_PORT",  "8008"))
 _GDRIVE_TOKEN_DIR = os.environ.get("GDRIVE_TOKEN_DIR",       "data/gdrive_tokens")
 _GDRIVE_SECRETS   = os.environ.get("GDRIVE_CLIENT_SECRETS",  "")
+_PUBLIC_URL       = os.environ.get("UNSTRUCTURED_PUBLIC_URL", f"http://localhost:{int(os.environ.get('UNSTRUCTURED_PORT', '8008'))}")
 
 Path(_GDRIVE_TOKEN_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -205,6 +206,63 @@ def get_asset_links(asset_id: str):
     }
 
 
+# ── Asset download ────────────────────────────────────────────────────────────
+
+@app.get("/assets/{asset_id}/download")
+def download_asset(asset_id: str):
+    """
+    Redirect to a presigned S3 URL (S3 sources), stream the file (local),
+    or return a Google Drive download URL (gdrive sources).
+    """
+    import json as _json
+    from fastapi.responses import RedirectResponse, FileResponse
+
+    asset = store.get_asset(asset_id)
+    if not asset:
+        raise HTTPException(404, f"Asset {asset_id!r} not found")
+
+    source = store.get_source(asset["source_id"])
+    if not source:
+        raise HTTPException(404, "Source not found")
+
+    src_type = source["source_type"]
+    conn = source["connection_json"]
+    connection = _json.loads(conn) if isinstance(conn, str) else conn
+
+    if src_type == "s3":
+        import boto3
+        remote_path = asset.get("remote_path")
+        if not remote_path:
+            raise HTTPException(404, "S3 key not recorded for this asset — re-index the source")
+        s3 = boto3.client(
+            "s3",
+            region_name=connection.get("region", "us-east-1"),
+            aws_access_key_id=connection.get("aws_access_key_id") or None,
+            aws_secret_access_key=connection.get("aws_secret_access_key") or None,
+        )
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": connection["bucket"], "Key": remote_path},
+            ExpiresIn=3600,
+        )
+        return RedirectResponse(url)
+
+    if src_type == "local":
+        path = asset["file_path"]
+        if not os.path.exists(path):
+            raise HTTPException(404, "File not found on disk")
+        return FileResponse(path, filename=asset["file_name"])
+
+    if src_type == "gdrive":
+        remote_path = asset.get("remote_path")
+        if not remote_path:
+            raise HTTPException(404, "Drive file ID not recorded — re-index the source")
+        drive_url = f"https://drive.google.com/uc?export=download&id={remote_path}"
+        return RedirectResponse(drive_url)
+
+    raise HTTPException(400, f"Download not supported for source type '{src_type}'")
+
+
 # ── Cross-modal query ─────────────────────────────────────────────────────────
 
 @app.post("/query")
@@ -225,6 +283,7 @@ def cross_modal_query(req: QueryRequest):
             question=req.question,
             kpi_names=req.kpi_names,
             store=store,
+            base_url=_PUBLIC_URL,
         )
     except Exception as exc:
         logger.warning("cross_modal_query failed: %s", exc)

@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS unstructured_assets (
     ocr_used         INTEGER NOT NULL DEFAULT 0,
     ocr_confidence   REAL,
     deleted          INTEGER NOT NULL DEFAULT 0,
+    remote_path      TEXT,
     indexed_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -128,6 +129,11 @@ class UnstructuredStore:
                 s = stmt.strip()
                 if s:
                     conn.execute(s)
+            # Migrations — safe to run on every startup (ALTER TABLE is idempotent via try/except)
+            try:
+                conn.execute("ALTER TABLE unstructured_assets ADD COLUMN remote_path TEXT")
+            except Exception:
+                pass
             conn.commit()
         finally:
             conn.close()
@@ -174,7 +180,8 @@ class UnstructuredStore:
     # ── unstructured_assets ──────────────────────────────────────────────────
 
     def upsert_asset(self, source_id: str, file_path: str, file_name: str,
-                     file_type: str, checksum: str, structural: Dict) -> str:
+                     file_type: str, checksum: str, structural: Dict,
+                     remote_path: Optional[str] = None) -> str:
         now = self._now()
         existing = self._conn().execute(
             "SELECT asset_id, checksum FROM unstructured_assets WHERE file_path=? AND source_id=?",
@@ -203,13 +210,13 @@ class UnstructuredStore:
                 """INSERT INTO unstructured_assets
                    (asset_id,source_id,file_path,file_name,file_type,checksum,
                     size_bytes,page_count,title,author,created_at_file,
-                    modified_at_file,indexed_at,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    modified_at_file,remote_path,indexed_at,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (asset_id, source_id, file_path, file_name, file_type, checksum,
                  structural.get("size_bytes"), structural.get("page_count"),
                  structural.get("title", ""), structural.get("author", ""),
                  structural.get("created_at_file"), structural.get("modified_at_file"),
-                 now, now),
+                 remote_path, now, now),
             )
         self._conn().commit()
         return asset_id

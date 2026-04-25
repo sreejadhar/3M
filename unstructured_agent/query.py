@@ -27,6 +27,7 @@ def query_for_context(
     kpi_names: List[str],
     store: UnstructuredStore,
     limit: int = _MAX_DOCS,
+    base_url: str = "",
 ) -> Optional[str]:
     """
     Returns a formatted markdown block of supporting document context,
@@ -85,7 +86,7 @@ def query_for_context(
     if not ranked:
         return None
 
-    return _format_context(ranked)
+    return _format_context(ranked, base_url=base_url)
 
 
 def _fts_query(question: str) -> str:
@@ -135,7 +136,7 @@ def _find_kpi_linked_docs(kpi_names: List[str],
     return result
 
 
-def _format_context(ranked: List[Dict]) -> str:
+def _format_context(ranked: List[Dict], base_url: str = "") -> str:
     """
     Format the ranked document context as a clean markdown block.
     The output is appended to the structured insight by synthesize_node.
@@ -186,6 +187,11 @@ def _format_context(ranked: List[Dict]) -> str:
         # Sensitivity watermark — important for governance
         if sensitivity in ("confidential", "restricted"):
             lines.append(f"*⚠ {sensitivity.upper()}*")
+
+        if base_url:
+            asset_id = asset.get("asset_id", "")
+            if asset_id:
+                lines.append(f"[↓ Download]({base_url}/assets/{asset_id}/download)")
 
         lines.append("")  # blank line between docs
 

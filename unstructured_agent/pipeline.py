@@ -82,6 +82,7 @@ def run_index_job(job_id: str, source_id: str, store: UnstructuredStore,
                 file_type=file_type,
                 checksum=manifest.checksum,
                 structural=structural,
+                remote_path=manifest.remote_path,
             )
 
             # Parse file

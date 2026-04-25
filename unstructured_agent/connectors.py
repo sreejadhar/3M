@@ -34,6 +34,7 @@ class FileManifest:
     checksum: str        # sha256:<hex>
     created_at: Optional[str]
     modified_at: Optional[str]
+    remote_path: Optional[str] = None  # S3 key, Drive file ID, etc.
 
 
 _SUPPORTED_EXTENSIONS = {
@@ -272,6 +273,7 @@ class S3Connector:
                     checksum=checksum,
                     created_at=None,
                     modified_at=modified_at,
+                    remote_path=key,
                 )
 
     def _download(self, s3_client, key: str, ext: str) -> str:
@@ -492,6 +494,7 @@ class GoogleDriveConnector:
                     source_type="gdrive",
                     file_name=fname,
                     size_bytes=os.path.getsize(tmp),
+                    remote_path=item["id"],
                     mime_type=dl_mime,
                     checksum=checksum,
                     created_at=item.get("createdTime"),

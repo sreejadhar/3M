@@ -1893,15 +1893,29 @@ async function docSearch(q) {
 
 // ── Add Document Source Modal ─────────────────────────────────────────────────
 
+let _docSrcType = 'local';
+
 function openAddDocSourceModal() {
-  // Populate nanite source select
   const sel = document.getElementById('doc-src-nanite-id');
   if (sel) {
     sel.innerHTML = '<option value="">— none —</option>' +
       _sources.map(s => `<option value="${s.id}">${_esc(s.name || s.id)}</option>`).join('');
   }
+  // Reset to local
+  onDocSrcTypeChange('local');
+  // Clear fields
+  ['doc-src-name','doc-src-path','doc-src-domain',
+   'doc-src-s3-bucket','doc-src-s3-prefix','doc-src-s3-region',
+   'doc-src-s3-key','doc-src-s3-secret',
+   'doc-src-gdrive-folder'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  const tokenEl = document.getElementById('doc-src-gdrive-token');
+  if (tokenEl) tokenEl.value = 'default';
+
   const overlay = document.getElementById('doc-source-modal-overlay');
-  if (overlay) { overlay.style.display = 'flex'; }
+  if (overlay) overlay.style.display = 'flex';
 }
 
 function closeDocSourceModal(e) {
@@ -1910,19 +1924,110 @@ function closeDocSourceModal(e) {
   if (overlay) overlay.style.display = 'none';
 }
 
-function onDocSrcTypeChange(/* type */) {
-  // Future: toggle connection fields per source type
+function onDocSrcTypeChange(type) {
+  _docSrcType = type;
+
+  // Update card highlights
+  document.querySelectorAll('.doc-src-type-card').forEach(el => {
+    el.classList.toggle('active', el.dataset.type === type);
+  });
+
+  // Show / hide field panels
+  document.getElementById('doc-src-fields-local').style.display  = type === 'local'  ? '' : 'none';
+  document.getElementById('doc-src-fields-s3').style.display     = type === 's3'     ? '' : 'none';
+  document.getElementById('doc-src-fields-gdrive').style.display = type === 'gdrive' ? '' : 'none';
+
+  // For gdrive: check auth token status
+  if (type === 'gdrive') _checkGdriveTokenStatus();
+}
+
+async function _checkGdriveTokenStatus() {
+  const tokenName = document.getElementById('doc-src-gdrive-token')?.value.trim() || 'default';
+  const statusEl  = document.getElementById('doc-src-gdrive-auth-status');
+  if (!statusEl) return;
+  statusEl.innerHTML = '<span style="color:var(--text-2)">Checking auth…</span>';
+  try {
+    // Try to get the auth URL — if GDRIVE_CLIENT_SECRETS is not set it returns 400
+    const resp = await fetch(`${API}${_UNSTRUCTURED}/auth/google/url?token_name=${encodeURIComponent(tokenName)}`);
+    if (resp.status === 400) {
+      statusEl.innerHTML = '<span style="color:var(--accent)">⚠ GDRIVE_CLIENT_SECRETS not set on server.</span>';
+    } else {
+      // Check if token file already exists by trying to list sources (no direct API for this)
+      statusEl.innerHTML =
+        `<span style="color:#4ade80">● Auth endpoint ready.</span> ` +
+        `<a href="#" onclick="showGdriveAuthInstructions('${tokenName}');return false;" ` +
+        `style="color:var(--accent);font-size:11px;">How to authorise →</a>`;
+    }
+  } catch {
+    statusEl.innerHTML = '<span style="color:var(--text-2)">Could not reach unstructured service.</span>';
+  }
+}
+
+async function showGdriveAuthInstructions(tokenName) {
+  try {
+    const data = await apiFetch(`${_UNSTRUCTURED}/auth/google/url?token_name=${encodeURIComponent(tokenName)}`);
+    const msg =
+      `1. Open this URL in your browser:\n\n${data.url}\n\n` +
+      `2. Sign in and grant access.\n` +
+      `3. Copy the authorisation code.\n` +
+      `4. Run:\n\n` +
+      `curl -X POST ${window.location.origin}/api${_UNSTRUCTURED}/auth/google/token \\\n` +
+      `  -H "Content-Type: application/json" \\\n` +
+      `  -d '{"auth_code":"<paste code>","token_name":"${tokenName}"}'\n\n` +
+      `5. Come back and register the source.`;
+    alert(msg);
+  } catch (e) {
+    toast('Could not generate auth URL: ' + e.message, 'error');
+  }
+}
+
+function _buildConnection() {
+  if (_docSrcType === 'local') {
+    const path = document.getElementById('doc-src-path')?.value.trim();
+    if (!path) { toast('Folder path is required', 'warn'); return null; }
+    return { path };
+  }
+
+  if (_docSrcType === 's3') {
+    const bucket = document.getElementById('doc-src-s3-bucket')?.value.trim();
+    if (!bucket) { toast('S3 bucket name is required', 'warn'); return null; }
+    const conn = { bucket };
+    const prefix = document.getElementById('doc-src-s3-prefix')?.value.trim();
+    const region = document.getElementById('doc-src-s3-region')?.value.trim();
+    const key    = document.getElementById('doc-src-s3-key')?.value.trim();
+    const secret = document.getElementById('doc-src-s3-secret')?.value.trim();
+    if (prefix) conn.prefix = prefix;
+    if (region) conn.region = region;
+    if (key)    conn.aws_access_key_id     = key;
+    if (secret) conn.aws_secret_access_key = secret;
+    return conn;
+  }
+
+  if (_docSrcType === 'gdrive') {
+    const folderId  = document.getElementById('doc-src-gdrive-folder')?.value.trim();
+    const tokenName = document.getElementById('doc-src-gdrive-token')?.value.trim() || 'default';
+    if (!folderId) { toast('Google Drive folder ID is required', 'warn'); return null; }
+    return {
+      folder_id:  folderId,
+      token_path: `data/gdrive_tokens/${tokenName}.json`,
+    };
+  }
+
+  return null;
 }
 
 async function submitDocSource() {
   const name     = document.getElementById('doc-src-name')?.value.trim();
-  const type     = document.getElementById('doc-src-type')?.value || 'local';
-  const path     = document.getElementById('doc-src-path')?.value.trim();
   const domain   = document.getElementById('doc-src-domain')?.value.trim();
   const naniteId = document.getElementById('doc-src-nanite-id')?.value || null;
 
-  if (!name)  { toast('Source name is required', 'warn'); return; }
-  if (!path)  { toast('Folder path is required', 'warn');  return; }
+  if (!name) { toast('Source name is required', 'warn'); return; }
+
+  const connection = _buildConnection();
+  if (!connection) return;
+
+  const btn = document.getElementById('doc-src-submit-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Registering…'; }
 
   try {
     const source = await apiFetch(`${_UNSTRUCTURED}/sources`, {
@@ -1930,10 +2035,10 @@ async function submitDocSource() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name,
-        source_type: type,
-        connection:  { path },
+        source_type:      _docSrcType,
+        connection,
         nanite_source_id: naniteId || null,
-        domain: domain || '',
+        domain:           domain || '',
       }),
     });
 
@@ -1941,13 +2046,14 @@ async function submitDocSource() {
     toast(`Source "${name}" registered. Starting index…`, 'info');
     await loadDocSources();
 
-    // Kick off initial index
     await apiFetch(`${_UNSTRUCTURED}/sources/${source.source_id}/index`, { method: 'POST' });
     _docSelectedSrcId = source.source_id;
     _renderDocSourceList();
     _pollDocJob(source.source_id);
   } catch (e) {
     toast('Failed to register source: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Register & Index'; }
   }
 }
 

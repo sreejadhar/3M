@@ -625,29 +625,94 @@
 </div>
 
 <!-- ── Add Document Source Modal ──────────────────────────────────────────── -->
-<div id="doc-source-modal-overlay" onclick="closeDocSourceModal(event)" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000;display:none;align-items:center;justify-content:center;">
-  <div class="modal" onclick="event.stopPropagation()" style="max-width:460px;">
+<div id="doc-source-modal-overlay" onclick="closeDocSourceModal(event)" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000;align-items:center;justify-content:center;">
+  <div class="modal" onclick="event.stopPropagation()" style="max-width:500px;width:95%;">
     <div class="modal-title">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
       Register Document Source
     </div>
+
+    <!-- Source Name -->
     <div class="form-row">
       <label>Source Name</label>
-      <input type="text" id="doc-src-name" placeholder="e.g. RGM Reports Folder">
+      <input type="text" id="doc-src-name" placeholder="e.g. Supply Chain Docs">
     </div>
+
+    <!-- Source Type selector with icons -->
     <div class="form-row">
       <label>Source Type</label>
-      <select id="doc-src-type" onchange="onDocSrcTypeChange(this.value)">
-        <option value="local">Local filesystem / NFS</option>
-      </select>
+      <div style="display:flex;gap:8px;margin-top:4px;">
+        <div class="doc-src-type-card active" data-type="local" onclick="onDocSrcTypeChange('local')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;display:block;margin:0 auto 4px"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          Local / NFS
+        </div>
+        <div class="doc-src-type-card" data-type="s3" onclick="onDocSrcTypeChange('s3')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;display:block;margin:0 auto 4px"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+          Amazon S3
+        </div>
+        <div class="doc-src-type-card" data-type="gdrive" onclick="onDocSrcTypeChange('gdrive')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:20px;height:20px;display:block;margin:0 auto 4px"><path d="M12 2L2 19h20L12 2z"/><path d="M12 2l5 17H7L12 2z" style="opacity:.4"/></svg>
+          Google Drive
+        </div>
+      </div>
     </div>
-    <div class="form-row" id="doc-src-path-row">
-      <label>Folder Path</label>
-      <input type="text" id="doc-src-path" placeholder="/data/reports or /mnt/nas/documents">
+
+    <!-- LOCAL fields -->
+    <div id="doc-src-fields-local">
+      <div class="form-row">
+        <label>Folder Path</label>
+        <input type="text" id="doc-src-path" placeholder="/data/reports or /mnt/nas/documents">
+      </div>
     </div>
+
+    <!-- S3 fields -->
+    <div id="doc-src-fields-s3" style="display:none;">
+      <div class="form-row">
+        <label>S3 Bucket</label>
+        <input type="text" id="doc-src-s3-bucket" placeholder="my-bucket-name">
+      </div>
+      <div class="form-row">
+        <label>Prefix / Folder <span style="color:var(--text-2);font-weight:400;">(optional)</span></label>
+        <input type="text" id="doc-src-s3-prefix" placeholder="docs/supply-chain/">
+      </div>
+      <div class="form-row">
+        <label>AWS Region <span style="color:var(--text-2);font-weight:400;">(optional — uses instance role if blank)</span></label>
+        <input type="text" id="doc-src-s3-region" placeholder="us-east-1">
+      </div>
+      <details style="margin:6px 0;">
+        <summary style="font-size:11px;color:var(--text-2);cursor:pointer;">Access Keys <span style="opacity:.6">(leave blank to use IAM role)</span></summary>
+        <div style="padding:8px 0 0;">
+          <div class="form-row">
+            <label>Access Key ID</label>
+            <input type="text" id="doc-src-s3-key" placeholder="AKIA…" autocomplete="off">
+          </div>
+          <div class="form-row">
+            <label>Secret Access Key</label>
+            <input type="password" id="doc-src-s3-secret" placeholder="••••••••" autocomplete="off">
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <!-- Google Drive fields -->
+    <div id="doc-src-fields-gdrive" style="display:none;">
+      <div class="form-row">
+        <label>Google Drive Folder ID</label>
+        <input type="text" id="doc-src-gdrive-folder" placeholder="1abc123XYZ…">
+        <div style="font-size:10px;color:var(--text-2);margin-top:3px;">From the folder URL: drive.google.com/drive/folders/<b>FOLDER_ID</b></div>
+      </div>
+      <div class="form-row">
+        <label>Auth Token Name</label>
+        <input type="text" id="doc-src-gdrive-token" placeholder="default" value="default">
+        <div style="font-size:10px;color:var(--text-2);margin-top:3px;">Must have completed OAuth flow via <b>GET /auth/google/url</b></div>
+      </div>
+      <div id="doc-src-gdrive-auth-status" style="font-size:11px;margin-top:4px;"></div>
+    </div>
+
+    <!-- Common fields -->
     <div class="form-row">
       <label>Domain Hint <span style="color:var(--text-2);font-weight:400;">(optional)</span></label>
-      <input type="text" id="doc-src-domain" placeholder="e.g. CPG/RGM, Banking/FP&amp;A">
+      <input type="text" id="doc-src-domain" placeholder="e.g. CPG/RGM, Banking/FP&amp;A, Supply Chain">
     </div>
     <div class="form-row">
       <label>Linked Data Source <span style="color:var(--text-2);font-weight:400;">(optional)</span></label>
@@ -655,9 +720,10 @@
         <option value="">— none —</option>
       </select>
     </div>
+
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
       <button class="btn btn-ghost" onclick="closeDocSourceModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="submitDocSource()">Register &amp; Index</button>
+      <button class="btn btn-primary" id="doc-src-submit-btn" onclick="submitDocSource()">Register &amp; Index</button>
     </div>
   </div>
 </div>

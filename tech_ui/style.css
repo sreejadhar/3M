@@ -634,6 +634,20 @@ body {
 .form-row .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
 
+/* ── Doc source type cards ────────────────────────────────────────────────── */
+.doc-src-type-card {
+  flex: 1; padding: 10px 8px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-3);
+  text-align: center; font-size: 11px; color: var(--text-2);
+  cursor: pointer; transition: border-color 0.15s, background 0.15s;
+  user-select: none;
+}
+.doc-src-type-card:hover { border-color: var(--accent); color: var(--text-0); }
+.doc-src-type-card.active {
+  border-color: var(--accent); background: rgba(251,191,36,0.08);
+  color: var(--accent); font-weight: 600;
+}
+
 /* ── Stats cards ──────────────────────────────────────────────────────────── */
 .stat-cards { display: flex; gap: 12px; padding: 14px; flex-shrink: 0; }
 .stat-card {

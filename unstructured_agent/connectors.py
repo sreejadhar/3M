@@ -144,9 +144,153 @@ def make_connector(source_type: str, connection: dict):
             service_account_json=connection.get("service_account_json"),
             max_size_mb=connection.get("max_size_mb", 200),
         )
+    if source_type == "s3":
+        return S3Connector(
+            bucket=connection["bucket"],
+            prefix=connection.get("prefix", ""),
+            region=connection.get("region"),
+            aws_access_key_id=connection.get("aws_access_key_id"),
+            aws_secret_access_key=connection.get("aws_secret_access_key"),
+            aws_session_token=connection.get("aws_session_token"),
+            max_size_mb=connection.get("max_size_mb", 200),
+            extensions=connection.get("extensions"),
+        )
     raise ValueError(
-        f"Unsupported source type: {source_type!r}. Supported: local, gdrive."
+        f"Unsupported source type: {source_type!r}. Supported: local, gdrive, s3."
     )
+
+
+# ── S3 connector ──────────────────────────────────────────────────────────────
+
+class S3Connector:
+    """
+    Enumerates files from an S3 bucket/prefix recursively.
+
+    Change detection uses the S3 ETag (MD5 of the object for single-part
+    uploads, or a composite hash for multipart) — no re-download needed
+    to detect unchanged files.
+
+    AWS credentials are resolved in this priority order:
+      1. Explicit keys in connection config (aws_access_key_id / aws_secret_access_key)
+      2. Environment variables (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+      3. IAM instance role — best for EC2, no credentials needed at all
+
+    connection config keys:
+      bucket              — S3 bucket name (required)
+      prefix              — key prefix / folder path, e.g. "docs/supply-chain/" (optional)
+      region              — AWS region, e.g. "us-east-1" (optional)
+      aws_access_key_id   — explicit key (optional)
+      aws_secret_access_key — explicit secret (optional)
+      aws_session_token   — for temporary STS credentials (optional)
+      max_size_mb         — skip files larger than this (default 200)
+    """
+
+    def __init__(self, bucket: str, prefix: str = "",
+                 region: Optional[str] = None,
+                 aws_access_key_id: Optional[str] = None,
+                 aws_secret_access_key: Optional[str] = None,
+                 aws_session_token: Optional[str] = None,
+                 max_size_mb: int = 200,
+                 extensions: Optional[List[str]] = None) -> None:
+        self.bucket               = bucket
+        self.prefix               = prefix.lstrip("/")   # S3 keys never start with /
+        self.region               = region
+        self.aws_access_key_id    = aws_access_key_id
+        self.aws_secret_access_key= aws_secret_access_key
+        self.aws_session_token    = aws_session_token
+        self.max_size_bytes       = max_size_mb * 1024 * 1024
+        self.extensions           = (
+            {e.lower() for e in extensions} if extensions else _SUPPORTED_EXTENSIONS
+        )
+        self._tmp_files: List[str] = []
+
+    def _client(self):
+        try:
+            import boto3  # type: ignore
+        except ImportError:
+            raise ImportError(
+                "boto3 is required for S3. Run: pip install boto3"
+            )
+        kwargs: dict = {}
+        if self.region:
+            kwargs["region_name"] = self.region
+        if self.aws_access_key_id:
+            kwargs["aws_access_key_id"]     = self.aws_access_key_id
+            kwargs["aws_secret_access_key"] = self.aws_secret_access_key
+            if self.aws_session_token:
+                kwargs["aws_session_token"] = self.aws_session_token
+        return boto3.client("s3", **kwargs)
+
+    def enumerate(self) -> Generator[FileManifest, None, None]:
+        s3 = self._client()
+        paginator = s3.get_paginator("list_objects_v2")
+
+        pages = paginator.paginate(
+            Bucket=self.bucket,
+            Prefix=self.prefix,
+        )
+
+        for page in pages:
+            for obj in page.get("Contents", []):
+                key  = obj["Key"]
+                name = key.split("/")[-1]   # filename portion of the key
+
+                if not name or name.endswith("/"):
+                    continue                 # skip folder markers
+                if _is_junk(name):
+                    continue
+
+                ext = Path(name).suffix.lower()
+                if ext not in self.extensions:
+                    continue
+
+                size = obj.get("Size", 0)
+                if size == 0 or size > self.max_size_bytes:
+                    logger.debug("s3: skip %s (size=%d)", key, size)
+                    continue
+
+                # ETag is MD5 for single-part uploads; strip quotes AWS wraps it in
+                etag = obj.get("ETag", "").strip('"')
+                checksum = f"etag:{etag}"
+
+                modified_at = obj["LastModified"].isoformat() if obj.get("LastModified") else None
+
+                # Download to temp file
+                try:
+                    tmp = self._download(s3, key, ext)
+                except Exception as exc:
+                    logger.warning("s3: download failed for s3://%s/%s: %s",
+                                   self.bucket, key, exc)
+                    continue
+
+                yield FileManifest(
+                    path=tmp,
+                    source_type="s3",
+                    file_name=name,
+                    size_bytes=os.path.getsize(tmp),
+                    mime_type=_mime(name),
+                    checksum=checksum,
+                    created_at=None,
+                    modified_at=modified_at,
+                )
+
+    def _download(self, s3_client, key: str, ext: str) -> str:
+        suffix = ext if ext.startswith(".") else f".{ext}"
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=suffix, prefix="nanite_s3_"
+        )
+        tmp.close()
+        s3_client.download_file(self.bucket, key, tmp.name)
+        self._tmp_files.append(tmp.name)
+        return tmp.name
+
+    def cleanup(self) -> None:
+        for path in self._tmp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._tmp_files.clear()
 
 
 # ── Google Drive connector ────────────────────────────────────────────────────

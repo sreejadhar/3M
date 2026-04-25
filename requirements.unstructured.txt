@@ -17,6 +17,9 @@ lxml>=5.0.0                   # fast HTML parser backend for BeautifulSoup
 # pdf2image>=1.16.0           # converts PDF pages to images (requires poppler)
 # pytesseract>=0.3.10         # OCR wrapper for Tesseract (requires tesseract-ocr system package)
 
+# AWS S3 connector
+boto3>=1.34.0
+
 # Google Drive connector
 google-api-python-client>=2.100.0
 google-auth>=2.22.0

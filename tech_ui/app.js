@@ -29,6 +29,7 @@ function switchView(view) {
     sql:        ['SQL Console',        'Query any connected source'],
     cdc:        ['Change Log',         'Structural schema change events'],
     documents:  ['Document Intelligence', 'Unstructured data — semantic fingerprints & cross-modal links'],
+    glossary:   ['Business Glossary',     'Domain terms, synonyms, thresholds & benchmarks'],
   };
   const [title, sub] = titles[view] || ['', ''];
   document.getElementById('topbar-title').textContent = title;

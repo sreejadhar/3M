@@ -2235,7 +2235,7 @@ async function openGlossaryModal(termId = null) {
 }
 
 function closeGlossaryModal(e) {
-  if (e && e.target !== document.getElementById('glossary-modal-overlay')) return;
+  if (e instanceof MouseEvent && e.target !== document.getElementById('glossary-modal-overlay')) return;
   document.getElementById('glossary-modal-overlay').style.display = 'none';
 }
 
@@ -2414,42 +2414,49 @@ function _renderKpis() {
   }).join('');
 }
 
-async function openKpiModal(kpiId = null) {
+function openKpiModal(kpiId = null) {
   _kpiEditId = kpiId;
   _resetKpiModal();
+  // Show immediately — async data loads populate fields after open
+  document.getElementById('kpi-modal-overlay').style.display = 'flex';
+  _loadKpiModalData(kpiId);
+}
 
-  // Populate source dropdown from registered data sources
+async function _loadKpiModalData(kpiId) {
+  // Populate source dropdown
   try {
     const sources = await apiFetch('/sources') || [];
     const sel = document.getElementById('kpi-source-id');
     if (sel) {
       sel.innerHTML = '<option value="">— any source —</option>' +
-        sources.map(s => `<option value="${_esc(s.id || s.source_id)}">${_esc(s.name)}</option>`).join('');
+        sources.map(s => `<option value="${_esc(s.source_id || s.id)}">${_esc(s.name)}</option>`).join('');
     }
   } catch { /* ignore */ }
 
-  if (kpiId) {
-    document.getElementById('kpi-modal-title').textContent = 'Edit KPI';
-    document.getElementById('kpi-delete-btn').style.display = '';
-    try {
-      const k = await apiFetch(`/kpis/${kpiId}`);
-      document.getElementById('kpi-name').value          = k.name || '';
-      document.getElementById('kpi-category').value      = k.category || '';
-      document.getElementById('kpi-source-id').value     = k.source_id || '';
-      document.getElementById('kpi-description').value   = k.description || '';
-      document.getElementById('kpi-nl-formula').value    = k.nl_formula || '';
-      document.getElementById('kpi-sql-expression').value= k.sql_expression || '';
-      document.getElementById('kpi-unit').value          = k.unit || '';
-      document.getElementById('kpi-direction').value     = k.direction || 'up';
-      document.getElementById('kpi-status').value        = k.status || 'draft';
-    } catch (e) { toast('Failed to load KPI: ' + e.message, 'error'); return; }
-  }
+  if (!kpiId) return;
 
-  document.getElementById('kpi-modal-overlay').style.display = 'flex';
+  // Editing — fill form fields
+  document.getElementById('kpi-modal-title').textContent = 'Edit KPI';
+  document.getElementById('kpi-delete-btn').style.display = '';
+  try {
+    const k = await apiFetch(`/kpis/${kpiId}`);
+    document.getElementById('kpi-name').value           = k.name || '';
+    document.getElementById('kpi-category').value       = k.category || '';
+    document.getElementById('kpi-source-id').value      = k.source_id || '';
+    document.getElementById('kpi-description').value    = k.description || '';
+    document.getElementById('kpi-nl-formula').value     = k.nl_formula || '';
+    document.getElementById('kpi-sql-expression').value = k.sql_expression || '';
+    document.getElementById('kpi-unit').value           = k.unit || '';
+    document.getElementById('kpi-direction').value      = k.direction || 'up';
+    document.getElementById('kpi-status').value         = k.status || 'draft';
+  } catch (e) { toast('Failed to load KPI: ' + e.message, 'error'); }
 }
 
 function closeKpiModal(e) {
-  if (e && e.target !== document.getElementById('kpi-modal-overlay')) return;
+  // When called via onclick="closeKpiModal(event)" from the overlay backdrop,
+  // only close if the click landed directly on the backdrop (not the modal box).
+  // When called with no arg (Cancel button), always close.
+  if (e instanceof MouseEvent && e.target !== document.getElementById('kpi-modal-overlay')) return;
   document.getElementById('kpi-modal-overlay').style.display = 'none';
 }
 

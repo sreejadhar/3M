@@ -516,6 +516,34 @@
         </div>
       </div>
 
+      <!-- ── GLOSSARY ──────────────────────────────────────────────────────── -->
+      <div id="view-glossary" class="view">
+        <!-- Toolbar -->
+        <div style="padding:8px 14px;background:var(--bg-2);border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-shrink:0;flex-wrap:wrap;">
+          <span style="font-weight:600;font-size:13px;">Business Glossary</span>
+          <input type="text" class="search-input" id="glossary-search-input" placeholder="Search terms, synonyms…"
+            style="width:220px" oninput="glossarySearchDebounced(this.value)">
+          <select id="glossary-domain-filter" onchange="loadGlossaryTerms()" style="font-size:12px;padding:3px 6px;background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);border-radius:4px;">
+            <option value="">All Domains</option>
+            <option>Finance</option><option>Supply Chain</option><option>CPG</option>
+            <option>Retail</option><option>Banking</option><option>Healthcare</option>
+          </select>
+          <button class="btn btn-secondary" onclick="loadGlossaryTerms()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            Refresh
+          </button>
+          <button class="btn btn-primary" onclick="openGlossaryModal()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add Term
+          </button>
+        </div>
+        <!-- Term list -->
+        <div style="flex:1;overflow:auto;padding:16px;">
+          <div id="glossary-term-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;"></div>
+          <div id="glossary-empty" style="display:none;color:var(--text-2);font-size:13px;padding:32px;text-align:center;">No terms yet. Click Add Term to define your first business term.</div>
+        </div>
+      </div>
+
     </div><!-- /content -->
   </div><!-- /main -->
 </div><!-- /app -->
@@ -625,35 +653,6 @@
     <div style="padding:12px 22px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;flex-shrink:0;">
       <button class="btn btn-ghost" onclick="closeShaclModal()">Close</button>
     </div>
-  </div>
-</div>
-
-<!-- ── Glossary View ──────────────────────────────────────────────────────── -->
-<div id="view-glossary" class="view">
-  <!-- Toolbar -->
-  <div style="padding:8px 14px;background:var(--bg-2);border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-shrink:0;flex-wrap:wrap;">
-    <span style="font-weight:600;font-size:13px;">Business Glossary</span>
-    <input type="text" class="search-input" id="glossary-search-input" placeholder="Search terms, synonyms…"
-      style="width:220px" oninput="glossarySearchDebounced(this.value)">
-    <select id="glossary-domain-filter" onchange="loadGlossaryTerms()" style="font-size:12px;padding:3px 6px;background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);border-radius:4px;">
-      <option value="">All Domains</option>
-      <option>Finance</option><option>Supply Chain</option><option>CPG</option>
-      <option>Retail</option><option>Banking</option><option>Healthcare</option>
-    </select>
-    <button class="btn btn-secondary" onclick="loadGlossaryTerms()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-      Refresh
-    </button>
-    <button class="btn btn-primary" onclick="openGlossaryModal()">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-      Add Term
-    </button>
-  </div>
-
-  <!-- Term list -->
-  <div style="flex:1;overflow:auto;padding:16px;">
-    <div id="glossary-term-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;"></div>
-    <div id="glossary-empty" style="display:none;color:var(--text-2);font-size:13px;padding:32px;text-align:center;">No terms yet. Click Add Term to define your first business term.</div>
   </div>
 </div>
 

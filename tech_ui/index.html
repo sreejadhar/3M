@@ -68,6 +68,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
         Glossary
       </div>
+      <div class="nav-item" data-view="kpi" onclick="switchView('kpi')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        KPI Registry
+      </div>
     </div>
 
     <div class="sidebar-source-selector">
@@ -552,6 +556,39 @@
         </div>
       </div>
 
+      <!-- ── KPI FORMULA REGISTRY ─────────────────────────────────────────── -->
+      <div id="view-kpi" class="view">
+        <!-- Toolbar -->
+        <div style="padding:8px 14px;background:var(--bg-2);border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:center;flex-shrink:0;flex-wrap:wrap;">
+          <span style="font-weight:600;font-size:13px;">KPI Formula Registry</span>
+          <input type="text" class="search-input" id="kpi-search-input" placeholder="Search KPIs…" style="width:200px" oninput="kpiSearchDebounced(this.value)">
+          <select id="kpi-category-filter" onchange="loadKpis()" style="font-size:12px;padding:3px 6px;background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);border-radius:4px;">
+            <option value="">All Categories</option>
+            <option>Sales</option><option>Finance</option><option>Supply Chain</option>
+            <option>Marketing</option><option>Operations</option><option>Customer</option>
+          </select>
+          <select id="kpi-status-filter" onchange="loadKpis()" style="font-size:12px;padding:3px 6px;background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);border-radius:4px;">
+            <option value="">All Statuses</option>
+            <option value="active">Active</option>
+            <option value="draft">Draft</option>
+            <option value="deprecated">Deprecated</option>
+          </select>
+          <button class="btn btn-secondary" onclick="loadKpis()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            Refresh
+          </button>
+          <button class="btn btn-primary" onclick="openKpiModal()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add KPI
+          </button>
+        </div>
+        <!-- KPI grid -->
+        <div style="flex:1;overflow:auto;padding:16px;">
+          <div id="kpi-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px;"></div>
+          <div id="kpi-empty" style="display:none;color:var(--text-2);font-size:13px;padding:32px;text-align:center;">No KPIs defined yet. Click Add KPI to register your first metric.</div>
+        </div>
+      </div>
+
     </div><!-- /content -->
   </div><!-- /main -->
 </div><!-- /app -->
@@ -935,7 +972,80 @@
 <div id="toast-container"></div>
 
 <!-- vis.js network -->
+<!-- ── KPI Modal ──────────────────────────────────────────────────────────── -->
+<div id="kpi-modal-overlay" onclick="closeKpiModal(event)" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000;align-items:center;justify-content:center;">
+  <div class="modal" onclick="event.stopPropagation()" style="max-width:580px;width:95%;max-height:92vh;overflow-y:auto;">
+    <div class="modal-title" id="kpi-modal-title">Add KPI</div>
+    <input type="hidden" id="kpi-edit-id">
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+      <div class="form-row" style="margin:0;grid-column:1/-1;">
+        <label>KPI Name <span style="color:#f87171">*</span></label>
+        <input type="text" id="kpi-name" placeholder="e.g. RSV Growth %">
+      </div>
+      <div class="form-row" style="margin:0;">
+        <label>Category</label>
+        <select id="kpi-category" style="background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);padding:6px 8px;border-radius:4px;width:100%;font-size:13px;">
+          <option value="">— select —</option>
+          <option>Sales</option><option>Finance</option><option>Supply Chain</option>
+          <option>Marketing</option><option>Operations</option><option>Customer</option>
+        </select>
+      </div>
+      <div class="form-row" style="margin:0;">
+        <label>Source</label>
+        <select id="kpi-source-id" style="background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);padding:6px 8px;border-radius:4px;width:100%;font-size:13px;">
+          <option value="">— any source —</option>
+        </select>
+      </div>
+      <div class="form-row" style="margin:0;grid-column:1/-1;">
+        <label>Description</label>
+        <textarea id="kpi-description" rows="2" placeholder="What this KPI measures and why it matters" style="width:100%;background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);padding:6px 8px;border-radius:4px;font-size:13px;resize:vertical;"></textarea>
+      </div>
+      <div class="form-row" style="margin:0;grid-column:1/-1;">
+        <label>Natural Language Formula <span style="color:var(--text-2);font-weight:400;">(business definition)</span></label>
+        <textarea id="kpi-nl-formula" rows="2" placeholder="e.g. Sum of RSV for current period minus prior period, divided by prior period, times 100" style="width:100%;background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);padding:6px 8px;border-radius:4px;font-size:13px;resize:vertical;"></textarea>
+      </div>
+      <div class="form-row" style="margin:0;grid-column:1/-1;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+          <label style="margin:0;">SQL Expression <span style="color:var(--text-2);font-weight:400;">(auto-compiled or manual)</span></label>
+          <button class="btn btn-secondary" id="kpi-compile-btn" style="font-size:11px;padding:3px 10px;" onclick="compileKpiFormula()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            Compile
+          </button>
+        </div>
+        <textarea id="kpi-sql-expression" rows="3" placeholder="e.g. (SUM(CASE WHEN period='current' THEN rsv END) - SUM(CASE WHEN period='prior' THEN rsv END)) / NULLIF(SUM(CASE WHEN period='prior' THEN rsv END),0)*100" style="width:100%;background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);padding:6px 8px;border-radius:4px;font-size:12px;font-family:var(--font-mono);resize:vertical;"></textarea>
+        <div id="kpi-compile-status" style="font-size:11px;color:var(--text-2);margin-top:3px;"></div>
+      </div>
+      <div class="form-row" style="margin:0;">
+        <label>Unit</label>
+        <input type="text" id="kpi-unit" placeholder="e.g. % or $ or units">
+      </div>
+      <div class="form-row" style="margin:0;">
+        <label>Direction</label>
+        <select id="kpi-direction" style="background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);padding:6px 8px;border-radius:4px;width:100%;font-size:13px;">
+          <option value="up">↑ Higher is better</option>
+          <option value="down">↓ Lower is better</option>
+        </select>
+      </div>
+      <div class="form-row" style="margin:0;grid-column:1/-1;">
+        <label>Status</label>
+        <select id="kpi-status" style="background:var(--bg-2);border:1px solid var(--border);color:var(--text-1);padding:6px 8px;border-radius:4px;width:100%;font-size:13px;">
+          <option value="draft">Draft — not injected into queries</option>
+          <option value="active">Active — injected into SQL planner</option>
+          <option value="deprecated">Deprecated</option>
+        </select>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+      <button class="btn btn-ghost" id="kpi-delete-btn" style="margin-right:auto;color:#f87171;display:none;" onclick="deleteKpi()">Delete</button>
+      <button class="btn btn-ghost" onclick="closeKpiModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitKpi()">Save KPI</button>
+    </div>
+  </div>
+</div>
+
 <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
-<script src="/tech/app.js?v=7"></script>
+<script src="/tech/app.js?v=8"></script>
 </body>
 </html>

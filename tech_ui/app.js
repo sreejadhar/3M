@@ -30,6 +30,7 @@ function switchView(view) {
     cdc:        ['Change Log',         'Structural schema change events'],
     documents:  ['Document Intelligence', 'Unstructured data — semantic fingerprints & cross-modal links'],
     glossary:   ['Business Glossary',     'Domain terms, synonyms, thresholds & benchmarks'],
+    kpi:        ['KPI Formula Registry',  'Business metrics, SQL formulas & query-time injection'],
   };
   const [title, sub] = titles[view] || ['', ''];
   document.getElementById('topbar-title').textContent = title;
@@ -43,6 +44,7 @@ function switchView(view) {
   if (view === 'cdc')        loadCDC();
   if (view === 'documents')  loadDocSources();
   if (view === 'glossary')   loadGlossaryTerms();
+  if (view === 'kpi')        loadKpis();
 }
 
 function refreshCurrentView() { switchView(_currentView); }
@@ -2341,5 +2343,248 @@ async function submitGlossaryTerm() {
     await loadGlossaryTerms();
   } catch (e) {
     toast('Save failed: ' + e.message, 'error');
+  }
+}
+
+
+// ── KPI Formula Registry ──────────────────────────────────────────────────────
+
+let _kpis        = [];
+let _kpiEditId   = null;
+
+const kpiSearchDebounced = _debounce(loadKpis, 350);
+
+async function loadKpis() {
+  const category = document.getElementById('kpi-category-filter')?.value || '';
+  const status   = document.getElementById('kpi-status-filter')?.value   || '';
+  const q        = document.getElementById('kpi-search-input')?.value.trim() || '';
+  try {
+    const qs = new URLSearchParams();
+    if (category) qs.set('category', category);
+    if (status)   qs.set('status', status);
+    let rows = await apiFetch(`/kpis?${qs}`) || [];
+    if (q) {
+      const ql = q.toLowerCase();
+      rows = rows.filter(k =>
+        (k.name || '').toLowerCase().includes(ql) ||
+        (k.description || '').toLowerCase().includes(ql) ||
+        (k.category || '').toLowerCase().includes(ql)
+      );
+    }
+    _kpis = rows;
+  } catch {
+    _kpis = [];
+  }
+  _renderKpis();
+}
+
+function _renderKpis() {
+  const list  = document.getElementById('kpi-list');
+  const empty = document.getElementById('kpi-empty');
+  if (!list) return;
+  if (!_kpis.length) {
+    list.innerHTML = '';
+    if (empty) empty.style.display = '';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+
+  const statusColor = { active: '#22c55e', draft: '#f59e0b', deprecated: '#6b7280' };
+  const dirArrow    = { up: '↑', down: '↓' };
+
+  list.innerHTML = _kpis.map(k => {
+    const sc   = statusColor[k.status] || '#6b7280';
+    const arrow = dirArrow[k.direction] || '↑';
+    const hasSQL = k.sql_expression ? '' : '<span style="font-size:10px;color:#f59e0b;margin-left:6px;">⚠ no SQL</span>';
+    return `<div class="catalog-card" style="cursor:pointer;" onclick="openKpiModal('${k.kpi_id}')">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+        <div style="min-width:0;">
+          <div style="font-weight:600;font-size:13px;">${_esc(k.name)}${hasSQL}</div>
+          ${k.category ? `<div style="font-size:10px;color:var(--accent);margin-top:1px;">${_esc(k.category)}</div>` : ''}
+        </div>
+        <div style="display:flex;gap:6px;align-items:center;flex-shrink:0;">
+          <span style="font-size:10px;background:${sc}22;color:${sc};border:1px solid ${sc}44;border-radius:10px;padding:1px 8px;">${k.status}</span>
+          <span style="font-size:12px;font-weight:600;color:var(--text-2);">${arrow} ${_esc(k.unit || '')}</span>
+        </div>
+      </div>
+      ${k.description ? `<div style="font-size:12px;color:var(--text-2);margin-top:6px;line-height:1.4;">${_esc(k.description)}</div>` : ''}
+      ${k.nl_formula  ? `<div style="font-size:11px;color:var(--text-2);margin-top:4px;font-style:italic;">${_esc(k.nl_formula.substring(0,120))}${k.nl_formula.length>120?'…':''}</div>` : ''}
+      ${k.sql_expression ? `<div style="font-size:11px;color:var(--accent);margin-top:4px;font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${_esc(k.sql_expression)}">${_esc(k.sql_expression.substring(0,100))}${k.sql_expression.length>100?'…':''}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+async function openKpiModal(kpiId = null) {
+  _kpiEditId = kpiId;
+  _resetKpiModal();
+
+  // Populate source dropdown from registered data sources
+  try {
+    const sources = await apiFetch('/sources') || [];
+    const sel = document.getElementById('kpi-source-id');
+    if (sel) {
+      sel.innerHTML = '<option value="">— any source —</option>' +
+        sources.map(s => `<option value="${_esc(s.id || s.source_id)}">${_esc(s.name)}</option>`).join('');
+    }
+  } catch { /* ignore */ }
+
+  if (kpiId) {
+    document.getElementById('kpi-modal-title').textContent = 'Edit KPI';
+    document.getElementById('kpi-delete-btn').style.display = '';
+    try {
+      const k = await apiFetch(`/kpis/${kpiId}`);
+      document.getElementById('kpi-name').value          = k.name || '';
+      document.getElementById('kpi-category').value      = k.category || '';
+      document.getElementById('kpi-source-id').value     = k.source_id || '';
+      document.getElementById('kpi-description').value   = k.description || '';
+      document.getElementById('kpi-nl-formula').value    = k.nl_formula || '';
+      document.getElementById('kpi-sql-expression').value= k.sql_expression || '';
+      document.getElementById('kpi-unit').value          = k.unit || '';
+      document.getElementById('kpi-direction').value     = k.direction || 'up';
+      document.getElementById('kpi-status').value        = k.status || 'draft';
+    } catch (e) { toast('Failed to load KPI: ' + e.message, 'error'); return; }
+  }
+
+  document.getElementById('kpi-modal-overlay').style.display = 'flex';
+}
+
+function closeKpiModal(e) {
+  if (e && e.target !== document.getElementById('kpi-modal-overlay')) return;
+  document.getElementById('kpi-modal-overlay').style.display = 'none';
+}
+
+function _resetKpiModal() {
+  document.getElementById('kpi-modal-title').textContent = 'Add KPI';
+  document.getElementById('kpi-delete-btn').style.display = 'none';
+  document.getElementById('kpi-compile-status').textContent = '';
+  ['kpi-name','kpi-description','kpi-nl-formula','kpi-sql-expression','kpi-unit'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  const cat = document.getElementById('kpi-category'); if (cat) cat.value = '';
+  const src = document.getElementById('kpi-source-id'); if (src) src.value = '';
+  const dir = document.getElementById('kpi-direction'); if (dir) dir.value = 'up';
+  const st  = document.getElementById('kpi-status'); if (st) st.value = 'draft';
+}
+
+async function submitKpi() {
+  const name = document.getElementById('kpi-name')?.value.trim();
+  if (!name) { toast('KPI name is required', 'warn'); return; }
+
+  const body = {
+    name,
+    description:    document.getElementById('kpi-description')?.value.trim() || '',
+    category:       document.getElementById('kpi-category')?.value || '',
+    source_id:      document.getElementById('kpi-source-id')?.value || '',
+    nl_formula:     document.getElementById('kpi-nl-formula')?.value.trim() || '',
+    sql_expression: document.getElementById('kpi-sql-expression')?.value.trim() || '',
+    unit:           document.getElementById('kpi-unit')?.value.trim() || '',
+    direction:      document.getElementById('kpi-direction')?.value || 'up',
+    status:         document.getElementById('kpi-status')?.value || 'draft',
+  };
+
+  try {
+    if (_kpiEditId) {
+      await apiFetch(`/kpis/${_kpiEditId}`, { method: 'PATCH', body: JSON.stringify(body) });
+      toast('KPI updated', 'info');
+    } else {
+      await apiFetch('/kpis', { method: 'POST', body: JSON.stringify(body) });
+      toast('KPI created', 'info');
+    }
+    document.getElementById('kpi-modal-overlay').style.display = 'none';
+    await loadKpis();
+  } catch (e) {
+    toast('Save failed: ' + e.message, 'error');
+  }
+}
+
+async function deleteKpi() {
+  if (!_kpiEditId) return;
+  const name = document.getElementById('kpi-name')?.value || _kpiEditId;
+  if (!confirm(`Delete KPI "${name}"? This cannot be undone.`)) return;
+  try {
+    await apiFetch(`/kpis/${_kpiEditId}`, { method: 'DELETE' }).catch(() => {});
+    document.getElementById('kpi-modal-overlay').style.display = 'none';
+    toast('KPI deleted', 'info');
+    await loadKpis();
+  } catch (e) {
+    toast('Delete failed: ' + e.message, 'error');
+  }
+}
+
+async function compileKpiFormula() {
+  const nlFormula = document.getElementById('kpi-nl-formula')?.value.trim();
+  if (!nlFormula) { toast('Enter a natural language formula first', 'warn'); return; }
+
+  const sourceId = document.getElementById('kpi-source-id')?.value;
+  const statusEl = document.getElementById('kpi-compile-status');
+  const btn      = document.getElementById('kpi-compile-btn');
+
+  if (btn) { btn.disabled = true; btn.textContent = 'Compiling…'; }
+  if (statusEl) statusEl.textContent = 'Fetching schema…';
+
+  try {
+    // Build column context from source schema
+    let columnContext = '';
+    if (sourceId) {
+      const entities = await apiFetch(`/metadata/entities?source_id=${encodeURIComponent(sourceId)}`).catch(() => []);
+      const lines = [];
+      for (const ent of (entities || []).slice(0, 15)) {
+        const full = await apiFetch(`/metadata/entities/${ent.metadata_id}`).catch(() => null);
+        if (!full) continue;
+        for (const attr of (full.attributes || []).slice(0, 30)) {
+          lines.push(`${full.table_name || ent.entity_name}.${attr.attribute_name} (${attr.data_type || 'TEXT'})`);
+        }
+      }
+      columnContext = lines.join('\n');
+    }
+    if (!columnContext) columnContext = '(No schema available — write formula referencing likely column names)';
+
+    if (statusEl) statusEl.textContent = 'Calling LLM…';
+
+    // Save or create KPI first so we have an ID to compile against
+    let kpiId = _kpiEditId;
+    if (!kpiId) {
+      const name = document.getElementById('kpi-name')?.value.trim();
+      if (!name) { toast('Save the KPI first (name is required)', 'warn'); return; }
+      const saved = await apiFetch('/kpis', {
+        method: 'POST',
+        body: JSON.stringify({
+          name,
+          nl_formula:  nlFormula,
+          source_id:   sourceId || '',
+          category:    document.getElementById('kpi-category')?.value || '',
+          description: document.getElementById('kpi-description')?.value.trim() || '',
+          unit:        document.getElementById('kpi-unit')?.value.trim() || '',
+          direction:   document.getElementById('kpi-direction')?.value || 'up',
+          status:      'draft',
+        }),
+      });
+      _kpiEditId = saved.kpi_id;
+      kpiId = saved.kpi_id;
+      document.getElementById('kpi-delete-btn').style.display = '';
+    } else {
+      // Update nl_formula before compiling
+      await apiFetch(`/kpis/${kpiId}`, {
+        method: 'PATCH', body: JSON.stringify({ nl_formula: nlFormula, source_id: sourceId || '' })
+      });
+    }
+
+    const result = await apiFetch(`/kpis/${kpiId}/compile`, {
+      method: 'POST',
+      body: JSON.stringify({ column_context: columnContext }),
+    });
+
+    const expr = result.sql_expression || '';
+    const sqlEl = document.getElementById('kpi-sql-expression');
+    if (sqlEl) sqlEl.value = expr;
+    if (statusEl) statusEl.textContent = expr ? '✓ Compiled successfully' : '⚠ LLM returned empty — check formula';
+    if (expr) toast('Formula compiled', 'info');
+
+  } catch (e) {
+    if (statusEl) statusEl.textContent = 'Compile failed: ' + e.message;
+    toast('Compile failed: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px"><polygon points="5 3 19 12 5 21 5 3"/></svg> Compile'; }
   }
 }

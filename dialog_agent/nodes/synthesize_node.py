@@ -672,6 +672,37 @@ def synthesize_node(state: DialogState) -> DialogState:
     except Exception:
         pass
 
+    # ── KPI context callout ───────────────────────────────────────────────────
+    # For each active KPI whose name appears in the answer, append its unit,
+    # direction, and formula so the user understands what the number represents.
+    try:
+        active_kpis = state.get("active_kpis") or []
+        kpi_lines = []
+        answer_lower = insights.lower()
+        for kpi in active_kpis:
+            kpi_name = kpi.get("name", "")
+            if not kpi_name or kpi_name.lower() not in answer_lower:
+                continue
+            parts = []
+            unit      = kpi.get("unit", "")
+            direction = kpi.get("direction", "up")
+            nl        = kpi.get("nl_formula", "")
+            sql       = kpi.get("sql_expression", "")
+            arrow = "↑ higher is better" if direction == "up" else "↓ lower is better"
+            if unit:
+                parts.append(f"unit: **{unit}**")
+            parts.append(arrow)
+            if nl:
+                parts.append(f"formula: _{nl}_")
+            if sql:
+                parts.append(f"`{sql}`")
+            if parts:
+                kpi_lines.append(f"**{kpi_name}** — " + " · ".join(parts))
+        if kpi_lines:
+            insights = insights.rstrip() + "\n\n> **KPI Definitions**  \n> " + "  \n> ".join(kpi_lines)
+    except Exception:
+        pass
+
     # ── Cross-modal: fetch supporting document context ─────────────────────
     # Runs after structured synthesis; never delays or degrades the answer.
     kpi_names   = _extract_kpi_names(state)

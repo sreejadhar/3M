@@ -2415,10 +2415,15 @@ function _renderKpis() {
 }
 
 function openKpiModal(kpiId = null) {
-  _kpiEditId = kpiId;
-  _resetKpiModal();
-  // Show immediately — async data loads populate fields after open
-  document.getElementById('kpi-modal-overlay').style.display = 'flex';
+  try {
+    _kpiEditId = kpiId;
+    _resetKpiModal();
+  } catch (err) {
+    console.error('openKpiModal reset failed:', err);
+  }
+  const overlay = document.getElementById('kpi-modal-overlay');
+  if (!overlay) { console.error('kpi-modal-overlay not found'); return; }
+  overlay.style.display = 'flex';
   _loadKpiModalData(kpiId);
 }
 
@@ -2461,17 +2466,20 @@ function closeKpiModal(e) {
 }
 
 function _resetKpiModal() {
-  document.getElementById('kpi-modal-title').textContent = 'Add KPI';
-  document.getElementById('kpi-delete-btn').style.display = 'none';
-  document.getElementById('kpi-compile-status').textContent = '';
+  const title = document.getElementById('kpi-modal-title');
+  if (title)  title.textContent = 'Add KPI';
+  const del = document.getElementById('kpi-delete-btn');
+  if (del)    del.style.display = 'none';
+  const cstat = document.getElementById('kpi-compile-status');
+  if (cstat)  cstat.textContent = '';
   ['kpi-name','kpi-description','kpi-nl-formula','kpi-sql-expression','kpi-unit'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });
-  const cat = document.getElementById('kpi-category'); if (cat) cat.value = '';
-  const src = document.getElementById('kpi-source-id'); if (src) src.value = '';
-  const dir = document.getElementById('kpi-direction'); if (dir) dir.value = 'up';
-  const st  = document.getElementById('kpi-status'); if (st) st.value = 'draft';
+  const cat = document.getElementById('kpi-category');    if (cat) cat.value = '';
+  const src = document.getElementById('kpi-source-id');   if (src) src.value = '';
+  const dir = document.getElementById('kpi-direction');   if (dir) dir.value = 'up';
+  const st  = document.getElementById('kpi-status');      if (st)  st.value  = 'draft';
 }
 
 async function submitKpi() {

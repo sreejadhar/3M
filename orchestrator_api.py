@@ -3156,6 +3156,8 @@ class UpdateKpiRequest(BaseModel):
     unit:           Optional[str]  = None
     direction:      Optional[str]  = None
     status:         Optional[str]  = None
+    changed_by:     Optional[str]  = None
+    change_note:    Optional[str]  = None
 
 
 @app.get("/kpis")
@@ -3173,9 +3175,12 @@ async def list_kpis(
 
 @app.post("/kpis", status_code=201)
 async def create_kpi(req: CreateKpiRequest):
-    """Create a new KPI definition."""
+    """Create a new KPI definition. Returns {kpi, warnings}."""
     try:
-        return _kpi.create_kpi(**req.dict(exclude_none=True))
+        result = _kpi.create_kpi(**req.dict(exclude_none=True))
+        return result  # {"kpi": {...}, "warnings": [...]}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -3196,18 +3201,23 @@ async def get_kpi(kpi_id: str):
 
 @app.patch("/kpis/{kpi_id}")
 async def update_kpi(kpi_id: str, req: UpdateKpiRequest):
-    """Update fields on a KPI definition."""
+    """Update fields on a KPI definition. Returns {kpi, warnings}."""
     try:
-        updates = {k: v for k, v in req.dict(exclude_none=True).items()}
-        if not updates:
+        payload = req.dict(exclude_none=True)
+        changed_by  = payload.pop("changed_by", "") or ""
+        change_note = payload.pop("change_note", "") or ""
+        if not payload:
             raise HTTPException(status_code=400, detail="No updatable fields provided")
-        _kpi.update_kpi(kpi_id, **updates)
-        row = _kpi.get_kpi(kpi_id)
-        if not row:
+        result = _kpi.update_kpi(kpi_id, changed_by=changed_by,
+                                  change_note=change_note, **payload)
+        if not result.get("ok"):
             raise HTTPException(status_code=404, detail="KPI not found")
-        return row
+        row = _kpi.get_kpi(kpi_id)
+        return {"kpi": row, "warnings": result.get("warnings", [])}
     except HTTPException:
         raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -3237,6 +3247,55 @@ async def compile_kpi_formula(kpi_id: str, req: CompileFormulaRequest):
         return {"kpi_id": kpi_id, "sql_expression": expr}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/kpis/{kpi_id}/versions")
+async def list_kpi_versions(kpi_id: str):
+    """Return version history for a KPI, newest first."""
+    try:
+        return _kpi.list_kpi_versions(kpi_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class RollbackRequest(BaseModel):
+    changed_by: Optional[str] = None
+
+
+@app.post("/kpis/{kpi_id}/versions/{version_num}/rollback")
+async def rollback_kpi_version(kpi_id: str, version_num: int,
+                               req: RollbackRequest = RollbackRequest()):
+    """Restore a KPI to a previous snapshot. Returns the restored KPI dict."""
+    try:
+        restored = _kpi.rollback_kpi_version(kpi_id, version_num,
+                                              changed_by=req.changed_by or "")
+        if not restored:
+            raise HTTPException(status_code=404,
+                                detail=f"Version {version_num} not found for KPI {kpi_id}")
+        return restored
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class ActivateKpiRequest(BaseModel):
+    approved_by: Optional[str] = None
+
+
+@app.post("/kpis/{kpi_id}/activate")
+async def activate_kpi(kpi_id: str, req: ActivateKpiRequest = ActivateKpiRequest()):
+    """
+    Activation gate: validates guardrails then sets status → active.
+    Returns {ok, kpi} on success; 422 with reasons on guardrail failure.
+    """
+    try:
+        kpi = _kpi.activate_kpi(kpi_id, approved_by=req.approved_by or "")
+        return {"ok": True, "kpi": kpi}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

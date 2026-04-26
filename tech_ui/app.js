@@ -68,7 +68,9 @@ async function apiFetch(path, opts = {}) {
   if (!r.ok) {
     let detail = `${r.status} ${r.statusText}`;
     try { const b = await r.json(); detail = b.detail || b.error || detail; } catch {}
-    throw new Error(detail);
+    const err = new Error(detail);
+    err.status = r.status;
+    throw err;
   }
   return r.json();
 }
@@ -2448,9 +2450,14 @@ async function _loadKpiModalData(kpiId) {
 
   if (!kpiId) return;
 
-  // Editing — fill form fields
+  // Editing — fill form fields and show edit-only controls
   document.getElementById('kpi-modal-title').textContent = 'Edit KPI';
   document.getElementById('kpi-delete-btn').style.display = '';
+  const changeRow = document.getElementById('kpi-change-note-row');
+  if (changeRow) changeRow.style.display = '';
+  const histBtn = document.getElementById('kpi-history-btn');
+  if (histBtn) histBtn.style.display = '';
+
   try {
     const k = await apiFetch(`/kpis/${kpiId}`);
     document.getElementById('kpi-name').value           = k.name || '';
@@ -2462,6 +2469,11 @@ async function _loadKpiModalData(kpiId) {
     document.getElementById('kpi-unit').value           = k.unit || '';
     document.getElementById('kpi-direction').value      = k.direction || 'up';
     document.getElementById('kpi-status').value         = k.status || 'draft';
+    // Show Activate button only if KPI has SQL and is not already active
+    const activateBtn = document.getElementById('kpi-activate-btn');
+    if (activateBtn) {
+      activateBtn.style.display = (k.status !== 'active' && k.sql_expression) ? '' : 'none';
+    }
   } catch (e) { toast('Failed to load KPI: ' + e.message, 'error'); }
 }
 
@@ -2478,9 +2490,21 @@ function _resetKpiModal() {
   if (title)  title.textContent = 'Add KPI';
   const del = document.getElementById('kpi-delete-btn');
   if (del)    del.style.display = 'none';
+  const activateBtn = document.getElementById('kpi-activate-btn');
+  if (activateBtn) activateBtn.style.display = 'none';
+  const histBtn = document.getElementById('kpi-history-btn');
+  if (histBtn) histBtn.style.display = 'none';
+  const verPanel = document.getElementById('kpi-version-history');
+  if (verPanel) verPanel.style.display = 'none';
+  const changeRow = document.getElementById('kpi-change-note-row');
+  if (changeRow) changeRow.style.display = 'none';
+  const guardrailEl = document.getElementById('kpi-guardrail-errors');
+  if (guardrailEl) { guardrailEl.style.display = 'none'; guardrailEl.innerHTML = ''; }
+  const dupEl = document.getElementById('kpi-dup-warnings');
+  if (dupEl) { dupEl.style.display = 'none'; dupEl.innerHTML = ''; }
   const cstat = document.getElementById('kpi-compile-status');
   if (cstat)  cstat.textContent = '';
-  ['kpi-name','kpi-description','kpi-nl-formula','kpi-sql-expression','kpi-unit'].forEach(id => {
+  ['kpi-name','kpi-description','kpi-nl-formula','kpi-sql-expression','kpi-unit','kpi-change-note'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });
@@ -2490,9 +2514,30 @@ function _resetKpiModal() {
   const st  = document.getElementById('kpi-status');      if (st)  st.value  = 'draft';
 }
 
+function _showKpiGuardrailErrors(msg) {
+  const el = document.getElementById('kpi-guardrail-errors');
+  if (!el) return;
+  el.innerHTML = '⛔ ' + _esc(msg).replace(/; /g, '<br>⛔ ');
+  el.style.display = '';
+  el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function _showKpiDupWarnings(warnings) {
+  const el = document.getElementById('kpi-dup-warnings');
+  if (!el || !warnings || !warnings.length) return;
+  el.innerHTML = warnings.map(w => `⚠ ${_esc(w.message)}`).join('<br>');
+  el.style.display = '';
+}
+
 async function submitKpi() {
   const name = document.getElementById('kpi-name')?.value.trim();
   if (!name) { toast('KPI name is required', 'warn'); return; }
+
+  // Clear previous banners
+  const guardrailEl = document.getElementById('kpi-guardrail-errors');
+  if (guardrailEl) { guardrailEl.style.display = 'none'; guardrailEl.innerHTML = ''; }
+  const dupEl = document.getElementById('kpi-dup-warnings');
+  if (dupEl) { dupEl.style.display = 'none'; dupEl.innerHTML = ''; }
 
   const body = {
     name,
@@ -2504,20 +2549,34 @@ async function submitKpi() {
     unit:           document.getElementById('kpi-unit')?.value.trim() || '',
     direction:      document.getElementById('kpi-direction')?.value || 'up',
     status:         document.getElementById('kpi-status')?.value || 'draft',
+    change_note:    document.getElementById('kpi-change-note')?.value.trim() || '',
   };
 
   try {
+    let warnings = [];
     if (_kpiEditId) {
-      await apiFetch(`/kpis/${_kpiEditId}`, { method: 'PATCH', body: JSON.stringify(body) });
+      const res = await apiFetch(`/kpis/${_kpiEditId}`, { method: 'PATCH', body: JSON.stringify(body) });
+      warnings = res.warnings || [];
       toast('KPI updated', 'info');
     } else {
-      await apiFetch('/kpis', { method: 'POST', body: JSON.stringify(body) });
+      const res = await apiFetch('/kpis', { method: 'POST', body: JSON.stringify(body) });
+      warnings = res.warnings || [];
       toast('KPI created', 'info');
     }
     document.getElementById('kpi-modal-overlay').style.display = 'none';
+    if (warnings.length) {
+      // Show dup warnings as a prominent multi-line toast after close
+      setTimeout(() => {
+        warnings.forEach(w => toast('⚠ ' + w.message, 'warn'));
+      }, 200);
+    }
     await loadKpis();
   } catch (e) {
-    toast('Save failed: ' + e.message, 'error');
+    if (e.status === 422) {
+      _showKpiGuardrailErrors(e.message);
+    } else {
+      toast('Save failed: ' + e.message, 'error');
+    }
   }
 }
 
@@ -2583,8 +2642,10 @@ async function compileKpiFormula() {
           status:      'draft',
         }),
       });
-      _kpiEditId = saved.kpi_id;
-      kpiId = saved.kpi_id;
+      // POST /kpis returns {kpi: {...}, warnings: [...]}
+      const savedKpi = saved.kpi || saved;
+      _kpiEditId = savedKpi.kpi_id;
+      kpiId = savedKpi.kpi_id;
       document.getElementById('kpi-delete-btn').style.display = '';
     } else {
       // Update nl_formula before compiling
@@ -2609,5 +2670,100 @@ async function compileKpiFormula() {
     toast('Compile failed: ' + e.message, 'error');
   } finally {
     if (btn) { btn.disabled = false; btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px"><polygon points="5 3 19 12 5 21 5 3"/></svg> Compile'; }
+  }
+}
+
+// ── KPI Activate ──────────────────────────────────────────────────────────────
+
+async function activateKpi() {
+  if (!_kpiEditId) return;
+  const guardrailEl = document.getElementById('kpi-guardrail-errors');
+  if (guardrailEl) { guardrailEl.style.display = 'none'; guardrailEl.innerHTML = ''; }
+  try {
+    const res = await apiFetch(`/kpis/${_kpiEditId}/activate`, { method: 'POST', body: '{}' });
+    toast('KPI activated ✓', 'info');
+    // Reflect new status in form
+    const stEl = document.getElementById('kpi-status');
+    if (stEl) stEl.value = 'active';
+    const activateBtn = document.getElementById('kpi-activate-btn');
+    if (activateBtn) activateBtn.style.display = 'none';
+    await loadKpis();
+  } catch (e) {
+    if (e.status === 422) {
+      _showKpiGuardrailErrors(e.message);
+    } else {
+      toast('Activation failed: ' + e.message, 'error');
+    }
+  }
+}
+
+// ── KPI Version History ───────────────────────────────────────────────────────
+
+function toggleKpiHistory() {
+  const panel = document.getElementById('kpi-version-history');
+  if (!panel) return;
+  const showing = panel.style.display !== 'none';
+  panel.style.display = showing ? 'none' : '';
+  if (!showing && _kpiEditId) loadKpiVersions(_kpiEditId);
+  const btn = document.getElementById('kpi-history-btn');
+  if (btn) btn.textContent = showing ? 'History' : 'Hide History';
+}
+
+async function loadKpiVersions(kpiId) {
+  try {
+    const versions = await apiFetch(`/kpis/${kpiId}/versions`);
+    _renderKpiVersions(versions || []);
+  } catch (e) {
+    const el = document.getElementById('kpi-version-list');
+    if (el) el.innerHTML = `<span style="color:var(--text-2);">Failed to load history: ${_esc(e.message)}</span>`;
+  }
+}
+
+function _renderKpiVersions(versions) {
+  const el = document.getElementById('kpi-version-list');
+  if (!el) return;
+  if (!versions.length) {
+    el.innerHTML = '<span style="color:var(--text-2);">No previous versions.</span>';
+    return;
+  }
+  el.innerHTML = versions.map(v => {
+    const note  = v.change_note ? ` — ${_esc(v.change_note)}` : '';
+    const by    = v.changed_by  ? ` by ${_esc(v.changed_by)}` : '';
+    const ts    = v.created_at  ? v.created_at.substring(0, 16).replace('T', ' ') : '';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border);">
+      <div>
+        <span style="color:var(--accent);font-weight:600;">v${v.version_num}</span>
+        <span style="color:var(--text-2);margin-left:6px;">${ts}${by}${note}</span>
+        <div style="color:var(--text-2);font-size:11px;margin-top:2px;">${v.status} · ${_esc((v.sql_expression||'').substring(0,60))}${(v.sql_expression||'').length>60?'…':''}</div>
+      </div>
+      <button class="btn btn-secondary" style="font-size:11px;padding:2px 8px;flex-shrink:0;margin-left:8px;"
+        onclick="rollbackKpiVersion(${v.version_num})">Rollback</button>
+    </div>`;
+  }).join('');
+}
+
+async function rollbackKpiVersion(versionNum) {
+  if (!_kpiEditId) return;
+  if (!confirm(`Rollback to version ${versionNum}? The current state will be saved as a new version.`)) return;
+  try {
+    const restored = await apiFetch(`/kpis/${_kpiEditId}/versions/${versionNum}/rollback`, {
+      method: 'POST', body: '{}',
+    });
+    // Refresh form with restored values
+    document.getElementById('kpi-name').value           = restored.name || '';
+    document.getElementById('kpi-category').value       = restored.category || '';
+    document.getElementById('kpi-source-id').value      = restored.source_id || '';
+    document.getElementById('kpi-description').value    = restored.description || '';
+    document.getElementById('kpi-nl-formula').value     = restored.nl_formula || '';
+    document.getElementById('kpi-sql-expression').value = restored.sql_expression || '';
+    document.getElementById('kpi-unit').value           = restored.unit || '';
+    document.getElementById('kpi-direction').value      = restored.direction || 'up';
+    document.getElementById('kpi-status').value         = restored.status || 'draft';
+    toast(`Rolled back to v${versionNum}`, 'info');
+    // Reload version list
+    await loadKpiVersions(_kpiEditId);
+    await loadKpis();
+  } catch (e) {
+    toast('Rollback failed: ' + e.message, 'error');
   }
 }

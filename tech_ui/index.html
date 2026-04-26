@@ -974,9 +974,14 @@
 <!-- vis.js network -->
 <!-- ── KPI Modal ──────────────────────────────────────────────────────────── -->
 <div id="kpi-modal-overlay" onclick="closeKpiModal(event)" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000;align-items:center;justify-content:center;">
-  <div class="modal" onclick="event.stopPropagation()" style="max-width:580px;width:95%;max-height:92vh;overflow-y:auto;">
+  <div class="modal" onclick="event.stopPropagation()" style="max-width:600px;width:95%;max-height:92vh;overflow-y:auto;">
     <div class="modal-title" id="kpi-modal-title">Add KPI</div>
     <input type="hidden" id="kpi-edit-id">
+
+    <!-- Guardrail errors (blocking — shown when save is rejected) -->
+    <div id="kpi-guardrail-errors" style="display:none;background:#7f1d1d22;border:1px solid #ef444455;border-radius:4px;padding:8px 12px;margin-bottom:10px;font-size:12px;color:#f87171;line-height:1.6;"></div>
+    <!-- Duplicate warnings (non-blocking — shown after successful save) -->
+    <div id="kpi-dup-warnings" style="display:none;background:#78350f22;border:1px solid #f59e0b55;border-radius:4px;padding:8px 12px;margin-bottom:10px;font-size:12px;color:#f59e0b;line-height:1.6;"></div>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
       <div class="form-row" style="margin:0;grid-column:1/-1;">
@@ -1035,17 +1040,30 @@
           <option value="deprecated">Deprecated</option>
         </select>
       </div>
+      <!-- Change tracking (edit only) -->
+      <div class="form-row" id="kpi-change-note-row" style="margin:0;grid-column:1/-1;display:none;">
+        <label>Change Note <span style="color:var(--text-2);font-weight:400;">(optional)</span></label>
+        <input type="text" id="kpi-change-note" placeholder="e.g. Updated formula for Q2 seasonality">
+      </div>
     </div>
 
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;">
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap;">
       <button class="btn btn-ghost" id="kpi-delete-btn" style="margin-right:auto;color:#f87171;display:none;" onclick="deleteKpi()">Delete</button>
+      <button class="btn btn-secondary" id="kpi-activate-btn" style="display:none;color:#22c55e;" onclick="activateKpi()">Activate</button>
+      <button class="btn btn-secondary" id="kpi-history-btn" style="display:none;" onclick="toggleKpiHistory()">History</button>
       <button class="btn btn-ghost" onclick="closeKpiModal()">Cancel</button>
       <button class="btn btn-primary" onclick="submitKpi()">Save KPI</button>
+    </div>
+
+    <!-- Version history panel (edit only) -->
+    <div id="kpi-version-history" style="display:none;margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+      <div style="font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:8px;">Version History</div>
+      <div id="kpi-version-list" style="max-height:220px;overflow-y:auto;font-size:12px;"></div>
     </div>
   </div>
 </div>
 
 <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
-<script src="/tech/app.js?v=10"></script>
+<script src="/tech/app.js?v=11"></script>
 </body>
 </html>

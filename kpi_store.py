@@ -176,6 +176,28 @@ CREATE TABLE IF NOT EXISTS kpis (
 )
 """
 
+_DDL_VERSIONS_SQLITE = """
+CREATE TABLE IF NOT EXISTS kpi_versions (
+    version_id   TEXT PRIMARY KEY,
+    kpi_id       TEXT NOT NULL,
+    version_num  INTEGER NOT NULL,
+    name           TEXT NOT NULL DEFAULT '',
+    description    TEXT NOT NULL DEFAULT '',
+    category       TEXT NOT NULL DEFAULT '',
+    source_id      TEXT NOT NULL DEFAULT '',
+    nl_formula     TEXT NOT NULL DEFAULT '',
+    sql_expression TEXT NOT NULL DEFAULT '',
+    unit           TEXT NOT NULL DEFAULT '',
+    direction      TEXT NOT NULL DEFAULT 'up',
+    status         TEXT NOT NULL DEFAULT 'draft',
+    changed_by   TEXT NOT NULL DEFAULT '',
+    change_note  TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL
+)
+"""
+
+_DDL_VERSIONS_PG = _DDL_VERSIONS_SQLITE  # same DDL works on PG
+
 _schema_ensured = False
 
 
@@ -183,20 +205,38 @@ def _ensure(cur: Any) -> None:
     global _schema_ensured
     if _is_postgres():
         cur.ddl(_DDL_KPIS_PG)
+        cur.ddl(_DDL_VERSIONS_PG)
     else:
         cur.ddl(_DDL_KPIS_SQLITE)
+        cur.ddl(_DDL_VERSIONS_SQLITE)
+    # Migration: add approved_by if missing
+    try:
+        cur.execute("ALTER TABLE kpis ADD COLUMN approved_by TEXT NOT NULL DEFAULT ''")
+    except Exception:
+        pass
     _schema_ensured = True
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 _ALLOWED_CREATE = {"name", "description", "category", "source_id",
-                   "nl_formula", "sql_expression", "unit", "direction", "status"}
+                   "nl_formula", "sql_expression", "unit", "direction",
+                   "status", "approved_by"}
 _ALLOWED_UPDATE = _ALLOWED_CREATE
 
 
 def create_kpi(**fields: Any) -> Dict:
-    """Create a new KPI. Returns the created KPI dict."""
+    """
+    Create a new KPI.
+    Runs guardrail checks and duplicate detection before persisting.
+    Returns {"kpi": {...}, "warnings": [...]}
+    """
+    guardrail_errors = _guardrail_check(fields)
+    if guardrail_errors:
+        raise ValueError("; ".join(guardrail_errors))
+
+    warnings = _duplicate_check(fields.get("name", ""), fields.get("nl_formula", ""))
+
     kpi_id = str(uuid.uuid4())
     now = _now()
     row = {
@@ -210,6 +250,7 @@ def create_kpi(**fields: Any) -> Dict:
         "unit":           fields.get("unit") or "",
         "direction":      fields.get("direction") or "up",
         "status":         fields.get("status") or "draft",
+        "approved_by":    fields.get("approved_by") or "",
         "created_at":     now,
         "updated_at":     now,
     }
@@ -217,14 +258,14 @@ def create_kpi(**fields: Any) -> Dict:
         _ensure(cur)
         cur.execute(
             "INSERT INTO kpis (kpi_id,name,description,category,source_id,"
-            "nl_formula,sql_expression,unit,direction,status,created_at,updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "nl_formula,sql_expression,unit,direction,status,approved_by,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (row["kpi_id"], row["name"], row["description"], row["category"],
              row["source_id"], row["nl_formula"], row["sql_expression"],
-             row["unit"], row["direction"], row["status"],
+             row["unit"], row["direction"], row["status"], row["approved_by"],
              row["created_at"], row["updated_at"]),
         )
-    return row
+    return {"kpi": row, "warnings": warnings}
 
 
 def list_kpis(
@@ -260,26 +301,276 @@ def get_kpi(kpi_id: str) -> Optional[Dict]:
     return dict(row) if row else None
 
 
-def update_kpi(kpi_id: str, **fields: Any) -> bool:
+def update_kpi(kpi_id: str, changed_by: str = "", change_note: str = "",
+               _skip_checks: bool = False, **fields: Any) -> Dict:
+    """
+    Update a KPI, snapshotting the current state into kpi_versions first.
+    Runs guardrail checks and duplicate detection on the new values.
+    Returns {"ok": True, "warnings": [...]}; raises ValueError on guardrail failure.
+    _skip_checks=True bypasses duplicate detection (used internally for rollback).
+    """
     updates = {k: v for k, v in fields.items() if k in _ALLOWED_UPDATE}
     if not updates:
-        return False
-    updates["updated_at"] = _now()
-    set_clause = ", ".join(f"{k}=?" for k in updates)
+        return {"ok": False, "warnings": []}
+
+    guardrail_errors = _guardrail_check(updates)
+    if guardrail_errors:
+        raise ValueError("; ".join(guardrail_errors))
+
     with _cursor_ctx() as cur:
         _ensure(cur)
+        existing = cur.execute("SELECT * FROM kpis WHERE kpi_id=?", (kpi_id,)).fetchone()
+        if not existing:
+            return {"ok": False, "warnings": []}
+
+        # Snapshot current state before overwriting
+        version_num = (cur.execute(
+            "SELECT COALESCE(MAX(version_num),0) AS max_ver FROM kpi_versions WHERE kpi_id=?",
+            (kpi_id,)
+        ).fetchone() or {}).get("max_ver", 0) or 0
+        version_num += 1
+        cur.execute(
+            "INSERT INTO kpi_versions "
+            "(version_id,kpi_id,version_num,name,description,category,source_id,"
+            "nl_formula,sql_expression,unit,direction,status,changed_by,change_note,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), kpi_id, version_num,
+             existing.get("name",""), existing.get("description",""),
+             existing.get("category",""), existing.get("source_id",""),
+             existing.get("nl_formula",""), existing.get("sql_expression",""),
+             existing.get("unit",""), existing.get("direction","up"),
+             existing.get("status","draft"),
+             changed_by, change_note, _now()),
+        )
+
+        updates["updated_at"] = _now()
+        set_clause = ", ".join(f"{k}=?" for k in updates)
         cur.execute(
             f"UPDATE kpis SET {set_clause} WHERE kpi_id=?",
             tuple(updates.values()) + (kpi_id,),
         )
-    return True
+
+    warnings: List[Dict] = []
+    if not _skip_checks:
+        name      = fields.get("name") or (get_kpi(kpi_id) or {}).get("name", "")
+        nl        = fields.get("nl_formula") or (get_kpi(kpi_id) or {}).get("nl_formula", "")
+        warnings  = _duplicate_check(name, nl, exclude_kpi_id=kpi_id)
+
+    return {"ok": True, "warnings": warnings}
 
 
 def delete_kpi(kpi_id: str) -> bool:
     with _cursor_ctx() as cur:
         _ensure(cur)
+        cur.execute("DELETE FROM kpi_versions WHERE kpi_id=?", (kpi_id,))
         cur.execute("DELETE FROM kpis WHERE kpi_id=?", (kpi_id,))
     return True
+
+
+# ── Versioning ────────────────────────────────────────────────────────────────
+
+def list_kpi_versions(kpi_id: str) -> List[Dict]:
+    """Return all snapshots for a KPI, newest first."""
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        rows = cur.execute(
+            "SELECT * FROM kpi_versions WHERE kpi_id=? ORDER BY version_num DESC",
+            (kpi_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def rollback_kpi_version(kpi_id: str, version_num: int,
+                         changed_by: str = "") -> Optional[Dict]:
+    """
+    Restore a KPI to a previous snapshot.
+    The current state is itself snapshotted first (so rollback is auditable).
+    Returns the restored KPI dict or None if version not found.
+    """
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        snap = cur.execute(
+            "SELECT * FROM kpi_versions WHERE kpi_id=? AND version_num=?",
+            (kpi_id, version_num)
+        ).fetchone()
+    if not snap:
+        return None
+    snap = dict(snap)
+    update_kpi(
+        kpi_id,
+        changed_by=changed_by,
+        change_note=f"Rolled back to version {version_num}",
+        _skip_checks=True,
+        name=snap["name"],
+        description=snap["description"],
+        category=snap["category"],
+        source_id=snap["source_id"],
+        nl_formula=snap["nl_formula"],
+        sql_expression=snap["sql_expression"],
+        unit=snap["unit"],
+        direction=snap["direction"],
+        status=snap["status"],
+    )
+    return get_kpi(kpi_id)
+
+
+# ── Guardrails ────────────────────────────────────────────────────────────────
+
+_SQL_DANGEROUS = re.compile(
+    r"\b(DROP|DELETE|UPDATE|INSERT|TRUNCATE|ALTER|CREATE|GRANT|REVOKE|EXEC|EXECUTE)\b",
+    re.IGNORECASE
+)
+_SQL_COMMENT = re.compile(r"(--|/\*|\*/)")
+
+
+def _guardrail_check(fields: Dict) -> List[str]:
+    """
+    Returns a list of error strings. Empty list = all checks pass.
+    Checks:
+      1. SQL expression must not contain DML/DDL keywords or comment tokens
+      2. KPI being set to 'active' must have a non-empty sql_expression
+      3. direction must be 'up' or 'down'
+    """
+    errors: List[str] = []
+    sql = (fields.get("sql_expression") or "").strip()
+
+    if sql:
+        m = _SQL_DANGEROUS.search(sql)
+        if m:
+            errors.append(
+                f"SQL expression contains forbidden keyword '{m.group().upper()}' — "
+                "only SELECT expressions are allowed"
+            )
+        if _SQL_COMMENT.search(sql):
+            errors.append("SQL expression must not contain comment tokens (-- or /* */)")
+
+    status = (fields.get("status") or "").strip()
+    if status == "active":
+        if not sql:
+            errors.append(
+                "A KPI must have a compiled SQL expression before it can be set to Active"
+            )
+        direction = (fields.get("direction") or "").strip()
+        if direction and direction not in ("up", "down"):
+            errors.append("direction must be 'up' or 'down'")
+
+    return errors
+
+
+def activate_kpi(kpi_id: str, approved_by: str = "") -> Dict:
+    """
+    Gate: validate the KPI passes all guardrails, then set status → active.
+    Returns {"ok": True, "kpi": {...}} or raises ValueError with failure reasons.
+    """
+    kpi = get_kpi(kpi_id)
+    if not kpi:
+        raise ValueError(f"KPI {kpi_id!r} not found")
+
+    errors = _guardrail_check({
+        "sql_expression": kpi.get("sql_expression", ""),
+        "status": "active",
+        "direction": kpi.get("direction", "up"),
+    })
+    if not kpi.get("sql_expression", "").strip():
+        errors.append("SQL expression is empty — run Compile first")
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    update_kpi(
+        kpi_id,
+        changed_by=approved_by,
+        change_note="Activated",
+        status="active",
+        approved_by=approved_by,
+    )
+    return get_kpi(kpi_id)
+
+
+# ── Duplicate Detection ───────────────────────────────────────────────────────
+
+def _levenshtein(a: str, b: str) -> int:
+    """Pure-Python Levenshtein distance."""
+    a, b = a.lower(), b.lower()
+    if a == b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            curr.append(min(prev[j] + 1, curr[j - 1] + 1,
+                            prev[j - 1] + (0 if ca == cb else 1)))
+        prev = curr
+    return prev[-1]
+
+
+def _normalise_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _tfidf_similarity(text_a: str, text_b: str) -> float:
+    """
+    Cosine similarity between two short texts using character n-gram TF-IDF.
+    Falls back to 0.0 if scikit-learn is unavailable.
+    """
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity as _cos
+        import numpy as np
+        vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4))
+        tfidf = vec.fit_transform([text_a, text_b])
+        return float(_cos(tfidf[0], tfidf[1])[0][0])
+    except Exception:
+        return 0.0
+
+
+def _duplicate_check(name: str, nl_formula: str,
+                     exclude_kpi_id: Optional[str] = None) -> List[Dict]:
+    """
+    Returns list of {type, kpi_id, name, score, message} for suspected duplicates.
+    Does NOT block creation — callers surface these as warnings.
+    """
+    existing = list_kpis()
+    warnings: List[Dict] = []
+    norm_new = _normalise_name(name)
+
+    for k in existing:
+        if k["kpi_id"] == exclude_kpi_id:
+            continue
+
+        # Pass 1 — name edit distance
+        norm_existing = _normalise_name(k["name"])
+        dist = _levenshtein(norm_new, norm_existing)
+        if dist <= 3 and norm_new and norm_existing:
+            warnings.append({
+                "type": "name_similarity",
+                "kpi_id": k["kpi_id"],
+                "name": k["name"],
+                "score": dist,
+                "message": (
+                    f"'{k['name']}' has a very similar name (edit distance {dist}) — "
+                    "check if this is a duplicate"
+                ),
+            })
+            continue  # no need to also check formula if name matches
+
+        # Pass 2 — formula semantic similarity (only if both have formulas)
+        if nl_formula and k.get("nl_formula"):
+            sim = _tfidf_similarity(nl_formula, k["nl_formula"])
+            if sim >= 0.85:
+                warnings.append({
+                    "type": "formula_similarity",
+                    "kpi_id": k["kpi_id"],
+                    "name": k["name"],
+                    "score": round(sim, 3),
+                    "message": (
+                        f"'{k['name']}' has a very similar formula "
+                        f"(similarity {sim:.0%}) — check if this is a duplicate"
+                    ),
+                })
+
+    return warnings
 
 
 # ── LLM Formula Compiler ──────────────────────────────────────────────────────

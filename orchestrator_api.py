@@ -65,6 +65,7 @@ import metadata_catalog as _mc   # standalone catalog module (no dialog_agent de
 import kpi_store as _kpi              # BI Manager KPI definitions
 import kg_store as _kg_store           # KG snapshot persistence
 import access_control as _ac           # RBAC / ABAC engine
+import ontology_enricher as _enricher  # glossary+KPI → KG/attribute enrichment
 
 # ── GraphRAG helpers (inlined — no dialog_agent import needed) ─────────────────
 # These functions mirror dialog_agent/nodes/retrieve_node.py but have no
@@ -3405,6 +3406,53 @@ async def run_bridge_transitivity():
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Ontology Enrichment endpoints ────────────────────────────────────────────
+
+@app.post("/ontology/enrich", status_code=202)
+async def trigger_ontology_enrichment(background_tasks: BackgroundTasks):
+    """
+    Run the full ontology enrichment pipeline in the background:
+      1. Glossary terms → md_attributes (semantic_role / description annotation)
+      2. Active KPI sql_expressions → KPI→attribute link table
+      3. Inject GLOSSARY_CONCEPT + KPI_METRIC nodes+edges into all KG snapshots
+    Returns immediately with a run_id; poll GET /ontology/enrich/status for progress.
+    """
+    def _run():
+        try:
+            _enricher.run_enrichment()
+        except Exception as exc:
+            logger.error("Ontology enrichment background task failed: %s", exc)
+
+    background_tasks.add_task(_run)
+    status = _enricher.get_status()
+    return {
+        "status":   "accepted",
+        "message":  "Ontology enrichment started in the background",
+        "last_run": status,
+    }
+
+
+@app.get("/ontology/enrich/status")
+async def get_ontology_enrichment_status():
+    """Return the most recent ontology enrichment run record."""
+    status = _enricher.get_status()
+    if not status:
+        return {"status": "never_run", "message": "No enrichment run recorded yet"}
+    return status
+
+
+@app.get("/ontology/glossary-links")
+async def list_glossary_attr_links(term_id: Optional[str] = None):
+    """Return glossary→attribute annotation links, optionally filtered by term."""
+    return _enricher.get_glossary_attr_links(term_id=term_id)
+
+
+@app.get("/ontology/kpi-links")
+async def list_kpi_attr_links(kpi_id: Optional[str] = None):
+    """Return KPI→attribute annotation links, optionally filtered by KPI."""
+    return _enricher.get_kpi_attr_links(kpi_id=kpi_id)
 
 
 # ── Access Control (RBAC / ABAC) endpoints ─────────────────────────────────────

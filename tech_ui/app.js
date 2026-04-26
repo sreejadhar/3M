@@ -43,8 +43,8 @@ function switchView(view) {
   if (view === 'sql')        onViewSQL();
   if (view === 'cdc')        loadCDC();
   if (view === 'documents')  loadDocSources();
-  if (view === 'glossary')   loadGlossaryTerms();
-  if (view === 'kpi')        loadKpis();
+  if (view === 'glossary')   { loadGlossaryTerms(); loadEnrichStatus(); }
+  if (view === 'kpi')        { loadKpis(); loadEnrichStatus(); }
 }
 
 function refreshCurrentView() { switchView(_currentView); }
@@ -2815,4 +2815,54 @@ async function rollbackKpiVersion(versionNum) {
   } catch (e) {
     toast('Rollback failed: ' + e.message, 'error');
   }
+}
+
+// ── Ontology Enrichment ───────────────────────────────────────────────────────
+
+async function runOntologyEnrichment() {
+  const btns = ['glossary-enrich-btn', 'kpi-enrich-btn']
+    .map(id => document.getElementById(id)).filter(Boolean);
+  btns.forEach(b => { b.disabled = true; b.textContent = 'Enriching…'; });
+
+  try {
+    await apiFetch('/ontology/enrich', { method: 'POST', body: '{}' });
+    toast('Ontology enrichment started — KG and attribute annotations updating in background', 'info');
+    // Poll status after 3s to show result
+    setTimeout(loadEnrichStatus, 3000);
+    setTimeout(loadEnrichStatus, 8000);
+  } catch (e) {
+    toast('Enrichment failed: ' + e.message, 'error');
+  } finally {
+    btns.forEach(b => {
+      b.disabled = false;
+      b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg> Enrich Ontology';
+    });
+  }
+}
+
+async function loadEnrichStatus() {
+  try {
+    const s = await apiFetch('/ontology/enrich/status');
+    const badge = document.getElementById('enrich-status-badge');
+    if (!badge || !s || s.status === 'never_run') return;
+
+    const stats = s.stats || {};
+    const g = stats.glossary || {};
+    const k = stats.kpis     || {};
+    const kg = stats.kg      || {};
+
+    const parts = [];
+    if (g.links_created) parts.push(`${g.links_created} glossary links`);
+    if (k.links_created) parts.push(`${k.links_created} KPI links`);
+    if (kg.nodes_added)  parts.push(`${kg.nodes_added} KG nodes`);
+
+    if (!parts.length && s.status === 'done') parts.push('up to date');
+
+    const ts = s.finished_at
+      ? new Date(s.finished_at).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
+      : '';
+    const statusColor = s.status === 'done' ? '#22c55e' : s.status === 'error' ? '#f87171' : '#f59e0b';
+    badge.innerHTML = `<span style="color:${statusColor}">●</span> Last enrichment: ${parts.join(', ')}${ts ? ' · ' + ts : ''}`;
+    badge.style.display = '';
+  } catch { /* silent */ }
 }

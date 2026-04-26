@@ -553,6 +553,11 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
             Refresh
           </button>
+          <button class="btn btn-secondary" id="glossary-enrich-btn" onclick="runOntologyEnrichment()" title="Propagate glossary terms and KPIs into the knowledge graph and annotate catalog attributes">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+            Enrich Ontology
+          </button>
+          <div id="enrich-status-badge" style="display:none;font-size:11px;color:var(--text-2);"></div>
           <button class="btn btn-primary" onclick="openGlossaryModal()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             Add Term
@@ -585,6 +590,10 @@
           <button class="btn btn-secondary" onclick="loadKpis()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
             Refresh
+          </button>
+          <button class="btn btn-secondary" id="kpi-enrich-btn" onclick="runOntologyEnrichment()" title="Propagate glossary terms and active KPIs into the knowledge graph">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
+            Enrich Ontology
           </button>
           <button class="btn btn-primary" onclick="openKpiModal()">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -1073,6 +1082,6 @@
 </div>
 
 <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>
-<script src="/tech/app.js?v=11"></script>
+<script src="/tech/app.js?v=12"></script>
 </body>
 </html>

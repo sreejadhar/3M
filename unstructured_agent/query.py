@@ -45,7 +45,8 @@ def query_for_context(
             fts_hits = store.search_assets(_fts_query(question), limit=limit * 2)
             for asset in fts_hits:
                 aid = asset["asset_id"]
-                candidates[aid] = {"asset": asset, "score": 1.0, "kpi_links": []}
+                candidates[aid] = {"asset": asset, "score": 1.0, "kpi_links": [],
+                                   "change_summary": _latest_change_summary(asset, store)}
         except Exception as exc:
             logger.debug("FTS search failed: %s", exc)
 
@@ -71,6 +72,7 @@ def query_for_context(
                         "asset": asset,
                         "score": max(l["confidence"] for l in links),
                         "kpi_links": links,
+                        "change_summary": _latest_change_summary(asset, store),
                     }
         except Exception as exc:
             logger.debug("KPI graph lookup failed: %s", exc)
@@ -136,6 +138,24 @@ def _find_kpi_linked_docs(kpi_names: List[str],
     return result
 
 
+def _latest_change_summary(asset: Dict, store: UnstructuredStore) -> str:
+    """
+    Return the change_summary from the most recent version snapshot,
+    or "" if this is the first version or no summary exists yet.
+    """
+    version_num = asset.get("version_num") or 1
+    if version_num <= 1:
+        return ""
+    try:
+        versions = store.list_asset_versions(asset["asset_id"])
+        # versions are newest-first; the most recent snapshot is the previous version
+        if versions:
+            return versions[0].get("change_summary", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
 def _format_context(ranked: List[Dict], base_url: str = "") -> str:
     """
     Format the ranked document context as a clean markdown block.
@@ -155,15 +175,23 @@ def _format_context(ranked: List[Dict], base_url: str = "") -> str:
         time_refs = asset.get("time_references") or []
         ents     = asset.get("named_entities") or {}
         sensitivity = asset.get("sensitivity", "internal")
+        version_num = asset.get("version_num") or 1
+        change_summary = item.get("change_summary", "")
 
-        # Meta line
+        # Meta line — includes version badge when >1
         meta_parts = [p for p in [doc_type, domain] if p]
+        if version_num > 1:
+            meta_parts.append(f"v{version_num}")
         meta = f" *({', '.join(meta_parts)})*" if meta_parts else ""
 
         lines.append(f"**{title}**{meta}")
 
         if summary:
             lines.append(summary)
+
+        # Change callout for documents that have been updated
+        if version_num > 1 and change_summary:
+            lines.append(f"*Latest update:* {change_summary}")
 
         # KPIs discussed in this document that match the structured answer
         if kpi_links:
@@ -192,6 +220,8 @@ def _format_context(ranked: List[Dict], base_url: str = "") -> str:
             asset_id = asset.get("asset_id", "")
             if asset_id:
                 lines.append(f"[↓ Download]({base_url}/assets/{asset_id}/download)")
+                if version_num > 1:
+                    lines.append(f"[Version history]({base_url}/assets/{asset_id}/versions)")
 
         lines.append("")  # blank line between docs
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List
+from typing import Dict, List, Optional
 
 from .connectors import make_connector, file_type_from_extension
 from .fingerprinter import quality_gate, extract_fingerprint
@@ -81,6 +81,9 @@ def run_index_job(job_id: str, source_id: str, store: UnstructuredStore,
                 "modified_at_file": manifest.modified_at,
             }
 
+            # Snapshot old version (if any) BEFORE upsert so we can diff later
+            old_version_snapshot = _get_old_snapshot(manifest, source_id, store)
+
             asset_id = store.upsert_asset(
                 source_id=source_id,
                 file_path=manifest.path,
@@ -114,6 +117,14 @@ def run_index_job(job_id: str, source_id: str, store: UnstructuredStore,
             )
             fp.setdefault("title", parse_result.title or manifest.file_name)
             store.save_fingerprint(asset_id, fp)
+
+            # If this was a version update, compute and persist the change summary
+            if old_version_snapshot is not None:
+                asset = store.get_asset(asset_id)
+                old_ver = (asset.get("version_num") or 1) - 1
+                if old_ver >= 1:
+                    change_summary = _compute_change_summary(old_version_snapshot, fp)
+                    store.save_version_change_summary(asset_id, old_ver, change_summary)
 
             # Cross-modal linking (non-blocking, best-effort)
             try:
@@ -167,3 +178,80 @@ def _load_connection(source: dict) -> dict:
 def _now() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+def _get_old_snapshot(manifest, source_id: str,
+                      store: UnstructuredStore) -> "dict | None":
+    """
+    Return the current enriched state of an asset before it is overwritten,
+    or None if this is a new file or the file hasn't changed.
+    Only called when we expect a potential version bump.
+    """
+    try:
+        if manifest.remote_path:
+            row = store._conn().execute(
+                "SELECT * FROM unstructured_assets WHERE source_id=? AND remote_path=?",
+                (source_id, manifest.remote_path),
+            ).fetchone()
+        else:
+            row = store._conn().execute(
+                "SELECT * FROM unstructured_assets WHERE source_id=? AND file_path=?",
+                (source_id, manifest.path),
+            ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("checksum") == manifest.checksum:
+            return None  # file unchanged — no version bump
+        return d
+    except Exception:
+        return None
+
+
+def _compute_change_summary(old: dict, new_fp: dict) -> str:
+    """
+    Produce a human-readable change summary by diffing the old asset state
+    against the newly computed fingerprint. No LLM call — pure structural diff.
+    """
+    parts: List[str] = []
+
+    # Title change
+    old_title = (old.get("title") or "").strip()
+    new_title = (new_fp.get("title") or "").strip()
+    if old_title and new_title and old_title != new_title:
+        parts.append(f'Title changed from "{old_title}" to "{new_title}"')
+
+    # Doc type change
+    old_type = (old.get("doc_type") or "").strip()
+    new_type = (new_fp.get("doc_type") or "").strip()
+    if old_type and new_type and old_type != new_type:
+        parts.append(f"Document type changed from {old_type} to {new_type}")
+
+    # Topic changes
+    import json as _json
+    try:
+        old_topics = set(_json.loads(old.get("topics_json") or "[]"))
+    except Exception:
+        old_topics = set()
+    new_topics = set(new_fp.get("topics") or [])
+
+    added   = new_topics - old_topics
+    removed = old_topics - new_topics
+    if added:
+        parts.append("New topics: " + ", ".join(sorted(added)))
+    if removed:
+        parts.append("Removed topics: " + ", ".join(sorted(removed)))
+
+    # Size change (significant = >10%)
+    old_size = old.get("size_bytes") or 0
+    new_size = new_fp.get("size_bytes") or 0
+    if old_size and new_size:
+        pct = abs(new_size - old_size) / old_size * 100
+        if pct >= 10:
+            direction = "grew" if new_size > old_size else "shrank"
+            parts.append(f"File {direction} by {pct:.0f}%")
+
+    if not parts:
+        parts.append("Content updated (no structural changes detected)")
+
+    return "; ".join(parts)

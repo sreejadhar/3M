@@ -1802,7 +1802,7 @@ function _renderDocAssets(assets) {
   const tbody = document.getElementById('doc-asset-body');
   if (!tbody) return;
   if (!assets.length) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-2);">No documents indexed yet. Click <b>Add Source</b> to register a folder and start indexing.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:40px;color:var(--text-2);">No documents indexed yet. Click <b>Add Source</b> to register a folder and start indexing.</td></tr>';
     return;
   }
   tbody.innerHTML = assets.map(a => {
@@ -1811,11 +1811,16 @@ function _renderDocAssets(assets) {
     const sensColor = { public:'badge-green', internal:'badge-gray', confidential:'badge-amber', restricted:'badge-red' };
     const sensBadge = `<span class="badge ${sensColor[a.sensitivity] || 'badge-gray'}" style="font-size:9px;">${_esc(a.sensitivity || 'internal')}</span>`;
     const dt = a.indexed_at ? new Date(a.indexed_at).toLocaleDateString() : '—';
+    const ver = a.version_num || 1;
+    const verBadge = ver > 1
+      ? `<span style="font-size:10px;background:var(--accent)22;color:var(--accent);border:1px solid var(--accent)44;border-radius:10px;padding:1px 6px;">v${ver}</span>`
+      : `<span style="font-size:10px;color:var(--text-2);">v1</span>`;
     return `<tr style="cursor:pointer" onclick="openDocDetail('${a.asset_id}')">
       <td>
         <div style="font-weight:600;font-size:12px">${_esc(a.title || a.file_name)}</div>
         <div style="font-size:10px;color:var(--text-2);margin-top:1px">${_esc(a.file_name)} · ${a.size_bytes ? _fmtBytes(a.size_bytes) : '—'}</div>
       </td>
+      <td>${verBadge}</td>
       <td><span class="badge badge-gray" style="font-size:9px;text-transform:uppercase">${_esc(a.file_type || '—')}</span></td>
       <td style="font-size:11px">${_esc(a.domain || '—')}</td>
       <td><div style="display:flex;flex-wrap:wrap;gap:2px">${topics || '<span class="text-dim">—</span>'}</div></td>
@@ -1844,6 +1849,8 @@ async function openDocDetail(assetId) {
   document.getElementById('doc-detail-topics').innerHTML  = '';
   document.getElementById('doc-detail-entities').innerHTML = '';
   document.getElementById('doc-detail-links').innerHTML   = 'Loading…';
+  const verSection = document.getElementById('doc-version-section');
+  if (verSection) verSection.style.display = 'none';
 
   try {
     const [asset, linkData] = await Promise.all([
@@ -1851,11 +1858,13 @@ async function openDocDetail(assetId) {
       apiFetch(`${_UNSTRUCTURED}/assets/${assetId}/links`).catch(() => ({ links: [] })),
     ]);
 
+    const verNum = asset.version_num || 1;
     document.getElementById('doc-detail-title').textContent =
       asset.title || asset.file_name;
     document.getElementById('doc-detail-meta').textContent =
       [asset.doc_type, asset.domain, asset.language,
        asset.page_count ? `${asset.page_count} pages` : null,
+       `v${verNum}`,
        asset.indexed_at ? new Date(asset.indexed_at).toLocaleDateString() : null]
       .filter(Boolean).join(' · ');
     document.getElementById('doc-detail-summary').textContent =
@@ -1895,10 +1904,50 @@ async function openDocDetail(assetId) {
         </div>`;
       }).join('');
     }
+
+    // Version history — only shown when asset has been updated at least once
+    if (verNum > 1 && verSection) {
+      verSection.style.display = '';
+      const badge = document.getElementById('doc-version-badge');
+      if (badge) badge.textContent = `Latest: v${verNum}`;
+      const verListEl = document.getElementById('doc-version-list');
+      if (verListEl) verListEl.innerHTML = 'Loading…';
+      apiFetch(`${_UNSTRUCTURED}/assets/${assetId}/versions`)
+        .then(versions => _renderDocVersionHistory(verListEl, versions, verNum))
+        .catch(() => { if (verListEl) verListEl.innerHTML = '<span class="text-dim">Failed to load version history</span>'; });
+    }
+
   } catch (e) {
     document.getElementById('doc-detail-title').textContent = 'Error loading document';
     document.getElementById('doc-detail-summary').textContent = e.message;
   }
+}
+
+function _renderDocVersionHistory(el, versions, currentVerNum) {
+  if (!el) return;
+  if (!versions || !versions.length) {
+    el.innerHTML = '<span class="text-dim">No prior versions.</span>';
+    return;
+  }
+  el.innerHTML = versions.map(v => {
+    const ts   = v.indexed_at ? v.indexed_at.substring(0, 16).replace('T', ' ') : '';
+    const note = v.change_summary
+      ? `<div style="color:var(--text-2);font-size:11px;margin-top:2px;">${_esc(v.change_summary)}</div>`
+      : '';
+    const topics = (v.topics || []).slice(0, 3).map(t => `<span class="top-val-chip" style="font-size:9px;">${_esc(t)}</span>`).join('');
+    return `<div style="padding:6px 0;border-bottom:1px solid var(--border);">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+        <div>
+          <span style="color:var(--accent);font-weight:600;font-size:12px;">v${v.version_num}</span>
+          <span style="color:var(--text-2);font-size:11px;margin-left:6px;">${ts}</span>
+          ${v.title ? `<span style="color:var(--text-1);font-size:11px;margin-left:6px;">${_esc(v.title)}</span>` : ''}
+        </div>
+        ${v.doc_type ? `<span class="badge badge-gray" style="font-size:9px;">${_esc(v.doc_type)}</span>` : ''}
+      </div>
+      ${note}
+      ${topics ? `<div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:2px;">${topics}</div>` : ''}
+    </div>`;
+  }).join('');
 }
 
 function closeDocDetail() {

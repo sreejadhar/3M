@@ -483,7 +483,8 @@
               <table class="data-table" id="doc-asset-table">
                 <thead>
                   <tr>
-                    <th style="width:40%">Document</th>
+                    <th style="width:38%">Document</th>
+                    <th>Ver</th>
                     <th>Type</th>
                     <th>Domain</th>
                     <th>Topics</th>
@@ -493,7 +494,7 @@
                   </tr>
                 </thead>
                 <tbody id="doc-asset-body">
-                  <tr><td colspan="7" style="text-align:center;padding:40px;color:var(--text-2);">Select a source to browse documents</td></tr>
+                  <tr><td colspan="8" style="text-align:center;padding:40px;color:var(--text-2);">Select a source to browse documents</td></tr>
                 </tbody>
               </table>
             </div>
@@ -521,6 +522,14 @@
                   <div style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; color:var(--text-2); margin-bottom:6px;">Cross-Modal Links</div>
                   <div id="doc-detail-links" style="font-size:11px; line-height:1.7;"></div>
                 </div>
+              </div>
+              <!-- Version history (shown only when asset has >1 version) -->
+              <div id="doc-version-section" style="display:none; margin-top:12px; border-top:1px solid var(--border); padding-top:12px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                  <div style="font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; color:var(--text-2);">Version History</div>
+                  <span id="doc-version-badge" style="font-size:11px; background:var(--accent)22; color:var(--accent); border:1px solid var(--accent)44; border-radius:10px; padding:1px 8px;"></span>
+                </div>
+                <div id="doc-version-list" style="font-size:12px; line-height:1.7;"></div>
               </div>
             </div>
 

@@ -207,6 +207,23 @@ def get_asset_links(asset_id: str):
     }
 
 
+@app.get("/assets/{asset_id}/versions")
+def list_asset_versions(asset_id: str):
+    """Return all previous version snapshots for an asset, newest first."""
+    if not store.get_asset(asset_id):
+        raise HTTPException(404, f"Asset {asset_id!r} not found")
+    return store.list_asset_versions(asset_id)
+
+
+@app.get("/assets/{asset_id}/versions/{version_num}")
+def get_asset_version(asset_id: str, version_num: int):
+    """Return a specific version snapshot."""
+    snap = store.get_asset_version(asset_id, version_num)
+    if not snap:
+        raise HTTPException(404, f"Version {version_num} not found for asset {asset_id!r}")
+    return snap
+
+
 # ── Asset download ────────────────────────────────────────────────────────────
 
 @app.get("/assets/{asset_id}/download")

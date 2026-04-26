@@ -2159,7 +2159,11 @@ const _GLOSSARY = '/metadata/glossary';
 let _glossaryTerms = [];
 let _glossaryEditSynonyms = [];  // synonyms for the term currently being edited
 
-const glossarySearchDebounced = _debounce(q => loadGlossaryTerms(q), 350);
+let _glossarySearchTimer = null;
+function glossarySearchDebounced(q) {
+  clearTimeout(_glossarySearchTimer);
+  _glossarySearchTimer = setTimeout(() => loadGlossaryTerms(q), 350);
+}
 
 async function loadGlossaryTerms(q = '') {
   const domain = document.getElementById('glossary-domain-filter')?.value || '';
@@ -2352,7 +2356,11 @@ async function submitGlossaryTerm() {
 let _kpis        = [];
 let _kpiEditId   = null;
 
-const kpiSearchDebounced = _debounce(loadKpis, 350);
+let _kpiSearchTimer = null;
+function kpiSearchDebounced() {
+  clearTimeout(_kpiSearchTimer);
+  _kpiSearchTimer = setTimeout(() => loadKpis(), 350);
+}
 
 async function loadKpis() {
   const category = document.getElementById('kpi-category-filter')?.value || '';

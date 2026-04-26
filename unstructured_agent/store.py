@@ -276,6 +276,14 @@ class UnstructuredStore:
         ).fetchall()
         return [self.get_asset(r["asset_id"]) for r in rows]
 
+    def clear_source_assets(self, source_id: str) -> int:
+        """Hard-delete all assets for a source so the next run re-indexes everything."""
+        cur = self._conn().execute(
+            "DELETE FROM unstructured_assets WHERE source_id=?", (source_id,)
+        )
+        self._conn().commit()
+        return cur.rowcount
+
     def soft_delete_asset(self, asset_id: str) -> None:
         self._conn().execute(
             "UPDATE unstructured_assets SET deleted=1,updated_at=? WHERE asset_id=?",

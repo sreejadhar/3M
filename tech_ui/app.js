@@ -1743,7 +1743,38 @@ function _renderDocSourceListError() {
 async function selectDocSource(sourceId) {
   _docSelectedSrcId = sourceId;
   _renderDocSourceList();
+  _setDocReindexButtons(true);
   await loadDocAssets(sourceId);
+}
+
+function _setDocReindexButtons(enabled) {
+  const b1 = document.getElementById('btn-doc-reindex');
+  const b2 = document.getElementById('btn-doc-force-reindex');
+  if (b1) b1.disabled = !enabled;
+  if (b2) b2.disabled = !enabled;
+}
+
+async function reindexDocSource(force = false) {
+  if (!_docSelectedSrcId) return;
+  const src = _docSources.find(s => s.source_id === _docSelectedSrcId);
+  const name = src ? src.name : _docSelectedSrcId;
+
+  if (force && !confirm(`Force reindex "${name}"?\n\nThis will delete all ${src?.doc_count ?? ''} indexed documents and re-process every file from scratch.`)) return;
+
+  _setDocReindexButtons(false);
+  const badge = document.getElementById('doc-status-badge');
+  if (badge) badge.textContent = force ? 'Clearing assets…' : 'Starting reindex…';
+
+  try {
+    const qs = force ? '?force=true' : '';
+    await apiFetch(`${_UNSTRUCTURED}/sources/${_docSelectedSrcId}/index${qs}`, { method: 'POST' });
+    toast(`Reindex started for "${name}"`, 'info');
+    _pollDocJob(_docSelectedSrcId);
+  } catch (e) {
+    toast('Reindex failed: ' + e.message, 'error');
+    _setDocReindexButtons(true);
+    if (badge) badge.textContent = '';
+  }
 }
 
 // ── Asset list ───────────────────────────────────────────────────────────────
@@ -2099,7 +2130,7 @@ async function submitDocSource() {
 async function _pollDocJob(sourceId) {
   const badge = document.getElementById('doc-status-badge');
   const start = Date.now();
-  while (Date.now() - start < 300000) {  // max 5 min poll
+  while (Date.now() - start < 600000) {  // max 10 min poll
     await new Promise(r => setTimeout(r, 3000));
     try {
       const jobs = await apiFetch(`${_UNSTRUCTURED}/sources/${sourceId}/jobs`);
@@ -2107,14 +2138,16 @@ async function _pollDocJob(sourceId) {
       if (!latest) break;
       if (badge) badge.textContent = `Indexing… ${latest.processed}/${latest.total_files} files`;
       if (latest.status === 'done' || latest.status === 'done_with_errors') {
-        const msg = `Indexed ${latest.enriched} documents`;
+        const msg = `Indexed ${latest.enriched} of ${latest.total_files} files`;
         if (badge) badge.textContent = msg;
         toast(msg + (latest.errors ? ` (${latest.errors} errors)` : ''), latest.errors ? 'warn' : 'info');
-        await loadDocAssets(sourceId);
+        if (sourceId === _docSelectedSrcId) await loadDocAssets(sourceId);
+        _setDocReindexButtons(true);
         break;
       }
     } catch { break; }
   }
+  _setDocReindexButtons(!!_docSelectedSrcId);
 }
 
 

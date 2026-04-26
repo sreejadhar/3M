@@ -143,16 +143,17 @@ def get_source(source_id: str):
 # ── Indexing ──────────────────────────────────────────────────────────────────
 
 @app.post("/sources/{source_id}/index", status_code=202)
-def start_index(source_id: str, background_tasks: BackgroundTasks):
+def start_index(source_id: str, background_tasks: BackgroundTasks,
+                force: bool = Query(False, description="Clear existing assets before indexing")):
     src = store.get_source(source_id)
     if not src:
         raise HTTPException(404, f"Source {source_id!r} not found")
 
     job_id = store.create_job(source_id)
     background_tasks.add_task(
-        run_index_job, job_id, source_id, store, _METADATA_API
+        run_index_job, job_id, source_id, store, _METADATA_API, force
     )
-    return {"job_id": job_id, "status": "running", "source_id": source_id}
+    return {"job_id": job_id, "status": "running", "source_id": source_id, "force": force}
 
 
 @app.get("/sources/{source_id}/jobs")

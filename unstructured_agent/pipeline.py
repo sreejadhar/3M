@@ -30,10 +30,12 @@ _WORKER_THREADS = int(os.environ.get("UNSTRUCTURED_WORKERS", "4"))
 
 
 def run_index_job(job_id: str, source_id: str, store: UnstructuredStore,
-                  metadata_api: str) -> None:
+                  metadata_api: str, force: bool = False) -> None:
     """
-    Execute a full indexing run for a source. Runs in a background thread.
+    Execute an indexing run for a source. Runs in a background thread.
     Updates job progress in the store throughout.
+    When force=True, all existing assets are cleared first so every file
+    is re-processed regardless of checksum.
     """
     source = store.get_source(source_id)
     if not source:
@@ -41,6 +43,10 @@ def run_index_job(job_id: str, source_id: str, store: UnstructuredStore,
                          error_log=[f"Source {source_id} not found"],
                          finished_at=_now())
         return
+
+    if force:
+        cleared = store.clear_source_assets(source_id)
+        logger.info("Job %s: force reindex — cleared %d existing assets", job_id, cleared)
 
     try:
         connection = _load_connection(source)

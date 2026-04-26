@@ -3473,6 +3473,39 @@ async def export_excel(req: ExcelExportRequest):
     )
 
 
+# ── Glossary proxy routes ─────────────────────────────────────────────────────
+# Forward /metadata/glossary/* → agent-api /glossary/*
+# The tech UI uses _GLOSSARY = '/metadata/glossary' which maps to this prefix.
+
+@app.api_route("/metadata/glossary/{path:path}",
+               methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_glossary(request: Request, path: str):
+    """Forward /metadata/glossary/{path} → METADATA_API/glossary/{path}."""
+    body = await request.body()
+    qs   = f"?{request.url.query}" if request.url.query else ""
+    fwd_headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in _HOP_HEADERS and k.lower() != "host"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.request(
+                method=request.method,
+                url=f"{METADATA_API}/glossary/{path}{qs}",
+                headers=fwd_headers,
+                content=body,
+            )
+        resp_headers = {k: v for k, v in resp.headers.items()
+                        if k.lower() not in _HOP_HEADERS}
+        from fastapi.responses import Response as _Resp
+        return _Resp(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type=resp.headers.get("content-type"),
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"Glossary service unavailable: {exc}")
+
+
 # ── Unstructured agent proxy routes ──────────────────────────────────────────
 # Two additive routes that forward /unstructured/* to the unstructured service.
 # All other orchestrator routes and data are untouched.

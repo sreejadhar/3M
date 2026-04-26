@@ -30,6 +30,9 @@ services:
       timeout: 5s
       retries: 8
       start_period: 90s
+    dns:
+      - 169.254.169.253   # AWS VPC resolver — resolves RDS/Redshift/internal hostnames
+      - 8.8.8.8
     networks:
       - metadata-net
 

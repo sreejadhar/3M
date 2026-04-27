@@ -3422,6 +3422,12 @@ async def trigger_ontology_enrichment(background_tasks: BackgroundTasks):
     def _run():
         try:
             _enricher.run_enrichment()
+            # Refresh in-memory KG snapshots so the graph UI sees the new nodes
+            # without requiring a container restart.
+            for src in _kg_store.load_all():
+                if src["id"] in _sources:
+                    _sources[src["id"]]["kg_nodes"] = src.get("kg_nodes") or []
+                    _sources[src["id"]]["kg_edges"] = src.get("kg_edges") or []
         except Exception as exc:
             logger.error("Ontology enrichment background task failed: %s", exc)
 

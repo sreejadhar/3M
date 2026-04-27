@@ -139,6 +139,9 @@ _SQL_KEYWORDS: Set[str] = {
 
 _SUFFIX_RE = re.compile(r"(_(id|key|code|num|no|ref|fk|pk))?$", re.IGNORECASE)
 
+# Matches "  col_name: xsd_type" lines in a KG node title (Properties: section)
+_TITLE_PROP_RE = re.compile(r'^\s{2}(.+?):\s+(\S+)', re.MULTILINE)
+
 
 def _norm(s: str) -> str:
     """Lowercase, strip spaces/underscores/hyphens, remove common FK suffixes."""
@@ -390,14 +393,30 @@ def _inject_kg_nodes() -> Dict[str, int]:
             if e.get("label") not in {"GLOSSARY_MATCHES", "MEASURES"}
         ]
 
-        # Build normalised property index for this source's entity nodes
-        # prop_norm → [node_id]
+        # Build normalised property index for this source's entity nodes.
+        # Strategy 1: structured properties list [{name, type}, ...]
+        # Strategy 2: parse column names from the title text (legacy nodes built
+        #   before the structured properties field was added — format is
+        #   "Properties:\n  col_name: type\n  ...")
         prop_to_nodes: Dict[str, List[str]] = {}
         for node in existing_nodes:
-            for prop in node.get("properties") or []:
-                pn = _norm(prop.get("name", ""))
-                if pn:
-                    prop_to_nodes.setdefault(pn, []).append(node["id"])
+            node_id = node.get("id", "")
+            if not node_id:
+                continue
+            props = node.get("properties") or []
+            if props:
+                for prop in props:
+                    pn = _norm(prop.get("name", "") or prop.get("column", ""))
+                    if pn:
+                        prop_to_nodes.setdefault(pn, []).append(node_id)
+            else:
+                title = node.get("title") or ""
+                pi = title.find("Properties:")
+                if pi != -1:
+                    for m in _TITLE_PROP_RE.finditer(title[pi + len("Properties:"):]):
+                        pn = _norm(m.group(1).strip())
+                        if pn:
+                            prop_to_nodes.setdefault(pn, []).append(node_id)
 
         new_nodes: List[Dict] = []
         new_edges: List[Dict] = []
@@ -462,7 +481,7 @@ def _inject_kg_nodes() -> Dict[str, int]:
                 "id":    node_id,
                 "label": k["name"],
                 "title": "\n".join(title_parts),
-                "color": "#f59e0b",   # amber — business metric
+                "color": "#10b981",   # green — business metric
                 "size":  16,
                 "properties": [
                     {"name": "unit",           "type": "text"},

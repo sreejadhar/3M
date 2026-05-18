@@ -13,6 +13,15 @@ spec:
       labels:
         app: chat-ui
     spec:
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ["sh", "-c", "mkdir -p /data/reports && chmod -R 777 /data/reports && mkdir -p /data && chmod -R 777 /data"]
+        volumeMounts:
+        - name: reports-data
+          mountPath: /data/reports
+        - name: metadata-catalog-data
+          mountPath: /data
       containers:
       - name: chat-ui
         image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-chat:latest
@@ -50,7 +59,7 @@ spec:
       volumes:
       - name: reports-data
         persistentVolumeClaim:
-          claimName: reports-pvc
+          claimName: chat-ui-pvc
       - name: metadata-catalog-data
         persistentVolumeClaim:
           claimName: metadata-catalog-pvc

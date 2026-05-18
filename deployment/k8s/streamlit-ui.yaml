@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: streamlit-ui
+  namespace: datananite
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: streamlit-ui
+  template:
+    metadata:
+      labels:
+        app: streamlit-ui
+    spec:
+      containers:
+      - name: streamlit-ui
+        image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-ui:latest
+        ports:
+        - containerPort: 8501
+        envFrom:
+        - configMapRef:
+            name: datananite-config
+        - secretRef:
+            name: datananite-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "250m"
+        livenessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: 8501
+          initialDelaySeconds: 60
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /_stcore/health
+            port: 8501
+          initialDelaySeconds: 60
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: streamlit-ui-service
+  namespace: datananite
+spec:
+  selector:
+    app: streamlit-ui
+  ports:
+  - port: 8501
+    targetPort: 8501
+  type: ClusterIP

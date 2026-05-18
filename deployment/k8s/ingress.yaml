@@ -1,0 +1,83 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: datananite-ingress
+  namespace: datananite
+  annotations:
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.global-static-ip-name: "datananite-static-ip"
+spec:
+  rules:
+  - host: datananite.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog
+    http:
+      paths:
+      - path: /api/agent/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: agent-api-service
+            port:
+              number: 8000
+      - path: /api/ontology/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: ontology-api-service
+            port:
+              number: 8001
+      - path: /api/kg/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: kg-api-service
+            port:
+              number: 8002
+      - path: /api/dialog/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: dialog-api-service
+            port:
+              number: 8003
+      - path: /api/conformity/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: conformity-api-service
+            port:
+              number: 8004
+      - path: /api/shacl/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: shacl-api-service
+            port:
+              number: 8007
+      - path: /api/unstructured/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: unstructured-api-service
+            port:
+              number: 8008
+      - path: /tech/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: tech-ui-service
+            port:
+              number: 8006
+      - path: /streamlit/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: streamlit-ui-service
+            port:
+              number: 8501
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: chat-ui-service
+            port:
+              number: 8005

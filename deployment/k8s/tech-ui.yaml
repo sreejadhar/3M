@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tech-ui
+  namespace: datananite
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tech-ui
+  template:
+    metadata:
+      labels:
+        app: tech-ui
+    spec:
+      containers:
+      - name: tech-ui
+        image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-tech:latest
+        ports:
+        - containerPort: 8006
+        envFrom:
+        - configMapRef:
+            name: datananite-config
+        - secretRef:
+            name: datananite-secrets
+        volumeMounts:
+        - name: reports-data
+          mountPath: /data/reports
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8006
+          initialDelaySeconds: 90
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8006
+          initialDelaySeconds: 90
+          periodSeconds: 10
+      volumes:
+      - name: reports-data
+        persistentVolumeClaim:
+          claimName: reports-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tech-ui-service
+  namespace: datananite
+spec:
+  selector:
+    app: tech-ui
+  ports:
+  - port: 8006
+    targetPort: 8006
+  type: ClusterIP

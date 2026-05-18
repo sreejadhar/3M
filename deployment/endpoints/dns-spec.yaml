@@ -1,0 +1,10 @@
+swagger: "2.0"
+info:
+  title: DataNanite
+  description: DataNanite AI Metadata Intelligence Platform
+  version: "1.0"
+host: "datananite.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog"
+x-google-endpoints:
+  - name: "datananite.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog"
+    target: "REPLACE_WITH_STATIC_IP"
+paths: {}

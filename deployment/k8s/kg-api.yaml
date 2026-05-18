@@ -13,6 +13,13 @@ spec:
       labels:
         app: kg-api
     spec:
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ["sh", "-c", "mkdir -p /data/reports && chmod -R 777 /data/reports"]
+        volumeMounts:
+        - name: reports-data
+          mountPath: /data/reports
       containers:
       - name: kg-api
         image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-kg:latest
@@ -48,7 +55,7 @@ spec:
       volumes:
       - name: reports-data
         persistentVolumeClaim:
-          claimName: reports-pvc
+          claimName: kg-api-pvc
 ---
 apiVersion: v1
 kind: Service

@@ -6,5 +6,5 @@ info:
 host: "datananite.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog"
 x-google-endpoints:
   - name: "datananite.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog"
-    target: "REPLACE_WITH_STATIC_IP"
+    target: "34.128.164.174"
 paths: {}

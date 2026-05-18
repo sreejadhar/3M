@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-ui
+  namespace: datananite
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chat-ui
+  template:
+    metadata:
+      labels:
+        app: chat-ui
+    spec:
+      containers:
+      - name: chat-ui
+        image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-chat:latest
+        ports:
+        - containerPort: 8005
+        envFrom:
+        - configMapRef:
+            name: datananite-config
+        - secretRef:
+            name: datananite-secrets
+        volumeMounts:
+        - name: reports-data
+          mountPath: /data/reports
+        - name: metadata-catalog-data
+          mountPath: /data
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8005
+          initialDelaySeconds: 90
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8005
+          initialDelaySeconds: 90
+          periodSeconds: 10
+      volumes:
+      - name: reports-data
+        persistentVolumeClaim:
+          claimName: reports-pvc
+      - name: metadata-catalog-data
+        persistentVolumeClaim:
+          claimName: metadata-catalog-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-ui-service
+  namespace: datananite
+spec:
+  selector:
+    app: chat-ui
+  ports:
+  - port: 8005
+    targetPort: 8005
+  type: ClusterIP

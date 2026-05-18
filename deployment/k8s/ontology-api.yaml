@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ontology-api
+  namespace: datananite
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ontology-api
+  template:
+    metadata:
+      labels:
+        app: ontology-api
+    spec:
+      containers:
+      - name: ontology-api
+        image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-ontology:latest
+        ports:
+        - containerPort: 8001
+        envFrom:
+        - configMapRef:
+            name: datananite-config
+        - secretRef:
+            name: datananite-secrets
+        volumeMounts:
+        - name: reports-data
+          mountPath: /data/reports
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 90
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 90
+          periodSeconds: 10
+      volumes:
+      - name: reports-data
+        persistentVolumeClaim:
+          claimName: reports-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ontology-api-service
+  namespace: datananite
+spec:
+  selector:
+    app: ontology-api
+  ports:
+  - port: 8001
+    targetPort: 8001
+  type: ClusterIP

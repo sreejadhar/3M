@@ -243,7 +243,7 @@ def _ask_llm(report: Dict, question: str) -> str:
         + json.dumps(report, indent=2, default=str)[:40_000]
     )
     msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-haiku-4-5",
         max_tokens=1024,
         temperature=0.0,
         system=system_content,

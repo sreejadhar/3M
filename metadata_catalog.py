@@ -1194,7 +1194,7 @@ def classify_pii(source_id: str, model: Optional[str] = None) -> int:
     Writes pii_flag ("PII"/"Non-PII") and pii_type to md_attributes.
     Returns the number of attributes updated.
     """
-    model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5-20251001")
+    model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5")
     now = _now()
     updated = 0
 
@@ -1809,7 +1809,7 @@ def enrich_taxonomy(source_id: str, model: Optional[str] = None,
 
     Returns the number of attributes updated.
     """
-    model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5-20251001")
+    model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5")
     updated = 0
 
     with _cursor_ctx() as cur:

@@ -220,7 +220,7 @@ def profile_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.warning("profile_node: ontology_graph is None — skipping")
         return state
 
-    model = os.environ.get("PROFILE_LLM_MODEL", "claude-haiku-4-5-20251001")
+    model = os.environ.get("PROFILE_LLM_MODEL", "claude-haiku-4-5")
 
     _SKIP_NS = (
         "http://www.w3.org/2001/XMLSchema#",

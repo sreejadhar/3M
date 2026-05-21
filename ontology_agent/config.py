@@ -36,5 +36,5 @@ class OntologyConfig:
     serialize_format:   str  = "turtle"
     include_statistics: bool = True
     annotate_concepts:  bool = True
-    llm_model:          str  = "claude-haiku-4-5-20251001"
+    llm_model:          str  = "claude-haiku-4-5"
     source_domain:      str  = ""

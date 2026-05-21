@@ -7,7 +7,7 @@ from .kg_registry import KGEntry, list_all as list_kgs
 logger = logging.getLogger(__name__)
 _ST_MODEL: Any = None
 
-def route(nlq:str, threshold:float=0.30, llm_model:str="claude-haiku-4-5-20251001",
+def route(nlq:str, threshold:float=0.30, llm_model:str="claude-haiku-4-5",
           llm_temperature:float=0.0, backend:str="auto") -> List[str]:
     """Return kg_ids relevant to *nlq*. Returns [] if no KGs registered."""
     kgs = list_kgs()

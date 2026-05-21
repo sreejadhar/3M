@@ -599,7 +599,7 @@ def compile_formula(kpi_id: str, column_context: str, model: Optional[str] = Non
     """
     import anthropic
 
-    model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5-20251001")
+    model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5")
     kpi = get_kpi(kpi_id)
     if not kpi:
         raise ValueError(f"KPI {kpi_id} not found")

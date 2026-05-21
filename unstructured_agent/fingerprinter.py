@@ -18,7 +18,7 @@ from .parsers import ParseResult
 
 logger = logging.getLogger(__name__)
 
-_MODEL_FAST   = "claude-haiku-4-5-20251001"
+_MODEL_FAST   = "claude-haiku-4-5"
 _MODEL_STRONG = "claude-sonnet-4-6"
 
 _JUNK_NAME_RE = re.compile(r"(~\$|\.tmp$|_backup|draft_)", re.IGNORECASE)

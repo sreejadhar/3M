@@ -512,7 +512,7 @@ def resolve_node(state: DialogState) -> DialogState:
     config = state["config"]
     # resolve_node is a structured JSON extraction task — always use the cheap
     # plan model (Haiku) regardless of which synthesis model the user selected.
-    model  = getattr(config, "plan_llm_model", None) or "claude-haiku-4-5-20251001"
+    model  = getattr(config, "plan_llm_model", None) or "claude-haiku-4-5"
 
     # ── Fuzzy pre-match: stemmed/edit-distance token overlap + hierarchy promotion ──
     fuzzy_candidates = _fuzzy_match_candidates(natural_query, categorical_columns, column_hierarchy)

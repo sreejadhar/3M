@@ -402,7 +402,7 @@ def build_node(state: OntologyState) -> OntologyState:
             col_concepts = _annotate_column_concepts(
                 table_name,
                 [c for c in cols_for_annotation if isinstance(c, dict)],
-                model=getattr(config, "llm_model", "claude-haiku-4-5-20251001"),
+                model=getattr(config, "llm_model", "claude-haiku-4-5"),
                 domain_hint=getattr(config, "source_domain", ""),
             )
             if col_concepts:

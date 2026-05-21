@@ -57,6 +57,7 @@ COPY ontology_agent/ /app/ontology_agent/
 
 # Copy the FastAPI entry-point and supporting stores
 COPY api.py           /app/api.py
+COPY llm_client.py   /app/llm_client.py
 COPY glossary_store.py /app/glossary_store.py
 
 # Data volume for reports and history

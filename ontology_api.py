@@ -75,7 +75,7 @@ class GenerateRequest(BaseModel):
     source_name:        str  = ""   # human-readable source name
     source_description: str  = ""   # source description from registration
     db_type:            str  = ""   # e.g. "postgresql", "bigquery", "snowflake"
-    llm_model:          str  = "claude-haiku-4-5-20251001"
+    llm_model:          str  = "claude-haiku-4-5"
 
 
 class ContentUpdate(BaseModel):

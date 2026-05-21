@@ -1398,7 +1398,7 @@ def _preflight_check_plan(
 
 
 _COST_PER_M = {
-    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    "claude-haiku-4-5": (0.80, 4.00),
     "claude-sonnet-4-6":         (3.00, 15.00),
     "claude-opus-4-6":           (15.00, 75.00),
 }
@@ -3106,7 +3106,7 @@ def plan_node(state: DialogState) -> DialogState:
         try:
             from llm_client import get_client as _get_client
             _client = _get_client()
-            _model  = getattr(config, "plan_llm_model", "claude-haiku-4-5-20251001")
+            _model  = getattr(config, "plan_llm_model", "claude-haiku-4-5")
             _resp   = _client.messages.create(
                 model=_model,
                 max_tokens=1024,
@@ -3218,7 +3218,7 @@ def plan_node(state: DialogState) -> DialogState:
 
     # Build conversation history section (with summarization for long sessions)
     history          = state.get("conversation_history") or []
-    haiku_model      = getattr(config, "plan_llm_model", "claude-haiku-4-5-20251001")
+    haiku_model      = getattr(config, "plan_llm_model", "claude-haiku-4-5")
     history_section  = _build_history_section_plan(history, haiku_model)
 
     # Build multi-KG section if applicable

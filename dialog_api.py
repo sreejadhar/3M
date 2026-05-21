@@ -142,7 +142,7 @@ class QueryRequest(BaseModel):
     max_sql_queries: int = 10
     row_limit:       int = 500
     llm_model:       str = ""                          # synthesize node — empty = use DialogConfig env default
-    plan_llm_model:  str = "claude-haiku-4-5-20251001" # plan node (SQL generation — cheaper)
+    plan_llm_model:  str = "claude-haiku-4-5" # plan node (SQL generation — cheaper)
 
     # User context — used to personalise insight framing
     analyst_role: str = ""   # e.g. "Financial Analyst", "Supply Chain Analyst"

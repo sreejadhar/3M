@@ -54,7 +54,7 @@ class AgentConfig:
     # Used only by agent.ask() for Q&A on the finished report — not by any
     # extraction pipeline node (all extraction is rule-based, no LLM calls).
     # Haiku is fully capable of factual Q&A on structured JSON.
-    llm_model: str = "claude-haiku-4-5-20251001"
+    llm_model: str = "claude-haiku-4-5"
     llm_temperature: float = 0.0
     output_path: Optional[str] = None       # where to write JSON report
     # Optional callback(step, status, message, detail) for fine-grained progress

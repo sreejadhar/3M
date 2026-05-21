@@ -82,7 +82,7 @@ def guard_plan_prompt(
     system: str,
     user: str,
     schema_context: str,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = "claude-haiku-4-5",
 ) -> Tuple[str, str]:
     """
     Enforce the token budget for plan_node prompts using char-based estimation.

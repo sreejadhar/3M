@@ -42,12 +42,12 @@ def test_sonnet_accessible():
 
 
 def test_haiku_accessible():
-    """claude-haiku-4-5-20251001 — may not be enabled in Vertex AI yet."""
+    """claude-haiku-4-5 — may not be enabled in Vertex AI yet."""
     from llm_client import get_client
     client = get_client()
     try:
         msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-haiku-4-5",
             max_tokens=5,
             messages=[{"role": "user", "content": "hi"}]
         )

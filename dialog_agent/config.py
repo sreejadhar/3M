@@ -4,7 +4,7 @@ Configuration for the Dialog with Data Agent.
 LLM model selection is driven by the DIALOG_ENV environment variable:
 
     DIALOG_ENV=production   → synthesize uses claude-sonnet-4-6  (default)
-    DIALOG_ENV=development  → synthesize uses claude-haiku-4-5-20251001 (cheap)
+    DIALOG_ENV=development  → synthesize uses claude-haiku-4-5 (cheap)
 
 SQL planning (plan_node) always uses Haiku regardless of environment.
 Set DIALOG_ENV in docker-compose.yml or your .env file.
@@ -22,7 +22,7 @@ _ENV = os.environ.get("DIALOG_ENV", "production").strip().lower()
 _IS_DEV = _ENV in ("development", "dev", "local")
 
 _DEFAULT_SYNTH_MODEL = (
-    "claude-haiku-4-5-20251001"   # cheap — fast iteration in dev
+    "claude-haiku-4-5"   # cheap — fast iteration in dev
     if _IS_DEV else
     "claude-sonnet-4-6"           # quality — what business users read
 )
@@ -50,7 +50,7 @@ class DialogConfig:
     # ── LLM settings ──────────────────────────────────────────────────────────
     # plan_llm_model: SQL generation — always Haiku (structured JSON output,
     #   10-15× cheaper than Sonnet, no quality difference for SQL tasks).
-    plan_llm_model: str = "claude-haiku-4-5-20251001"
+    plan_llm_model: str = "claude-haiku-4-5"
     # llm_model: insight synthesis — Sonnet in production, Haiku in dev.
     #   Driven by DIALOG_ENV env var; can also be overridden per-request via API.
     llm_model: str = field(default_factory=lambda: _DEFAULT_SYNTH_MODEL)

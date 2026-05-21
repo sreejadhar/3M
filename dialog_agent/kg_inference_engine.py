@@ -75,7 +75,7 @@ class InferenceOptions:
     cross_domain_penalty: float = 0.08    # added to both thresholds for cross-domain
     run_tier2_embeddings: bool = True
     run_tier3_llm: bool = True            # Tier 3 always runs async (non-blocking)
-    llm_model: str = "claude-haiku-4-5-20251001"  # fast + cheap for validation
+    llm_model: str = "claude-haiku-4-5"  # fast + cheap for validation
     llm_batch_size: int = 20              # max candidates per LLM call
     embedding_sim_threshold: float = 0.78  # min cosine sim for Tier 2 candidate
     transitivity_decay: float = 0.90      # conf(A→C) = conf(A→B)×conf(B→C)×decay

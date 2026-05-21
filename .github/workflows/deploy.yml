@@ -14,23 +14,60 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ── Job 1: Build & Push each image in parallel with layer caching ─────────────
-  build-and-push:
-    name: Build & Push ${{ matrix.service.name }}
+  # ── Job 0: Update K8s secrets + ConfigMap FIRST so pods get correct env ───────
+  pre-deploy:
+    name: Update Secrets & ConfigMap
     runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        install_components: 'gke-gcloud-auth-plugin'
+
+    - name: Get GKE credentials
+      run: |
+        gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
+
+    - name: Update K8s secrets from GitHub Actions secrets
+      run: |
+        kubectl create secret generic datananite-secrets \
+          --namespace=$NAMESPACE \
+          --from-literal=ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} \
+          --from-literal=GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }} \
+          --from-literal=VERTEX_REGION=${{ secrets.VERTEX_REGION }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Apply ConfigMap and PVCs
+      run: |
+        kubectl apply -f deployment/k8s/configmap.yaml
+        kubectl apply -f deployment/k8s/pvc.yaml
+
+  # ── Job 1: Build → Push → Deploy each service fully in parallel ───────────────
+  build-push-deploy:
+    name: Build→Push→Deploy ${{ matrix.service.name }}
+    runs-on: ubuntu-latest
+    needs: pre-deploy
     strategy:
       matrix:
         service:
-          - { name: agent-api,        image: datananite-agent,        dockerfile: Dockerfile.agent }
-          - { name: ontology-api,     image: datananite-ontology,     dockerfile: Dockerfile.ontology }
-          - { name: kg-api,           image: datananite-kg,           dockerfile: Dockerfile.kg }
-          - { name: dialog-api,       image: datananite-dialog,       dockerfile: Dockerfile.dialog }
-          - { name: conformity-api,   image: datananite-conformity,   dockerfile: Dockerfile.conformity }
-          - { name: chat-ui,          image: datananite-chat,         dockerfile: Dockerfile.chat }
-          - { name: tech-ui,          image: datananite-tech,         dockerfile: Dockerfile.tech }
-          - { name: shacl-api,        image: datananite-shacl,        dockerfile: Dockerfile.shacl }
-          - { name: unstructured-api, image: datananite-unstructured, dockerfile: Dockerfile.unstructured }
-          - { name: streamlit-ui,     image: datananite-ui,           dockerfile: Dockerfile.ui }
+          - { name: agent-api,        image: datananite-agent,        dockerfile: Dockerfile.agent,        deployment: agent-api,        container: agent-api }
+          - { name: ontology-api,     image: datananite-ontology,     dockerfile: Dockerfile.ontology,     deployment: ontology-api,     container: ontology-api }
+          - { name: kg-api,           image: datananite-kg,           dockerfile: Dockerfile.kg,           deployment: kg-api,           container: kg-api }
+          - { name: dialog-api,       image: datananite-dialog,       dockerfile: Dockerfile.dialog,       deployment: dialog-api,       container: dialog-api }
+          - { name: conformity-api,   image: datananite-conformity,   dockerfile: Dockerfile.conformity,   deployment: conformity-api,   container: conformity-api }
+          - { name: chat-ui,          image: datananite-chat,         dockerfile: Dockerfile.chat,         deployment: chat-ui,          container: chat-ui }
+          - { name: tech-ui,          image: datananite-tech,         dockerfile: Dockerfile.tech,         deployment: tech-ui,          container: tech-ui }
+          - { name: shacl-api,        image: datananite-shacl,        dockerfile: Dockerfile.shacl,        deployment: shacl-api,        container: shacl-api }
+          - { name: unstructured-api, image: datananite-unstructured, dockerfile: Dockerfile.unstructured, deployment: unstructured-api, container: unstructured-api }
+          - { name: streamlit-ui,     image: datananite-ui,           dockerfile: Dockerfile.ui,           deployment: streamlit-ui,     container: streamlit-ui }
 
     steps:
     - name: Checkout code
@@ -43,6 +80,8 @@ jobs:
 
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v2
+      with:
+        install_components: 'gke-gcloud-auth-plugin'
 
     - name: Configure Docker
       run: gcloud auth configure-docker gcr.io
@@ -75,16 +114,25 @@ jobs:
         rm -rf /tmp/.buildx-cache-${{ matrix.service.name }}
         mv /tmp/.buildx-cache-${{ matrix.service.name }}-new /tmp/.buildx-cache-${{ matrix.service.name }}
 
-  # ── Job 2: Deploy to GKE after ALL images are pushed ─────────────────────────
-  deploy:
-    name: Deploy to GKE
+    - name: Get GKE credentials
+      run: |
+        gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
+
+    - name: Deploy ${{ matrix.service.name }} to GKE
+      run: |
+        kubectl set image deployment/${{ matrix.service.deployment }} \
+          ${{ matrix.service.container }}=gcr.io/$PROJECT_ID/${{ matrix.service.image }}:${{ github.sha }} \
+          -n $NAMESPACE
+        kubectl rollout restart deployment/${{ matrix.service.deployment }} -n $NAMESPACE
+        kubectl rollout status deployment/${{ matrix.service.deployment }} -n $NAMESPACE --timeout=5m
+
+  # ── Job 2: Final status check after all services deployed ─────────────────────
+  status:
+    name: Deployment Status
     runs-on: ubuntu-latest
-    needs: build-and-push
+    needs: build-push-deploy
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
     - name: Authenticate to Google Cloud
       uses: google-github-actions/auth@v2
       with:
@@ -99,61 +147,10 @@ jobs:
       run: |
         gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
 
-    - name: Update K8s secrets from GitHub Actions secrets
-      run: |
-        kubectl create secret generic datananite-secrets \
-          --namespace=$NAMESPACE \
-          --from-literal=ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} \
-          --from-literal=GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }} \
-          --from-literal=VERTEX_REGION=${{ secrets.VERTEX_REGION }} \
-          --dry-run=client -o yaml | kubectl apply -f -
-
-    - name: Apply ConfigMap and manifests
-      run: |
-        kubectl apply -f deployment/k8s/configmap.yaml
-        kubectl apply -f deployment/k8s/pvc.yaml
-
-    - name: Deploy all services to GKE
-      run: |
-        kubectl set image deployment/agent-api       agent-api=gcr.io/$PROJECT_ID/datananite-agent:${{ github.sha }}        -n $NAMESPACE
-        kubectl set image deployment/ontology-api    ontology-api=gcr.io/$PROJECT_ID/datananite-ontology:${{ github.sha }}  -n $NAMESPACE
-        kubectl set image deployment/kg-api          kg-api=gcr.io/$PROJECT_ID/datananite-kg:${{ github.sha }}              -n $NAMESPACE
-        kubectl set image deployment/dialog-api      dialog-api=gcr.io/$PROJECT_ID/datananite-dialog:${{ github.sha }}      -n $NAMESPACE
-        kubectl set image deployment/conformity-api  conformity-api=gcr.io/$PROJECT_ID/datananite-conformity:${{ github.sha }} -n $NAMESPACE
-        kubectl set image deployment/chat-ui         chat-ui=gcr.io/$PROJECT_ID/datananite-chat:${{ github.sha }}           -n $NAMESPACE
-        kubectl set image deployment/tech-ui         tech-ui=gcr.io/$PROJECT_ID/datananite-tech:${{ github.sha }}           -n $NAMESPACE
-        kubectl set image deployment/shacl-api       shacl-api=gcr.io/$PROJECT_ID/datananite-shacl:${{ github.sha }}        -n $NAMESPACE
-        kubectl set image deployment/unstructured-api unstructured-api=gcr.io/$PROJECT_ID/datananite-unstructured:${{ github.sha }} -n $NAMESPACE
-        kubectl set image deployment/streamlit-ui    streamlit-ui=gcr.io/$PROJECT_ID/datananite-ui:${{ github.sha }}        -n $NAMESPACE
-        kubectl rollout restart deployment/agent-api deployment/ontology-api deployment/kg-api \
-          deployment/dialog-api deployment/conformity-api deployment/chat-ui \
-          deployment/tech-ui deployment/shacl-api deployment/unstructured-api \
-          deployment/streamlit-ui -n $NAMESPACE
-
-    - name: Verify Deployments (parallel)
-      run: |
-        kubectl rollout status deployment/agent-api       -n $NAMESPACE --timeout=5m &
-        kubectl rollout status deployment/ontology-api    -n $NAMESPACE --timeout=5m &
-        kubectl rollout status deployment/kg-api          -n $NAMESPACE --timeout=5m &
-        kubectl rollout status deployment/dialog-api      -n $NAMESPACE --timeout=5m &
-        kubectl rollout status deployment/conformity-api  -n $NAMESPACE --timeout=5m &
-        kubectl rollout status deployment/chat-ui         -n $NAMESPACE --timeout=5m &
-        kubectl rollout status deployment/tech-ui         -n $NAMESPACE --timeout=5m &
-        kubectl rollout status deployment/shacl-api       -n $NAMESPACE --timeout=5m &
-        kubectl rollout status deployment/unstructured-api -n $NAMESPACE --timeout=5m &
-        kubectl rollout status deployment/streamlit-ui    -n $NAMESPACE --timeout=5m &
-        wait
-
     - name: Get Deployment Status
       run: |
         echo "=== Pods ==="
         kubectl get pods -n $NAMESPACE
         echo ""
-        echo "=== Services ==="
-        kubectl get svc -n $NAMESPACE
-        echo ""
         echo "=== Ingress ==="
         kubectl get ingress -n $NAMESPACE
-        echo ""
-        echo "=== PVCs ==="
-        kubectl get pvc -n $NAMESPACE

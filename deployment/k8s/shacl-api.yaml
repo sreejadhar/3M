@@ -13,6 +13,15 @@ spec:
       labels:
         app: shacl-api
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - datananite-pool
       containers:
       - name: shacl-api
         image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-shacl:latest

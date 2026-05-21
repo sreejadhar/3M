@@ -5,6 +5,8 @@ metadata:
   namespace: datananite
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: chat-ui
@@ -13,6 +15,15 @@ spec:
       labels:
         app: chat-ui
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - datananite-pool
       initContainers:
       - name: fix-permissions
         image: busybox
@@ -59,10 +70,10 @@ spec:
       volumes:
       - name: reports-data
         persistentVolumeClaim:
-          claimName: chat-ui-pvc
+          claimName: datananite-shared-pvc
       - name: metadata-catalog-data
         persistentVolumeClaim:
-          claimName: metadata-catalog-pvc
+          claimName: datananite-shared-pvc
 ---
 apiVersion: v1
 kind: Service

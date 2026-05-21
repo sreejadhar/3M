@@ -21,6 +21,7 @@ COPY --from=builder /install /usr/local
 
 # Copy the Streamlit app and its theme config
 COPY app.py           /app/app.py
+COPY llm_client.py    /app/llm_client.py
 COPY .streamlit/      /app/.streamlit/
 
 RUN chown -R ui:ui /app

@@ -17,6 +17,7 @@ COPY --from=builder /install /usr/local
 # Copy only the SHACL agent source
 COPY shacl_agent/ ./shacl_agent/
 COPY shacl_api.py .
+COPY llm_client.py .
 
 ENV PYTHONUNBUFFERED=1
 

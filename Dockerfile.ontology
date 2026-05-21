@@ -24,6 +24,7 @@ COPY ontology_agent/ /app/ontology_agent/
 
 # Copy the FastAPI entry-point
 COPY ontology_api.py /app/ontology_api.py
+COPY llm_client.py /app/llm_client.py
 
 # Data volume — ontology files are written here
 RUN mkdir -p /data/reports && chown -R agent:agent /data /app

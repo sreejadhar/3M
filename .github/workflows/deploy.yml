@@ -14,7 +14,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  # ── Job 1: Build & Push each image in parallel ───────────────────────────────
+  # ── Job 1: Build & Push each image in parallel with layer caching ─────────────
   build-and-push:
     name: Build & Push ${{ matrix.service.name }}
     runs-on: ubuntu-latest
@@ -47,14 +47,33 @@ jobs:
     - name: Configure Docker
       run: gcloud auth configure-docker gcr.io
 
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Cache Docker layers
+      uses: actions/cache@v4
+      with:
+        path: /tmp/.buildx-cache-${{ matrix.service.name }}
+        key: ${{ runner.os }}-buildx-${{ matrix.service.name }}-${{ hashFiles(matrix.service.dockerfile) }}-${{ hashFiles('requirements*.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-buildx-${{ matrix.service.name }}-
+
     - name: Build & Push ${{ matrix.service.name }}
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ${{ matrix.service.dockerfile }}
+        push: true
+        tags: |
+          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:${{ github.sha }}
+          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:latest
+        cache-from: type=local,src=/tmp/.buildx-cache-${{ matrix.service.name }}
+        cache-to: type=local,dest=/tmp/.buildx-cache-${{ matrix.service.name }}-new,mode=max
+
+    - name: Rotate cache
       run: |
-        docker build \
-          -t gcr.io/$PROJECT_ID/${{ matrix.service.image }}:${{ github.sha }} \
-          -t gcr.io/$PROJECT_ID/${{ matrix.service.image }}:latest \
-          -f ${{ matrix.service.dockerfile }} .
-        docker push gcr.io/$PROJECT_ID/${{ matrix.service.image }}:${{ github.sha }}
-        docker push gcr.io/$PROJECT_ID/${{ matrix.service.image }}:latest
+        rm -rf /tmp/.buildx-cache-${{ matrix.service.name }}
+        mv /tmp/.buildx-cache-${{ matrix.service.name }}-new /tmp/.buildx-cache-${{ matrix.service.name }}
 
   # ── Job 2: Deploy to GKE after ALL images are pushed ─────────────────────────
   deploy:
@@ -111,18 +130,19 @@ jobs:
           deployment/tech-ui deployment/shacl-api deployment/unstructured-api \
           deployment/streamlit-ui -n $NAMESPACE
 
-    - name: Verify Deployments
+    - name: Verify Deployments (parallel)
       run: |
-        kubectl rollout status deployment/agent-api       -n $NAMESPACE --timeout=5m
-        kubectl rollout status deployment/ontology-api    -n $NAMESPACE --timeout=5m
-        kubectl rollout status deployment/kg-api          -n $NAMESPACE --timeout=5m
-        kubectl rollout status deployment/dialog-api      -n $NAMESPACE --timeout=5m
-        kubectl rollout status deployment/conformity-api  -n $NAMESPACE --timeout=5m
-        kubectl rollout status deployment/chat-ui         -n $NAMESPACE --timeout=5m
-        kubectl rollout status deployment/tech-ui         -n $NAMESPACE --timeout=5m
-        kubectl rollout status deployment/shacl-api       -n $NAMESPACE --timeout=5m
-        kubectl rollout status deployment/unstructured-api -n $NAMESPACE --timeout=5m
-        kubectl rollout status deployment/streamlit-ui    -n $NAMESPACE --timeout=5m
+        kubectl rollout status deployment/agent-api       -n $NAMESPACE --timeout=5m &
+        kubectl rollout status deployment/ontology-api    -n $NAMESPACE --timeout=5m &
+        kubectl rollout status deployment/kg-api          -n $NAMESPACE --timeout=5m &
+        kubectl rollout status deployment/dialog-api      -n $NAMESPACE --timeout=5m &
+        kubectl rollout status deployment/conformity-api  -n $NAMESPACE --timeout=5m &
+        kubectl rollout status deployment/chat-ui         -n $NAMESPACE --timeout=5m &
+        kubectl rollout status deployment/tech-ui         -n $NAMESPACE --timeout=5m &
+        kubectl rollout status deployment/shacl-api       -n $NAMESPACE --timeout=5m &
+        kubectl rollout status deployment/unstructured-api -n $NAMESPACE --timeout=5m &
+        kubectl rollout status deployment/streamlit-ui    -n $NAMESPACE --timeout=5m &
+        wait
 
     - name: Get Deployment Status
       run: |

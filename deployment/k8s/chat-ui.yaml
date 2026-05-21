@@ -48,13 +48,13 @@ spec:
           httpGet:
             path: /health
             port: 8005
-          initialDelaySeconds: 90
+          initialDelaySeconds: 60
           periodSeconds: 15
         readinessProbe:
           httpGet:
             path: /health
             port: 8005
-          initialDelaySeconds: 90
+          initialDelaySeconds: 60
           periodSeconds: 10
       volumes:
       - name: reports-data

@@ -44,14 +44,14 @@ spec:
           httpGet:
             path: /health
             port: 8000
-          initialDelaySeconds: 90
+          initialDelaySeconds: 60
           periodSeconds: 15
           timeoutSeconds: 10
         readinessProbe:
           httpGet:
             path: /health
             port: 8000
-          initialDelaySeconds: 90
+          initialDelaySeconds: 60
           periodSeconds: 10
           timeoutSeconds: 10
       volumes:

@@ -95,14 +95,9 @@ def extract_fingerprint(parse_result: ParseResult, domain_hint: str = "",
     Call the LLM to produce a semantic fingerprint from the text window.
     Returns a dict with the fingerprint fields, or a minimal fallback on failure.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        logger.warning("ANTHROPIC_API_KEY not set — returning structural-only fingerprint")
-        return _structural_fingerprint(parse_result, file_name)
-
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
+        from llm_client import get_client
+        client = get_client()
     except ImportError:
         return _structural_fingerprint(parse_result, file_name)
 

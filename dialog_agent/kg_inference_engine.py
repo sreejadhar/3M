@@ -527,8 +527,8 @@ async def _llm_validate_candidates(
     batches = [candidates[i:i + bs] for i in range(0, len(candidates), bs)]
 
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
+        from llm_client import get_client
+        client = get_client()
     except ImportError:
         logger.debug("anthropic package unavailable — skipping LLM validation")
         return

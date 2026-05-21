@@ -128,7 +128,8 @@ def _call_profile_llm(table_name: str, columns: List[Dict[str, str]], model: str
     user_msg = _PROFILE_USER.format(table_name=table_name, column_list=col_lines)
 
     try:
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        from llm_client import get_client
+        client = get_client()
         msg = client.messages.create(
             model=model,
             max_tokens=2048,

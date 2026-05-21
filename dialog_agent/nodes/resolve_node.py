@@ -389,8 +389,8 @@ def _build_hint_section(candidates: List[Dict[str, Any]]) -> str:
 
 
 def _call_resolve_llm(system: str, user: str, model: str) -> str:
-    import anthropic
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    from llm_client import get_client
+    client = get_client()
     msg = client.messages.create(
         model=model,
         max_tokens=1024,

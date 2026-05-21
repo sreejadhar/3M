@@ -46,8 +46,8 @@ def _summarize_old_turns_plan(old_turns: list, model: str) -> str:
         if turn.get("insights"):
             lines.append(f"  Answer: {turn['insights'][:200]}")
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        from llm_client import get_client
+        client = get_client()
         msg = client.messages.create(
             model=model,
             max_tokens=256,
@@ -1421,8 +1421,8 @@ def _call_llm(
     temperature: float,
 ) -> str:
     """Call Anthropic Claude and return the raw text response."""
-    import anthropic
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    from llm_client import get_client
+    client = get_client()
     msg = client.messages.create(
         model=model,
         max_tokens=4096,
@@ -3104,8 +3104,8 @@ def plan_node(state: DialogState) -> DialogState:
         )
 
         try:
-            import anthropic as _anthropic
-            _client = _anthropic.Anthropic()
+            from llm_client import get_client as _get_client
+            _client = _get_client()
             _model  = getattr(config, "plan_llm_model", "claude-haiku-4-5-20251001")
             _resp   = _client.messages.create(
                 model=_model,

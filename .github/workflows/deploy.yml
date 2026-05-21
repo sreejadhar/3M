@@ -123,11 +123,13 @@ jobs:
       run: |
         gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
 
-    - name: Update K8s secret with ANTHROPIC_API_KEY
+    - name: Update K8s secrets from GitHub Actions secrets
       run: |
         kubectl create secret generic datananite-secrets \
           --namespace=$NAMESPACE \
           --from-literal=ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} \
+          --from-literal=GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }} \
+          --from-literal=VERTEX_REGION=${{ secrets.VERTEX_REGION }} \
           --dry-run=client -o yaml | kubectl apply -f -
 
     - name: Apply ConfigMap and manifests

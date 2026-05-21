@@ -417,8 +417,8 @@ def _summarize_old_turns(old_turns: list, model: str) -> str:
         if turn.get("insights"):
             lines.append(f"A: {turn['insights'][:200]}")
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        from llm_client import get_client
+        client = get_client()
         msg = client.messages.create(
             model=model,
             max_tokens=256,
@@ -523,8 +523,8 @@ def _fetch_doc_context(question: str, kpi_names: List[str]) -> Optional[str]:
 
 
 def _call_llm(system: str, user: str, model: str, temperature: float) -> str:
-    import anthropic
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    from llm_client import get_client
+    client = get_client()
     msg = client.messages.create(
         model=model,
         max_tokens=4096,

@@ -137,11 +137,11 @@ class MetadataExtractionAgent:
         self._graph = build_graph()
         self._report: Optional[Dict[str, Any]] = None
 
-        # Optional LLM for the interpret step
-        self._llm = ChatAnthropic(
-            model=config.llm_model,
-            temperature=config.llm_temperature,
-        )
+        # Optional LLM for the interpret step — uses Vertex AI via llm_client
+        from llm_client import get_client
+        self._llm_client = get_client()
+        self._llm_model  = config.llm_model
+        self._llm_temp   = config.llm_temperature
 
     # ------------------------------------------------------------------
     def run(self) -> Dict[str, Any]:
@@ -193,16 +193,21 @@ class MetadataExtractionAgent:
         if not self._report:
             return "No report available yet — call run() first."
 
-        system = SystemMessage(content=(
+        system_content = (
             "You are a data engineering expert.  You have been provided the full "
             "metadata report from a database schema scan.  Answer questions about "
             "the schema structure, data quality, and relationships concisely and accurately.\n\n"
             "METADATA REPORT (JSON):\n"
-            + json.dumps(self._report, indent=2, default=str)[:40_000]   # truncate if huge
-        ))
-        human = HumanMessage(content=question)
-        response = self._llm.invoke([system, human])
-        return response.content
+            + json.dumps(self._report, indent=2, default=str)[:40_000]
+        )
+        msg = self._llm_client.messages.create(
+            model=self._llm_model,
+            max_tokens=1024,
+            temperature=self._llm_temp,
+            system=system_content,
+            messages=[{"role": "user", "content": question}],
+        )
+        return msg.content[0].text
 
     # ------------------------------------------------------------------
     def stream_run(self):

@@ -193,8 +193,8 @@ def _annotate_column_concepts(
         return {}
 
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        from llm_client import get_client
+        client = get_client()
     except Exception:
         return {}
 

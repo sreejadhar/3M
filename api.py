@@ -229,23 +229,27 @@ def _load_report_from_path(path: str) -> Dict:
 
 # ── Helper: LLM ask ───────────────────────────────────────────────────────────
 def _ask_llm(report: Dict, question: str) -> str:
-    from langchain_anthropic import ChatAnthropic
-    from langchain_core.messages import HumanMessage, SystemMessage
+    from llm_client import get_client
 
     if not report:
         return "No report available — run an extraction first."
 
-    llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.0)
-    system = SystemMessage(content=(
+    client = get_client()
+    system_content = (
         "You are a data engineering expert. You have been provided the full "
         "metadata report from a database schema scan. Answer questions about "
         "the schema structure, data quality, and relationships concisely and accurately.\n\n"
         "METADATA REPORT (JSON):\n"
         + json.dumps(report, indent=2, default=str)[:40_000]
-    ))
-    human = HumanMessage(content=question)
-    response = llm.invoke([system, human])
-    return response.content
+    )
+    msg = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        temperature=0.0,
+        system=system_content,
+        messages=[{"role": "user", "content": question}],
+    )
+    return msg.content[0].text
 
 
 # ── Schema / table discovery helpers ──────────────────────────────────────────

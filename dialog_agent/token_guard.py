@@ -52,8 +52,8 @@ def _count_tokens_exact(
     the caller can fall back to the char-based estimate.
     """
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        from llm_client import get_client
+        client = get_client()
         resp = client.messages.count_tokens(
             model=model,
             system=system,

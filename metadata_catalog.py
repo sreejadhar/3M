@@ -1591,7 +1591,8 @@ def _call_enrich_llm(table_name: str, col_specs: List[Dict], model: str,
     )
 
     try:
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        from llm_client import get_client
+        client = get_client()
         msg = client.messages.create(
             model=model, max_tokens=2048, temperature=0.0,
             system=_ENRICH_SYSTEM,

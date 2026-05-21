@@ -5,6 +5,8 @@ metadata:
   namespace: datananite
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: tech-ui
@@ -13,6 +15,15 @@ spec:
       labels:
         app: tech-ui
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - datananite-pool
       initContainers:
       - name: fix-permissions
         image: busybox
@@ -55,7 +66,7 @@ spec:
       volumes:
       - name: reports-data
         persistentVolumeClaim:
-          claimName: tech-ui-pvc
+          claimName: datananite-shared-pvc
 ---
 apiVersion: v1
 kind: Service

@@ -411,6 +411,8 @@ def _db_type_from_path(path: str) -> str:
         return "excel"
     if ext in (".sqlite", ".db", ".sqlite3"):
         return "sqlite"
+    if ext == ".csv":
+        return "csv"
     if Path(path).is_dir():
         return "csv"
     return "unknown"

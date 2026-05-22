@@ -1695,6 +1695,17 @@ function _hideWbLogin() {
   if (ol) { ol.style.display = 'none'; }
 }
 
+function _wbLogout() {
+  sessionStorage.removeItem('auth_token');
+  localStorage.removeItem('auth_email');
+  _showWbLogin();
+}
+
+function _setWbEmail() {
+  const el = document.getElementById('wbTopbarEmail');
+  if (el) el.textContent = localStorage.getItem('auth_email') || '';
+}
+
 async function _wbCheckAuth() {
   const token = _wbToken();
   if (!token) { _showWbLogin(); return false; }
@@ -1702,6 +1713,7 @@ async function _wbCheckAuth() {
     const r = await fetch('/auth/validate', { headers: { Authorization: `Bearer ${token}` } });
     const d = await r.json();
     if (!d.valid) { _showWbLogin(); return false; }
+    _setWbEmail();
     return true;
   } catch { _showWbLogin(); return false; }
 }
@@ -1717,6 +1729,9 @@ window.fetch = function(url, opts = {}) {
 };
 
 document.addEventListener('DOMContentLoaded', () => {
+  const logoutBtn = document.getElementById('wbLogoutBtn');
+  if (logoutBtn) logoutBtn.addEventListener('click', _wbLogout);
+
   const form = document.getElementById('wbLoginForm');
   if (!form) return;
   form.addEventListener('submit', async (e) => {
@@ -1744,6 +1759,7 @@ document.addEventListener('DOMContentLoaded', () => {
       sessionStorage.setItem('auth_token', data.access_token);
       localStorage.setItem('auth_email', data.email);
       _hideWbLogin();
+      _setWbEmail();
       init();
     } catch (err) {
       errEl.textContent = err.message;

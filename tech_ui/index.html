@@ -98,6 +98,11 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           Add Source
         </button>
+        <span class="topbar-email" id="wbTopbarEmail"></span>
+        <button class="btn btn-logout" id="wbLogoutBtn" title="Sign out">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          Sign out
+        </button>
       </div>
     </div>
 
@@ -1134,6 +1139,9 @@
   #loginOverlay > div:first-child { display:flex; flex-direction:column; }
   @keyframes wbShake { 0%,100%{transform:translateX(0)} 20%,60%{transform:translateX(-8px)} 40%,80%{transform:translateX(8px)} }
   .wb-shake { animation: wbShake .4s ease; }
+  .topbar-email { font-size:12px; color:#888; margin-right:4px; white-space:nowrap; overflow:hidden; max-width:160px; text-overflow:ellipsis; }
+  .btn.btn-logout { display:flex; align-items:center; gap:5px; background:transparent; border:1px solid #ccc; color:#555; font-size:12px; }
+  .btn.btn-logout:hover { background:#c0392b; border-color:#c0392b; color:#fff; }
 </style>
 
 <script src="https://unpkg.com/vis-network@9.1.2/dist/vis-network.min.js"></script>

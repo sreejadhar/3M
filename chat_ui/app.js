@@ -4512,6 +4512,18 @@ function _hideLoginOverlay() {
   document.getElementById('loginOverlay').style.display = 'none';
 }
 
+function _logout() {
+  sessionStorage.removeItem('auth_token');
+  localStorage.removeItem('auth_email');
+  _showLoginOverlay();
+}
+document.getElementById('logoutBtn').addEventListener('click', _logout);
+
+function _setTopbarEmail() {
+  const el = document.getElementById('topbarEmail');
+  if (el) el.textContent = localStorage.getItem('auth_email') || '';
+}
+
 async function _checkAuth() {
   const token = _authToken();
   if (!token) { _showLoginOverlay(); return false; }
@@ -4519,6 +4531,7 @@ async function _checkAuth() {
     const r = await fetch('/auth/validate', { headers: { Authorization: `Bearer ${token}` } });
     const data = await r.json();
     if (!data.valid) { _showLoginOverlay(); return false; }
+    _setTopbarEmail();
     return true;
   } catch {
     _showLoginOverlay();
@@ -4552,6 +4565,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
     sessionStorage.setItem('auth_token', data.access_token);
     localStorage.setItem('auth_email', data.email);
     _hideLoginOverlay();
+    _setTopbarEmail();
     _appInit();
   } catch (err) {
     errEl.textContent = err.message;

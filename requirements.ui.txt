@@ -4,3 +4,6 @@ requests>=2.31.0
 
 # Interactive graph visualisation for the Knowledge Graph view
 pyvis>=0.3.2
+
+# Auth proxy
+flask>=3.0.0

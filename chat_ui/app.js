@@ -4500,9 +4500,83 @@ document.getElementById('bimViewKgBtn')?.addEventListener('click', () => {
   openKGExplorer(srcId);
 });
 
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+function _authToken() { return sessionStorage.getItem('auth_token') || ''; }
+
+function _showLoginOverlay() {
+  document.getElementById('loginOverlay').style.display = 'flex';
+}
+
+function _hideLoginOverlay() {
+  document.getElementById('loginOverlay').style.display = 'none';
+}
+
+async function _checkAuth() {
+  const token = _authToken();
+  if (!token) { _showLoginOverlay(); return false; }
+  try {
+    const r = await fetch('/auth/validate', { headers: { Authorization: `Bearer ${token}` } });
+    const data = await r.json();
+    if (!data.valid) { _showLoginOverlay(); return false; }
+    return true;
+  } catch {
+    _showLoginOverlay();
+    return false;
+  }
+}
+
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const email    = document.getElementById('loginEmail').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  const errEl    = document.getElementById('loginError');
+  const btn      = document.getElementById('loginSubmitBtn');
+  const form     = document.getElementById('loginForm');
+
+  errEl.style.display = 'none';
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+
+  try {
+    const r = await fetch('/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.detail || 'Invalid email or password');
+    }
+    const data = await r.json();
+    sessionStorage.setItem('auth_token', data.access_token);
+    localStorage.setItem('auth_email', data.email);
+    _hideLoginOverlay();
+    _appInit();
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.style.display = 'block';
+    form.classList.add('login-shake');
+    form.addEventListener('animationend', () => form.classList.remove('login-shake'), { once: true });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign in';
+  }
+});
+
+// Patch fetch to inject auth token on all API calls
+const _origFetch = window.fetch;
+window.fetch = function(url, opts = {}) {
+  const token = _authToken();
+  if (token && typeof url === 'string' && (url.startsWith('/') || url.startsWith(location.origin))) {
+    opts = { ...opts, headers: { Authorization: `Bearer ${token}`, ...(opts.headers || {}) } };
+  }
+  return _origFetch(url, opts);
+};
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
-(async function init() {
+async function _appInit() {
   applyPersona();
   await Promise.all([loadSources(), loadSessions()]);
 
@@ -4524,7 +4598,10 @@ document.getElementById('bimViewKgBtn')?.addEventListener('click', () => {
   Object.values(sources).forEach(s => {
     if (s.status === 'indexing') pollSourceStatus(s.id);
   });
-})();
+}
+
+// Guard: check auth before running the app
+_checkAuth().then(ok => { if (ok) _appInit(); });
 
 // ── RBAC / Users & Access Panel ──────────────────────────────────────────────
 

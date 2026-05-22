@@ -26,7 +26,7 @@ spec:
       - name: streamlit-ui
         image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-ui:latest
         ports:
-        - containerPort: 8501
+        - containerPort: 8502
         envFrom:
         - configMapRef:
             name: datananite-config
@@ -41,14 +41,14 @@ spec:
             cpu: "250m"
         livenessProbe:
           httpGet:
-            path: /_stcore/health
-            port: 8501
+            path: /health
+            port: 8502
           initialDelaySeconds: 60
           periodSeconds: 15
         readinessProbe:
           httpGet:
-            path: /_stcore/health
-            port: 8501
+            path: /health
+            port: 8502
           initialDelaySeconds: 60
           periodSeconds: 10
 ---
@@ -63,6 +63,6 @@ spec:
   selector:
     app: streamlit-ui
   ports:
-  - port: 8501
-    targetPort: 8501
+  - port: 8502
+    targetPort: 8502
   type: ClusterIP

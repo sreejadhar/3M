@@ -36,6 +36,14 @@ jobs:
       run: |
         gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
 
+    - name: Guard — reject placeholder JWT_SECRET
+      run: |
+        # Fail if the GitHub Actions secret itself looks like a placeholder
+        if echo "${{ secrets.JWT_SECRET }}" | grep -qiE "^$|CHANGE_ME|openssl"; then
+          echo "FATAL: JWT_SECRET GitHub secret is empty or placeholder. Generate one with: openssl rand -hex 32"
+          exit 1
+        fi
+
     - name: Update K8s secrets from GitHub Actions secrets
       run: |
         kubectl create secret generic datananite-secrets \
@@ -43,6 +51,12 @@ jobs:
           --from-literal=ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} \
           --from-literal=GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }} \
           --from-literal=VERTEX_REGION=${{ secrets.VERTEX_REGION }} \
+          --from-literal=JWT_SECRET=${{ secrets.JWT_SECRET }} \
+          --from-literal=SEED_PASSWORD_RIMNA=${{ secrets.SEED_PASSWORD_RIMNA }} \
+          --from-literal=SEED_PASSWORD_IYER=${{ secrets.SEED_PASSWORD_IYER }} \
+          --from-literal=SEED_PASSWORD_SENTHEESH=${{ secrets.SEED_PASSWORD_SENTHEESH }} \
+          --from-literal=SEED_PASSWORD_HARPREET=${{ secrets.SEED_PASSWORD_HARPREET }} \
+          --from-literal=SEED_PASSWORD_SUNIL=${{ secrets.SEED_PASSWORD_SUNIL }} \
           --dry-run=client -o yaml | kubectl apply -f -
 
     - name: Apply Namespace, ConfigMap and PVCs

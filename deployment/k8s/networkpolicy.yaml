@@ -2,7 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: internal-services-only
-  namespace: datananite
+  namespace: datananite2
 spec:
   podSelector:
     matchLabels: {}
@@ -12,13 +12,19 @@ spec:
   - from:
     - namespaceSelector:
         matchLabels:
-          kubernetes.io/metadata.name: datananite
+          kubernetes.io/metadata.name: datananite2
+  - from:
+    - ipBlock:
+        cidr: 130.211.0.0/22
+  - from:
+    - ipBlock:
+        cidr: 35.191.0.0/16
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: chat-ui-allow-ingress
-  namespace: datananite
+  namespace: datananite2
 spec:
   podSelector:
     matchLabels:
@@ -32,7 +38,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: tech-ui-allow-ingress
-  namespace: datananite
+  namespace: datananite2
 spec:
   podSelector:
     matchLabels:
@@ -46,7 +52,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: streamlit-ui-allow-ingress
-  namespace: datananite
+  namespace: datananite2
 spec:
   podSelector:
     matchLabels:

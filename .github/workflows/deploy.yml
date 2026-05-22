@@ -10,7 +10,7 @@ env:
   PROJECT_ID: cog01k24f1ea555zdv7ynzthxanz5
   GKE_CLUSTER: lvp-fastapi-cluster
   GKE_ZONE: asia-south1-a
-  NAMESPACE: datananite
+  NAMESPACE: datananite2
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -45,10 +45,11 @@ jobs:
           --from-literal=VERTEX_REGION=${{ secrets.VERTEX_REGION }} \
           --dry-run=client -o yaml | kubectl apply -f -
 
-    - name: Apply ConfigMap and PVCs
+    - name: Apply Namespace, ConfigMap and PVCs
       run: |
+        kubectl apply -f deployment/k8s/namespace2.yaml
+        kubectl apply -f deployment/k8s/pvc2.yaml
         kubectl apply -f deployment/k8s/configmap.yaml
-        kubectl apply -f deployment/k8s/pvc.yaml
 
   # ── Job 1: Build → Push → Deploy each service fully in parallel ───────────────
   build-push-deploy:

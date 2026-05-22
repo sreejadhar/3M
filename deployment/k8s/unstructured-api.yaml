@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: unstructured-api
-  namespace: datananite
+  namespace: datananite2
 spec:
   replicas: 1
   selector:
@@ -13,6 +13,15 @@ spec:
       labels:
         app: unstructured-api
     spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - datananite-pool
       containers:
       - name: unstructured-api
         image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-unstructured:latest
@@ -48,13 +57,15 @@ spec:
       volumes:
       - name: unstructured-data
         persistentVolumeClaim:
-          claimName: unstructured-pvc
+          claimName: datananite2-unstructured-pvc
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: unstructured-api-service
-  namespace: datananite
+  namespace: datananite2
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
 spec:
   selector:
     app: unstructured-api

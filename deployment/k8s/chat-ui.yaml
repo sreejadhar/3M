@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: chat-ui
-  namespace: datananite
+  namespace: datananite2
 spec:
   replicas: 1
   strategy:
@@ -24,15 +24,6 @@ spec:
                 operator: In
                 values:
                 - datananite-pool
-      initContainers:
-      - name: fix-permissions
-        image: busybox
-        command: ["sh", "-c", "mkdir -p /data/reports && chmod -R 777 /data/reports && mkdir -p /data && chmod -R 777 /data"]
-        volumeMounts:
-        - name: reports-data
-          mountPath: /data/reports
-        - name: metadata-catalog-data
-          mountPath: /data
       containers:
       - name: chat-ui
         image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-chat:latest
@@ -44,9 +35,7 @@ spec:
         - secretRef:
             name: datananite-secrets
         volumeMounts:
-        - name: reports-data
-          mountPath: /data/reports
-        - name: metadata-catalog-data
+        - name: shared-data
           mountPath: /data
         resources:
           requests:
@@ -68,18 +57,17 @@ spec:
           initialDelaySeconds: 60
           periodSeconds: 10
       volumes:
-      - name: reports-data
+      - name: shared-data
         persistentVolumeClaim:
-          claimName: datananite-shared-pvc
-      - name: metadata-catalog-data
-        persistentVolumeClaim:
-          claimName: datananite-shared-pvc
+          claimName: datananite2-shared-pvc
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: chat-ui-service
-  namespace: datananite
+  namespace: datananite2
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
 spec:
   selector:
     app: chat-ui

@@ -13,6 +13,12 @@ spec:
     - namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: datananite2
+  - from:
+    - ipBlock:
+        cidr: 130.211.0.0/22
+  - from:
+    - ipBlock:
+        cidr: 35.191.0.0/16
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

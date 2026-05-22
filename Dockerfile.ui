@@ -26,7 +26,7 @@ COPY streamlit_auth_proxy.py  /app/streamlit_auth_proxy.py
 COPY start_ui.sh              /app/start_ui.sh
 COPY .streamlit/              /app/.streamlit/
 
-RUN chmod +x /app/start_ui.sh && chown -R ui:ui /app
+RUN sed -i 's/\r//' /app/start_ui.sh && chmod +x /app/start_ui.sh && chown -R ui:ui /app
 
 ENV AGENT_API_URL=http://agent-api:8000 \
     PYTHONUNBUFFERED=1

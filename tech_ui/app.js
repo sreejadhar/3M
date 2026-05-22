@@ -1682,6 +1682,81 @@ async function exportCatalogExcel() {
 })();
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+function _wbToken() { return sessionStorage.getItem('auth_token') || ''; }
+
+function _showWbLogin() {
+  const ol = document.getElementById('loginOverlay');
+  if (ol) { ol.style.display = 'flex'; }
+}
+
+function _hideWbLogin() {
+  const ol = document.getElementById('loginOverlay');
+  if (ol) { ol.style.display = 'none'; }
+}
+
+async function _wbCheckAuth() {
+  const token = _wbToken();
+  if (!token) { _showWbLogin(); return false; }
+  try {
+    const r = await fetch('/auth/validate', { headers: { Authorization: `Bearer ${token}` } });
+    const d = await r.json();
+    if (!d.valid) { _showWbLogin(); return false; }
+    return true;
+  } catch { _showWbLogin(); return false; }
+}
+
+// Patch fetch to inject auth token
+const _wbOrigFetch = window.fetch;
+window.fetch = function(url, opts = {}) {
+  const token = _wbToken();
+  if (token && typeof url === 'string' && (url.startsWith('/') || url.startsWith(location.origin))) {
+    opts = { ...opts, headers: { Authorization: `Bearer ${token}`, ...(opts.headers || {}) } };
+  }
+  return _wbOrigFetch(url, opts);
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+  const form = document.getElementById('wbLoginForm');
+  if (!form) return;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email    = document.getElementById('wbLoginEmail').value.trim();
+    const password = document.getElementById('wbLoginPassword').value;
+    const errEl    = document.getElementById('wbLoginError');
+    const btn      = document.getElementById('wbLoginBtn');
+
+    errEl.style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = 'Signing in…';
+
+    try {
+      const r = await _wbOrigFetch('/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        throw new Error(d.detail || 'Invalid email or password');
+      }
+      const data = await r.json();
+      sessionStorage.setItem('auth_token', data.access_token);
+      localStorage.setItem('auth_email', data.email);
+      _hideWbLogin();
+      init();
+    } catch (err) {
+      errEl.textContent = err.message;
+      errEl.style.display = 'block';
+      form.classList.add('wb-shake');
+      form.addEventListener('animationend', () => form.classList.remove('wb-shake'), { once: true });
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Sign in';
+    }
+  });
+});
+
 // Initialise
 // ─────────────────────────────────────────────────────────────────────────────
 async function init() {
@@ -1696,7 +1771,9 @@ async function init() {
   setInterval(loadSources, 10000);
 }
 
-document.addEventListener('DOMContentLoaded', init);
+document.addEventListener('DOMContentLoaded', () => {
+  _wbCheckAuth().then(ok => { if (ok) init(); });
+});
 
 // =============================================================================
 // DOCUMENTS TAB — Unstructured Data Intelligence

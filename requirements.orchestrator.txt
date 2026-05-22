@@ -11,3 +11,5 @@ scikit-learn>=1.4.0    # TF-IDF embedding backend (optional but recommended)
 openpyxl>=3.1.0               # Excel export (multi-tab workbook + charts)
 matplotlib>=3.7.0             # chart rendering to PNG for Excel embedding
 Pillow>=10.0.0                # image handling for openpyxl XlImage embedding
+bcrypt>=4.0.0                 # password hashing for auth
+PyJWT>=2.8.0                  # JWT token signing/verification

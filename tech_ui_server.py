@@ -18,17 +18,50 @@ from typing import AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://chat-ui:8005").rstrip("/")
 STATIC_DIR = Path(__file__).parent / "tech_ui"
 
+_AUTH_VALIDATE_URL = f"{ORCHESTRATOR_URL}/auth/validate"
+
+
+async def _is_authenticated(request: Request) -> bool:
+    """Validate JWT against the orchestrator /auth/validate endpoint."""
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not token:
+        token = request.cookies.get("auth_token", "")
+    if not token:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+            r = await client.get(_AUTH_VALIDATE_URL, headers={"Authorization": f"Bearer {token}"})
+            return r.status_code == 200 and r.json().get("valid", False)
+    except Exception:
+        return False
+
 log = logging.getLogger("tech_ui_server")
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="DataNanite Tech UI", docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    # Always allow health check and auth passthrough
+    if path == "/health" or path.startswith("/auth"):
+        return await call_next(request)
+    # Allow static JS/CSS (the login overlay needs them to render)
+    if path.startswith("/tech/style") or path.startswith("/tech/app"):
+        return await call_next(request)
+    if not await _is_authenticated(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+
 
 # Serve static assets under /tech/  (CSS, JS, images)
 # html=False keeps the default; we set headers in middleware below
@@ -55,6 +88,12 @@ app.add_middleware(NoCacheMiddleware)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "tech-ui"}
+
+
+# ── Auth proxy — forward /auth/* to orchestrator ──────────────────────────────
+@app.api_route("/auth/{path:path}", methods=["GET", "POST"])
+async def proxy_auth(request: Request, path: str):
+    return await _proxy(request, f"auth/{path}")
 
 
 # ── Root — serve index.html ───────────────────────────────────────────────────

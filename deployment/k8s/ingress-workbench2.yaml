@@ -17,7 +17,7 @@ spec:
           service:
             name: streamlit-ui-service
             port:
-              number: 8501
+              number: 8502
       - path: /*
         pathType: ImplementationSpecific
         backend:

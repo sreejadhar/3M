@@ -51,6 +51,10 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
+import sqlite3
+
+import bcrypt
+import jwt as _jwt
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -249,6 +253,53 @@ UI_DIR    = Path(__file__).parent / "chat_ui"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── Auth config ────────────────────────────────────────────────────────────────
+_JWT_SECRET  = os.environ.get("JWT_SECRET", "dev-secret-change-in-production")
+_JWT_ALG     = "HS256"
+_JWT_EXPIRY  = 24 * 3600  # 24 hours in seconds
+
+_AUTH_DB_PATH = Path(os.environ.get("DATA_DIR", "./data")) / "auth.db"
+
+# Seed users: env var name → email
+_SEED_USERS = [
+    ("SEED_PASSWORD_RIMNA",      "Rimna.Radhakrishnan@cognizant.com"),
+    ("SEED_PASSWORD_IYER",       "Iyer.Kasinath@cognizant.com"),
+    ("SEED_PASSWORD_SENTHEESH",  "Sentheesh.Lingam@cognizant.com"),
+    ("SEED_PASSWORD_HARPREET",   "Harpreet.Sethi@cognizant.com"),
+    ("SEED_PASSWORD_SUNIL",      "Sunil.Pinnamaneni@cognizant.com"),
+]
+
+
+def _auth_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(_AUTH_DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _bootstrap_auth() -> None:
+    """Create auth_users table and seed users from env vars."""
+    _AUTH_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _auth_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_users (
+                email       TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                role        TEXT NOT NULL DEFAULT 'user'
+            )
+        """)
+        for env_var, email in _SEED_USERS:
+            raw_pw = os.environ.get(env_var, "")
+            if not raw_pw:
+                continue
+            pw_hash = bcrypt.hashpw(raw_pw.encode(), bcrypt.gensalt()).decode()
+            conn.execute(
+                "INSERT INTO auth_users (email, password_hash, role) VALUES (?, ?, 'user') "
+                "ON CONFLICT(email) DO UPDATE SET password_hash=excluded.password_hash",
+                (email, pw_hash),
+            )
+        conn.commit()
+    logger.info("auth: bootstrapped auth_users table")
+
 # ── Session store ──────────────────────────────────────────────────────────────
 # session_id → session dict
 _sessions: Dict[str, Dict] = {}
@@ -407,6 +458,11 @@ async def _startup() -> None:
     Also bootstrap the RBAC store (creates tables, seeds default admin if needed).
     """
     try:
+        _bootstrap_auth()
+    except Exception as exc:
+        logger.warning("auth bootstrap failed (non-fatal): %s", exc)
+
+    try:
         _ac.bootstrap()
         logger.info("access_control: RBAC store bootstrapped (enforced=%s)", _ac.is_enforced())
     except Exception as exc:
@@ -462,6 +518,43 @@ async def _startup() -> None:
             _threading.Thread(target=_startup_bridge_inference, daemon=True, name="startup-bridge-infer").start()
     except Exception as exc:
         logger.warning("kg_store restore failed (non-fatal): %s", exc)
+
+
+# ── Auth endpoints ─────────────────────────────────────────────────────────────
+
+class _LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/auth/login")
+async def auth_login(body: _LoginRequest):
+    with _auth_db() as conn:
+        row = conn.execute(
+            "SELECT email, password_hash, role FROM auth_users WHERE email = ?",
+            (body.email.strip().lower(),),
+        ).fetchone()
+    if row is None or not bcrypt.checkpw(body.password.encode(), row["password_hash"].encode()):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = _jwt.encode(
+        {"sub": row["email"], "role": row["role"], "exp": int(time.time()) + _JWT_EXPIRY},
+        _JWT_SECRET,
+        algorithm=_JWT_ALG,
+    )
+    return {"access_token": token, "email": row["email"], "role": row["role"]}
+
+
+@app.get("/auth/validate")
+async def auth_validate(request: Request):
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not token:
+        return {"valid": False}
+    try:
+        _jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALG])
+        return {"valid": True}
+    except _jwt.PyJWTError:
+        return {"valid": False}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

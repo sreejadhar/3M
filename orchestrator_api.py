@@ -295,7 +295,7 @@ def _bootstrap_auth() -> None:
             conn.execute(
                 "INSERT INTO auth_users (email, password_hash, role) VALUES (?, ?, 'user') "
                 "ON CONFLICT(email) DO UPDATE SET password_hash=excluded.password_hash",
-                (email, pw_hash),
+                (email.lower(), pw_hash),
             )
         conn.commit()
     logger.info("auth: bootstrapped auth_users table")

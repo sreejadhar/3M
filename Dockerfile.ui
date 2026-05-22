@@ -19,13 +19,14 @@ WORKDIR /app
 
 COPY --from=builder /install /usr/local
 
-# Copy the Streamlit app, auth proxy, and theme config
+# Copy the Streamlit app, auth proxy, startup script and theme config
 COPY app.py                   /app/app.py
 COPY llm_client.py            /app/llm_client.py
 COPY streamlit_auth_proxy.py  /app/streamlit_auth_proxy.py
+COPY start_ui.sh              /app/start_ui.sh
 COPY .streamlit/              /app/.streamlit/
 
-RUN chown -R ui:ui /app
+RUN chmod +x /app/start_ui.sh && chown -R ui:ui /app
 
 ENV AGENT_API_URL=http://agent-api:8000 \
     PYTHONUNBUFFERED=1
@@ -35,7 +36,7 @@ USER ui
 # 8502 is the auth proxy (public); 8501 is Streamlit (internal only)
 EXPOSE 8502
 
-HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=20s --timeout=10s --start-period=60s --retries=5 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8502/health')"
 
-CMD ["sh", "-c", "streamlit run app.py --server.address=127.0.0.1 --server.port=8501 --server.headless=true & python streamlit_auth_proxy.py"]
+CMD ["/app/start_ui.sh"]

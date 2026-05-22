@@ -53,7 +53,7 @@ app = FastAPI(title="DataNanite Tech UI", docs_url=None, redoc_url=None)
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
     # Always allow health check and auth passthrough
-    if path == "/health" or path.startswith("/auth"):
+    if path in ("/", "/health") or path.startswith("/auth"):
         return await call_next(request)
     # Allow static JS/CSS (the login overlay needs them to render)
     if path.startswith("/tech/style") or path.startswith("/tech/app"):

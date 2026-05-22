@@ -139,7 +139,7 @@ jobs:
           ${{ matrix.service.container }}=gcr.io/$PROJECT_ID/${{ matrix.service.image }}:${{ github.sha }} \
           -n $NAMESPACE
         kubectl rollout restart deployment/${{ matrix.service.deployment }} -n $NAMESPACE
-        kubectl rollout status deployment/${{ matrix.service.deployment }} -n $NAMESPACE --timeout=5m
+        kubectl rollout status deployment/${{ matrix.service.deployment }} -n $NAMESPACE --timeout=10m
 
   # ── Job 2: Final status check after all services deployed ─────────────────────
   status:

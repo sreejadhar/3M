@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: agent-api
-  namespace: datananite
+  namespace: datananite2
 spec:
   replicas: 1
   strategy:
@@ -24,13 +24,6 @@ spec:
                 operator: In
                 values:
                 - datananite-pool
-      initContainers:
-      - name: fix-permissions
-        image: busybox
-        command: ["sh", "-c", "mkdir -p /data/reports/uploads && chmod -R 777 /data/reports"]
-        volumeMounts:
-        - name: reports-data
-          mountPath: /data/reports
       containers:
       - name: agent-api
         image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-agent:latest
@@ -42,8 +35,8 @@ spec:
         - secretRef:
             name: datananite-secrets
         volumeMounts:
-        - name: reports-data
-          mountPath: /data/reports
+        - name: shared-data
+          mountPath: /data
         resources:
           requests:
             memory: "512Mi"
@@ -66,15 +59,17 @@ spec:
           periodSeconds: 10
           timeoutSeconds: 10
       volumes:
-      - name: reports-data
+      - name: shared-data
         persistentVolumeClaim:
-          claimName: datananite-shared-pvc
+          claimName: datananite2-shared-pvc
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: agent-api-service
-  namespace: datananite
+  namespace: datananite2
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
 spec:
   selector:
     app: agent-api

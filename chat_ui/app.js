@@ -28,7 +28,7 @@ const ANALYST_ROLES = [
 let currentPersona     = localStorage.getItem('datachat_persona') || 'business_user';
 // currentAnalystRole: '' | role key | 'other' (pending) | 'other:Custom text'
 let currentAnalystRole = localStorage.getItem('datachat_analyst_role') || '';
-const _VALID_MODELS = new Set(['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-7']);
+const _VALID_MODELS = new Set(['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-5']);
 let _storedModel = localStorage.getItem('datachat_llm_model') || '';
 let currentLlmModel = _VALID_MODELS.has(_storedModel) ? _storedModel : 'claude-sonnet-4-6';
 

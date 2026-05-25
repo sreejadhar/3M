@@ -102,6 +102,35 @@ body {
   font-weight: 600;
 }
 .nav-item svg { width: 15px; height: 15px; flex-shrink: 0; }
+
+/* ── Coming Soon nav items ─────────────────────────────────────────────────── */
+.nav-item.coming-soon {
+  opacity: 0.38;
+  cursor: not-allowed;
+  pointer-events: none;
+  position: relative;
+}
+.nav-item.coming-soon:hover {
+  background: transparent;
+  color: var(--text-1);
+}
+.coming-soon-badge {
+  display: none;
+  margin-left: auto;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-2);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+/* Re-enable pointer events just for the tooltip on hover */
+.nav-item.coming-soon { pointer-events: auto; }
+.nav-item.coming-soon:hover { background: transparent; color: var(--text-1); cursor: not-allowed; }
+.nav-item.coming-soon:hover .coming-soon-badge { display: inline-block; }
 .nav-item .badge {
   margin-left: auto;
   background: var(--accent-dim);

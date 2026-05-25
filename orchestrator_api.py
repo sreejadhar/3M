@@ -1924,7 +1924,10 @@ async def _sse_generator(session_id: str) -> AsyncGenerator[str, None]:
         q = asyncio.Queue()
         _event_queues[session_id] = q
 
-    # Replay current stage so freshly connected clients get context
+    # Replay current stage so freshly connected clients get context.
+    # We do NOT replay "ready" — the frontend reads stage from GET /messages on
+    # resume, so replaying here would render a duplicate Ready card on every
+    # SSE reconnect (page reload, chat response, network blip, etc.).
     session = _sessions.get(session_id, {})
     stage = session.get("stage", "idle")
     if stage not in ("idle", "ready", "error"):
@@ -1933,13 +1936,6 @@ async def _sse_generator(session_id: str) -> AsyncGenerator[str, None]:
             "stage":   stage,
             "message": session.get("stage_message", stage),
             "pct":     session.get("pct", 0),
-        })
-    elif stage == "ready":
-        tables = list((session.get("report") or {}).get("tables", {}).keys())
-        yield _sse_line({
-            "type":    "ready",
-            "message": f"Ready! {len(tables)} table{'s' if len(tables) != 1 else ''} available.",
-            "tables":  tables,
         })
     elif stage == "error":
         yield _sse_line({"type": "error", "message": session.get("error", "Unknown error")})

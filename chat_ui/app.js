@@ -1193,6 +1193,7 @@ async function openSourceSession(sourceId) {
     showChatView(src.name);
 
     if (stage === 'ready') {
+      _readyShownSessions.add(session_id);
       msgInput.disabled = false;
       msgInput.placeholder = 'Ask anything about your data…';
       updateSendState();

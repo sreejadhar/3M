@@ -2088,39 +2088,29 @@ async def upload_files(
     session["stage"] = "uploading"
 
     try:
-        if len(files) == 1 and files[0].filename.lower().endswith((".xlsx", ".xls", ".xlsm", ".xlsb")):
-            # Single Excel file → upload-file
-            file = files[0]
-            file_bytes = await file.read()
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                r = await client.post(
-                    f"{METADATA_API}/upload-file",
-                    files={"file": (file.filename, file_bytes, file.content_type or "application/octet-stream")},
-                )
-                r.raise_for_status()
-                upload_info = r.json()
+        upload_dir = DATA_DIR / "uploads"
+        upload_dir.mkdir(parents=True, exist_ok=True)
 
-            server_path = upload_info["path"]
-            db_type     = upload_info["db_type"]
+        if len(files) == 1 and files[0].filename.lower().endswith((".xlsx", ".xls", ".xlsm", ".xlsb")):
+            # Single Excel file — save directly on shared PVC
+            file = files[0]
+            dest = upload_dir / file.filename
+            dest.write_bytes(await file.read())
+            server_path = str(dest)
+            db_type     = _db_type_from_ext(file.filename)
             session["files"] = [{"name": file.filename, "server_path": server_path, "db_type": db_type}]
             session["db_file_path"] = server_path
             session["db_type"]      = db_type
 
         else:
-            # Multiple CSVs or single CSV → upload-files
-            form_files = []
+            # Multiple CSVs or single CSV — save into uploads/csv/ on shared PVC
+            csv_dir = upload_dir / "csv"
+            csv_dir.mkdir(parents=True, exist_ok=True)
             for f in files:
-                content = await f.read()
-                form_files.append(("files", (f.filename, content, f.content_type or "text/csv")))
-
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                r = await client.post(f"{METADATA_API}/upload-files", files=form_files)
-                r.raise_for_status()
-                upload_info = r.json()
-
-            server_path = upload_info["path"]
-            db_type     = upload_info["db_type"]
-            session["files"] = [{"name": f.filename, "server_path": server_path, "db_type": "csv"} for f in files]
+                (csv_dir / f.filename).write_bytes(await f.read())
+            server_path = str(csv_dir)
+            db_type     = "csv"
+            session["files"] = [{"name": f.filename, "server_path": str(csv_dir / f.filename), "db_type": "csv"} for f in files]
             session["db_file_path"] = server_path
             session["db_type"]      = db_type
 
@@ -2468,25 +2458,29 @@ async def delete_source(source_id: str):
     return {"deleted": source_id}
 
 
+def _db_type_from_ext(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    if ext in (".xlsx", ".xls", ".xlsm", ".xlsb"):
+        return "excel"
+    if ext in (".sqlite", ".db", ".sqlite3"):
+        return "sqlite"
+    if ext == ".csv":
+        return "csv"
+    return "unknown"
+
+
 @app.post("/sources/upload-file", status_code=200)
 async def upload_source_file(file: UploadFile = File(...)):
-    """Upload a file for a registered source. Stored permanently until the source is deleted."""
-    file_bytes = await file.read()
+    """Upload a file for a registered source. Saved locally on the shared PVC so all pods can read it."""
+    upload_dir = DATA_DIR / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    dest = upload_dir / file.filename
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            r = await client.post(
-                f"{METADATA_API}/upload-permanent",
-                files={"file": (file.filename, file_bytes,
-                                file.content_type or "application/octet-stream")},
-            )
-            r.raise_for_status()
-            info = r.json()
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=502,
-                            detail=f"File upload failed: {exc.response.text[:200]}")
+        dest.write_bytes(await file.read())
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-    return {"path": info["path"], "db_type": info["db_type"], "filename": info["filename"]}
+    db_type = _db_type_from_ext(file.filename)
+    return {"path": str(dest), "db_type": db_type, "filename": file.filename}
 
 
 @app.post("/sources/{source_id}/reindex", status_code=202)

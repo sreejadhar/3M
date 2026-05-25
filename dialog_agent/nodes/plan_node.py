@@ -1399,8 +1399,8 @@ def _preflight_check_plan(
 
 _COST_PER_M = {
     "claude-haiku-4-5": (0.80, 4.00),
-    "claude-sonnet-4-6":         (3.00, 15.00),
-    "claude-opus-4-6":           (15.00, 75.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-opus-4-5":   (15.00, 75.00),
 }
 
 

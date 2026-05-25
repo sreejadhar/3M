@@ -2390,6 +2390,10 @@ async def create_source(req: CreateSourceRequest):
         persona_access=req.persona_access,
     )
     _sources[s["id"]] = s
+    try:
+        _kg_store.save(s)
+    except Exception as _ks_exc:
+        logger.warning("kg_store.save on register failed (non-fatal): %s", _ks_exc)
     if req.auto_index:
         asyncio.create_task(_index_source(s["id"]))
     logger.info("Source registered: %s (%s)", s["id"][:8], req.name)
@@ -2423,6 +2427,10 @@ async def update_source(source_id: str, req: UpdateSourceRequest):
         s["description"] = req.description.strip()
     if req.domain is not None:
         s["domain"] = req.domain.strip()
+    try:
+        _kg_store.save(s)
+    except Exception as _ks_exc:
+        logger.warning("kg_store.save on update failed (non-fatal): %s", _ks_exc)
     logger.info("Source updated: %s — domain=%s", source_id[:8], s.get("domain"))
     return _source_public(s)
 

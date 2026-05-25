@@ -28,13 +28,16 @@ const ANALYST_ROLES = [
 let currentPersona     = localStorage.getItem('datachat_persona') || 'business_user';
 // currentAnalystRole: '' | role key | 'other' (pending) | 'other:Custom text'
 let currentAnalystRole = localStorage.getItem('datachat_analyst_role') || '';
-let currentLlmModel    = localStorage.getItem('datachat_llm_model') || 'claude-sonnet-4-6';
+const _VALID_MODELS = new Set(['claude-haiku-4-5-20251001', 'claude-sonnet-4-6', 'claude-opus-4-7']);
+let _storedModel = localStorage.getItem('datachat_llm_model') || '';
+let currentLlmModel = _VALID_MODELS.has(_storedModel) ? _storedModel : 'claude-sonnet-4-6';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let activeSessionId   = null;
 let activeEventSource = null;
 let pendingFiles      = [];
 let isWaitingForReply = false;
+let _suppressNextReady = false;  // suppress SSE ready replay when resuming an already-ready session
 let progressMsgId     = null;
 let sessions          = {};
 let sources           = {};       // source_id → source dict
@@ -1232,7 +1235,16 @@ function handleSSEEvent(ev) {
       break;
 
     case 'ready':
-      finishPipeline(ev.message, ev.tables || []);
+      if (_suppressNextReady) {
+        _suppressNextReady = false;
+        // session already rendered — just ensure input is enabled
+        updateTopbarStatus('Ready', 'done');
+        msgInput.disabled = false;
+        msgInput.placeholder = 'Ask anything about your data…';
+        updateSendState();
+      } else {
+        finishPipeline(ev.message, ev.tables || []);
+      }
       break;
 
     case 'ontology_ready':
@@ -2040,6 +2052,7 @@ function renderSessionList() {
 
 async function resumeSession(sessionId) {
   activeSessionId = sessionId;
+  _suppressNextReady = true;  // the SSE generator replays ready on connect; don't add another card
   subscribeSSE(sessionId);
   clearChatUI();
   renderSessionList();

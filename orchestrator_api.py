@@ -313,6 +313,8 @@ _sources: Dict[str, Dict] = {}
 _source_event_queues: Dict[str, asyncio.Queue] = {}
 # Per-source recent event buffer for replay on new SSE connections (last 100 events)
 _source_event_log: Dict[str, List[Dict]] = {}
+# Event loop reference — captured at startup so sync threads can schedule onto it
+_main_loop: asyncio.AbstractEventLoop | None = None
 
 DOMAIN_ICONS: Dict[str, str] = {
     "Sales":      "💼",
@@ -457,6 +459,9 @@ async def _startup() -> None:
     their KG nodes/edges are immediately available without re-indexing.
     Also bootstrap the RBAC store (creates tables, seeds default admin if needed).
     """
+    global _main_loop
+    _main_loop = asyncio.get_event_loop()
+
     try:
         _bootstrap_auth()
     except Exception as exc:
@@ -1476,11 +1481,13 @@ def _push_index_event(source_id: str, step: str, status: str, message: str, deta
     buf.append(event)
     if len(buf) > 100:
         buf.pop(0)
-    # Push to live SSE queue if a client is connected
+    # Push to live SSE queue if a client is connected.
+    # _push_index_event is called from a background thread, so we must
+    # schedule onto the event loop rather than calling put_nowait directly.
     q = _source_event_queues.get(source_id)
-    if q:
+    if q and _main_loop is not None:
         try:
-            q.put_nowait(event)
+            _main_loop.call_soon_threadsafe(q.put_nowait, event)
         except asyncio.QueueFull:
             pass
 

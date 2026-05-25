@@ -55,6 +55,9 @@ async def auth_middleware(request: Request, call_next):
     # Always allow health check and auth passthrough
     if path in ("/", "/health") or path.startswith("/auth"):
         return await call_next(request)
+    # Allow SSE index-events — EventSource cannot send Authorization headers
+    if path.endswith("/index-events"):
+        return await call_next(request)
     # Allow static JS/CSS (the login overlay needs them to render)
     if path.startswith("/tech/style") or path.startswith("/tech/app"):
         return await call_next(request)

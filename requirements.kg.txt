@@ -16,6 +16,9 @@ langchain-core>=0.3.0
 neo4j>=5.0.0
 gremlinpython>=3.7.0
 
+# Anthropic LLM (profile_node)
+anthropic>=0.25.0
+
 # GraphRAG embedding (embed_node)
 numpy>=1.26.0                          # vector math (required)
 # sentence-transformers>=3.0.0         # best-quality local backend (optional, 384 dims)

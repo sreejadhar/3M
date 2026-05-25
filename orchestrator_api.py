@@ -2092,10 +2092,20 @@ async def upload_files(
         upload_dir.mkdir(parents=True, exist_ok=True)
 
         if len(files) == 1 and files[0].filename.lower().endswith((".xlsx", ".xls", ".xlsm", ".xlsb")):
-            # Single Excel file — save directly on shared PVC
+            # Single Excel — save locally (for dialog-api) and forward to agent-api (for extraction)
             file = files[0]
+            file_bytes = await file.read()
             dest = upload_dir / file.filename
-            dest.write_bytes(await file.read())
+            dest.write_bytes(file_bytes)
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    await client.post(
+                        f"{METADATA_API}/upload-file",
+                        files={"file": (file.filename, file_bytes,
+                                        file.content_type or "application/octet-stream")},
+                    )
+            except Exception as exc:
+                logger.warning("Could not forward session upload to agent-api (non-fatal): %s", exc)
             server_path = str(dest)
             db_type     = _db_type_from_ext(file.filename)
             session["files"] = [{"name": file.filename, "server_path": server_path, "db_type": db_type}]
@@ -2103,11 +2113,19 @@ async def upload_files(
             session["db_type"]      = db_type
 
         else:
-            # Multiple CSVs or single CSV — save into uploads/csv/ on shared PVC
+            # Multiple CSVs or single CSV — save locally and forward to agent-api
             csv_dir = upload_dir / "csv"
             csv_dir.mkdir(parents=True, exist_ok=True)
+            form_files = []
             for f in files:
-                (csv_dir / f.filename).write_bytes(await f.read())
+                content = await f.read()
+                (csv_dir / f.filename).write_bytes(content)
+                form_files.append(("files", (f.filename, content, f.content_type or "text/csv")))
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    await client.post(f"{METADATA_API}/upload-files", files=form_files)
+            except Exception as exc:
+                logger.warning("Could not forward CSV upload to agent-api (non-fatal): %s", exc)
             server_path = str(csv_dir)
             db_type     = "csv"
             session["files"] = [{"name": f.filename, "server_path": str(csv_dir / f.filename), "db_type": "csv"} for f in files]
@@ -2471,14 +2489,32 @@ def _db_type_from_ext(filename: str) -> str:
 
 @app.post("/sources/upload-file", status_code=200)
 async def upload_source_file(file: UploadFile = File(...)):
-    """Upload a file for a registered source. Saved locally on the shared PVC so all pods can read it."""
+    """
+    Upload a file for a registered source.
+    Saves to the orchestrator's DATA_DIR/uploads/ (for dialog-api chat queries)
+    AND forwards to agent-api's /upload-permanent (for extraction).
+    Both pods need the file; the shared PVC gives each pod its own mount binding.
+    """
+    file_bytes = await file.read()
     upload_dir = DATA_DIR / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     dest = upload_dir / file.filename
     try:
-        dest.write_bytes(await file.read())
+        dest.write_bytes(file_bytes)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=f"Local save failed: {exc}")
+
+    # Forward to agent-api so it has the file for extraction
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            await client.post(
+                f"{METADATA_API}/upload-permanent",
+                files={"file": (file.filename, file_bytes,
+                                file.content_type or "application/octet-stream")},
+            )
+    except Exception as exc:
+        logger.warning("Could not forward upload to agent-api (non-fatal): %s", exc)
+
     db_type = _db_type_from_ext(file.filename)
     return {"path": str(dest), "db_type": db_type, "filename": file.filename}
 

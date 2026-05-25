@@ -38,6 +38,7 @@ let activeEventSource = null;
 let pendingFiles      = [];
 let isWaitingForReply = false;
 let _suppressNextReady = false;  // suppress SSE ready replay when resuming an already-ready session
+const _readyShownSessions = new Set(); // sessions where the Ready card has already been rendered
 let progressMsgId     = null;
 let sessions          = {};
 let sources           = {};       // source_id → source dict
@@ -1235,14 +1236,14 @@ function handleSSEEvent(ev) {
       break;
 
     case 'ready':
-      if (_suppressNextReady) {
-        _suppressNextReady = false;
-        // session already rendered — just ensure input is enabled
+      if (_readyShownSessions.has(activeSessionId)) {
+        // Already shown for this session — just ensure UI state is correct
         updateTopbarStatus('Ready', 'done');
         msgInput.disabled = false;
         msgInput.placeholder = 'Ask anything about your data…';
         updateSendState();
       } else {
+        _readyShownSessions.add(activeSessionId);
         finishPipeline(ev.message, ev.tables || []);
       }
       break;
@@ -2052,7 +2053,6 @@ function renderSessionList() {
 
 async function resumeSession(sessionId) {
   activeSessionId = sessionId;
-  _suppressNextReady = true;  // the SSE generator replays ready on connect; don't add another card
   subscribeSSE(sessionId);
   clearChatUI();
   renderSessionList();
@@ -2075,6 +2075,7 @@ async function resumeSession(sessionId) {
     });
 
     if (data.stage === 'ready') {
+      _readyShownSessions.add(sessionId); // mark as shown so SSE replay doesn't add another card
       msgInput.disabled = false;
       msgInput.placeholder = 'Ask anything about your data…';
       updateTopbarStatus('Ready', 'done');

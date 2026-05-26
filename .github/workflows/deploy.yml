@@ -57,6 +57,9 @@ jobs:
           --from-literal=SEED_PASSWORD_SENTHEESH=${{ secrets.SEED_PASSWORD_SENTHEESH }} \
           --from-literal=SEED_PASSWORD_HARPREET=${{ secrets.SEED_PASSWORD_HARPREET }} \
           --from-literal=SEED_PASSWORD_SUNIL=${{ secrets.SEED_PASSWORD_SUNIL }} \
+          --from-literal=SEED_PASSWORD_SATHISH=${{ secrets.SEED_PASSWORD_SATHISH }} \
+          --from-literal=SEED_PASSWORD_PALASH=${{ secrets.SEED_PASSWORD_PALASH }} \
+          --from-literal=SEED_PASSWORD_SASWATA=${{ secrets.SEED_PASSWORD_SASWATA }} \
           --dry-run=client -o yaml | kubectl apply -f -
 
     - name: Apply Namespace, ConfigMap and PVCs

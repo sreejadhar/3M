@@ -10,6 +10,7 @@ import GraphExplorer from './views/GraphExplorer.jsx';
 import SchemaCatalog from './views/SchemaCatalog.jsx';
 import OntologyViewer from './views/OntologyViewer.jsx';
 import Redundancies from './views/Redundancies.jsx';
+import Glossary from './views/Glossary.jsx';
 
 const VIEWS = {
   pipeline: PipelineMonitor,
@@ -17,6 +18,7 @@ const VIEWS = {
   catalog: SchemaCatalog,
   ontology: OntologyViewer,
   redundancy: Redundancies,
+  glossary: Glossary,
 };
 
 function Workbench() {

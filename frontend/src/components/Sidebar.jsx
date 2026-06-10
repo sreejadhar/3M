@@ -20,13 +20,13 @@ const INSPECT = [
   ['catalog', IconCatalog, 'Schema Catalog'],
   ['ontology', IconOntology, 'Ontology Viewer'],
   ['redundancy', IconRedundancy, 'Redundancies'],
+  ['glossary', IconGlossary, 'Business Glossary'],
 ];
 // DEVELOP — "Coming Soon", disabled (matches current tech_ui).
 const DEVELOP = [
   ['sql', IconSql, 'SQL Console'],
   ['cdc', IconCdc, 'Change Log'],
   ['documents', IconDocuments, 'Documents'],
-  ['glossary', IconGlossary, 'Glossary'],
   ['kpi', IconKpi, 'KPI Registry'],
 ];
 

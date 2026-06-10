@@ -75,3 +75,19 @@ export const classifyPII = (id) => apiPost(`/metadata/sources/${id}/classify-pii
 
 // ── KG bridges ──────────────────────────────────────────────────────────────
 export const listBridges = () => apiGet('/kg-bridges');
+
+// ── Business Glossary ─────────────────────────────────────────────────────────
+// All routes proxy through the orchestrator: /metadata/glossary/* → agent-api /glossary/*.
+const _G = '/metadata/glossary';
+export const listGlossaryTerms = (domain = '') =>
+  apiGet(`${_G}/terms${domain ? `?domain=${encodeURIComponent(domain)}` : ''}`);
+export const searchGlossaryTerms = (q, domain = '') =>
+  apiGet(`${_G}/search?q=${encodeURIComponent(q)}&domain=${encodeURIComponent(domain)}&limit=50`);
+export const getGlossaryTerm = (id) => apiGet(`${_G}/terms/${id}`);
+export const createGlossaryTerm = (body) => apiPost(`${_G}/terms`, body);
+export const updateGlossaryTerm = (id, body) => apiPut(`${_G}/terms/${id}`, body);
+export const deleteGlossaryTerm = (id) => apiDelete(`${_G}/terms/${id}`);
+export const addGlossarySynonym = (termId, synonym, domainScope = '') =>
+  apiPost(`${_G}/terms/${termId}/synonyms`, { synonym, domain_scope: domainScope });
+export const removeGlossarySynonym = (synonymId) => apiDelete(`${_G}/synonyms/${synonymId}`);
+export const upsertGlossaryThreshold = (termId, body) => apiPut(`${_G}/terms/${termId}/threshold`, body);

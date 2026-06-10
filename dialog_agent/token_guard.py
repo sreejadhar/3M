@@ -26,8 +26,10 @@ from typing import Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-# Conservative chars-per-token for schema/SQL content (prose is ~4, SQL ~2-3).
-_CHARS_PER_TOKEN: float = 2.5
+# Conservative chars-per-token for schema/SQL content. Measured ~2.29 on real
+# dense schema prompts, so 2.5 let prompts slip ~1% over the 200k ceiling
+# (201,887 > 200,000). 2.0 keeps the char budget safely under the real limit.
+_CHARS_PER_TOKEN: float = 2.0
 
 # Token budget: 15k below the hard 200k limit.
 _MAX_INPUT_TOKENS: int = 185_000

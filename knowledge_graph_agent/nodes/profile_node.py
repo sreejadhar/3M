@@ -34,9 +34,16 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Max concurrent per-table taxonomy-classification LLM calls. One call is made
+# per table; running them in parallel bounds total time by the slowest single
+# call rather than their sum, keeping the KG step inside the orchestrator's poll
+# window on multi-table sources.
+_PROFILE_MAX_WORKERS = int(os.environ.get("KG_PROFILE_WORKERS", "8"))
 
 
 # ── LLM prompt ────────────────────────────────────────────────────────────────
@@ -258,25 +265,43 @@ def profile_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "xsd_type": xsd_type,
         })
 
-    total_annotated = 0
-    for uri_str, cls in classes.items():
-        props = cls["props"]
-        if not props:
-            continue
+    # Classify every table concurrently — one LLM call per table, run in a
+    # thread pool so total time is bounded by the slowest call, not their sum.
+    classes_with_props = [(uri_str, cls) for uri_str, cls in classes.items() if cls["props"]]
 
-        table_name = cls["name"]
-        columns    = [{"name": p["name"], "xsd_type": p["xsd_type"]} for p in props]
-
+    def _classify(uri_str: str, cls: Dict) -> List[Dict]:
+        columns = [{"name": p["name"], "xsd_type": p["xsd_type"]} for p in cls["props"]]
         logger.info(
             "profile_node: classifying %d columns for table %r",
-            len(columns), table_name,
+            len(columns), cls["name"],
         )
-        annotations = _call_profile_llm(table_name, columns, model)
+        return _call_profile_llm(cls["name"], columns, model)
+
+    annotations_by_uri: Dict[str, List[Dict]] = {}
+    if classes_with_props:
+        with ThreadPoolExecutor(max_workers=_PROFILE_MAX_WORKERS) as pool:
+            futures = {
+                pool.submit(_classify, uri_str, cls): uri_str
+                for uri_str, cls in classes_with_props
+            }
+            for fut in as_completed(futures):
+                uri_str = futures[fut]
+                try:
+                    annotations_by_uri[uri_str] = fut.result()
+                except Exception as exc:           # already logged inside; stay defensive
+                    logger.warning("profile_node: classification task failed for %s: %s", uri_str, exc)
+                    annotations_by_uri[uri_str] = []
+
+    total_annotated = 0
+    for uri_str, cls in classes_with_props:
+        props = cls["props"]
+        annotations = annotations_by_uri.get(uri_str, [])
 
         # Build a name → annotation lookup (case-insensitive)
         ann_by_name = {a.get("name", "").lower(): a for a in annotations}
 
         for prop in props:
+            table_name = cls["name"]
             ann = ann_by_name.get(prop["name"].lower())
             if not ann:
                 continue

@@ -250,6 +250,9 @@ def _use_neo4j() -> bool:
 
 DATA_DIR  = Path(os.environ.get("DATA_DIR", "./reports"))
 UI_DIR    = Path(__file__).parent / "chat_ui"
+# React build (Vite) for the DataChat UI; served at "/" when present, with the
+# legacy chat_ui/ kept as a fallback.
+REACT_UI_DIR = Path(__file__).parent / "chat_frontend" / "dist"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -448,9 +451,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static UI assets under /ui/
+# Serve static UI assets under /ui/ (legacy chat_ui)
 if UI_DIR.exists():
     app.mount("/ui", StaticFiles(directory=str(UI_DIR)), name="ui")
+
+# Serve the React build's hashed assets at /assets/ (index.html references them).
+if (REACT_UI_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(REACT_UI_DIR / "assets")), name="react_assets")
 
 
 # ── Startup: restore KG snapshots + bootstrap RBAC ────────────────────────────
@@ -1739,7 +1746,10 @@ async def _index_source(source_id: str) -> None:
                 onto_job_id = ro.json()["job_id"]
 
             src["ontology_job_id"] = onto_job_id
-            deadline2 = time.time() + 300
+            # Safety margin: the build runs one LLM concept-annotation call per
+            # table (now parallelized in build_node), but transient API 500s +
+            # retries can still stretch a large source past a few minutes.
+            deadline2 = time.time() + 600
             async with httpx.AsyncClient(timeout=30.0) as client:
                 while time.time() < deadline2:
                     pr  = await client.get(f"{ONTOLOGY_API}/jobs/{onto_job_id}")
@@ -1792,7 +1802,9 @@ async def _index_source(source_id: str) -> None:
                     kg_job_id = rk.json()["job_id"]
 
                 src["kg_job_id"] = kg_job_id
-                deadline3 = time.time() + 300
+                # Safety margin: KG profile_node runs one LLM taxonomy call per
+                # table (now parallelized); match the ontology step's window.
+                deadline3 = time.time() + 600
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     while time.time() < deadline3:
                         pr  = await client.get(f"{KG_API}/jobs/{kg_job_id}")
@@ -1971,9 +1983,13 @@ async def health():
 
 @app.get("/")
 async def serve_ui():
+    # Prefer the React build; fall back to the legacy chat_ui.
+    react_index = REACT_UI_DIR / "index.html"
+    if react_index.exists():
+        return FileResponse(str(react_index), headers={"Cache-Control": "no-store"})
     index = UI_DIR / "index.html"
     if not index.exists():
-        return {"error": "UI not found. Ensure chat_ui/index.html exists."}
+        return {"error": "UI not found. Build chat_frontend or ensure chat_ui/index.html exists."}
     return FileResponse(str(index), headers={"Cache-Control": "no-store"})
 
 

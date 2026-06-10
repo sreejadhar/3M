@@ -1,0 +1,25 @@
+{
+  "name": "datachat-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "React rebuild of the DataNanite DataChat UI (orchestrator :8005)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "chart.js": "^4.4.7",
+    "chartjs-plugin-datalabels": "^2.2.0",
+    "marked": "^9.1.6",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "vis-network": "^9.1.9",
+    "vis-data": "^7.1.9"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.7"
+  }
+}

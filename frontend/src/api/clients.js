@@ -91,3 +91,24 @@ export const addGlossarySynonym = (termId, synonym, domainScope = '') =>
   apiPost(`${_G}/terms/${termId}/synonyms`, { synonym, domain_scope: domainScope });
 export const removeGlossarySynonym = (synonymId) => apiDelete(`${_G}/synonyms/${synonymId}`);
 export const upsertGlossaryThreshold = (termId, body) => apiPut(`${_G}/terms/${termId}/threshold`, body);
+
+// ── KPI Formula Registry ──────────────────────────────────────────────────────
+// Served directly by the orchestrator (/kpis/*), backed by kpi_store.
+export const listKpis = ({ source_id = '', category = '', status = '' } = {}) => {
+  const qs = new URLSearchParams();
+  if (source_id) qs.set('source_id', source_id);
+  if (category) qs.set('category', category);
+  if (status) qs.set('status', status);
+  const q = qs.toString();
+  return apiGet(`/kpis${q ? `?${q}` : ''}`);
+};
+export const getKpi = (id) => apiGet(`/kpis/${id}`);
+export const createKpi = (body) => apiPost('/kpis', body);          // → { kpi, warnings }
+export const updateKpi = (id, body) => apiPatch(`/kpis/${id}`, body); // → { kpi, warnings }
+export const deleteKpi = (id) => apiDelete(`/kpis/${id}`);
+export const compileKpi = (id, columnContext, model) =>
+  apiPost(`/kpis/${id}/compile`, { column_context: columnContext, model });
+export const listKpiVersions = (id) => apiGet(`/kpis/${id}/versions`);
+export const rollbackKpiVersion = (id, versionNum) =>
+  apiPost(`/kpis/${id}/versions/${versionNum}/rollback`, {});
+export const activateKpi = (id) => apiPost(`/kpis/${id}/activate`, {});

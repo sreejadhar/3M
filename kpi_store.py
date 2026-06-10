@@ -313,7 +313,13 @@ def update_kpi(kpi_id: str, changed_by: str = "", change_note: str = "",
     if not updates:
         return {"ok": False, "warnings": []}
 
-    guardrail_errors = _guardrail_check(updates)
+    # Guardrails must be checked against the MERGED result (stored values +
+    # this update), not just the incoming fields. Otherwise a partial update
+    # like "set status to active" — which omits sql_expression — falsely trips
+    # the "active KPIs need a SQL expression" check even when SQL is already
+    # stored (this is what blocked every activation).
+    _merged_for_check = {**(get_kpi(kpi_id) or {}), **updates}
+    guardrail_errors = _guardrail_check(_merged_for_check)
     if guardrail_errors:
         raise ValueError("; ".join(guardrail_errors))
 

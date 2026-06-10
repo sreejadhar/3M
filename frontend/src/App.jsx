@@ -11,6 +11,7 @@ import SchemaCatalog from './views/SchemaCatalog.jsx';
 import OntologyViewer from './views/OntologyViewer.jsx';
 import Redundancies from './views/Redundancies.jsx';
 import Glossary from './views/Glossary.jsx';
+import Kpi from './views/Kpi.jsx';
 
 const VIEWS = {
   pipeline: PipelineMonitor,
@@ -19,6 +20,7 @@ const VIEWS = {
   ontology: OntologyViewer,
   redundancy: Redundancies,
   glossary: Glossary,
+  kpi: Kpi,
 };
 
 function Workbench() {

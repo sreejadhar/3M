@@ -21,13 +21,13 @@ const INSPECT = [
   ['ontology', IconOntology, 'Ontology Viewer'],
   ['redundancy', IconRedundancy, 'Redundancies'],
   ['glossary', IconGlossary, 'Business Glossary'],
+  ['kpi', IconKpi, 'KPI Registry'],
 ];
 // DEVELOP — "Coming Soon", disabled (matches current tech_ui).
 const DEVELOP = [
   ['sql', IconSql, 'SQL Console'],
   ['cdc', IconCdc, 'Change Log'],
   ['documents', IconDocuments, 'Documents'],
-  ['kpi', IconKpi, 'KPI Registry'],
 ];
 
 function NavItem({ id, Icon, label, badge }) {

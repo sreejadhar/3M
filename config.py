@@ -15,6 +15,7 @@ class DBType(str, Enum):
     DELTA_LAKE = "delta_lake"
     REDSHIFT   = "redshift"
     SQLSERVER  = "sqlserver"
+    SNOWFLAKE  = "snowflake"
     BIGQUERY   = "bigquery"
     SQLITE     = "sqlite"
     CSV        = "csv"

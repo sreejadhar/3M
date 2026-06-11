@@ -2554,7 +2554,8 @@ async def test_source_connection(req: TestConnectionRequest):
     conn      = req.connection.dict()
     db_config = _build_db_config(req.db_type, conn)
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        # 60s: Snowflake key-pair connects can take ~45s on first OCSP validation.
+        async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(f"{METADATA_API}/discover", json=db_config)
             if r.status_code == 422:
                 return {"ok": False, "error": str(r.json().get("detail", "Invalid parameters"))}

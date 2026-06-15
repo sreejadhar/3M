@@ -71,6 +71,7 @@ jobs:
         kubectl apply -f deployment/k8s/namespace2.yaml
         kubectl apply -f deployment/k8s/pvc2.yaml
         kubectl apply -f deployment/k8s/configmap.yaml
+        kubectl apply -f deployment/k8s/orchestrator-api.yaml
 
   # ── Job 1: Build → Push → Deploy each service fully in parallel ───────────────
   build-push-deploy:

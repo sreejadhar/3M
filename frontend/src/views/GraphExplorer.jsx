@@ -252,7 +252,7 @@ export default function GraphExplorer() {
           onChange={(e) => setSelectedRemoteKg(e.target.value)}
         >
           <option value="">— none —</option>
-          {[...new Set(bridgesRef.current.map((b) => (b.from_kg === activeSourceId ? b.to_kg : b.from_kg)))]
+          {[...new Set(bridges.filter((b) => b.from_kg === activeSourceId || b.to_kg === activeSourceId).map((b) => (b.from_kg === activeSourceId ? b.to_kg : b.from_kg)))]
             .map((kid) => {
               const name = sources.find((s) => s.id === kid)?.name || kid.slice(0, 8);
               return <option key={kid} value={kid}>{name}</option>;

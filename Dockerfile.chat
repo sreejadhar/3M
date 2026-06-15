@@ -19,6 +19,7 @@ COPY excel_export.py .
 COPY metadata_catalog.py .
 COPY kpi_store.py .
 COPY kg_store.py .
+COPY session_store.py .
 COPY access_control.py .
 COPY ontology_enricher.py .
 COPY glossary_store.py .

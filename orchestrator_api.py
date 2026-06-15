@@ -274,6 +274,10 @@ _SEED_USERS = [
     ("SEED_PASSWORD_SATHISH",    "Sathish.Hegde@cognizant.com"),
     ("SEED_PASSWORD_PALASH",     "Palash.Ghosh@cognizant.com"),
     ("SEED_PASSWORD_SASWATA",    "Saswata.Kundu@cognizant.com"),
+    ("SEED_PASSWORD_MURUGESH",   "Murugesh.Mayandi@cognizant.com"),
+    ("SEED_PASSWORD_JISHNU",     "Jishnu.Chatterji@cognizant.com"),
+    ("SEED_PASSWORD_HEMANT",     "Hemant.Singhal@cognizant.com"),
+    ("SEED_PASSWORD_SAMIR",      "Samir.Sawant@cognizant.com"),
 ]
 
 

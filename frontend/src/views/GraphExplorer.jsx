@@ -111,89 +111,45 @@ export default function GraphExplorer() {
         };
       });
 
-      // ── Cross-source bridge overlay ────────────────────────────────────────
+      // ── Cross-source bridge overlay — highlight bridged local nodes ──────────
+      // With thousands of bridges across many KGs, adding remote nodes clutters
+      // the graph. Instead, highlight local nodes that participate in a bridge
+      // with a green glow + thicker border so they stand out without adding clutter.
       const activeBridges = (Array.isArray(allBridges) ? allBridges : []).filter(
         (b) => b.enabled && (b.from_kg === id || b.to_kg === id),
       );
-      const remoteIds = [...new Set(activeBridges.map((b) => (b.from_kg === id ? b.to_kg : b.from_kg)))];
-      const remoteGraphs = {};
-      await Promise.all(
-        remoteIds.map((rid) =>
-          getGraph(rid).then((rg) => { remoteGraphs[rid] = rg; }).catch(() => {}),
-        ),
+      const bridgedEntities = new Set(
+        activeBridges.map((b) => (b.from_kg === id ? b.from_entity : b.to_entity).toLowerCase()),
       );
 
-      const bridgeNodes = [];
-      const bridgeEdges = [];
-      const addedRemote = new Set();
+      const allNodes = nodes.map((n) => {
+        if (!bridgedEntities.has(n.label.toLowerCase())) return n;
+        const bridgeCount = activeBridges.filter(
+          (b) => (b.from_kg === id ? b.from_entity : b.to_entity).toLowerCase() === n.label.toLowerCase(),
+        ).length;
+        const st = KIND_STYLE[n._kind || 'other'];
+        return {
+          ...n,
+          borderWidth: 3,
+          color: {
+            background: st.background,
+            border: '#3fb950',
+            highlight: { background: st.background, border: '#ffffff' },
+            hover: { background: st.background, border: '#ffffff' },
+          },
+          shadow: { enabled: true, color: 'rgba(63,185,80,0.45)', size: 24, x: 0, y: 0 },
+          title: `${n.title || n.label}\n🔗 ${bridgeCount} cross-source bridge${bridgeCount > 1 ? 's' : ''}`,
+        };
+      });
 
-      for (const b of activeBridges) {
-        const isFromLocal = b.from_kg === id;
-        const remoteId    = isFromLocal ? b.to_kg     : b.from_kg;
-        const remoteEntity = isFromLocal ? b.to_entity : b.from_entity;
-        const localEntity  = isFromLocal ? b.from_entity : b.to_entity;
-
-        const rg = remoteGraphs[remoteId];
-        if (!rg) continue;
-
-        const remoteRaw = rg.nodes.find(
-          (n) => (n.label || '').toLowerCase() === remoteEntity.toLowerCase() ||
-                 String(n.id).toLowerCase() === remoteEntity.toLowerCase(),
-        );
-        const localNode = nodes.find(
-          (n) => n.label.toLowerCase() === localEntity.toLowerCase(),
-        );
-        if (!remoteRaw || !localNode) continue;
-
-        const remoteNodeId = `bridge__${remoteId}__${remoteRaw.id}`;
-        if (!addedRemote.has(remoteNodeId)) {
-          addedRemote.add(remoteNodeId);
-          bridgeNodes.push({
-            id: remoteNodeId,
-            label: remoteRaw.label || String(remoteRaw.id),
-            title: `[${remoteId}]\n${remoteRaw.title || ''}`,
-            shape: 'box',
-            shapeProperties: { borderRadius: 8 },
-            margin: { top: 8, bottom: 8, left: 12, right: 12 },
-            borderWidth: 2,
-            borderWidthSelected: 3,
-            color: {
-              background: '#0f2318',
-              border: '#3fb950',
-              highlight: { background: '#0f2318', border: '#ffffff' },
-              hover: { background: '#0f2318', border: '#ffffff' },
-            },
-            font: { color: '#e6edf3', size: 12, face: 'Inter, sans-serif' },
-            shadow: { enabled: true, color: 'rgba(63,185,80,0.30)', size: 16, x: 0, y: 0 },
-            _kind: 'remote',
-          });
-        }
-
-        bridgeEdges.push({
-          from: isFromLocal ? localNode.id : remoteNodeId,
-          to:   isFromLocal ? remoteNodeId : localNode.id,
-          label: b.join_type || 'FK',
-          title: `Bridge: ${b.from_entity}.${b.from_column} → ${b.to_entity}.${b.to_column}\n${b.source} · ${Math.round((b.confidence ?? 1) * 100)}%`,
-          arrows: { to: { enabled: true, scaleFactor: 0.6, type: 'arrow' } },
-          color: { color: '#3fb950', highlight: '#3fb950', hover: '#ffffff', opacity: 0.9 },
-          width: 2,
-          dashes: [8, 4],
-          smooth: { enabled: true, type: 'dynamic', roundness: 0.5 },
-          font: { color: '#3fb950', size: 10, face: 'Inter, sans-serif', strokeWidth: 4, strokeColor: '#0a0e1a', align: 'middle' },
-        });
-      }
-
-      const allNodes = [...nodes, ...bridgeNodes];
-      const allEdges = [...edges, ...bridgeEdges];
-
-      setStats({ nodes: allNodes.length, edges: allEdges.length });
+      setStats({ nodes: allNodes.length, edges: edges.length });
       setHasGraph(nodes.length > 0);
       if (netRef.current) { netRef.current.destroy(); netRef.current = null; }
       if (!nodes.length || !visRef.current) return;
 
       netRef.current = new Network(
         visRef.current,
-        { nodes: allNodes, edges: allEdges },
+        { nodes: allNodes, edges },
         {
           autoResize: true,
           nodes: { borderWidthSelected: 3 },

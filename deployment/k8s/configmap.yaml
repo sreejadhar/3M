@@ -21,3 +21,4 @@ data:
   UNSTRUCTURED_API_URL: "http://unstructured-api-service:8008"
   UNSTRUCTURED_PUBLIC_URL: "http://datananite2.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog/api/unstructured"
   ORCHESTRATOR_URL: "http://chat-ui-service:8005"
+  KG_FEDERATION_DB: "/data/kg_federation.db"

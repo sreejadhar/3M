@@ -68,6 +68,7 @@ if _PROJECT_ROOT not in sys.path:
 import metadata_catalog as _mc   # standalone catalog module (no dialog_agent dep)
 import kpi_store as _kpi              # BI Manager KPI definitions
 import kg_store as _kg_store           # KG snapshot persistence
+import session_store as _sess_store     # chat session + history persistence
 import access_control as _ac           # RBAC / ABAC engine
 import ontology_enricher as _enricher  # glossary+KPI → KG/attribute enrichment
 
@@ -250,6 +251,9 @@ def _use_neo4j() -> bool:
 
 DATA_DIR  = Path(os.environ.get("DATA_DIR", "./reports"))
 UI_DIR    = Path(__file__).parent / "chat_ui"
+# React build (Vite) for the DataChat UI; served at "/" when present, with the
+# legacy chat_ui/ kept as a fallback.
+REACT_UI_DIR = Path(__file__).parent / "chat_frontend" / "dist"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -412,11 +416,13 @@ def _source_public(s: Dict) -> Dict:
     }
 
 
-def _new_session(title: str = "New conversation", persona: str = "business_user") -> Dict:
+def _new_session(title: str = "New conversation", persona: str = "business_user",
+                 user_email: str = "") -> Dict:
     return {
         "id":               str(uuid.uuid4()),
         "title":            title,
         "persona":          persona,
+        "user_email":       user_email,    # owner — sessions are scoped per user
         "created_at":       time.time(),
         # pipeline state
         "stage":            "idle",        # idle|uploading|extracting|ontology|kg|ready|error
@@ -452,9 +458,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve static UI assets under /ui/
+# Serve static UI assets under /ui/ (legacy chat_ui)
 if UI_DIR.exists():
     app.mount("/ui", StaticFiles(directory=str(UI_DIR)), name="ui")
+
+# Serve the React build's hashed assets at /assets/ (index.html references them).
+if (REACT_UI_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(REACT_UI_DIR / "assets")), name="react_assets")
 
 
 # ── Startup: restore KG snapshots + bootstrap RBAC ────────────────────────────
@@ -531,6 +541,33 @@ async def _startup() -> None:
     except Exception as exc:
         logger.warning("kg_store restore failed (non-fatal): %s", exc)
 
+    # Restore persisted chat sessions so the RECENT list + conversation history
+    # survive a restart (sessions otherwise live only in the in-memory dict).
+    try:
+        restored_sessions = _sess_store.load_all()
+        for sess in restored_sessions:
+            sid = sess.get("id")
+            if not sid or sid in _sessions:
+                continue
+            # Re-hydrate source-derived fields (incl. credentials, which are NOT
+            # persisted in the session store) from the live source registry,
+            # which was restored from kg_store just above.
+            src = _sources.get(sess.get("source_id")) if sess.get("source_id") else None
+            if src and src.get("status") == "ready":
+                sess["db_connection"] = src["connection"]
+                sess["db_type"]       = src["db_type"]
+                sess["report"]        = src.get("report")
+                sess["kg_nodes"]      = src.get("kg_nodes", [])
+                sess["kg_edges"]      = src.get("kg_edges", [])
+                if src["db_type"].lower() in _FILE_BASED_TYPES:
+                    sess["db_file_path"] = src["connection"].get("file_path", "")
+            sess.setdefault("db_connection", {})
+            _sessions[sid] = sess
+            _event_queues.setdefault(sid, asyncio.Queue())
+        logger.info("session_store: restored %d sessions from persistent store", len(restored_sessions))
+    except Exception as exc:
+        logger.warning("session_store restore failed (non-fatal): %s", exc)
+
 
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
 
@@ -569,6 +606,37 @@ async def auth_validate(request: Request):
         return {"valid": False}
 
 
+def _current_user_email(request: Request) -> Optional[str]:
+    """Extract the authenticated user's email (JWT ``sub``) from the request.
+
+    Returns the lower-cased email, or None when no valid token is present
+    (e.g. auth disabled in local dev) — callers treat None as "unscoped".
+    """
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not token:
+        return None
+    try:
+        payload = _jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALG])
+    except _jwt.PyJWTError:
+        return None
+    sub = payload.get("sub")
+    return sub.strip().lower() if isinstance(sub, str) and sub.strip() else None
+
+
+def _owns_session(session: Dict, email: Optional[str]) -> bool:
+    """True if `email` may access `session`.
+
+    Access is granted when the caller is unauthenticated (dev / auth off), the
+    session has no owner (legacy session created before per-user scoping), or
+    the owners match. Owner comparison is case-insensitive.
+    """
+    if email is None:
+        return True
+    owner = (session.get("user_email") or "").strip().lower()
+    return owner == "" or owner == email
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _get_session(session_id: str) -> Dict:
@@ -576,6 +644,22 @@ def _get_session(session_id: str) -> Dict:
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
     return s
+
+
+def _persist_session(session_id: str) -> None:
+    """Best-effort persist a session (config + history) to the session store.
+
+    A single-row upsert is sub-millisecond, so we write inline (mirroring the
+    existing _kg_store.save usage). Never raises — persistence failures must
+    not break the chat flow.
+    """
+    s = _sessions.get(session_id)
+    if not s:
+        return
+    try:
+        _sess_store.save(s)
+    except Exception as exc:
+        logger.warning("session_store.save failed for %s: %s", session_id[:8], exc)
 
 
 async def _push(session_id: str, event: Dict) -> None:
@@ -1743,7 +1827,10 @@ async def _index_source(source_id: str) -> None:
                 onto_job_id = ro.json()["job_id"]
 
             src["ontology_job_id"] = onto_job_id
-            deadline2 = time.time() + 300
+            # Safety margin: the build runs one LLM concept-annotation call per
+            # table (now parallelized in build_node), but transient API 500s +
+            # retries can still stretch a large source past a few minutes.
+            deadline2 = time.time() + 600
             async with httpx.AsyncClient(timeout=30.0) as client:
                 while time.time() < deadline2:
                     pr  = await client.get(f"{ONTOLOGY_API}/jobs/{onto_job_id}")
@@ -1796,7 +1883,9 @@ async def _index_source(source_id: str) -> None:
                     kg_job_id = rk.json()["job_id"]
 
                 src["kg_job_id"] = kg_job_id
-                deadline3 = time.time() + 300
+                # Safety margin: KG profile_node runs one LLM taxonomy call per
+                # table (now parallelized); match the ontology step's window.
+                deadline3 = time.time() + 600
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     while time.time() < deadline3:
                         pr  = await client.get(f"{KG_API}/jobs/{kg_job_id}")
@@ -1901,19 +1990,41 @@ async def _index_source(source_id: str) -> None:
         except Exception as _reg_exc:
             logger.warning("KG registry registration failed (non-fatal): %s", _reg_exc)
 
-        src["status"]     = "ready"
         src["indexed_at"] = time.time()
 
-        # ── Persist KG snapshot so it survives restarts ────────────────────────
+        # ── Guardrail: a source with no KG nodes has no schema context, so the
+        # dialog agent cannot answer questions against it — it falls back to junk
+        # discovery probes (e.g. a 3-part `SCHEMA.INFORMATION_SCHEMA.TABLES`,
+        # which Snowflake rejects with "Database '<schema>' does not exist").
+        # The KG step is wrapped in its own try/except and is skipped entirely
+        # when there is no ontology, so a build that errored / timed out / was
+        # skipped used to still be marked 'ready'. Refuse to do that: surface the
+        # failure so the source is not presented as queryable until re-indexed.
+        if not src.get("kg_nodes"):
+            src["status"]        = "error"
+            src["error_message"] = (
+                "Indexing did not produce a knowledge graph (0 nodes) — the "
+                "ontology or KG build step was skipped, errored, or timed out. "
+                "Re-index this source to rebuild it."
+            )
+            _push_index_event(source_id, "complete", "error",
+                              "Indexing incomplete — no knowledge graph was built. Please re-index.")
+            logger.warning(
+                "Source %s marked ERROR: KG build produced 0 nodes (%d tables extracted)",
+                source_id[:8], src.get("table_count", 0),
+            )
+        else:
+            src["status"] = "ready"
+            _push_index_event(source_id, "complete", "done",
+                              f"Indexing complete — {src['table_count']} tables ready for querying")
+            logger.info("Source %s indexed: %d tables", source_id[:8], src["table_count"])
+
+        # ── Persist snapshot (ready OR error) so the state survives restarts ───
         try:
             _kg_store.save(src)
-            logger.info("kg_store: snapshot saved for %s", source_id[:8])
+            logger.info("kg_store: snapshot saved for %s (status=%s)", source_id[:8], src["status"])
         except Exception as _ks_exc:
             logger.warning("kg_store.save failed (non-fatal): %s", _ks_exc)
-
-        _push_index_event(source_id, "complete", "done",
-                          f"Indexing complete — {src['table_count']} tables ready for querying")
-        logger.info("Source %s indexed: %d tables", source_id[:8], src["table_count"])
 
     except Exception as exc:
         logger.exception("Source %s indexing failed", source_id[:8])
@@ -1975,9 +2086,13 @@ async def health():
 
 @app.get("/")
 async def serve_ui():
+    # Prefer the React build; fall back to the legacy chat_ui.
+    react_index = REACT_UI_DIR / "index.html"
+    if react_index.exists():
+        return FileResponse(str(react_index), headers={"Cache-Control": "no-store"})
     index = UI_DIR / "index.html"
     if not index.exists():
-        return {"error": "UI not found. Ensure chat_ui/index.html exists."}
+        return {"error": "UI not found. Build chat_frontend or ensure chat_ui/index.html exists."}
     return FileResponse(str(index), headers={"Cache-Control": "no-store"})
 
 
@@ -1990,8 +2105,9 @@ class NewSessionRequest(BaseModel):
 
 
 @app.post("/sessions", status_code=201)
-async def create_session(req: NewSessionRequest):
-    s = _new_session(req.title or "New conversation", req.persona)
+async def create_session(req: NewSessionRequest, request: Request):
+    s = _new_session(req.title or "New conversation", req.persona,
+                     user_email=_current_user_email(request) or "")
 
     if req.source_id:
         src = _sources.get(req.source_id)
@@ -2020,6 +2136,10 @@ async def create_session(req: NewSessionRequest):
 
     _sessions[s["id"]] = s
     _event_queues[s["id"]] = asyncio.Queue()
+    try:
+        _sess_store.save(s)
+    except Exception as exc:
+        logger.warning("session_store.save failed for new session %s: %s", s["id"][:8], exc)
     logger.info("Session created: %s (source: %s)", s["id"][:8], req.source_id or "none")
     return {
         "session_id": s["id"],
@@ -2030,7 +2150,8 @@ async def create_session(req: NewSessionRequest):
 
 
 @app.get("/sessions")
-async def list_sessions(persona: Optional[str] = None):
+async def list_sessions(request: Request, persona: Optional[str] = None):
+    email = _current_user_email(request)
     all_sessions = sorted(_sessions.values(), key=lambda x: x["created_at"], reverse=True)
     return [
         {
@@ -2044,16 +2165,22 @@ async def list_sessions(persona: Optional[str] = None):
             "msg_count":  len(s.get("messages", [])),
         }
         for s in all_sessions
-        if persona is None or s.get("persona", "business_user") == persona
+        if (persona is None or s.get("persona", "business_user") == persona)
+        and _owns_session(s, email)
     ]
 
 
 @app.delete("/sessions/{session_id}", status_code=200)
-async def delete_session(session_id: str):
-    s = _sessions.pop(session_id, None)
-    _event_queues.pop(session_id, None)
-    if s is None:
+async def delete_session(session_id: str, request: Request):
+    s = _sessions.get(session_id)
+    if s is None or not _owns_session(s, _current_user_email(request)):
         raise HTTPException(status_code=404, detail="Session not found")
+    _sessions.pop(session_id, None)
+    _event_queues.pop(session_id, None)
+    try:
+        _sess_store.delete(session_id)
+    except Exception as exc:
+        logger.warning("session_store.delete failed for %s: %s", session_id[:8], exc)
     # Purge uploaded files via metadata API (best-effort)
     for f in s.get("files", []):
         path = f.get("server_path")
@@ -2072,10 +2199,13 @@ async def delete_session(session_id: str):
 @app.post("/sessions/{session_id}/upload", status_code=202)
 async def upload_files(
     session_id: str,
+    request: Request,
     files: List[UploadFile] = File(...),
     background_tasks: BackgroundTasks = None,
 ):
     session = _get_session(session_id)
+    if not _owns_session(session, _current_user_email(request)):
+        raise HTTPException(status_code=404, detail="Session not found")
     if session["stage"] not in ("idle", "error"):
         raise HTTPException(
             status_code=409,
@@ -2192,8 +2322,10 @@ class ChatRequest(BaseModel):
 
 
 @app.post("/sessions/{session_id}/chat", status_code=202)
-async def send_chat(session_id: str, req: ChatRequest):
+async def send_chat(session_id: str, req: ChatRequest, request: Request):
     session = _get_session(session_id)
+    if not _owns_session(session, _current_user_email(request)):
+        raise HTTPException(status_code=404, detail="Session not found")
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="message must not be empty")
     if session["stage"] == "error":
@@ -2211,6 +2343,7 @@ async def send_chat(session_id: str, req: ChatRequest):
         "content": req.message,
         "ts":      ts,
     })
+    _persist_session(session_id)
 
     # Push user message to SSE so all connected clients see it
     await _push(session_id, {
@@ -2325,6 +2458,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
             "errors":        visible_errors,
             "ts":            ai_ts,
         })
+        _persist_session(session_id)
 
         await _push(session_id, {
             "type":          "chat_response",
@@ -2347,6 +2481,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
             "error":   True,
             "ts":      time.time(),
         })
+        _persist_session(session_id)
         await _push(session_id, {
             "type":    "chat_error",
             "msg_id":  msg_id,
@@ -2357,8 +2492,10 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
 # ── Session history ────────────────────────────────────────────────────────────
 
 @app.get("/sessions/{session_id}/messages")
-async def get_messages(session_id: str):
+async def get_messages(session_id: str, request: Request):
     session = _get_session(session_id)
+    if not _owns_session(session, _current_user_email(request)):
+        raise HTTPException(status_code=404, detail="Session not found")
     return {
         "session_id": session_id,
         "stage":      session["stage"],
@@ -2542,7 +2679,10 @@ async def test_source_connection(req: TestConnectionRequest):
     conn      = req.connection.dict()
     db_config = _build_db_config(req.db_type, conn)
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        # 120s: Snowflake connects on this network can take ~50-70s on OCSP
+        # certificate validation (measured 51-69s here), so 60s was too tight
+        # and valid connections timed out as "Failed".
+        async with httpx.AsyncClient(timeout=120.0) as client:
             r = await client.post(f"{METADATA_API}/discover", json=db_config)
             if r.status_code == 422:
                 return {"ok": False, "error": str(r.json().get("detail", "Invalid parameters"))}

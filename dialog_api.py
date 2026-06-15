@@ -190,30 +190,23 @@ def _run_dialog(
         multi_kg_configs: List[Dict] = []
         kg_bridges_active: List[Dict] = []
 
-        if cfg.multi_kg_enabled and len(_list_kgs()) > 1:
-            if cfg.kg_ids:
-                active_kg_ids = list(cfg.kg_ids)
-            else:
-                active_kg_ids = _kg_route(
-                    natural_query,
-                    threshold=cfg.kg_router_threshold,
-                    llm_model=cfg.plan_llm_model,
-                    llm_temperature=cfg.llm_temperature,
-                )
-
+        # Federate across KGs ONLY when the caller explicitly lists kg_ids.
+        # A DataChat conversation is scoped to a single source, so the default
+        # path stays single-KG (uses the session's own kg_nodes). The semantic
+        # auto-router is intentionally NOT used here: it pulled unrelated KGs
+        # into single-source chats, and multi_kg_configs cannot be populated in
+        # this service — that combination made the planner emit the KG-id as a
+        # table name (e.g. FROM CPG."<uuid>"), so every query failed.
+        if cfg.multi_kg_enabled and cfg.kg_ids and len(_list_kgs()) > 1:
+            active_kg_ids = [k for k in cfg.kg_ids if k]
             if len(active_kg_ids) > 1:
-                # Load bridges between active KGs
                 bridges = _list_bridges(active_kg_ids)
                 kg_bridges_active = [b.to_dict() for b in bridges]
                 logger.info(
-                    "Multi-KG routing: active_kg_ids=%s, bridges=%d",
+                    "Multi-KG routing (explicit kg_ids): active_kg_ids=%s, bridges=%d",
                     active_kg_ids, len(kg_bridges_active),
                 )
-                # Tag kg_nodes with their kg_id (nodes should have kg_id set by orchestrator)
-                # multi_kg_configs left empty — orchestrator source configs not available here
-                # without ORCHESTRATOR_API integration; execute_node falls back to default cfg
             else:
-                # Only one KG selected — behave as single-KG
                 active_kg_ids = []
 
         agent  = DialogAgent(cfg)

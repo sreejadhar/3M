@@ -29,7 +29,13 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Set, Tuple
+
+# Max concurrent per-table concept-annotation LLM calls. The annotation makes
+# one call per table; running them in parallel keeps total build time bounded by
+# the slowest single call rather than their sum (~10× faster on a 10-table source).
+_ANNOTATION_MAX_WORKERS = int(os.environ.get("ONTOLOGY_ANNOTATION_WORKERS", "8"))
 
 from rdflib import BNode, Graph, Literal, Namespace, RDF, RDFS, OWL, URIRef, XSD
 
@@ -239,7 +245,16 @@ def _annotate_column_concepts(
         raw = resp.content[0].text if resp.content else "{}"
         # Strip markdown fences if present
         raw = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`")
-        result = json.loads(raw)
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            # Models occasionally append a trailing note after the JSON object
+            # ("Extra data: line N…"). Fall back to the first balanced {...} block.
+            start = raw.find("{")
+            end   = raw.rfind("}")
+            if start == -1 or end <= start:
+                raise
+            result = json.loads(raw[start:end + 1])
         # Filter nulls and non-string values; lowercase keys for lookup
         return {
             str(k).lower(): str(v).lower().strip()
@@ -347,6 +362,44 @@ def build_node(state: OntologyState) -> OntologyState:
     added_obj_props: Set[URIRef] = set()
 
     # ------------------------------------------------------------------
+    # 0. LLM concept annotation — one call per table, run concurrently.
+    #    Maps opaque column names (arpu, gsv, tts, nii, gmv…) to standard
+    #    business concept labels.  Skipped when annotate_concepts=False or
+    #    when ANTHROPIC_API_KEY is not set.  Computing these up front in a
+    #    thread pool keeps total time bounded by the slowest single call
+    #    rather than the sum of all of them (the previous sequential loop
+    #    could push a 10-table build past the orchestrator's poll window).
+    # ------------------------------------------------------------------
+    table_concepts: Dict[str, Dict[str, str]] = {}
+    if getattr(config, "annotate_concepts", True) and os.environ.get("ANTHROPIC_API_KEY"):
+        annotation_model = getattr(config, "llm_model", "claude-haiku-4-5")
+        domain_hint      = getattr(config, "source_domain", "")
+        to_annotate = {
+            tname: [c for c in (tmeta.get("columns") or []) if isinstance(c, dict)]
+            for tname, tmeta in tables.items()
+            if isinstance(tmeta, dict) and (tmeta.get("columns") or [])
+        }
+        if to_annotate:
+            with ThreadPoolExecutor(max_workers=_ANNOTATION_MAX_WORKERS) as pool:
+                futures = {
+                    pool.submit(
+                        _annotate_column_concepts,
+                        tname, cols, annotation_model, domain_hint,
+                    ): tname
+                    for tname, cols in to_annotate.items()
+                }
+                for fut in as_completed(futures):
+                    tname = futures[fut]
+                    try:
+                        concepts = fut.result()
+                    except Exception as exc:           # already logged inside; stay defensive
+                        logger.warning("build_node: annotation task failed for %s: %s", tname, exc)
+                        concepts = {}
+                    if concepts:
+                        table_concepts[tname] = concepts
+                        logger.debug("build_node: concept annotations for %s: %s", tname, concepts)
+
+    # ------------------------------------------------------------------
     # 1. OWL Classes from tables + DatatypeProperties from columns
     # ------------------------------------------------------------------
     for table_name, table_meta in tables.items():
@@ -392,24 +445,10 @@ def build_node(state: OntologyState) -> OntologyState:
         if not isinstance(table_meta, dict):
             continue
 
-        # ── LLM concept annotation (one batched call per table) ──────────
+        # ── LLM concept annotation — computed concurrently above ─────────
         # Maps opaque column names (arpu, gsv, tts, nii, gmv…) to standard
-        # business concept labels regardless of domain.  Skipped when
-        # annotate_concepts=False or when ANTHROPIC_API_KEY is not set.
-        col_concepts: Dict[str, str] = {}
-        if getattr(config, "annotate_concepts", True) and os.environ.get("ANTHROPIC_API_KEY"):
-            cols_for_annotation = table_meta.get("columns") or []
-            col_concepts = _annotate_column_concepts(
-                table_name,
-                [c for c in cols_for_annotation if isinstance(c, dict)],
-                model=getattr(config, "llm_model", "claude-haiku-4-5"),
-                domain_hint=getattr(config, "source_domain", ""),
-            )
-            if col_concepts:
-                logger.debug(
-                    "build_node: concept annotations for %s: %s",
-                    table_name, col_concepts,
-                )
+        # business concept labels regardless of domain.
+        col_concepts: Dict[str, str] = table_concepts.get(table_name, {})
 
         for col in table_meta.get("columns") or []:
             if not isinstance(col, dict):

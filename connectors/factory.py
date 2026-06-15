@@ -32,6 +32,10 @@ def get_connector(config: DBConfig) -> BaseConnector:
         from .sqlserver import SQLServerConnector
         return SQLServerConnector(config)
 
+    if db_type == DBType.SNOWFLAKE:
+        from .snowflake import SnowflakeConnector
+        return SnowflakeConnector(config)
+
     if db_type == DBType.BIGQUERY:
         from .bigquery import BigQueryConnector
         return BigQueryConnector(config)

@@ -288,6 +288,41 @@ WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully 
 SUBQUERY COLUMNS  : A subquery used as a scalar value (IN, NOT IN, =) MUST return
                     exactly ONE column — same ANSI rule as all other databases."""
 
+    if db == "snowflake":
+        return """\
+IDENTIFIER CASE   : ★ CRITICAL ★ Snowflake folds UNQUOTED identifiers to UPPER CASE.
+                    Table/column names here are stored in their exact (often
+                    lower-case) form, so wrap every table and column name in
+                    double quotes using the EXACT case shown in the schema
+                    context — e.g. "fact_gl", "dim_account"."account_name".
+                    Database and schema names (e.g. SYNTHGEN_DB, FPNA) are upper-case
+                    and need no quotes. NEVER change the case of an identifier and
+                    NEVER leave a table/column name unquoted.
+COLUMN ALIASES    : Quote every alias / CTE column you introduce with AS in lower
+                    case at BOTH its definition AND every reference — e.g.
+                    SUM("net_amount") AS "total_net" ... ORDER BY "total_net".
+                    An UNQUOTED alias is folded to UPPER CASE, so a later quoted
+                    lower-case reference fails with "invalid identifier".
+ROW LIMITING      : LIMIT N at the end  (e.g. SELECT "col" FROM "t" LIMIT 100)
+TOP-N QUERIES     : ORDER BY "col" DESC LIMIT N
+CASE-INSENSITIVE  : col ILIKE '%term%'   — preferred; or LOWER(col) LIKE LOWER('%term%')
+DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
+                    DATE_TRUNC('month', date_col)
+DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
+STRING CONCAT     : col1 || col2   or   CONCAT(col1, col2)
+PERCENTILES       : PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) AS median
+PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
+                    ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Pct
+NULL HANDLING     : COALESCE(col, 0)
+TYPE CASTING      : value::integer, value::numeric, value::text  (:: casting IS supported)
+CURRENT DATE/TIME : CURRENT_TIMESTAMP  or  CURRENT_DATE  — do NOT use NOW()/GETDATE()
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
+                    ALL navigation/offset functions MUST have ORDER BY inside OVER():
+                      LAG(col) OVER (PARTITION BY x ORDER BY period_col)  ← correct
+                      LAG(col) OVER (PARTITION BY x)                      ← ERROR
+STRING AGGREGATION: LISTAGG(col, ', ') WITHIN GROUP (ORDER BY col)
+                    — STRING_AGG also works, but LISTAGG is the Snowflake-native form"""
+
     if db == "bigquery":
         return """\
 ROW LIMITING      : LIMIT N at the end
@@ -3185,6 +3220,7 @@ def plan_node(state: DialogState) -> DialogState:
         "redshift": "Amazon Redshift (PostgreSQL-compatible)",
         "sqlserver": "SQL Server (T-SQL)",
         "oracle": "Oracle SQL",
+        "snowflake": "Snowflake",
         "bigquery": "Google BigQuery",
     }
     db_label = _DB_LABELS.get(config.db_type.lower(), config.db_type.upper())

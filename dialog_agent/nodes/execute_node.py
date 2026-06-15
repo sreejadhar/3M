@@ -126,6 +126,7 @@ _RETRYABLE_RE = re.compile(
     r"|cannot be cast"
     r"|ambiguous column"                        # qualify with table name
     r"|no such column"                          # may be ambiguous — LLM can qualify
+    r"|invalid identifier"                       # Snowflake: alias case / quoting — LLM can fix
     r"|syntax error"                            # generic / PostgreSQL / SQLite
     r"|incorrect syntax"                        # SQL Server: "Incorrect syntax near ..."
     r"|no such function"                        # wrong function for this DB
@@ -521,6 +522,8 @@ def _run_sql(cfg: DialogConfig, sql: str, state: Optional[Dict] = None, kg_id: s
             return _run_oracle(cfg, sql)
         elif db == "sqlserver":
             return _run_sqlserver(cfg, sql)
+        elif db == "snowflake":
+            return _run_snowflake(cfg, sql)
         elif db == "bigquery":
             return _run_bigquery(cfg, sql)
         elif db == "teradata":
@@ -653,6 +656,32 @@ def _run_sqlserver(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
                 cur.execute(f"USE [{cfg.db_name}]")
             cur.execute(sql)
             return _cursor_to_result(cur)
+    finally:
+        conn.close()
+
+
+def _run_snowflake(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
+    # Password or key-pair auth via the shared helper. Account/host/user/password
+    # and any warehouse/role overrides arrive via cfg fields + cfg.db_extra
+    # (passed through from the registered source's connection).
+    from snowflake_auth import connect_snowflake
+
+    conn = connect_snowflake(
+        database=cfg.db_name,
+        schema=cfg.db_schema,
+        username=cfg.db_user,
+        password=cfg.db_password,
+        host=cfg.db_host,
+        port=cfg.db_port or 0,
+        extra=cfg.db_extra,
+    )
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+            return _cursor_to_result(cur)
+        finally:
+            cur.close()
     finally:
         conn.close()
 

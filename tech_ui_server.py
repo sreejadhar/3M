@@ -24,6 +24,9 @@ from fastapi.staticfiles import StaticFiles
 # ── Config ────────────────────────────────────────────────────────────────────
 ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://chat-ui:8005").rstrip("/")
 STATIC_DIR = Path(__file__).parent / "tech_ui"
+# React build (Vite) for the Engineer Workbench; served at "/" when present,
+# with the legacy tech_ui/ kept as a fallback.
+REACT_DIR = Path(__file__).parent / "frontend" / "dist"
 
 _AUTH_VALIDATE_URL = f"{ORCHESTRATOR_URL}/auth/validate"
 
@@ -61,14 +64,21 @@ async def auth_middleware(request: Request, call_next):
     # Allow static JS/CSS (the login overlay needs them to render)
     if path.startswith("/tech/style") or path.startswith("/tech/app"):
         return await call_next(request)
+    # Allow the React build's hashed assets + favicon (must load pre-auth)
+    if path.startswith("/assets") or path == "/favicon.ico" or path == "/vite.svg":
+        return await call_next(request)
     if not await _is_authenticated(request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return await call_next(request)
 
 
-# Serve static assets under /tech/  (CSS, JS, images)
+# Serve static assets under /tech/  (legacy tech_ui CSS, JS, images)
 # html=False keeps the default; we set headers in middleware below
 app.mount("/tech", StaticFiles(directory=str(STATIC_DIR)), name="tech_static")
+
+# Serve the React build's hashed assets at /assets/ (index.html references them).
+if (REACT_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(REACT_DIR / "assets")), name="react_assets")
 
 
 # Disable browser caching for all static assets so CSS/JS changes are instant
@@ -102,10 +112,15 @@ async def proxy_auth(request: Request, path: str):
 # ── Root — serve index.html ───────────────────────────────────────────────────
 @app.get("/")
 async def root():
+    # Prefer the React build; fall back to the legacy tech_ui.
+    react_index = REACT_DIR / "index.html"
+    if react_index.exists():
+        return FileResponse(str(react_index), media_type="text/html",
+                            headers={"Cache-Control": "no-store"})
     index = STATIC_DIR / "index.html"
     if index.exists():
         return FileResponse(str(index), media_type="text/html")
-    return HTMLResponse("<h1>tech_ui/index.html not found</h1>", status_code=404)
+    return HTMLResponse("<h1>UI not found — build frontend/ or ensure tech_ui/index.html exists</h1>", status_code=404)
 
 
 # ── Proxy helpers ─────────────────────────────────────────────────────────────

@@ -88,10 +88,15 @@ def _run_ontology(job_id: str, report: Dict, cfg: OntologyConfig) -> None:
         _jobs[job_id]["status"] = "running"
 
     completed: List[str] = []
+    # Accumulate the per-node state updates as the pipeline streams so we can
+    # read the final result here — running the whole graph a second time via
+    # agent.run() would re-execute every node (including the per-table LLM
+    # concept-annotation calls), roughly doubling build time for no benefit.
+    final_state: Dict = {}
     try:
         agent = OntologyAgent(cfg)
 
-        for node_name, _ in agent.stream_run(report):
+        for node_name, state_update in agent.stream_run(report):
             clean = node_name.strip("_").replace("error_end", "error")
             with _lock:
                 if "error" in node_name:
@@ -103,21 +108,20 @@ def _run_ontology(job_id: str, report: Dict, cfg: OntologyConfig) -> None:
                     completed.append(real)
                 _jobs[job_id]["completed_nodes"] = list(completed)
                 _jobs[job_id]["current_node"]    = clean
-
-        # Run synchronously to get the result (stream_run doesn't return values)
-        result = agent.run(report)
+            if isinstance(state_update, dict):
+                final_state.update(state_update)
 
         with _lock:
             _jobs[job_id].update({
                 "status":          "done",
                 "completed_nodes": list(ONTO_NODES),
                 "current_node":    "serialize",
-                "output_path":     result["output_path"],
+                "output_path":     final_state.get("output_path", ""),
                 "serialize_format": cfg.serialize_format,
-                "class_count":     result["class_count"],
-                "property_count":  result["property_count"],
-                "triple_count":    result["triple_count"],
-                "errors":          result["errors"],
+                "class_count":     final_state.get("class_count", 0),
+                "property_count":  final_state.get("property_count", 0),
+                "triple_count":    final_state.get("triple_count", 0),
+                "errors":          final_state.get("errors", []),
             })
 
     except Exception as exc:

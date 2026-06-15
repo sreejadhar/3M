@@ -291,6 +291,14 @@ def _list_schemas(connector, db_type: str) -> List[str]:
             )
             return [r.get("DatabaseName") or r.get("databasename", "") for r in rows]
 
+        elif db_type == "snowflake":
+            rows = connector.execute(
+                "SELECT schema_name FROM INFORMATION_SCHEMA.SCHEMATA "
+                "WHERE schema_name <> 'INFORMATION_SCHEMA' "
+                "ORDER BY schema_name"
+            )
+            return [r.get("schema_name", "") for r in rows]
+
         elif db_type == "bigquery":
             rows = connector.execute(
                 "SELECT schema_name FROM INFORMATION_SCHEMA.SCHEMATA ORDER BY schema_name"

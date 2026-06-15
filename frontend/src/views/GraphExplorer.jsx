@@ -155,6 +155,15 @@ export default function GraphExplorer() {
           setInfo(null);
         }
       });
+
+      // Freeze the layout once it settles so nodes stop drifting around.
+      // (Physics is re-enabled only when the user clicks "Reset Layout".)
+      netRef.current.on('stabilizationIterationsDone', () => {
+        if (netRef.current) {
+          netRef.current.setOptions({ physics: false });
+          netRef.current.fit({ animation: false });
+        }
+      });
     } catch (e) {
       toast(`Graph load failed: ${e.message}`, 'error');
       setHasGraph(false);
@@ -189,7 +198,7 @@ export default function GraphExplorer() {
         </button>
         <div style={{ width: 1, height: 20, background: 'var(--border)' }} />
         <button className="btn btn-ghost" onClick={() => netRef.current && netRef.current.fit({ animation: true })}>Fit</button>
-        <button className="btn btn-ghost" onClick={() => netRef.current && netRef.current.stabilize()}>Reset Layout</button>
+        <button className="btn btn-ghost" onClick={() => { if (netRef.current) { netRef.current.setOptions({ physics: true }); netRef.current.stabilize(); } }}>Reset Layout</button>
 
         {/* node legend */}
         <div style={{ display: 'flex', gap: 12, marginLeft: 16, alignItems: 'center' }}>

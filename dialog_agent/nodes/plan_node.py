@@ -298,6 +298,11 @@ IDENTIFIER CASE   : ★ CRITICAL ★ Snowflake folds UNQUOTED identifiers to UPP
                     Database and schema names (e.g. SYNTHGEN_DB, FPNA) are upper-case
                     and need no quotes. NEVER change the case of an identifier and
                     NEVER leave a table/column name unquoted.
+COLUMN ALIASES    : Quote every alias / CTE column you introduce with AS in lower
+                    case at BOTH its definition AND every reference — e.g.
+                    SUM("net_amount") AS "total_net" ... ORDER BY "total_net".
+                    An UNQUOTED alias is folded to UPPER CASE, so a later quoted
+                    lower-case reference fails with "invalid identifier".
 ROW LIMITING      : LIMIT N at the end  (e.g. SELECT "col" FROM "t" LIMIT 100)
 TOP-N QUERIES     : ORDER BY "col" DESC LIMIT N
 CASE-INSENSITIVE  : col ILIKE '%term%'   — preferred; or LOWER(col) LIKE LOWER('%term%')

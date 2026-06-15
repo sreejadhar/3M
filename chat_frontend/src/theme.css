@@ -887,6 +887,47 @@ body {
 .md-table-wrap::-webkit-scrollbar-track { background:transparent; }
 .md-table-wrap::-webkit-scrollbar-thumb { background:var(--clr-border); border-radius:3px; }
 
+/* Chat markdown tables (rendered from the synthesized answer). */
+.md-chat-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  background: var(--clr-surface);
+}
+.md-chat-table thead th {
+  background: var(--clr-bg);
+  color: var(--clr-text-sec);
+  font-weight: 700;
+  font-size: 12px;
+  text-align: left;
+  vertical-align: bottom;
+  padding: 10px 16px;
+  border-bottom: 2px solid var(--clr-border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  line-height: 1.3;
+}
+.md-chat-table tbody td {
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--clr-border);
+  color: var(--clr-text);
+  vertical-align: top;
+  line-height: 1.4;
+  max-width: 360px;
+}
+.md-chat-table tbody tr:nth-child(even) td { background: #fafbfd; }
+.md-chat-table tbody tr:hover td           { background: #eef3fd; }
+.md-chat-table tbody tr:last-child td       { border-bottom: none; }
+.md-chat-table tbody td:first-child         { font-weight: 600; white-space: nowrap; }
+/* Numeric columns (tagged in renderMarkdown) right-align and don't wrap. */
+.md-chat-table th.col-num,
+.md-chat-table td.col-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .md-table {
   width: 100%;
   border-collapse: collapse;
@@ -1116,9 +1157,22 @@ body {
   color:var(--clr-text); white-space:nowrap;
   max-width:280px; overflow:hidden; text-overflow:ellipsis;
 }
-.result-table tr:last-child td { border-bottom:none; }
-.result-table tr:hover td      { background:var(--clr-bg); }
+.result-table tbody tr:last-child td { border-bottom:none; }
+.result-table tbody tr:nth-child(even) td { background:#fafbfd; }
+.result-table tbody tr:hover td      { background:#eef3fd; }
 .result-table .num-cell        { text-align:right; font-variant-numeric:tabular-nums; }
+.result-table th.num-cell      { text-align:right; }
+/* Totals row */
+.result-table tfoot td {
+  padding:8px 12px;
+  border-top:2px solid var(--clr-border);
+  background:var(--clr-bg);
+  font-weight:700;
+  color:var(--clr-text);
+  position:sticky; bottom:0;
+}
+.result-table tfoot td.total-label { color:var(--clr-text-sec); font-weight:600; }
+.result-table tfoot td.total-val   { color:var(--clr-primary-dk); }
 
 /* ── KPI cards ────────────────────────────────────────────────────────────── */
 .kpi-grid {
@@ -1170,6 +1224,88 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* Single-row KPI callout cards (Message.jsx KpiCards). */
+.kpi-card-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--clr-primary);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+}
+.kpi-card-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--clr-text-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kpi-card {
+  background: linear-gradient(180deg, #ffffff, #f7f9fc);
+  position: relative;
+  overflow: hidden;
+}
+.kpi-card::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: linear-gradient(180deg, var(--clr-primary), var(--clr-accent));
+}
+
+/* ── Trend delta badges ───────────────────────────────────────────────────── */
+.trend-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  padding: 2px 7px;
+  border-radius: 999px;
+  width: fit-content;
+  line-height: 1.4;
+}
+.trend-up   { color: var(--clr-success); background: var(--clr-success-bg); }
+.trend-down { color: var(--clr-error);   background: var(--clr-error-bg); }
+
+/* ── KPI hero (single metric over time) ───────────────────────────────────── */
+.kpi-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  margin: 12px 0 0;
+  padding: 16px 18px;
+  border: 1px solid var(--clr-border);
+  border-radius: 14px;
+  background: linear-gradient(135deg, #f4f8ff, #ffffff 60%);
+  box-shadow: var(--shadow-sm);
+}
+.kpi-hero-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--clr-text-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 4px;
+}
+.kpi-hero-value {
+  font-size: 30px;
+  font-weight: 700;
+  color: var(--clr-text);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+}
+.kpi-hero-deltas { display: flex; gap: 18px; }
+.kpi-hero-delta { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.kpi-hero-delta-cap { font-size: 10px; color: var(--clr-text-mute); text-transform: uppercase; letter-spacing: 0.04em; }
 
 /* ── Heatmap table ────────────────────────────────────────────────────────── */
 .heatmap-wrap {
@@ -2881,3 +3017,98 @@ tr.md-row-deleted td:last-child { text-decoration:none; }
 html, body, #root { height: 100%; }
 #root { display: flex; width: 100%; }
 .placeholder-screen { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; color:var(--clr-text-mute, #888); gap:8px; text-align:center; padding:40px; }
+
+/* DataChat result charts — professional card presentation */
+.chart-wrap {
+  box-sizing: border-box;
+  position: relative;
+  background: linear-gradient(180deg, #ffffff, #fbfcfe);
+  border: 1px solid var(--clr-border);
+  border-radius: 14px;
+  padding: 16px 18px 12px;
+  margin: 12px 0;
+  box-shadow: var(--shadow-sm);
+}
+.chart-wrap canvas { width: 100% !important; height: 100% !important; }
+
+/* ── Print / PDF export ───────────────────────────────────────────────────────
+   The "PDF" button marks one assistant message with .print-target and adds
+   .printing to <body>, then calls window.print(). These rules strip the app
+   chrome (sidebar/topbar/composer), break the fixed 100vh/overflow:hidden
+   layout so content can flow across pages, and isolate just that one insight. */
+@media print {
+  @page { margin: 14mm; }
+
+  body.printing {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+  }
+
+  /* App chrome and anything not part of the target insight. */
+  body.printing .sidebar,
+  body.printing .topbar,
+  body.printing .input-area,
+  body.printing .welcome,
+  body.printing .persona-dropdown,
+  body.printing .persona-overlay,
+  body.printing .toast-container,
+  body.printing .wizard-overlay,
+  body.printing .pipeline-bar { display: none !important; }
+
+  /* Unlock the scroll containers so the page expands to fit the content. */
+  body.printing .main,
+  body.printing .chat-view,
+  body.printing .chat-area,
+  body.printing .messages {
+    display: block !important;
+    position: static !important;
+    height: auto !important;
+    max-width: none !important;
+    width: auto !important;
+    overflow: visible !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  /* Print only the clicked insight, full width, no avatar/bubble chrome. */
+  body.printing .msg-row { display: none !important; }
+  body.printing .msg-row.print-target { display: block !important; }
+  body.printing .print-target .msg-avatar { display: none !important; }
+  body.printing .print-target .msg-bubble {
+    max-width: none !important;
+    width: 100% !important;
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+  }
+
+  /* In-bubble controls that shouldn't appear in the PDF. */
+  body.printing .insight-action-bar,
+  body.printing .result-data-footer,
+  body.printing .sql-disclosure,
+  body.printing .data-toggle-btn,
+  body.printing .cache-note { display: none !important; }
+
+  /* Keep visualizations and tables intact across page breaks. */
+  body.printing .result-block {
+    break-inside: avoid;
+    box-shadow: none !important;
+    border: 1px solid #e3e8f0 !important;
+  }
+  body.printing .chart-wrap { break-inside: avoid; }
+  body.printing .result-table-wrap,
+  body.printing .md-table-wrap {
+    max-height: none !important;
+    overflow: visible !important;
+  }
+  body.printing .md-chat-table { break-inside: auto; }
+  body.printing .md-chat-table tr { break-inside: avoid; }
+
+  /* Ensure chart/background colours are preserved by the print engine. */
+  body.printing * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+}

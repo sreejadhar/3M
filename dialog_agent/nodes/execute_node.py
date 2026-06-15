@@ -126,6 +126,7 @@ _RETRYABLE_RE = re.compile(
     r"|cannot be cast"
     r"|ambiguous column"                        # qualify with table name
     r"|no such column"                          # may be ambiguous — LLM can qualify
+    r"|invalid identifier"                       # Snowflake: alias case / quoting — LLM can fix
     r"|syntax error"                            # generic / PostgreSQL / SQLite
     r"|incorrect syntax"                        # SQL Server: "Incorrect syntax near ..."
     r"|no such function"                        # wrong function for this DB

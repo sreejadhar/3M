@@ -16,6 +16,7 @@ COPY --from=builder /install /usr/local
 # Copy the server entrypoint and the static UI assets
 COPY tech_ui_server.py .
 COPY tech_ui/ ./tech_ui/
+COPY frontend/dist/ ./frontend/dist/
 COPY llm_client.py .
 
 ENV PYTHONUNBUFFERED=1 \

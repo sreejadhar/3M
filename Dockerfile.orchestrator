@@ -1,0 +1,36 @@
+# ── Stage 1: builder ──────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+COPY requirements.orchestrator.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.orchestrator.txt
+
+# ── Stage 2: runtime ──────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+
+# Core entry-point and supporting modules
+COPY orchestrator_api.py .
+COPY session_store.py .
+COPY kpi_store.py .
+COPY kg_store.py .
+COPY metadata_catalog.py .
+COPY access_control.py .
+COPY ontology_enricher.py .
+COPY snowflake_auth.py .
+COPY config.py .
+COPY llm_client.py .
+COPY connectors/ ./connectors/
+
+# Chat UI static assets served by the orchestrator
+COPY chat_frontend/dist/ ./chat_frontend/dist/
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 8005
+
+CMD ["uvicorn", "orchestrator_api:app", "--host", "0.0.0.0", "--port", "8005", "--log-level", "info"]

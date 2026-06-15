@@ -25,6 +25,7 @@ const LEGEND = [
   ['Dimension', '#58a6ff'],
   ['KPI / summary', '#bc8cff'],
   ['Other', '#39c5cf'],
+  ['Cross-source', '#3fb950'],
 ];
 
 // Edge cardinality → colour. Tokens like "(1:N)", "N:1", "M:N" appear in labels.
@@ -51,13 +52,17 @@ export default function GraphExplorer() {
   const [hasGraph, setHasGraph] = useState(false);
   const [info, setInfo] = useState(null);
   const [bridges, setBridges] = useState([]);
+  const [selectedRemoteKg, setSelectedRemoteKg] = useState('');
   const visRef = useRef(null);
   const netRef = useRef(null);
+  const rawNodesRef = useRef([]);   // base node styles, no highlight applied
+  const bridgesRef  = useRef([]);   // all bridges for current source
 
   const load = async (id) => {
     if (!id) return;
     try {
-      const g = await getGraph(id);
+      const [g, allBridges] = await Promise.all([getGraph(id), listBridges().catch(() => [])]);
+      setBridges(Array.isArray(allBridges) ? allBridges : []);
       const rawNodes = g.nodes || [];
       const rawEdges = g.edges || [];
 
@@ -103,11 +108,18 @@ export default function GraphExplorer() {
           color: { color: cs.color, highlight: cs.color, hover: '#ffffff', opacity: 1 },
           width: cs.width,
           selectionWidth: cs.width + 1,
-          dashes: card === 'N:N' ? [6, 4] : false, // many-to-many drawn dashed
+          dashes: card === 'N:N' ? [6, 4] : false,
           smooth: { enabled: true, type: 'dynamic', roundness: 0.5 },
           font: { color: card ? cs.color : '#9fb2c8', size: 10, face: 'Inter, sans-serif', strokeWidth: 4, strokeColor: '#0a0e1a', align: 'middle' },
         };
       });
+
+      // Store base nodes + bridges for the highlight effect (applied separately).
+      const activeBridges = (Array.isArray(allBridges) ? allBridges : []).filter(
+        (b) => b.enabled && (b.from_kg === id || b.to_kg === id),
+      );
+      rawNodesRef.current = nodes;
+      bridgesRef.current  = activeBridges;
 
       setStats({ nodes: nodes.length, edges: edges.length });
       setHasGraph(nodes.length > 0);
@@ -171,17 +183,52 @@ export default function GraphExplorer() {
   };
 
   useEffect(() => {
-    listBridges().then((b) => setBridges(Array.isArray(b) ? b : [])).catch(() => setBridges([]));
-  }, [refreshTick]);
-
-  useEffect(() => {
+    setSelectedRemoteKg('');
     load(activeSourceId);
     return () => { if (netRef.current) { netRef.current.destroy(); netRef.current = null; } };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSourceId, refreshTick]);
 
+  // Re-apply node highlight whenever the remote KG filter changes.
+  useEffect(() => {
+    if (!netRef.current) return;
+    const nodes = rawNodesRef.current;
+    const activeBridges = bridgesRef.current;
+    if (!nodes.length) return;
+
+    let updates;
+    if (!selectedRemoteKg) {
+      // Clear all highlights — restore original styles.
+      updates = nodes.map((n) => ({ id: n.id, borderWidth: n.borderWidth, color: n.color, shadow: n.shadow, title: n.title }));
+    } else {
+      const bridgedEntities = new Set(
+        activeBridges
+          .filter((b) => (b.from_kg === activeSourceId ? b.to_kg : b.from_kg) === selectedRemoteKg)
+          .map((b) => (b.from_kg === activeSourceId ? b.from_entity : b.to_entity).toLowerCase()),
+      );
+      updates = nodes.map((n) => {
+        const isBridged = bridgedEntities.has(n.label.toLowerCase());
+        if (!isBridged) return { id: n.id, borderWidth: n.borderWidth, color: n.color, shadow: n.shadow, title: n.title };
+        const bridgeCount = activeBridges.filter(
+          (b) => (b.from_kg === activeSourceId ? b.to_kg : b.from_kg) === selectedRemoteKg &&
+                 (b.from_kg === activeSourceId ? b.from_entity : b.to_entity).toLowerCase() === n.label.toLowerCase(),
+        ).length;
+        const st = KIND_STYLE[n._kind || 'other'];
+        return {
+          id: n.id,
+          borderWidth: 3,
+          color: { background: st.background, border: '#3fb950', highlight: { background: st.background, border: '#ffffff' }, hover: { background: st.background, border: '#ffffff' } },
+          shadow: { enabled: true, color: 'rgba(63,185,80,0.45)', size: 24, x: 0, y: 0 },
+          title: `${n.title || n.label}\n🔗 ${bridgeCount} bridge${bridgeCount > 1 ? 's' : ''} → ${sources.find(s => s.id === selectedRemoteKg)?.name || selectedRemoteKg}`,
+        };
+      });
+    }
+    netRef.current.body.data.nodes.update(updates);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRemoteKg]);
+
   const srcBridges = bridges.filter(
-    (b) => b.from_source_id === activeSourceId || b.to_source_id === activeSourceId || !activeSourceId,
+    (b) => b.from_kg === activeSourceId || b.to_kg === activeSourceId || !activeSourceId,
   );
 
   return (
@@ -196,6 +243,21 @@ export default function GraphExplorer() {
           <IconRefresh />
           Load
         </button>
+        <div style={{ width: 1, height: 20, background: 'var(--border)' }} />
+        <span style={{ fontSize: 12, color: 'var(--text-1)' }}>Bridges from:</span>
+        <select
+          className="search-input"
+          style={{ padding: '5px 8px', width: 160 }}
+          value={selectedRemoteKg}
+          onChange={(e) => setSelectedRemoteKg(e.target.value)}
+        >
+          <option value="">— none —</option>
+          {[...new Set(bridgesRef.current.map((b) => (b.from_kg === activeSourceId ? b.to_kg : b.from_kg)))]
+            .map((kid) => {
+              const name = sources.find((s) => s.id === kid)?.name || kid.slice(0, 8);
+              return <option key={kid} value={kid}>{name}</option>;
+            })}
+        </select>
         <div style={{ width: 1, height: 20, background: 'var(--border)' }} />
         <button className="btn btn-ghost" onClick={() => netRef.current && netRef.current.fit({ animation: true })}>Fit</button>
         <button className="btn btn-ghost" onClick={() => { if (netRef.current) { netRef.current.setOptions({ physics: true }); netRef.current.stabilize(); } }}>Reset Layout</button>

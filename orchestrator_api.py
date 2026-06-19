@@ -2878,9 +2878,13 @@ async def source_index_events(source_id: str):
         raise HTTPException(status_code=404, detail="Source not found")
 
     async def _gen() -> AsyncGenerator[str, None]:
-        # Replay buffered events so reconnecting clients catch up
+        # Replay buffered events so reconnecting clients catch up.
+        # Mark them as replays so the frontend doesn't act on stale terminal events.
+        # Only replay events from the last 10 minutes (stale pipelines are irrelevant).
+        cutoff = time.time() - 600
         for ev in list(_source_event_log.get(source_id, [])):
-            yield _sse_line(ev)
+            if ev.get("ts", 0) > cutoff:
+                yield _sse_line({**ev, "is_replay": True})
 
         # Attach a live queue
         q: asyncio.Queue = asyncio.Queue(maxsize=200)
@@ -2910,8 +2914,9 @@ async def source_index_events(source_id: str):
 
 
 class ExecuteSQLRequest(BaseModel):
-    sql:   str
-    limit: int = 500
+    sql:      str
+    limit:    int = 500
+    password: Optional[str] = None  # runtime override — not persisted
 
 
 @app.post("/sources/{source_id}/execute-sql")
@@ -2941,7 +2946,7 @@ async def execute_sql_for_source(source_id: str, req: ExecuteSQLRequest):
             "db_name":     conn.get("database", ""),
             "db_schema":   conn.get("schema_", "") or conn.get("schema", "public"),
             "db_user":     conn.get("username", ""),
-            "db_password": conn.get("password", ""),
+            "db_password": req.password if req.password is not None else conn.get("password", ""),
         })
         if conn.get("connection_string"):
             payload["db_connection_string"] = conn["connection_string"]
@@ -3307,24 +3312,38 @@ async def enrich_source_taxonomy(source_id: str, background_tasks: BackgroundTas
     """
     async def _run_enrichment(sid: str) -> None:
         src_domain = (_sources.get(sid) or {}).get("domain", "")
+        # Reset the replay buffer so reconnecting clients only see this run's events.
+        # Events accumulate in the buffer as the pipeline runs; an EventSource that
+        # connects mid-run will replay missed steps from here before going live.
+        _source_event_log[sid] = []
         # Step 1: deterministic pattern-based inference (no LLM, always runs)
+        _push_index_event(sid, "taxonomy", "running", "Running pattern-based taxonomy inference…")
         try:
             n_pat = _mc.infer_taxonomy(sid, domain=src_domain)
             logger.info("Enrich: pattern taxonomy %d columns for %s", n_pat, sid[:8])
+            _push_index_event(sid, "taxonomy", "done", f"Pattern inference: {n_pat} columns classified")
         except Exception as exc:
             logger.warning("Enrich: pattern taxonomy failed for %s: %s", sid[:8], exc)
+            _push_index_event(sid, "taxonomy", "error", f"Pattern inference failed: {exc}")
         # Step 2: LLM enrichment — overwrites/improves the pattern classifications
+        _push_index_event(sid, "taxonomy", "running", "Running LLM taxonomy enrichment…")
         try:
             n_llm = _mc.enrich_taxonomy(sid, domain=src_domain)
             logger.info("Enrich: LLM taxonomy %d columns for %s", n_llm, sid[:8])
+            _push_index_event(sid, "taxonomy", "done", f"LLM enrichment: {n_llm} columns annotated")
         except Exception as exc:
             logger.warning("Enrich: LLM taxonomy failed for %s: %s", sid[:8], exc)
+            _push_index_event(sid, "taxonomy", "error", f"LLM enrichment failed: {exc}")
         # Step 3: PII classification (deterministic + LLM)
+        _push_index_event(sid, "taxonomy", "running", "Running PII classification…")
         try:
             n_pii = _mc.classify_pii(sid)
             logger.info("Enrich: PII classification %d columns for %s", n_pii, sid[:8])
+            _push_index_event(sid, "taxonomy", "done", f"PII classification: {n_pii} columns flagged")
         except Exception as exc:
             logger.warning("Enrich: PII classification failed for %s: %s", sid[:8], exc)
+            _push_index_event(sid, "taxonomy", "error", f"PII classification failed: {exc}")
+        _push_index_event(sid, "complete", "done", "Taxonomy enrichment complete")
 
     background_tasks.add_task(_run_enrichment, source_id)
     return {"status": "accepted", "source_id": source_id,

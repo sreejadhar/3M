@@ -9,6 +9,9 @@ async function apiFetch(path, opts = {}) {
     headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
   });
   if (!res.ok) {
+    if (res.status === 401) {
+      window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+    }
     let detail = res.statusText;
     try {
       const j = await res.json();
@@ -46,6 +49,13 @@ export async function apiUpload(path, formData) {
   }
   return res.json();
 }
+
+export const executeSourceSQL = (sourceId, sql, limit = 500, password = null) =>
+  apiPost(`/sources/${sourceId}/execute-sql`, {
+    sql,
+    limit,
+    ...(password != null ? { password } : {}),
+  });
 
 // SSE — EventSource cannot send Authorization headers; the proxy/middleware
 // exempts /index-events from auth, so a bare connection is fine.

@@ -484,24 +484,26 @@ body {
 #view-sql { flex-direction: column; }
 #sql-workspace { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 #sql-editor-wrap {
-  height: 200px; min-height: 120px;
+  height: 220px; min-height: 120px;
   border-bottom: 1px solid var(--border);
   position: relative;
   flex-shrink: 0;
+  background: var(--bg-0);
 }
 #sql-input {
   width: 100%; height: 100%;
   background: var(--bg-0);
-  color: var(--accent);
+  color: var(--text-0);
   font-family: var(--font-mono);
   font-size: 13px;
   border: none; outline: none; resize: none;
   padding: 14px 16px;
-  line-height: 1.6;
+  line-height: 1.7;
 }
+#sql-input::placeholder { color: var(--text-2); font-style: italic; }
+#sql-input:focus { background: var(--bg-1); }
 #sql-results { flex: 1; overflow: auto; }
 #sql-toolbar { padding: 8px 14px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; background: var(--bg-2); flex-shrink: 0; }
-#sql-status { font-size: 11px; color: var(--text-1); margin-left: auto; }
 
 /* ── Ontology Editor ──────────────────────────────────────────────────────── */
 /* Override .view.active flex-direction:column — ID beats class but be explicit */

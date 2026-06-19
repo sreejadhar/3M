@@ -12,6 +12,7 @@ import OntologyViewer from './views/OntologyViewer.jsx';
 import Redundancies from './views/Redundancies.jsx';
 import Glossary from './views/Glossary.jsx';
 import Kpi from './views/Kpi.jsx';
+import SqlConsole from './views/SqlConsole.jsx';
 
 const VIEWS = {
   pipeline: PipelineMonitor,
@@ -21,6 +22,7 @@ const VIEWS = {
   redundancy: Redundancies,
   glossary: Glossary,
   kpi: Kpi,
+  sql: SqlConsole,
 };
 
 function Workbench() {

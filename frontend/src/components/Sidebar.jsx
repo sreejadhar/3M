@@ -23,9 +23,7 @@ const INSPECT = [
   ['glossary', IconGlossary, 'Business Glossary'],
   ['kpi', IconKpi, 'KPI Registry'],
 ];
-// DEVELOP — "Coming Soon", disabled (matches current tech_ui).
-const DEVELOP = [
-  ['sql', IconSql, 'SQL Console'],
+const DEVELOP_COMING = [
   ['cdc', IconCdc, 'Change Log'],
   ['documents', IconDocuments, 'Documents'],
 ];
@@ -72,7 +70,8 @@ export default function Sidebar() {
 
       <div className="sidebar-section">
         <div className="sidebar-section-label">Develop</div>
-        {DEVELOP.map(([id, Icon, label]) => (
+        <NavItem id="sql" Icon={IconSql} label="SQL Console" />
+        {DEVELOP_COMING.map(([id, Icon, label]) => (
           <div key={id} className="nav-item coming-soon" title="Coming Soon">
             <Icon />
             {label}

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 import httpx
+import jwt as _jwt
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -28,11 +29,15 @@ STATIC_DIR = Path(__file__).parent / "tech_ui"
 # with the legacy tech_ui/ kept as a fallback.
 REACT_DIR = Path(__file__).parent / "frontend" / "dist"
 
-_AUTH_VALIDATE_URL = f"{ORCHESTRATOR_URL}/auth/validate"
+# Validate JWTs locally with the same secret the orchestrator uses — avoids a
+# synchronous round-trip to /auth/validate on every proxied request, which was
+# causing timeout-induced 401s under concurrent load.
+_JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production")
+_JWT_ALG    = "HS256"
 
 
-async def _is_authenticated(request: Request) -> bool:
-    """Validate JWT against the orchestrator /auth/validate endpoint."""
+def _is_authenticated(request: Request) -> bool:
+    """Validate the Bearer JWT locally (no orchestrator round-trip)."""
     auth_header = request.headers.get("Authorization", "")
     token = auth_header.removeprefix("Bearer ").strip()
     if not token:
@@ -40,10 +45,9 @@ async def _is_authenticated(request: Request) -> bool:
     if not token:
         return False
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-            r = await client.get(_AUTH_VALIDATE_URL, headers={"Authorization": f"Bearer {token}"})
-            return r.status_code == 200 and r.json().get("valid", False)
-    except Exception:
+        _jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALG])
+        return True
+    except _jwt.PyJWTError:
         return False
 
 log = logging.getLogger("tech_ui_server")
@@ -67,7 +71,7 @@ async def auth_middleware(request: Request, call_next):
     # Allow the React build's hashed assets + favicon (must load pre-auth)
     if path.startswith("/assets") or path == "/favicon.ico" or path == "/vite.svg":
         return await call_next(request)
-    if not await _is_authenticated(request):
+    if not _is_authenticated(request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return await call_next(request)
 

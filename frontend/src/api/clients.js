@@ -73,7 +73,7 @@ export const getGraph = (id) => apiGet(`/sources/${id}/graph`);
 export const getOntology = (id) => apiGet(`/sources/${id}/ontology`);
 export const saveOntology = (id, content, rebuildKg) =>
   apiPost(`/sources/${id}/ontology`, { content, rebuild_kg: rebuildKg });
-export const validateOntology = (id) => apiPost(`/sources/${id}/ontology/validate`);
+export const validateOntology = (id) => apiPost(`/sources/${id}/validate-ontology`, {});
 
 // ── Metadata ──────────────────────────────────────────────────────────────────
 export const listEntities = (sourceId) =>

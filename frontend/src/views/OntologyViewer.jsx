@@ -123,7 +123,9 @@ export default function OntologyViewer() {
   const validate = async () => {
     try {
       const r = await validateOntology(activeSourceId);
-      toast(r && r.valid ? 'Validation passed' : 'Validation found issues', r && r.valid ? 'success' : 'warn');
+      const passed = r && r.quality === 'PASS';
+      const label = r?.quality === 'PASS' ? 'Validation passed' : r?.quality === 'WARN' ? `Validation warnings (${(r.warnings || []).length})` : `Validation failed (${(r.violations || []).length} violations)`;
+      toast(label, passed ? 'success' : 'warn');
     } catch (e) {
       toast(`Validate failed: ${e.message}`, 'error');
     }

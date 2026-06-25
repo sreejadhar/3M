@@ -64,7 +64,7 @@ export function sourceEvents(sourceId) {
 }
 
 // ── Sources ───────────────────────────────────────────────────────────────────
-export const listSources = () => apiGet('/sources');
+export const listSources = () => apiGet('/sources?persona=admin');
 export const createSource = (payload) => apiPost('/sources', payload);
 export const patchSource = (id, payload) => apiPatch(`/sources/${id}`, payload);
 export const reindexSource = (id) => apiPost(`/sources/${id}/reindex`);

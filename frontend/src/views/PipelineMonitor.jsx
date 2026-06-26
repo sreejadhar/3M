@@ -38,16 +38,17 @@ function evTime(ts) {
 }
 
 export default function PipelineMonitor() {
-  const { sources, activeSourceId, setActiveSourceId, refreshSources, setAddSourceOpen, toast } =
+  const { sources, activeSourceId, setActiveSourceId, refreshSources, bumpRefresh, setAddSourceOpen, toast } =
     useAppState();
   const [events, setEvents] = useState([]);
   const [sseState, setSseState] = useState('idle'); // idle|connecting|open|closed|error
+  const [sseKey, setSseKey] = useState(0); // bump to force-reopen SSE for a new pipeline run
   const esRef = useRef(null);
   const logRef = useRef(null);
 
   const selected = sources.find((s) => s.id === activeSourceId) || null;
 
-  // Open / re-open the SSE stream when the selected source changes.
+  // Open / re-open the SSE stream when the selected source changes or sseKey bumps.
   useEffect(() => {
     if (esRef.current) {
       esRef.current.close();
@@ -63,6 +64,15 @@ export default function PipelineMonitor() {
     esRef.current = es;
     es.onopen = () => setSseState('open');
     es.onerror = () => setSseState('error');
+
+    // Debounce refreshSources so bursts of SSE events (e.g. replayed queue on
+    // reconnect) don't flood the connection pool with concurrent GET /sources.
+    let refreshTimer = null;
+    const debouncedRefresh = () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => { refreshTimer = null; refreshSources(); }, 800);
+    };
+
     es.onmessage = (e) => {
       let ev;
       try {
@@ -72,15 +82,22 @@ export default function PipelineMonitor() {
       }
       if (ev.type === 'heartbeat') return;
       setEvents((prev) => [...prev, { ...ev, _ts: Date.now() }]);
-      if (ev.status === 'done' || ev.status === 'error') refreshSources();
-      if (ev.step === 'complete') {
+      if (ev.status === 'done' || ev.status === 'error') debouncedRefresh();
+      // Only close the EventSource for a *live* complete — not a replayed one from
+      // a prior run, which would prematurely close before this run's events arrive.
+      if (ev.step === 'complete' && !ev.is_replay) {
+        bumpRefresh();
+        refreshSources();
         es.close();
         setSseState('closed');
       }
     };
-    return () => es.close();
+    return () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      es.close();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSourceId]);
+  }, [activeSourceId, sseKey]);
 
   // Auto-scroll the log to the newest event.
   useEffect(() => {
@@ -90,6 +107,9 @@ export default function PipelineMonitor() {
   const act = async (fn, label) => {
     if (!activeSourceId) return;
     try {
+      // Reopen SSE before the API call so the fresh queue is ready when the
+      // backend starts pushing events (clears any closed state from a prior run).
+      setSseKey((k) => k + 1);
       await fn(activeSourceId);
       toast(`${label} started`, 'success');
       refreshSources();

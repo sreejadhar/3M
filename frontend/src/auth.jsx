@@ -82,8 +82,30 @@ export function AuthProvider({ children }) {
       setAuthed(ok);
       setChecking(false);
     });
+    // Re-validate every 5 minutes so expired JWTs force a re-login
+    // instead of silently failing with 401 on every API call.
+    const intervalId = setInterval(() => {
+      validate().then((ok) => {
+        if (!alive) return;
+        if (!ok) {
+          clearAuth();
+          setAuthed(false);
+          setEmail('');
+        }
+      });
+    }, 5 * 60 * 1000);
+    // Any API call that receives a 401 dispatches this event so the UI
+    // immediately shows the login screen rather than showing stale data.
+    const onUnauthorized = () => {
+      clearAuth();
+      setAuthed(false);
+      setEmail('');
+    };
+    window.addEventListener('auth:unauthorized', onUnauthorized);
     return () => {
       alive = false;
+      clearInterval(intervalId);
+      window.removeEventListener('auth:unauthorized', onUnauthorized);
     };
   }, []);
 

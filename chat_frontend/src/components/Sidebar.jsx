@@ -16,6 +16,7 @@ export default function Sidebar() {
     else toast(`Source "${s.name}" is ${s.status}`, 'info', 3000);
   };
 
+
   const removeSession = async (e, s) => {
     e.stopPropagation();
     try {

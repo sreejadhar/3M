@@ -11,7 +11,7 @@ const SUGGESTIONS = [
 ];
 
 export default function ChatView() {
-  const { activeSessionId, llmModel, setLlmModel, analystRole, persona, toast, refreshSessions } = useApp();
+  const { activeSessionId, llmModel, setLlmModel, analystRole, persona, toast, refreshSessions, sources, activeSourceName } = useApp();
   const [messages, setMessages] = useState([]);
   const [typing, setTyping] = useState(false);
   const [pipeline, setPipeline] = useState(null); // {stage, message, pct}
@@ -88,6 +88,18 @@ export default function ChatView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSessionId]);
 
+  // Build effective analyst_role: persona role + datasource domain context
+  const effectiveRole = (() => {
+    const personaCfg = PERSONAS[persona];
+    const personaRole = personaCfg?.role || '';
+    const activeSource = sources.find(s => s.name === activeSourceName);
+    const domain = activeSource?.domain ? `Data domain: ${activeSource.domain}.` : '';
+    const sourceName = activeSourceName ? `Datasource: ${activeSourceName}.` : '';
+    // Manual override takes full precedence
+    if (analystRole) return [analystRole, domain, sourceName].filter(Boolean).join(' ');
+    return [personaRole, domain, sourceName].filter(Boolean).join(' ');
+  })();
+
   const send = async () => {
     const text = input.trim();
     if (!text || !activeSessionId || sending) return;
@@ -97,7 +109,7 @@ export default function ChatView() {
     setTyping(true);
     scrollDown();
     try {
-      await sendChat(activeSessionId, { message: text, analyst_role: analystRole, llm_model: llmModel });
+      await sendChat(activeSessionId, { message: text, analyst_role: effectiveRole, llm_model: llmModel });
     } catch (e) {
       setTyping(false);
       setSending(false);

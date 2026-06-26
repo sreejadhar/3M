@@ -86,6 +86,16 @@ export const classifyPII = (id) => apiPost(`/metadata/sources/${id}/classify-pii
 // ── KG bridges ──────────────────────────────────────────────────────────────
 export const listBridges = () => apiGet('/kg-bridges');
 
+// ── Change Log (CDC) ─────────────────────────────────────────────────────────
+export const listChanges = ({ sourceId = '', entityId = '', limit = 200 } = {}) => {
+  const qs = new URLSearchParams();
+  if (sourceId)  qs.set('source_id',  sourceId);
+  if (entityId)  qs.set('entity_id',  entityId);
+  if (limit !== 200) qs.set('limit', limit);
+  const q = qs.toString();
+  return apiGet(`/metadata/changes${q ? `?${q}` : ''}`);
+};
+
 // ── Business Glossary ─────────────────────────────────────────────────────────
 // All routes proxy through the orchestrator: /metadata/glossary/* → agent-api /glossary/*.
 const _G = '/metadata/glossary';

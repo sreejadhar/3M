@@ -498,12 +498,18 @@ export default function GraphExplorer() {
               const isSelected = selectedRemoteKg &&
                 ((b.from_kg === activeSourceId && b.to_kg === selectedRemoteKg) ||
                  (b.to_kg === activeSourceId && b.from_kg === selectedRemoteKg));
-              const color = !b.enabled ? 'var(--text-2)' : b.source === 'inferred' ? 'var(--blue)' : 'var(--green)';
+              const color = isSelected
+                ? '#a8f0b8'
+                : !b.enabled ? 'var(--text-2)' : b.source === 'inferred' ? 'var(--blue)' : 'var(--green)';
               return (
                 <div key={i} style={{
                   fontFamily: 'var(--font-mono)', fontSize: 11, color,
-                  padding: '2px 0',
-                  opacity: selectedRemoteKg && !isSelected ? 0.35 : 1,
+                  padding: '3px 8px',
+                  margin: '1px 0',
+                  borderRadius: 4,
+                  background: isSelected ? 'rgba(74,222,128,0.10)' : 'transparent',
+                  borderLeft: isSelected ? '3px solid #4ade80' : '3px solid transparent',
+                  opacity: selectedRemoteKg && !isSelected ? 0.30 : 1,
                   fontWeight: isSelected ? 600 : 'normal',
                 }}>
                   {b.from_kg || b.from_entity}.{b.from_column} → {b.to_kg || b.to_entity}.{b.to_column}

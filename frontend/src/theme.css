@@ -422,7 +422,7 @@ body {
 .bridges-legend-disabled  { color: var(--text-2); }
 #graph-bridges-body {
   overflow-x: auto;
-  overflow-y: hidden;
+  overflow-y: auto;
   min-height: 80px;
   max-height: 200px;
   position: relative;

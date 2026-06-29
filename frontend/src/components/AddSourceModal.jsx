@@ -28,6 +28,7 @@ export default function AddSourceModal() {
   const [schema, setSchema] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [warehouse, setWarehouse] = useState('');
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [testMsg, setTestMsg] = useState(null);
@@ -47,6 +48,7 @@ export default function AddSourceModal() {
     schema: schema || 'public',
     username,
     password,
+    ...(dbType === 'snowflake' && warehouse.trim() ? { extra: { warehouse: warehouse.trim() } } : {}),
   });
 
   const doTest = async () => {
@@ -157,6 +159,12 @@ export default function AddSourceModal() {
                 </div>
               </div>
             </div>
+            {dbType === 'snowflake' && (
+              <div className="form-row">
+                <label>Warehouse</label>
+                <input value={warehouse} onChange={(e) => setWarehouse(e.target.value)} placeholder="e.g. COMPUTE_WH" />
+              </div>
+            )}
             <div className="form-row">
               <div className="form-grid">
                 <div>

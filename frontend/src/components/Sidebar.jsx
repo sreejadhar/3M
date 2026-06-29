@@ -24,7 +24,6 @@ const INSPECT = [
   ['kpi', IconKpi, 'KPI Registry'],
 ];
 const DEVELOP_COMING = [
-  ['cdc', IconCdc, 'Change Log'],
   ['documents', IconDocuments, 'Documents'],
 ];
 
@@ -71,6 +70,7 @@ export default function Sidebar() {
       <div className="sidebar-section">
         <div className="sidebar-section-label">Develop</div>
         <NavItem id="sql" Icon={IconSql} label="SQL Console" />
+        <NavItem id="cdc" Icon={IconCdc} label="Change Log" />
         {DEVELOP_COMING.map(([id, Icon, label]) => (
           <div key={id} className="nav-item coming-soon" title="Coming Soon">
             <Icon />

@@ -13,6 +13,7 @@ import Redundancies from './views/Redundancies.jsx';
 import Glossary from './views/Glossary.jsx';
 import Kpi from './views/Kpi.jsx';
 import SqlConsole from './views/SqlConsole.jsx';
+import ChangeLog from './views/ChangeLog.jsx';
 
 const VIEWS = {
   pipeline: PipelineMonitor,
@@ -23,6 +24,7 @@ const VIEWS = {
   glossary: Glossary,
   kpi: Kpi,
   sql: SqlConsole,
+  cdc: ChangeLog,
 };
 
 function Workbench() {

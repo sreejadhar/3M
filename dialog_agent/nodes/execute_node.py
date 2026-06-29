@@ -148,6 +148,7 @@ _NOT_RETRYABLE_RE = re.compile(
     r"no such table"
     r"|relation .{0,80} does not exist"
     r"|table .{0,80} doesn't exist"
+    r"|object .{0,120} does not exist"          # Snowflake: table/view not found
     r"|invalid object name"                     # SQL Server: table not found
     r"|column .{0,80} does not exist"
     r"|unknown column"

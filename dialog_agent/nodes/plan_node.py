@@ -1460,7 +1460,7 @@ def _call_llm(
     client = get_client()
     msg = client.messages.create(
         model=model,
-        max_tokens=4096,
+        max_tokens=8192,
         temperature=temperature,
         system=system,
         messages=[{"role": "user", "content": user}],
@@ -3225,16 +3225,18 @@ def plan_node(state: DialogState) -> DialogState:
     }
     db_label = _DB_LABELS.get(config.db_type.lower(), config.db_type.upper())
 
-    # Build persona-aware prefix if an analyst_role is configured
+    # Build persona-aware prefix if an analyst_role is configured.
+    # analyst_role may be a short name ("Portfolio Manager") or the full role
+    # description ("Portfolio Manager — focus on pool-level exposure…").
+    # Use only the short name in template text so the prompt stays concise.
     analyst_role = getattr(config, "analyst_role", "").strip()
     if analyst_role:
+        role_name = re.split(r"\s*[—\-–]\s*", analyst_role, maxsplit=1)[0].strip()
         analyst_role_prefix = (
-            f"You are an expert SQL analyst embedded in a team of **{analyst_role}s**.\n"
-            f"Reason like a senior {analyst_role}: prioritise the metrics, ratios, and "
-            f"analytical patterns that matter most to this function.  When the schema "
-            f"contains columns that can be combined into a rate, share, index, or "
-            f"contribution metric that is standard for a {analyst_role}, ALWAYS compute "
-            f"and include that derived metric — do not return raw values alone.\n\n"
+            f"You are an expert SQL analyst assisting a **{role_name}**.\n"
+            f"Prioritise the metrics, ratios, and analytical patterns most relevant "
+            f"to a {role_name}.  Compute derived metrics (rates, shares, growth %) "
+            f"wherever the schema supports it — do not return raw values alone.\n\n"
         )
     else:
         analyst_role_prefix = ""

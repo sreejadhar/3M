@@ -64,7 +64,7 @@ export function sourceEvents(sourceId) {
 }
 
 // ── Sources ───────────────────────────────────────────────────────────────────
-export const listSources = () => apiGet('/sources');
+export const listSources = () => apiGet('/sources?persona=admin');
 export const createSource = (payload) => apiPost('/sources', payload);
 export const patchSource = (id, payload) => apiPatch(`/sources/${id}`, payload);
 export const reindexSource = (id) => apiPost(`/sources/${id}/reindex`);
@@ -73,7 +73,7 @@ export const getGraph = (id) => apiGet(`/sources/${id}/graph`);
 export const getOntology = (id) => apiGet(`/sources/${id}/ontology`);
 export const saveOntology = (id, content, rebuildKg) =>
   apiPost(`/sources/${id}/ontology`, { content, rebuild_kg: rebuildKg });
-export const validateOntology = (id) => apiPost(`/sources/${id}/ontology/validate`);
+export const validateOntology = (id) => apiPost(`/sources/${id}/validate-ontology`, {});
 
 // ── Metadata ──────────────────────────────────────────────────────────────────
 export const listEntities = (sourceId) =>
@@ -85,6 +85,16 @@ export const classifyPII = (id) => apiPost(`/metadata/sources/${id}/classify-pii
 
 // ── KG bridges ──────────────────────────────────────────────────────────────
 export const listBridges = () => apiGet('/kg-bridges');
+
+// ── Change Log (CDC) ─────────────────────────────────────────────────────────
+export const listChanges = ({ sourceId = '', entityId = '', limit = 200 } = {}) => {
+  const qs = new URLSearchParams();
+  if (sourceId)  qs.set('source_id',  sourceId);
+  if (entityId)  qs.set('entity_id',  entityId);
+  if (limit !== 200) qs.set('limit', limit);
+  const q = qs.toString();
+  return apiGet(`/metadata/changes${q ? `?${q}` : ''}`);
+};
 
 // ── Business Glossary ─────────────────────────────────────────────────────────
 // All routes proxy through the orchestrator: /metadata/glossary/* → agent-api /glossary/*.

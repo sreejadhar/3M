@@ -93,8 +93,9 @@ def _cache_key(
     db_name: str,
     db_schema: str,
     kg_nodes: List[Dict],
+    analyst_role: str = "",
 ) -> str:
-    """Stable fingerprint for a (query, db, schema, kg) combination."""
+    """Stable fingerprint for a (query, db, schema, kg, persona) combination."""
     kg_labels = ",".join(sorted(n.get("label", "") for n in kg_nodes if n.get("label")))
     raw = "|".join([
         natural_query.strip().lower(),
@@ -104,6 +105,7 @@ def _cache_key(
         db_name.lower(),
         db_schema.lower(),
         kg_labels,
+        analyst_role.strip().lower(),
     ])
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -361,6 +363,7 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
     ck = _cache_key(
         req.natural_query, req.db_type, req.db_host,
         req.db_port, req.db_name, req.db_schema, req.kg_nodes,
+        req.analyst_role,
     )
     dbfp = _db_fingerprint(req.db_type, req.db_host, req.db_port, req.db_name, req.db_schema)
     kgfp = _kg_fingerprint(req.kg_nodes)

@@ -665,7 +665,7 @@ def _run_snowflake(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
     # Password or key-pair auth via the shared helper. Account/host/user/password
     # and any warehouse/role overrides arrive via cfg fields + cfg.db_extra
     # (passed through from the registered source's connection).
-    from ...snowflake_auth import connect_snowflake
+    from snowflake_auth import connect_snowflake
 
     conn = connect_snowflake(
         database=cfg.db_name,

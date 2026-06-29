@@ -18,6 +18,7 @@ COPY dialog_agent/ ./dialog_agent/
 COPY dialog_api.py .
 COPY kpi_store.py .
 COPY llm_client.py .
+COPY snowflake_auth.py .
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

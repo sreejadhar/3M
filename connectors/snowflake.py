@@ -30,7 +30,7 @@ class SnowflakeConnector(BaseConnector):
         self._cur = None
 
     def connect(self) -> None:
-        from snowflake_auth import connect_snowflake
+        from ..snowflake_auth import connect_snowflake
         self._conn = connect_snowflake(
             database=self._config.database or "",
             schema=self._config.schema or "",

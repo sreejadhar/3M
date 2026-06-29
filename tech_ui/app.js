@@ -405,7 +405,7 @@ function updateConnFields() {
   const isFile = t === 'sqlite' || t === 'csv';
   document.getElementById('conn-fields').style.display = isFile ? 'none' : '';
   document.getElementById('file-field').style.display = isFile ? '' : 'none';
-  // Update default port
+  document.getElementById('warehouse-field').style.display = (t === 'snowflake') ? '' : 'none';
   const ports = { postgres:5432, redshift:5439, mysql:3306, oracle:1521, sqlserver:1433, snowflake:443, bigquery:443 };
   const portEl = document.getElementById('src-port');
   if (ports[t] && portEl) portEl.value = ports[t];
@@ -414,6 +414,7 @@ function updateConnFields() {
 async function testConnection() {
   const type = document.getElementById('src-type').value;
   if (type === 'sqlite' || type === 'csv') { toast('File sources do not require a connection test', 'info'); return; }
+  const warehouse = document.getElementById('src-warehouse').value.trim();
   const payload = {
     db_type: type,
     connection: {
@@ -423,6 +424,7 @@ async function testConnection() {
       schema: document.getElementById('src-schema').value || 'public',
       username: document.getElementById('src-user').value,
       password: document.getElementById('src-password').value,
+      ...(warehouse && { extra: { warehouse } }),
     }
   };
   try {
@@ -469,6 +471,7 @@ async function addSource() {
     return;
   }
 
+  const warehouse = document.getElementById('src-warehouse').value.trim();
   const payload = {
     name,
     db_type: type,
@@ -479,6 +482,7 @@ async function addSource() {
       schema: document.getElementById('src-schema').value || 'public',
       username: document.getElementById('src-user').value,
       password: document.getElementById('src-password').value,
+      ...(warehouse && { extra: { warehouse } }),
     },
     auto_index: true,
   };

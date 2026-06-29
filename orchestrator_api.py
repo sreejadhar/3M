@@ -1550,7 +1550,7 @@ def _build_db_config(db_type: str, conn: Dict) -> Dict:
         "database":    conn.get("database", ""),
         "username":    conn.get("username", ""),
         "password":    conn.get("password", ""),
-        "schema_name": conn.get("schema_", "public"),
+        "schema_name": conn.get("schema_") or conn.get("schema", "public"),
     }
     if conn.get("extra"):
         cfg["extra"] = conn["extra"]

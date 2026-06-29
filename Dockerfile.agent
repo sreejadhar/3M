@@ -51,6 +51,7 @@ COPY state.py         /app/metadata_agent/state.py
 COPY connectors/      /app/metadata_agent/connectors/
 COPY tools/           /app/metadata_agent/tools/
 COPY nodes/           /app/metadata_agent/nodes/
+COPY snowflake_auth.py /app/metadata_agent/snowflake_auth.py
 
 # Copy the ontology_agent package into /app/ontology_agent/
 COPY ontology_agent/ /app/ontology_agent/

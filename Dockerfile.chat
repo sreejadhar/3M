@@ -25,6 +25,7 @@ COPY ontology_enricher.py .
 COPY glossary_store.py .
 COPY llm_client.py .
 COPY chat_ui/ ./chat_ui/
+COPY chat_frontend/dist/ ./chat_frontend/dist/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1

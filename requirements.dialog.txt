@@ -38,3 +38,6 @@ pymssql>=2.2.0                 # SQL Server — pure-Python wheel, no ODBC drive
 # Delta Lake local / PySpark:
 # pyspark>=3.4.0
 # delta-spark>=3.0.0
+
+# Snowflake
+snowflake-connector-python>=3.6.0

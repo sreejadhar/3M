@@ -38,6 +38,9 @@ pyodbc>=5.0.0
 # google-cloud-bigquery>=3.0.0
 # google-auth>=2.0.0
 
+# Snowflake
+snowflake-connector-python>=3.6.0
+
 # Delta Lake / Databricks
 # pyspark>=3.4.0
 # delta-spark>=3.0.0

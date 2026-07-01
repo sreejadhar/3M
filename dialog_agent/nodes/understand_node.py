@@ -222,8 +222,9 @@ def _load_samples_from_catalog(source_id: str) -> tuple:
                 #   unique_count ≤ 50: mark as categorical so LLM uses LIKE not =.
                 description  = (attr.get("description") or "").strip()
 
+                _is_cat = stat_type in ("categorical", "ordinal", "identifier")
                 if top_vals and (
-                    stat_type in ("categorical", "ordinal")
+                    _is_cat
                     or (unique_count is not None and unique_count <= 50)
                 ):
                     samples.setdefault(tbl, {})[col] = {
@@ -231,7 +232,7 @@ def _load_samples_from_catalog(source_id: str) -> tuple:
                         "categorical": True,
                         "description": description,
                     }
-                elif stat_type in ("categorical", "ordinal") and not top_vals:
+                elif _is_cat and not top_vals:
                     if unique_count is not None and unique_count <= 50:
                         samples.setdefault(tbl, {})[col] = {
                             "values": [],

@@ -647,8 +647,12 @@ def _extract_comments_from_title(title: str) -> List[str]:
     return comments
 
 
-def _qualified(schema: str, table: str) -> str:
-    """Return `schema.table` if schema is set, else just `table`."""
+def _qualified(schema: str, table: str, quote: bool = False) -> str:
+    """Return `schema.table` if schema is set, else just `table`.
+    When quote=True wraps both in double quotes for case-sensitive dialects (Snowflake)."""
+    if quote:
+        tbl = f'"{table}"'
+        return f'{schema}.{tbl}' if schema else tbl
     return f"{schema}.{table}" if schema else table
 
 
@@ -658,6 +662,7 @@ def _summarise_graph(
     db_schema: str,
     samples: Optional[Dict[str, Dict[str, List]]] = None,
     hierarchy: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None,
+    db_type: str = "",
 ) -> str:
     """
     Convert KG nodes/edges to a schema description the SQL planner can use.
@@ -683,6 +688,10 @@ def _summarise_graph(
         n.get("id", ""): n.get("label", "") for n in nodes
     }
 
+    # Snowflake stores lowercase quoted identifiers — pre-quote them in the schema
+    # context so the LLM copies the already-quoted form rather than uppercasing.
+    quote_ids = db_type.lower() == "snowflake"
+
     lines: List[str] = []
 
     # ── Section 1: Quick reference ────────────────────────────────────────────
@@ -690,10 +699,17 @@ def _summarise_graph(
     lines.append("=" * 60)
     if db_schema:
         lines.append(f"Schema: {db_schema}")
-        lines.append(
-            "IMPORTANT: Always write table names as "
-            f"`{db_schema}.tablename` in your SQL queries."
-        )
+        if quote_ids:
+            lines.append(
+                "IMPORTANT: Always write table names as "
+                f'{db_schema}."tablename" in your SQL queries. '
+                "Column names MUST be wrapped in double quotes exactly as shown below."
+            )
+        else:
+            lines.append(
+                "IMPORTANT: Always write table names as "
+                f"`{db_schema}.tablename` in your SQL queries."
+            )
     lines.append("")
 
     lines.append("AVAILABLE TABLES (use these exact qualified names in SQL):")
@@ -703,7 +719,7 @@ def _summarise_graph(
             # For file-based sources, show the sanitized SQLite table name so
             # the LLM generates SQL that actually matches what is in SQLite.
             sql_name = _to_sql_table(label) if samples is not None else label
-            lines.append(f"  - {_qualified(db_schema, sql_name)}")
+            lines.append(f"  - {_qualified(db_schema, sql_name, quote=quote_ids)}")
     lines.append("")
 
     # ── Section 1b: Join keys ──────────────────────────────────────────────────
@@ -797,7 +813,14 @@ def _summarise_graph(
                 # Translate original KG column name → SQL-safe name used in SQLite
                 sql_col  = _to_sql_col(original_col) if samples is not None else original_col
                 col_info = tbl_samples.get(sql_col)
-                display  = f"{sql_col}{col_type}" if samples is not None else col
+                # For Snowflake, pre-quote column names so the LLM copies them
+                # with quotes and doesn't fold them to uppercase.
+                if quote_ids:
+                    display = f'"{original_col}"{col_type}'
+                elif samples is not None:
+                    display = f"{sql_col}{col_type}"
+                else:
+                    display = col
                 if col_info:
                     # col_info is {"values": [...], "categorical": bool, "values_unknown"?: bool, "description"?: str}
                     vals           = col_info.get("values", []) if isinstance(col_info, dict) else col_info
@@ -970,7 +993,7 @@ def understand_node(state: DialogState) -> DialogState:
         sections: List[str] = []
         for kid in active_kg_ids:
             kg_nodes_group = kg_node_groups.get(kid, [])
-            section_text = _summarise_graph(kg_nodes_group, edges, db_schema, None)
+            section_text = _summarise_graph(kg_nodes_group, edges, db_schema, None, db_type=config.db_type)
             sections.append(f"=== KG: {kid} ===\n{section_text}")
 
         # Append cross-KG bridge section
@@ -1037,7 +1060,7 @@ def understand_node(state: DialogState) -> DialogState:
                 len(hierarchy),
             )
 
-    schema_context = _summarise_graph(nodes, edges, db_schema, samples, hierarchy)
+    schema_context = _summarise_graph(nodes, edges, db_schema, samples, hierarchy, db_type=config.db_type)
 
     logger.info(
         "Schema context built: %d chars, %d tables, %d relationships, schema=%r",

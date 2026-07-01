@@ -50,6 +50,16 @@ class CardinalityAnalyzerTool(BaseTool):
     class Config:
         arbitrary_types_allowed = True
 
+    @staticmethod
+    def _bare_col(name: str) -> str:
+        """
+        Strip table-alias prefix from Snowflake view column names.
+        e.g. 'evt.event_key' → 'event_key', 'plain_col' → 'plain_col'.
+        Snowflake stores un-aliased view SELECT expressions (t.col) verbatim
+        in INFORMATION_SCHEMA.COLUMNS; the bare suffix is the actual column name.
+        """
+        return name.rsplit(".", 1)[-1] if "." in name else name
+
     def _find_join_columns(
         self,
         left_table: str,
@@ -61,6 +71,10 @@ class CardinalityAnalyzerTool(BaseTool):
         """
         Returns candidate join column sets (each set is a list of col names
         used as the join key).  Tries FK hints first, then name matching.
+
+        Column names are normalized by stripping any alias prefix (e.g.
+        'evt.event_key' → 'event_key') before comparison so that Snowflake
+        view columns match their base-table counterparts.
         """
         candidates: List[List[str]] = []
 
@@ -71,11 +85,21 @@ class CardinalityAnalyzerTool(BaseTool):
             elif fk.get("referenced_table") == left_table:
                 candidates.append([fk["column"]])
 
-        # Name-based candidates: columns that share the same name
-        right_col_set = set(rc.lower() for rc in right_cols)
+        # Name-based candidates: match by bare (alias-stripped) column name.
+        # Build a map from bare lower name → original right column so we can
+        # retrieve the real column name for the SQL query.
+        right_bare_map: Dict[str, str] = {}
+        for rc in right_cols:
+            bare = self._bare_col(rc).lower()
+            if bare not in right_bare_map:
+                right_bare_map[bare] = rc
+
         for lc in left_cols:
-            if lc.lower() in right_col_set and [lc] not in candidates:
-                candidates.append([lc])
+            bare_lc = self._bare_col(lc).lower()
+            if bare_lc in right_bare_map:
+                bare_name = self._bare_col(lc)   # normalized form used in SQL
+                if [bare_name] not in candidates:
+                    candidates.append([bare_name])
 
         return candidates  # empty = no join columns found, skip this pair
 
@@ -96,9 +120,10 @@ class CardinalityAnalyzerTool(BaseTool):
 
             relationships = []
             for join_cols in join_col_sets[:5]:  # cap at 5 candidate sets
-                # Ensure the join column exists in both tables
-                right_col_set = set(rc.lower() for rc in right_columns)
-                valid_join = [c for c in join_cols if c.lower() in right_col_set]
+                # Validate join column exists in right table, stripping alias
+                # prefixes so 'event_key' matches 'evt.event_key' in view columns.
+                right_col_set = set(self._bare_col(rc).lower() for rc in right_columns)
+                valid_join = [c for c in join_cols if self._bare_col(c).lower() in right_col_set]
                 if not valid_join:
                     continue
 

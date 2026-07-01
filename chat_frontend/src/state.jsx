@@ -80,7 +80,7 @@ let toastSeq = 0;
 
 export function AppStateProvider({ children }) {
   const [persona, setPersonaState] = useState(localStorage.getItem(LS.persona) || 'business_user');
-  const [llmModel, setLlmModelState] = useState(localStorage.getItem(LS.model) || 'claude-sonnet-4-6');
+  const [llmModel, setLlmModelState] = useState(localStorage.getItem(LS.model) || 'claude-haiku-4-5');
   const [analystRole, setAnalystRoleState] = useState(localStorage.getItem(LS.role) || '');
   const [sources, setSources] = useState([]);
   const [sessions, setSessions] = useState([]);

@@ -2496,10 +2496,27 @@ async def get_messages(session_id: str, request: Request):
     session = _get_session(session_id)
     if not _owns_session(session, _current_user_email(request)):
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # Truncate result rows to the display limit (50) so historical sessions
+    # don't return megabyte payloads that block the browser's JSON.parse.
+    # DataTable already slices to 50 on render, so no UX loss.
+    _ROW_CAP = 50
+    trimmed = []
+    for msg in session.get("messages", []):
+        if msg.get("results"):
+            msg = {
+                **msg,
+                "results": [
+                    {**r, "rows": (r.get("rows") or [])[:_ROW_CAP]}
+                    for r in msg["results"]
+                ],
+            }
+        trimmed.append(msg)
+
     return {
         "session_id": session_id,
         "stage":      session["stage"],
-        "messages":   session.get("messages", []),
+        "messages":   trimmed,
         "files":      [f["name"] for f in session.get("files", [])],
     }
 
@@ -3062,6 +3079,11 @@ async def _rebuild_kg(source_id: str, ontology_text: str) -> None:
                         graph = rg.json()
                         src["kg_nodes"] = graph.get("nodes") or []
                         src["kg_edges"] = graph.get("edges") or []
+                        src["ontology_content"] = ontology_text
+                        try:
+                            _kg_store.save(src)
+                        except Exception as _kse:
+                            logger.warning("kg_store.save after KG rebuild failed: %s", _kse)
                     break
                 if job.get("status") == "error":
                     raise RuntimeError(job.get("error", "KG build failed"))

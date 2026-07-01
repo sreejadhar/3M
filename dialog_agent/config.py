@@ -18,14 +18,7 @@ from typing import Dict, Any, List
 # ---------------------------------------------------------------------------
 # Environment-aware model defaults
 # ---------------------------------------------------------------------------
-_ENV = os.environ.get("DIALOG_ENV", "production").strip().lower()
-_IS_DEV = _ENV in ("development", "dev", "local")
-
-_DEFAULT_SYNTH_MODEL = (
-    "claude-haiku-4-5"   # cheap — fast iteration in dev
-    if _IS_DEV else
-    "claude-sonnet-4-6"           # quality — what business users read
-)
+_DEFAULT_SYNTH_MODEL = "claude-haiku-4-5"
 
 
 @dataclass

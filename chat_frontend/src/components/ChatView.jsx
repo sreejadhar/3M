@@ -37,8 +37,13 @@ export default function ChatView() {
     setPipeline(null);
     if (!activeSessionId) return undefined;
 
+    // cancelled flag prevents a stale getMessages response (from a previous
+    // session that was switched away before the fetch completed) from
+    // overwriting state for the current session.
+    let cancelled = false;
     getMessages(activeSessionId)
       .then((d) => {
+        if (cancelled) return;
         const msgs = Array.isArray(d) ? d : d.messages || [];
         setMessages(msgs.map((m, i) => ({ ...m, id: m.id || `h-${i}` })));
         scrollDown();
@@ -84,7 +89,7 @@ export default function ChatView() {
           break;
       }
     };
-    return () => es.close();
+    return () => { cancelled = true; es.close(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSessionId]);
 

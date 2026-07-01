@@ -720,6 +720,99 @@ def build_node(state: OntologyState) -> OntologyState:
         g.add((prop_uri, RDFS.comment, Literal("\n".join(card_desc_parts))))
 
     # ------------------------------------------------------------------
+    # 4b. Fallback: infer edges for tables that are fully isolated (no
+    #     FK, IND, or cardinality edge in either direction).
+    #
+    #     Root cause this guards against: Snowflake view columns returned
+    #     by INFORMATION_SCHEMA.COLUMNS carry a table-alias prefix (e.g.
+    #     "evt.event_key") because the view was defined without column
+    #     aliases.  The cardinality analyser compares raw names and never
+    #     finds a match between the view table and its base table, leaving
+    #     the node fully disconnected in the graph.
+    #
+    #     Strategy: strip alias prefixes, keep only FK-signal columns
+    #     (_key / _id / _code / _ref / _no / _num suffixes), then link any
+    #     isolated table to tables that share at least one such column.
+    #     We limit to key-signal columns to avoid noisy matches on generic
+    #     columns like "name", "description", or "created_date".
+    # ------------------------------------------------------------------
+    _KEY_SUFFIX_RE = re.compile(
+        r'(_key|_id|_code|_ref|_no|_num|_sk|_nk|_bk|_fk)\s*$',
+        re.IGNORECASE,
+    )
+
+    def _bare(col_name: str) -> str:
+        """Strip alias prefix: 'evt.event_key' → 'event_key'."""
+        return col_name.rsplit(".", 1)[-1] if "." in col_name else col_name
+
+    def _key_cols(tbl_name: str) -> set:
+        """Return bare-name key columns for a table from the report."""
+        tmeta = tables.get(tbl_name)
+        if not isinstance(tmeta, dict):
+            return set()
+        return {
+            _bare(c.get("name", "")).lower()
+            for c in (tmeta.get("columns") or [])
+            if isinstance(c, dict) and _KEY_SUFFIX_RE.search(_bare(c.get("name", "")))
+        }
+
+    # Discover which class URIs already participate in at least one edge.
+    connected_cls: set = set()
+    for prop_uri in added_obj_props:
+        for _, _, o in g.triples((prop_uri, RDFS.domain, None)):
+            connected_cls.add(o)
+        for _, _, o in g.triples((prop_uri, RDFS.range, None)):
+            connected_cls.add(o)
+
+    isolated_tables = [
+        t for t, cls_uri in class_map.items()
+        if cls_uri not in connected_cls
+    ]
+
+    if isolated_tables:
+        # Pre-compute key-column sets for every table to avoid repeated iteration
+        all_key_cols = {t: _key_cols(t) for t in class_map}
+
+        for left_t in isolated_tables:
+            left_keys = all_key_cols.get(left_t, set())
+            if not left_keys:
+                continue
+            for right_t, right_keys in all_key_cols.items():
+                if right_t == left_t:
+                    continue
+                shared = left_keys & right_keys
+                if not shared:
+                    continue
+                edge_uri = ns[f"{_safe(left_t)}_inferred_rel_{_safe(right_t)}"]
+                if edge_uri in added_obj_props:
+                    continue
+                g.add((edge_uri, RDF.type,    OWL.ObjectProperty))
+                g.add((edge_uri, RDFS.label,  Literal(f"{left_t} → {right_t}")))
+                g.add((edge_uri, RDFS.domain, class_map[left_t]))
+                g.add((edge_uri, RDFS.range,  class_map[right_t]))
+                shared_str = ", ".join(sorted(shared)[:5])
+                g.add((edge_uri, RDFS.comment, Literal(
+                    f"Inferred relationship: shared key column(s): {shared_str}. "
+                    f"(Cardinality could not be determined — alias-prefixed view columns "
+                    f"prevented automatic detection during indexing.)"
+                )))
+                added_obj_props.add(edge_uri)
+                logger.debug(
+                    "build_node: fallback edge %s → %s (shared keys: %s)",
+                    left_t, right_t, shared_str,
+                )
+
+        n_inferred = sum(
+            1 for prop_uri in added_obj_props
+            if "_inferred_rel_" in str(prop_uri)
+        )
+        if n_inferred:
+            logger.info(
+                "build_node: added %d inferred edge(s) for %d isolated table(s)",
+                n_inferred, len(isolated_tables),
+            )
+
+    # ------------------------------------------------------------------
     # 5. Annotate classes with FD summaries (rich descriptions)
     # ------------------------------------------------------------------
     for fd in report.get("functional_dependencies") or []:

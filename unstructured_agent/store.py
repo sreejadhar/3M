@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS unstructured_assets (
     time_refs_json   TEXT NOT NULL DEFAULT '[]',
     sensitivity      TEXT NOT NULL DEFAULT 'internal',
     pii_risk         INTEGER NOT NULL DEFAULT 0,
+    pii_entities_json TEXT NOT NULL DEFAULT '[]',
     ocr_used         INTEGER NOT NULL DEFAULT 0,
     ocr_confidence   REAL,
     deleted          INTEGER NOT NULL DEFAULT 0,
@@ -151,6 +152,7 @@ class UnstructuredStore:
             for col_ddl in [
                 "ALTER TABLE unstructured_assets ADD COLUMN remote_path TEXT",
                 "ALTER TABLE unstructured_assets ADD COLUMN version_num INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE unstructured_assets ADD COLUMN pii_entities_json TEXT NOT NULL DEFAULT '[]'",
             ]:
                 try:
                     conn.execute(col_ddl)
@@ -340,13 +342,14 @@ class UnstructuredStore:
             """UPDATE unstructured_assets SET
                enriched=1, summary=?, domain=?, doc_type=?, language=?,
                topics_json=?, entities_json=?, time_refs_json=?,
-               sensitivity=?, pii_risk=?, updated_at=?
+               sensitivity=?, pii_risk=?, pii_entities_json=?, updated_at=?
                WHERE asset_id=?""",
             (fp.get("summary", ""), fp.get("domain", ""), fp.get("doc_type", ""),
              fp.get("language", "en"), json.dumps(fp.get("topics", [])),
              json.dumps(fp.get("named_entities", {})),
              json.dumps(fp.get("time_references", [])),
              fp.get("sensitivity", "internal"), int(fp.get("pii_risk", False)),
+             json.dumps(fp.get("pii_entities", [])),
              now, asset_id),
         )
         self._conn().commit()
@@ -366,11 +369,17 @@ class UnstructuredStore:
         if not row:
             return None
         d = dict(row)
-        for field in ("topics_json", "entities_json", "time_refs_json"):
+        for field, default in (
+            ("topics_json",       "[]"),
+            ("entities_json",     "{}"),
+            ("time_refs_json",    "[]"),
+            ("pii_entities_json", "[]"),
+        ):
+            key = field.replace("_json", "")
             try:
-                d[field.replace("_json", "")] = json.loads(d.pop(field, "[]") or "[]")
+                d[key] = json.loads(d.pop(field, default) or default)
             except Exception:
-                d[field.replace("_json", "")] = []
+                d[key] = json.loads(default)
         return d
 
     def list_assets(self, source_id: Optional[str] = None,

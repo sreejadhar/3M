@@ -30,7 +30,7 @@ let currentPersona     = localStorage.getItem('datachat_persona') || 'business_u
 let currentAnalystRole = localStorage.getItem('datachat_analyst_role') || '';
 const _VALID_MODELS = new Set(['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-5']);
 let _storedModel = localStorage.getItem('datachat_llm_model') || '';
-let currentLlmModel = _VALID_MODELS.has(_storedModel) ? _storedModel : 'claude-sonnet-4-6';
+let currentLlmModel = _VALID_MODELS.has(_storedModel) ? _storedModel : 'claude-haiku-4-5';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let activeSessionId   = null;

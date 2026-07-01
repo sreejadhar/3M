@@ -1578,11 +1578,23 @@ body {
 .sql-toggle-icon.open { transform:rotate(90deg); }
 .sql-block { display:none; background:#1e2432; border-radius:var(--radius-sm); margin-top:6px; overflow:hidden; }
 .sql-block.visible { display:block; }
+.sql-pre-wrap { position:relative; }
 .sql-block pre {
   margin:0; padding:12px 14px;
   font-size:12px; color:#e6edf3; overflow-x:auto;
   font-family:'Fira Code','Cascadia Code',monospace; line-height:1.6;
 }
+.sql-copy-btn {
+  position:absolute; top:8px; right:8px;
+  display:flex; align-items:center; justify-content:center;
+  width:28px; height:28px; padding:0;
+  background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.12);
+  border-radius:5px; cursor:pointer; color:#9ca3af;
+  transition:background 0.15s, color 0.15s;
+  z-index:1;
+}
+.sql-copy-btn:hover { background:rgba(255,255,255,0.15); color:#e6edf3; }
+.sql-copy-btn svg { width:14px; height:14px; }
 
 .msg-error-note {
   font-size:12px; color:var(--clr-error); margin-top:8px;

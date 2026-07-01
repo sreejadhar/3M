@@ -338,15 +338,25 @@ WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully 
                       LAG(col) OVER (PARTITION BY x)                      ← ERROR
 STRING AGGREGATION: LISTAGG(col, ', ') WITHIN GROUP (ORDER BY col)
                     — STRING_AGG also works, but LISTAGG is the Snowflake-native form
-GEOGRAPHIC FILTERS: Country data is stored as ISO 2-letter codes in "country_code".
-                    NEVER filter on a full country name string — always map to the code:
-                      Malaysia   → 'MY'    Thailand     → 'TH'    Indonesia  → 'ID'
-                      Philippines→ 'PH'    Vietnam      → 'VN'    Singapore  → 'SG'
-                      India      → 'IN'    Bangladesh   → 'BD'    Sri Lanka  → 'SL'
-                    Use exact equality: WHERE "country_code" = 'MY'
-                    For multi-country: WHERE "country_code" IN ('MY', 'TH')
-                    NEVER fall back to showing all countries when the user names a
-                    specific country — always resolve the name to its code and filter."""
+SAMPLE VALUE TYPE : If a column's [sample values] are all numeric strings ('0','1','2'),
+                    compare as strings — e.g. WHERE "flag_col" = '1', NOT = 1 or = TRUE.
+                    Snowflake does not implicitly cast strings to integers in comparisons.
+COLUMN EXISTENCE  : Only reference columns that appear in the schema context.
+                    NEVER assume a column exists based on business logic or naming
+                    convention. If it is not listed in the schema, do not use it.
+ENTITY HEADCOUNT  : When counting distinct entities (people, accounts, products, etc.),
+                    use COUNT(DISTINCT "primary_key_col") — NOT COUNT(*). COUNT(*) inflates
+                    counts when rows are duplicated across joins or denormalised views.
+SAFE DIVISION     : Wrap every denominator with NULLIF to prevent division-by-zero:
+                      ROUND(numerator * 100.0 / NULLIF(denominator, 0), 2)
+                    Never divide directly without NULLIF.
+CODE COLUMN FILTER: When a column's [sample values] are short codes (e.g. 'MY','USD',
+                    'ACTIVE'), NEVER filter using a descriptive name ('Malaysia','Dollar').
+                    Use the exact code shown in the sample values. If the user provides a
+                    descriptive name, map it to the closest matching sample code and filter
+                    on that — NEVER fall back to returning all rows / all codes.
+SCHEMA PREFIX     : Always qualify table names with the schema name shown in the schema
+                    context: schema_name."table_name". Never write bare table names."""
 
     if db == "bigquery":
         return """\

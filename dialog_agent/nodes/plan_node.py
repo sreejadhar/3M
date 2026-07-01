@@ -298,6 +298,12 @@ IDENTIFIER CASE   : ★ CRITICAL ★ Snowflake folds UNQUOTED identifiers to UPP
                     Database and schema names (e.g. SYNTHGEN_DB, FPNA) are upper-case
                     and need no quotes. NEVER change the case of an identifier and
                     NEVER leave a table/column name unquoted.
+TABLE ALIASES     : When using a table alias, the column MUST still be quoted:
+                      t."hcp_key"  ← correct
+                      t.HCP_KEY    ← WRONG — Snowflake folds to uppercase, fails
+                      t.hcp_key    ← WRONG — same folding, fails
+                    Copy the quoted column name from the schema context and prefix
+                    it with the alias: alias."column_name"
 COLUMN ALIASES    : Quote every alias / CTE column you introduce with AS in lower
                     case at BOTH its definition AND every reference — e.g.
                     SUM("net_amount") AS "total_net" ... ORDER BY "total_net".

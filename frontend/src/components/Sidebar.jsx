@@ -22,10 +22,9 @@ const INSPECT = [
   ['redundancy', IconRedundancy, 'Redundancies'],
   ['glossary', IconGlossary, 'Business Glossary'],
   ['kpi', IconKpi, 'KPI Registry'],
+  ['documents', IconDocuments, 'Document Intelligence'],
 ];
-const DEVELOP_COMING = [
-  ['documents', IconDocuments, 'Documents'],
-];
+const DEVELOP_COMING = [];
 
 function NavItem({ id, Icon, label, badge }) {
   const { currentView, setCurrentView } = useAppState();

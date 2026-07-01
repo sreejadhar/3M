@@ -132,3 +132,18 @@ export const listKpiVersions = (id) => apiGet(`/kpis/${id}/versions`);
 export const rollbackKpiVersion = (id, versionNum) =>
   apiPost(`/kpis/${id}/versions/${versionNum}/rollback`, {});
 export const activateKpi = (id) => apiPost(`/kpis/${id}/activate`, {});
+
+// ── Document Intelligence (unstructured agent, port 8008) ─────────────────────
+// All routes proxy through the orchestrator: /unstructured/* → unstructured-api/*
+const _U = '/unstructured';
+export const docListSources  = ()         => apiGet(`${_U}/sources`);
+export const docCreateSource = (body)     => apiPost(`${_U}/sources`, body);
+export const docStartIndex   = (id, force = false) => apiPost(`${_U}/sources/${id}/index?force=${force}`);
+export const docGetJob       = (jobId)    => apiGet(`${_U}/jobs/${jobId}`);
+export const docListAssets   = (srcId, enrichedOnly = false) =>
+  apiGet(`${_U}/assets?source_id=${encodeURIComponent(srcId)}&enriched_only=${enrichedOnly}`);
+export const docGetAsset     = (id)       => apiGet(`${_U}/assets/${id}`);
+export const docGetAssetLinks = (id)      => apiGet(`${_U}/assets/${id}/links`);
+export const docSearch       = (q, limit = 50) => apiGet(`${_U}/search?q=${encodeURIComponent(q)}&limit=${limit}`);
+export const docQuery        = (question, kpiNames = []) =>
+  apiPost(`${_U}/query`, { question, kpi_names: kpiNames });

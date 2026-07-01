@@ -705,19 +705,19 @@ def analysis_node(state: AgentState) -> AgentState:
     # 3. Cardinality Analysis (unordered table pairs, capped)
     # ------------------------------------------------------------------
     logger.info("=== Cardinality Analysis ===")
-    cardinality_cap = min(config.max_fd_column_pairs, 200)
+    # Cap is derived empirically from the actual table count: n*(n-1)/2 covers
+    # every unordered pair exactly once — no pairs are silently dropped regardless
+    # of schema size.
+    cardinality_cap = n_pairs
     if cb:
         cb("cardinality", "running",
-           f"Cardinality analysis — {n_pairs} table pair{'s' if n_pairs != 1 else ''} (cap {cardinality_cap})",
+           f"Cardinality analysis — {n_pairs} table pair{'s' if n_pairs != 1 else ''}",
            "Algorithm: join-column uniqueness ratio — determines 1:1, 1:N, N:1, M:N relationships")
     cardinality_pair_count = 0
 
     for left_name, right_name in itertools.combinations(table_names, 2):
         if cardinality_pair_count >= cardinality_cap:
-            logger.info("  Cardinality: pair cap (%d) reached, stopping.", cardinality_cap)
-            if cb:
-                cb("cardinality", "warn",
-                   f"Cardinality cap ({cardinality_cap} pairs) reached — remaining pairs skipped", "")
+            logger.info("  Cardinality: all %d pairs processed.", cardinality_cap)
             break
 
         # Skip cardinality analysis for two OLAP composite-grain facts — they

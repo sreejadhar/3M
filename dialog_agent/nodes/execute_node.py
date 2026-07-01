@@ -230,6 +230,59 @@ def _llm_fix_sql(
         return sql
 
 
+_SF_INVALID_ID_RE = re.compile(
+    r"invalid identifier\s+'([^']+)'",
+    re.IGNORECASE,
+)
+
+
+def _snowflake_fix_identifier_case(sql: str, error_msg: str) -> str:
+    """
+    Deterministic pre-fix for Snowflake 'invalid identifier' errors.
+
+    Snowflake raises 'invalid identifier' when a double-quoted identifier's
+    case does not match what INFORMATION_SCHEMA stores.  The fix is to
+    lowercase the offending identifier and re-quote it.
+
+    Examples:
+      error: invalid identifier 'P.HCP_KEY'
+      fix  : replace "HCP_KEY" → "hcp_key" everywhere in the SQL
+
+      error: invalid identifier 'T.MARKET_NAME'
+      fix  : replace "MARKET_NAME" → "market_name"
+
+    Returns the patched SQL, or the original if nothing could be parsed/fixed.
+    """
+    m = _SF_INVALID_ID_RE.search(error_msg)
+    if not m:
+        return sql
+    bad_id = m.group(1)
+    # bad_id is like 'P.HCP_KEY' or 'HCP_KEY'
+    col_name = bad_id.split(".")[-1]
+    if not col_name:
+        return sql
+    lower_col = col_name.lower()
+    if col_name == lower_col:
+        # Already lowercase — can't fix deterministically; let LLM handle it
+        return sql
+
+    # Replace quoted uppercase form: "HCP_KEY" → "hcp_key"
+    fixed = sql.replace(f'"{col_name}"', f'"{lower_col}"')
+    # Also replace unquoted uppercase form: HCP_KEY → "lower_col"
+    # (using word-boundary so we don't clobber longer names)
+    fixed = re.sub(
+        r'(?<!["\w])' + re.escape(col_name) + r'(?!["\w])',
+        f'"{lower_col}"',
+        fixed,
+    )
+    if fixed != sql:
+        logger.info(
+            "snowflake-fix: replaced identifier %r → %r (deterministic pre-fix)",
+            col_name, lower_col,
+        )
+    return fixed
+
+
 def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = None, kg_id: str = "") -> Dict[str, Any]:
     """
     Execute *sql* against a live DB, retrying up to _MAX_RETRIES times when
@@ -255,6 +308,22 @@ def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = N
         if not _is_retryable(error_msg):
             logger.info("self-heal: non-retryable error — %s", error_msg[:120])
             break
+
+        # For Snowflake 'invalid identifier' errors, try a fast deterministic
+        # case-fix before burning an LLM call — covers the very common pattern
+        # where the LLM emitted "HCP_KEY" but the column is stored as "hcp_key".
+        if (
+            cfg.db_type.lower() == "snowflake"
+            and "invalid identifier" in error_msg.lower()
+        ):
+            deterministic = _snowflake_fix_identifier_case(current_sql, error_msg)
+            if deterministic != current_sql:
+                logger.info(
+                    "self-heal: attempt %d/%d — Snowflake identifier case pre-fix applied",
+                    attempt + 1, _MAX_RETRIES,
+                )
+                current_sql = deterministic
+                continue  # retry immediately without LLM
 
         logger.info(
             "self-heal: attempt %d/%d — type/dialect error, asking LLM to fix SQL\n"

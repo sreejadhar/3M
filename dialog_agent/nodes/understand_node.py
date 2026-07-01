@@ -807,9 +807,20 @@ def _summarise_graph(
             sql_table  = _to_sql_table(label) if samples is not None else label
             tbl_samples   = (samples or {}).get(sql_table, {})
             tbl_hierarchy = (hierarchy or {}).get(sql_table, {})
+            # For Snowflake: build a case-insensitive lookup from the catalog
+            # samples.  The catalog (md_attributes) was populated from
+            # INFORMATION_SCHEMA, so its keys carry the authoritative exact case.
+            # If the KG node title has a stale uppercase column name (from an old
+            # extraction run) this lookup silently corrects it.
+            sf_col_lookup: Dict[str, str] = {}
+            if quote_ids and tbl_samples:
+                sf_col_lookup = {k.lower(): k for k in tbl_samples}
             for col in cols:
                 original_col = col.split(":")[0].strip()
                 col_type     = col[len(original_col):].strip()  # e.g. ": integer"
+                # For Snowflake: correct stale uppercase names using catalog case
+                if quote_ids and sf_col_lookup:
+                    original_col = sf_col_lookup.get(original_col.lower(), original_col)
                 # Translate original KG column name → SQL-safe name used in SQLite
                 sql_col  = _to_sql_col(original_col) if samples is not None else original_col
                 col_info = tbl_samples.get(sql_col)

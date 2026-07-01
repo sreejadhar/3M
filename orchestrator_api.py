@@ -506,6 +506,111 @@ async def _startup() -> None:
             except Exception as _ts_exc:
                 logger.warning("Startup taxonomy sync failed for %s: %s", src["id"][:8], _ts_exc)
 
+        # Snowflake column-case validation — compare stored report_json column
+        # names against actual INFORMATION_SCHEMA and correct any mismatches.
+        # Runs in a background thread; never crashes the service.
+        def _validate_snowflake_column_cases():
+            try:
+                import sys as _sys
+                _sys.path.insert(0, _PROJECT_ROOT)
+                from connectors.snowflake import SnowflakeConnector
+                from config import DBConfig, DBType
+                import sqlite3 as _sqlite3, json as _json
+
+                kg_db_path = str(Path(_PROJECT_ROOT) / "data" / "kg_store.db")
+
+                for src in list(_sources.values()):
+                    if src.get("db_type", "").lower() != "snowflake":
+                        continue
+                    if src.get("status") != "ready":
+                        continue
+                    report = src.get("report") or {}
+                    tables = report.get("tables") or {}
+                    if not tables:
+                        continue
+                    conn_cfg = src.get("connection") or {}
+                    sf_schema = conn_cfg.get("schema_") or conn_cfg.get("schema") or ""
+                    try:
+                        db_cfg = DBConfig(
+                            db_type=DBType.SNOWFLAKE,
+                            host=conn_cfg.get("host", ""),
+                            database=conn_cfg.get("database", ""),
+                            username=conn_cfg.get("username", ""),
+                            password=conn_cfg.get("password", ""),
+                            schema=sf_schema,
+                            extra=conn_cfg.get("extra", {}),
+                        )
+                        sf = SnowflakeConnector(db_cfg)
+                        sf.connect()
+                    except Exception as _ce:
+                        logger.debug("Snowflake col-validation: cannot connect for source %s: %s", src["id"][:8], _ce)
+                        continue
+
+                    report_changed = False
+                    for tbl_name, tbl_meta in tables.items():
+                        if not isinstance(tbl_meta, dict):
+                            continue
+                        try:
+                            actual_cols = sf.get_columns(sf_schema, tbl_name)
+                            actual_map = {c["name"].lower(): c["name"] for c in actual_cols}
+                        except Exception:
+                            continue
+
+                        cols = tbl_meta.get("columns") or []
+                        for col in cols:
+                            stored = col.get("name", "")
+                            correct = actual_map.get(stored.lower())
+                            if correct and stored != correct:
+                                col["name"] = correct
+                                report_changed = True
+                                logger.info(
+                                    "Snowflake col-validation: %s.%s fixed %r→%r",
+                                    src["id"][:8], tbl_name, stored, correct,
+                                )
+
+                    try:
+                        sf.close()
+                    except Exception:
+                        pass
+
+                    if not report_changed:
+                        continue
+
+                    # Persist corrected report_json to kg_store.db
+                    try:
+                        with _sqlite3.connect(kg_db_path, check_same_thread=False) as db_conn:
+                            db_conn.row_factory = _sqlite3.Row
+                            row = db_conn.execute(
+                                "SELECT report_json FROM kg_sources WHERE id=?", (src["id"],)
+                            ).fetchone()
+                            if row:
+                                stored_report = _json.loads(row["report_json"] or "{}")
+                                stored_tables = stored_report.get("tables") or {}
+                                for tbl_name, tbl_meta in tables.items():
+                                    if tbl_name in stored_tables:
+                                        stored_tables[tbl_name]["columns"] = tbl_meta.get("columns", [])
+                                stored_report["tables"] = stored_tables
+                                db_conn.execute(
+                                    "UPDATE kg_sources SET report_json=? WHERE id=?",
+                                    (_json.dumps(stored_report), src["id"]),
+                                )
+                                db_conn.commit()
+                                logger.info(
+                                    "Snowflake col-validation: report_json updated in kg_store for %s",
+                                    src["id"][:8],
+                                )
+                    except Exception as _pe:
+                        logger.warning("Snowflake col-validation: kg_store update failed for %s: %s", src["id"][:8], _pe)
+
+            except Exception as _exc:
+                logger.warning("Snowflake col-validation thread failed (non-fatal): %s", _exc)
+
+        import threading as _threading
+        _threading.Thread(
+            target=_validate_snowflake_column_cases, daemon=True,
+            name="startup-sf-col-validate",
+        ).start()
+
         # Startup bridge inference — run across all restored KG pairs so bridges
         # are available immediately after restart without requiring a re-index.
         # Only runs when ≥2 KGs are registered.  Non-blocking: runs in a thread

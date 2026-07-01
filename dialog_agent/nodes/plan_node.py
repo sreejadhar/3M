@@ -337,7 +337,16 @@ WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully 
                       LAG(col) OVER (PARTITION BY x ORDER BY period_col)  ← correct
                       LAG(col) OVER (PARTITION BY x)                      ← ERROR
 STRING AGGREGATION: LISTAGG(col, ', ') WITHIN GROUP (ORDER BY col)
-                    — STRING_AGG also works, but LISTAGG is the Snowflake-native form"""
+                    — STRING_AGG also works, but LISTAGG is the Snowflake-native form
+GEOGRAPHIC FILTERS: Country data is stored as ISO 2-letter codes in "country_code".
+                    NEVER filter on a full country name string — always map to the code:
+                      Malaysia   → 'MY'    Thailand     → 'TH'    Indonesia  → 'ID'
+                      Philippines→ 'PH'    Vietnam      → 'VN'    Singapore  → 'SG'
+                      India      → 'IN'    Bangladesh   → 'BD'    Sri Lanka  → 'SL'
+                    Use exact equality: WHERE "country_code" = 'MY'
+                    For multi-country: WHERE "country_code" IN ('MY', 'TH')
+                    NEVER fall back to showing all countries when the user names a
+                    specific country — always resolve the name to its code and filter."""
 
     if db == "bigquery":
         return """\

@@ -5,6 +5,7 @@ import {
   reindexSource,
   enrichTaxonomy,
   classifyPII,
+  detectBusiness,
 } from '../api/clients.js';
 import { dbIcon, statusDotClass, fmtRelTime, fmtNum } from '../lib/utils.js';
 import { IconRefresh, IconPlus, IconDatabase, IconOntology, IconLock, IconExcel } from '../components/Icons.jsx';
@@ -47,6 +48,19 @@ export default function PipelineMonitor() {
   const logRef = useRef(null);
 
   const selected = sources.find((s) => s.id === activeSourceId) || null;
+  const [predictedBusiness, setPredictedBusiness] = useState(null); // { business, confidence, method } | null
+  const [businessLoading, setBusinessLoading] = useState(false);
+
+  // Fetch the ML-predicted business/industry whenever the selected source changes.
+  useEffect(() => {
+    setPredictedBusiness(null);
+    if (!activeSourceId) return;
+    setBusinessLoading(true);
+    detectBusiness(activeSourceId)
+      .then((r) => setPredictedBusiness(r))
+      .catch(() => setPredictedBusiness(null))
+      .finally(() => setBusinessLoading(false));
+  }, [activeSourceId]);
 
   // Open / re-open the SSE stream when the selected source changes or sseKey bumps.
   useEffect(() => {
@@ -83,6 +97,11 @@ export default function PipelineMonitor() {
       if (ev.type === 'heartbeat') return;
       setEvents((prev) => [...prev, { ...ev, _ts: Date.now() }]);
       if (ev.status === 'done' || ev.status === 'error') debouncedRefresh();
+      // The classifier retrains in the background after persist — re-fetch the
+      // prediction once that step reports done so the badge reflects it live.
+      if (ev.step === 'business-classifier' && ev.status === 'done') {
+        detectBusiness(activeSourceId).then(setPredictedBusiness).catch(() => {});
+      }
       // Only close the EventSource for a *live* complete — not a replayed one from
       // a prior run, which would prematurely close before this run's events arrive.
       if (ev.step === 'complete' && !ev.is_replay) {
@@ -221,6 +240,14 @@ export default function PipelineMonitor() {
             <div id="detail-src-stats" style={{ display: 'flex', gap: 20, marginTop: 10, fontSize: 11, color: 'var(--text-2)' }}>
               <span>📋 {fmtNum(selected.table_count || 0)} tables</span>
               {selected.domain && <span>🏷️ {selected.domain}</span>}
+              {businessLoading ? (
+                <span>🤖 detecting business…</span>
+              ) : predictedBusiness ? (
+                <span title={predictedBusiness.method === 'ml' ? 'ML-predicted' : 'Rule-based (model not trained yet)'}>
+                  🤖 {predictedBusiness.business}
+                  {predictedBusiness.confidence != null && ` (${Math.round(predictedBusiness.confidence * 100)}%)`}
+                </span>
+              ) : null}
               <span>
                 <span className={`status-dot ${statusDotClass(selected.status)}`} style={{ marginRight: 5 }} />
                 {selected.status}

@@ -1909,6 +1909,29 @@ async def _index_source(source_id: str) -> None:
                     logger.info("Pattern taxonomy: %d columns for %s", n_inf, source_id[:8])
             except Exception as _ti:
                 logger.warning("Pattern taxonomy inference failed for %s: %s", source_id[:8], _ti)
+
+            # Retrain the ML business/industry classifier so it picks up this
+            # source's newly-persisted schema. Fired as a detached background
+            # task (NOT awaited) so it can never add latency to this indexing
+            # run — the pipeline proceeds straight to the ontology step below
+            # while training runs concurrently in a worker thread. Failures
+            # (e.g. not enough bootstrap-labeled sources/classes yet) are
+            # expected while the catalog is still small and are non-fatal.
+            async def _retrain_business_classifier_bg() -> None:
+                try:
+                    import business_classifier as _bc
+                    stats = await asyncio.to_thread(_bc.train)
+                    logger.info("business_classifier retrained after indexing %s: %s",
+                                source_id[:8], stats)
+                    _push_index_event(source_id, "business-classifier", "done",
+                                      f"Business classifier retrained — {stats['trained_on']} sources, "
+                                      f"{len(stats['classes'])} categories")
+                except RuntimeError as _bc_re:
+                    logger.info("business_classifier retrain skipped for %s: %s", source_id[:8], _bc_re)
+                except Exception as _bc_exc:
+                    logger.warning("business_classifier retrain failed for %s: %s", source_id[:8], _bc_exc)
+
+            asyncio.create_task(_retrain_business_classifier_bg())
         except Exception as _me:
             logger.warning("Metadata persistence failed for %s: %s", source_id[:8], _me)
 
@@ -3556,6 +3579,38 @@ async def patch_metadata_source(source_id: str, req: UpdateSourceRequest):
         return updated
     except HTTPException:
         raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/metadata/sources/{source_id}/detect-business")
+async def detect_source_business(source_id: str):
+    """
+    Predict the business/industry for one indexed source using the ML
+    classifier (falls back to the deterministic keyword scorer if no model
+    has been trained yet). Does not modify the source's stored domain —
+    use PATCH /metadata/sources/{source_id} to apply the result.
+    """
+    import business_classifier as _bc
+    try:
+        result = _bc.predict(source_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="No indexed metadata for this source")
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/metadata/business-classifier/train")
+async def train_business_classifier():
+    """Retrain the ML business/industry classifier on all currently indexed sources."""
+    import business_classifier as _bc
+    try:
+        return _bc.train()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

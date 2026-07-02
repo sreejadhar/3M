@@ -283,6 +283,68 @@ def _snowflake_fix_identifier_case(sql: str, error_msg: str) -> str:
     return fixed
 
 
+_DOTTED_LITERAL_RE = re.compile(r'"([A-Za-z0-9_]+\.[A-Za-z0-9_]+)"')
+
+
+def _extract_dotted_literal_columns(schema_context: str) -> List[str]:
+    """
+    Column names that are themselves LITERALLY dotted (e.g. "evt.event_key") —
+    real, single-token Snowflake identifiers auto-generated when a view joins
+    two tables and doesn't alias their shared column name (Snowflake then
+    names the output columns after the unaliased qualified expression). These
+    are pre-quoted in schema_context by understand_node — see the "." check
+    there. Returned in original case, deduped, in first-seen order.
+    """
+    seen: List[str] = []
+    for m in _DOTTED_LITERAL_RE.finditer(schema_context or ""):
+        lit = m.group(1)
+        if lit not in seen:
+            seen.append(lit)
+    return seen
+
+
+def _snowflake_quote_dotted_columns(sql: str, schema_context: str) -> str:
+    """
+    Deterministic pre-fix for Snowflake 'invalid identifier' errors caused by a
+    LITERAL dotted column name. The LLM commonly misreads "evt.event_key" as
+    alias-qualification and emits it split — either fully unquoted
+    (evt.event_key) or only the tail quoted (evt."event_key") — both of which
+    Snowflake rejects because the real identifier is the ENTIRE dotted string.
+
+    Rewrites any such broken reference back into the single, correctly quoted
+    identifier "evt.event_key". Returns sql unchanged if schema_context has no
+    literal dotted columns, or none of the broken forms are present.
+    """
+    literals = _extract_dotted_literal_columns(schema_context)
+    if not literals:
+        return sql
+
+    fixed = sql
+    for lit in literals:
+        alias, _, col = lit.partition(".")
+        if not alias or not col:
+            continue
+        # Tail-only-quoted form: alias."col"  →  "alias.col"
+        fixed = re.sub(
+            r'\b' + re.escape(alias) + r'\s*\.\s*"' + re.escape(col) + r'"',
+            f'"{lit}"',
+            fixed,
+            flags=re.IGNORECASE,
+        )
+        # Fully unquoted form: alias.col  →  "alias.col"  (word-boundary guarded
+        # so an already-fixed '"alias.col"' occurrence is left untouched)
+        fixed = re.sub(
+            r'(?<!["\w])' + re.escape(alias) + r'\.' + re.escape(col) + r'(?!["\w])',
+            f'"{lit}"',
+            fixed,
+            flags=re.IGNORECASE,
+        )
+
+    if fixed != sql:
+        logger.info("snowflake-fix: quoted literal dotted column(s) (deterministic pre-fix)")
+    return fixed
+
+
 def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = None, kg_id: str = "") -> Dict[str, Any]:
     """
     Execute *sql* against a live DB, retrying up to _MAX_RETRIES times when
@@ -309,18 +371,25 @@ def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = N
             logger.info("self-heal: non-retryable error — %s", error_msg[:120])
             break
 
-        # For Snowflake 'invalid identifier' errors, try a fast deterministic
-        # case-fix before burning an LLM call — covers the very common pattern
-        # where the LLM emitted "HCP_KEY" but the column is stored as "hcp_key".
+        # For Snowflake 'invalid identifier' errors, try fast deterministic
+        # pre-fixes before burning an LLM call:
+        #   1. literal dotted column names split/mis-quoted by the LLM (e.g.
+        #      "evt.event_key" written as evt."event_key" or evt.event_key)
+        #   2. the very common case-mismatch pattern (HCP_KEY vs hcp_key)
         if (
             cfg.db_type.lower() == "snowflake"
             and "invalid identifier" in error_msg.lower()
         ):
-            deterministic = _snowflake_fix_identifier_case(current_sql, error_msg)
+            schema_context = (state or {}).get("schema_context", "")
+            deterministic = _snowflake_quote_dotted_columns(current_sql, schema_context)
+            fix_kind = "dotted-column quoting"
+            if deterministic == current_sql:
+                deterministic = _snowflake_fix_identifier_case(current_sql, error_msg)
+                fix_kind = "identifier case"
             if deterministic != current_sql:
                 logger.info(
-                    "self-heal: attempt %d/%d — Snowflake identifier case pre-fix applied",
-                    attempt + 1, _MAX_RETRIES,
+                    "self-heal: attempt %d/%d — Snowflake %s pre-fix applied",
+                    attempt + 1, _MAX_RETRIES, fix_kind,
                 )
                 current_sql = deterministic
                 continue  # retry immediately without LLM

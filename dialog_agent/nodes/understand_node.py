@@ -829,6 +829,22 @@ def _summarise_graph(
                 # with quotes and doesn't fold them to uppercase.
                 if quote_ids:
                     display = f'"{original_col}"{col_type}'
+                    # Some views auto-name an unaliased duplicate join column as
+                    # a LITERAL dotted string (e.g. a view joining EVENT_MASTER
+                    # "evt" with EVENT_MATERIAL "evt_mat" without aliasing their
+                    # shared event_key produces columns actually named
+                    # evt.event_key / evt_mat.event_key). The dot is part of the
+                    # identifier, not table-qualification — warn explicitly so
+                    # the LLM doesn't split it into alias.column and re-quote
+                    # only the tail (which Snowflake then rejects).
+                    if "." in original_col:
+                        display += (
+                            "  [LITERAL COLUMN NAME — the dot is part of the name, "
+                            "NOT alias.column qualification; copy the ENTIRE quoted "
+                            f'string "{original_col}" exactly as one identifier, '
+                            f'do NOT write it as alias."{original_col.split(".", 1)[-1]}" '
+                            f'or unquoted {original_col}]'
+                        )
                 elif samples is not None:
                     display = f"{sql_col}{col_type}"
                 else:

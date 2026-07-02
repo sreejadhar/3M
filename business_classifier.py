@@ -1,25 +1,37 @@
 """
 business_classifier.py
-ML-based business/industry classifier for datasources.
+ML-based business/industry classifier for datasources — with an OPEN, self-growing
+taxonomy instead of a fixed category list.
 
-DataNanite already infers a business "domain" for each datasource with a
-deterministic keyword scorer (`_INDUSTRY_SIGNALS` / `_infer_domain_from_report`
-in orchestrator_api.py). This module trains a real statistical classifier
-(TF-IDF + Logistic Regression) on top of the SAME table/column names and
-sampled values already persisted in the metadata catalog, using the keyword
-scorer's output as bootstrap pseudo-labels — so no manual labeling is
-required to get started, but the trained model can generalize past exact
-keyword matches (synonyms, partial hits, unseen naming conventions).
+The label space is NOT hardcoded. For each source, an LLM looks at the actual
+table/column names and sampled values and decides the business/industry — reusing
+one of the categories already seen across other sources when it genuinely fits,
+or coining a new one (e.g. "Human Resources") when none of the existing labels
+apply. Every decision is persisted in `md_business_labels`, so the taxonomy is
+simply "whatever distinct labels exist in that table" — it grows automatically
+as new kinds of datasources get indexed, with no code change required.
+
+A TF-IDF + Logistic Regression model is trained on top of those LLM-assigned
+labels so that classification is fast (no LLM round-trip) for sources that
+already resemble ones seen before; its class list is whatever labels exist in
+the table at training time, so it grows/shrinks with the taxonomy too.
+
+The only hardcoded piece left is a small keyword scorer (_INDUSTRY_SIGNALS),
+kept purely as a last-resort fallback for when the LLM is unreachable (e.g. no
+ANTHROPIC_API_KEY configured) — it is never the source of truth for the label
+space and is not used to decide what categories can exist.
 
 Standalone / root-level (like metadata_catalog.py) so it can be imported by
 orchestrator_api.py without pulling in unrelated heavy deps.
 
 Public API
 ----------
-build_training_set()   -> List[Tuple[text, label]]   bootstrap-labeled examples
-train(min_examples=4)  -> dict                        trains + persists the model, returns stats
-is_trained()            -> bool
-predict(source_id)      -> dict | None                {"business", "confidence", "method"}
+known_labels()          -> List[str]                  the current (dynamic) taxonomy
+label_source(source_id) -> dict | None                 LLM-classify one source, cache + return it
+build_training_set()    -> List[Tuple[text, label]]    cached LLM-labeled examples
+train(min_examples=4)   -> dict                         trains + persists the model, returns stats
+is_trained()             -> bool
+predict(source_id)       -> dict | None                 {"business", "confidence", "method"}
 """
 from __future__ import annotations
 
@@ -27,6 +39,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -36,13 +49,15 @@ logger = logging.getLogger(__name__)
 
 MODEL_PATH = os.environ.get("BUSINESS_MODEL_PATH", "data/business_classifier.joblib")
 
-# Minimum keyword-signal score (name hits + 0.5 * sample hits) for a source
-# to be considered confidently labeled enough to use as a training example.
+# Minimum keyword-signal score (name hits + 0.5 * sample hits) for the
+# last-resort fallback scorer to consider itself confident.
 _MIN_BOOTSTRAP_SCORE = 1.0
 
+# ── Last-resort fallback ONLY (used when the LLM can't be reached) ─────────────
 # Kept in sync with orchestrator_api.py's _INDUSTRY_SIGNALS / _INDUSTRY_SAMPLE_SIGNALS
 # (industry tier only — copied rather than imported so this module stays free of
 # orchestrator_api's heavy runtime deps, matching metadata_catalog.py's design).
+# NOT the taxonomy — see label_source()/known_labels() for the real, open-ended one.
 _INDUSTRY_SIGNALS: List[Tuple[str, set]] = [
     ("Aviation", {
         "aircraft", "aircraft_type", "tail_number", "tail_no", "registration",
@@ -348,7 +363,7 @@ _INDUSTRY_SAMPLE_SIGNALS: Dict[str, set] = {
 
 
 def _score_industry(name_tokens: set, sample_tokens: set) -> Optional[Tuple[str, float]]:
-    """Same scoring rule as orchestrator_api._infer_domain_from_report's industry tier: name hits (weight 1.0) + sample hits (weight 0.5)."""
+    """Fallback only — see module docstring. Same rule as orchestrator_api._infer_domain_from_report's industry tier."""
     best_label, best_score = None, 0.0
     for label, name_signals in _INDUSTRY_SIGNALS:
         name_hits = len(name_tokens & name_signals)
@@ -359,6 +374,159 @@ def _score_industry(name_tokens: set, sample_tokens: set) -> Optional[Tuple[str,
     if best_label is None or best_score < _MIN_BOOTSTRAP_SCORE:
         return None
     return best_label, best_score
+
+
+# ── Open taxonomy: persisted LLM labels ─────────────────────────────────────────
+
+_DDL_LABELS = """
+CREATE TABLE IF NOT EXISTS md_business_labels (
+    source_id   TEXT PRIMARY KEY,
+    label       TEXT NOT NULL,
+    is_new      INTEGER NOT NULL DEFAULT 0,
+    confidence  REAL,
+    updated_at  TEXT NOT NULL
+)
+"""
+
+
+def _ensure_labels_table(cur) -> None:
+    cur.ddl(_DDL_LABELS)
+
+
+def known_labels() -> List[str]:
+    """The current taxonomy — every distinct business/industry label assigned to any source so far. Grows dynamically; never a fixed list."""
+    with _mc._cursor_ctx() as cur:
+        _ensure_labels_table(cur)
+        rows = cur.execute(
+            "SELECT DISTINCT label FROM md_business_labels ORDER BY label"
+        ).fetchall()
+    return [r["label"] for r in rows]
+
+
+def _get_cached_label(source_id: str) -> Optional[Dict]:
+    with _mc._cursor_ctx() as cur:
+        _ensure_labels_table(cur)
+        row = cur.execute(
+            "SELECT label, is_new, confidence FROM md_business_labels WHERE source_id=?",
+            (source_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "business":   row["label"],
+        "confidence": row.get("confidence"),
+        "method":     "llm",
+        "is_new":     bool(row.get("is_new")),
+    }
+
+
+def _store_label(source_id: str, label: str, is_new: bool, confidence: Optional[float]) -> None:
+    with _mc._cursor_ctx() as cur:
+        _ensure_labels_table(cur)
+        cur.execute(
+            "INSERT INTO md_business_labels (source_id, label, is_new, confidence, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(source_id) DO UPDATE SET "
+            "label=excluded.label, is_new=excluded.is_new, "
+            "confidence=excluded.confidence, updated_at=excluded.updated_at",
+            (source_id, label, int(is_new), confidence, _mc._now()),
+        )
+
+
+_CLASSIFY_SYSTEM = (
+    "You classify a datasource's business/industry purely from its own schema — the "
+    "table names, column names, and sample values given below. Judge ONLY what this "
+    "specific data looks like; do not try to match, reuse, or steer toward any category "
+    "used for other datasources — there is no preset list to fit into.\n\n"
+    "Give a concise, accurate business/industry label (1-4 words, Title Case, e.g. "
+    "'Human Resources', 'Aviation Operations', 'Legal Services') that describes what "
+    "this data is actually about.\n\n"
+    "Respond with ONLY a JSON object, no markdown fences: "
+    '{"label": "<category name>", "confidence": <0.0-1.0>}'
+)
+
+
+def _llm_classify_business(text: str, model: Optional[str] = None) -> Optional[Dict]:
+    """Ask the LLM to name this source's business/industry from its schema signals alone — no prior taxonomy is shown to it. Returns None on any failure (caller falls back)."""
+    model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5")
+    # Cap prompt size — schema signal tokens are already deduped/sorted by _text_blob.
+    signals = " ".join(text.split()[:400])
+    user_msg = (
+        f"Schema signals for this datasource (table names, column names, sample values):\n"
+        f"{signals}\n\n"
+        f"What business/industry is this datasource?"
+    )
+    try:
+        from llm_client import get_client
+        client = get_client()
+        msg = client.messages.create(
+            model=model, max_tokens=256, temperature=0.0,
+            system=_CLASSIFY_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = msg.content[0].text if msg.content else ""
+    except Exception as exc:
+        logger.warning("business_classifier: LLM call failed — %s", exc)
+        return None
+
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+    try:
+        obj = json.loads(cleaned)
+    except json.JSONDecodeError:
+        s, e = cleaned.find("{"), cleaned.rfind("}")
+        if s == -1 or e == -1:
+            logger.warning("business_classifier: could not parse LLM response: %r", raw[:200])
+            return None
+        try:
+            obj = json.loads(cleaned[s:e + 1])
+        except json.JSONDecodeError:
+            logger.warning("business_classifier: could not parse LLM response: %r", raw[:200])
+            return None
+
+    label = str(obj.get("label") or "").strip()
+    if not label:
+        return None
+    return {
+        "label":      label,
+        "confidence": float(obj.get("confidence")) if obj.get("confidence") is not None else None,
+    }
+
+
+def label_source(source_id: str, model: Optional[str] = None, force: bool = False) -> Optional[Dict]:
+    """
+    Classify one source purely from its own schema signals (no other source's
+    label is shown to the LLM) and persist the result. Returns the cached
+    label without an LLM call unless force=True. Returns None if the source
+    has no metadata indexed, or the LLM is unreachable.
+    """
+    if not force:
+        cached = _get_cached_label(source_id)
+        if cached:
+            return cached
+
+    per_source = _fetch_source_texts()
+    bucket = per_source.get(source_id)
+    if not bucket or not (bucket["names"] or bucket["samples"]):
+        return None
+
+    text = _text_blob(bucket)
+    result = _llm_classify_business(text, model=model)
+    if not result:
+        return None
+
+    # is_new is a post-hoc, deterministic check against the taxonomy accumulated
+    # so far (case-insensitive exact match) — purely informational for the UI/
+    # event log, it plays no part in how the LLM arrived at the label above.
+    existing = {l.lower() for l in known_labels()}
+    is_new = result["label"].lower() not in existing
+
+    _store_label(source_id, result["label"], is_new, result["confidence"])
+    return {
+        "business":   result["label"],
+        "confidence": result["confidence"],
+        "method":     "llm",
+        "is_new":     is_new,
+    }
 
 
 def _fetch_source_texts() -> Dict[str, Dict[str, set]]:
@@ -403,17 +571,23 @@ def _text_blob(bucket: Dict[str, set]) -> str:
 
 def build_training_set() -> List[Tuple[str, str]]:
     """
-    Bootstrap (text, label) pairs from every indexed source, using the existing
-    keyword-based industry scorer as a pseudo-labeler. Sources with no keyword
-    signal strong enough to clear _MIN_BOOTSTRAP_SCORE are skipped.
+    (text, label) pairs for every source that already has a cached LLM label
+    in md_business_labels. Sources never classified yet (label_source() hasn't
+    run for them — e.g. via indexing or a /detect-business call) are skipped;
+    they'll be picked up once they get a label. The label set here — and
+    therefore the model's classes — is exactly the current open taxonomy.
     """
+    with _mc._cursor_ctx() as cur:
+        _ensure_labels_table(cur)
+        rows = cur.execute("SELECT source_id, label FROM md_business_labels").fetchall()
+    labels_by_source = {r["source_id"]: r["label"] for r in rows}
+
     per_source = _fetch_source_texts()
     examples: List[Tuple[str, str]] = []
-    for bucket in per_source.values():
-        scored = _score_industry(bucket["names"], bucket["samples"])
-        if not scored:
+    for source_id, label in labels_by_source.items():
+        bucket = per_source.get(source_id)
+        if not bucket or not (bucket["names"] or bucket["samples"]):
             continue
-        label, _score = scored
         examples.append((_text_blob(bucket), label))
     return examples
 
@@ -478,17 +652,40 @@ def _load_model():
 
 def predict(source_id: str) -> Optional[Dict]:
     """
-    Predict the business/industry for one already-indexed source.
-    Uses the trained ML model when available; falls back to the deterministic
-    keyword scorer (same rule already used elsewhere in the app) when no model
-    has been trained yet. Returns None if the source has no metadata indexed.
+    Predict the business/industry for one already-indexed source, from the
+    OPEN taxonomy (see module docstring) — never a fixed category list.
+
+    Order of precedence:
+      1. Cached LLM label for this exact source (no LLM call — cheap, and
+         still fully dynamic since it's whatever label the LLM assigned).
+      2. A fresh, live LLM classification (label_source()) — this is the
+         source of truth, so it's tried before the ML model on every
+         never-before-seen source; caches the result for next time and can
+         coin a brand-new taxonomy entry on the spot (e.g. "Human Resources").
+      3. Trained ML model — ONLY reached if the LLM call itself failed
+         (e.g. transient API error). Its classes are whatever the taxonomy
+         currently contains, so it stays roughly in sync, but it's a
+         same-request fallback, not the primary decision path.
+      4. Keyword-scorer fallback — ONLY reached if the LLM is unreachable at
+         all (e.g. no ANTHROPIC_API_KEY configured). Degraded offline mode,
+         never the source of truth for what categories can exist.
+
+    Returns None if the source has no metadata indexed.
     """
+    cached = _get_cached_label(source_id)
+    if cached:
+        return cached
+
+    live = label_source(source_id)
+    if live:
+        return live
+
     per_source = _fetch_source_texts()
     bucket = per_source.get(source_id)
     if not bucket or not (bucket["names"] or bucket["samples"]):
         return None
-
     text = _text_blob(bucket)
+
     model = _load_model()
     if model is not None:
         proba = model.predict_proba([text])[0]
@@ -497,29 +694,54 @@ def predict(source_id: str) -> Optional[Dict]:
         return {
             "business":   str(classes[best_idx]),
             "confidence": round(float(proba[best_idx]), 4),
-            "method":     "ml",
+            "method":     "ml-fallback",
         }
 
     scored = _score_industry(bucket["names"], bucket["samples"])
     if not scored:
         return None
     label, score = scored
-    return {"business": label, "confidence": None, "method": "rule", "score": score}
+    return {"business": label, "confidence": None, "method": "rule-fallback", "score": score}
+
+
+def backfill() -> Dict:
+    """Live-classify (LLM) every indexed source that has no cached label yet. Makes one LLM call per unlabeled source."""
+    per_source = _fetch_source_texts()
+    labeled, skipped = [], []
+    for source_id in per_source:
+        result = label_source(source_id)
+        if result:
+            labeled.append({"source_id": source_id, **result})
+        else:
+            skipped.append(source_id)
+    return {"labeled": len(labeled), "skipped": len(skipped), "results": labeled}
 
 
 def _cli() -> None:
     parser = argparse.ArgumentParser(description="Business/industry classifier for datasources")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("train")
+    sub.add_parser("backfill")
+    sub.add_parser("labels")
     predict_parser = sub.add_parser("predict")
     predict_parser.add_argument("source_id")
+    label_parser = sub.add_parser("label")
+    label_parser.add_argument("source_id")
+    label_parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     if args.cmd == "train":
         print(json.dumps(train(), indent=2))
+    elif args.cmd == "backfill":
+        print(json.dumps(backfill(), indent=2))
+    elif args.cmd == "labels":
+        print(json.dumps(known_labels(), indent=2))
     elif args.cmd == "predict":
         result = predict(args.source_id)
+        print(json.dumps(result, indent=2) if result else "null")
+    elif args.cmd == "label":
+        result = label_source(args.source_id, force=args.force)
         print(json.dumps(result, indent=2) if result else "null")
 
 

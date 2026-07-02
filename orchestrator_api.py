@@ -1910,16 +1910,22 @@ async def _index_source(source_id: str) -> None:
             except Exception as _ti:
                 logger.warning("Pattern taxonomy inference failed for %s: %s", source_id[:8], _ti)
 
-            # Retrain the ML business/industry classifier so it picks up this
-            # source's newly-persisted schema. Fired as a detached background
-            # task (NOT awaited) so it can never add latency to this indexing
-            # run — the pipeline proceeds straight to the ontology step below
-            # while training runs concurrently in a worker thread. Failures
-            # (e.g. not enough bootstrap-labeled sources/classes yet) are
-            # expected while the catalog is still small and are non-fatal.
-            async def _retrain_business_classifier_bg() -> None:
+            # (Re)classify this source's business/industry against the OPEN
+            # taxonomy — an LLM call, not a fixed category list — then retrain
+            # the ML fast-path model on whatever labels now exist. Fired as a
+            # detached background task (NOT awaited) so neither the LLM call
+            # nor training can add latency to this indexing run — the pipeline
+            # proceeds straight to the ontology step below while this runs
+            # concurrently. force=True because a reindex may mean the schema
+            # changed, so the old cached label shouldn't just be kept as-is.
+            async def _classify_and_retrain_bg() -> None:
                 try:
                     import business_classifier as _bc
+                    label_result = await asyncio.to_thread(_bc.label_source, source_id, None, True)
+                    if label_result:
+                        tag = " (new category)" if label_result.get("is_new") else ""
+                        _push_index_event(source_id, "business-classifier", "running",
+                                          f"Business classified: {label_result['business']}{tag}")
                     stats = await asyncio.to_thread(_bc.train)
                     logger.info("business_classifier retrained after indexing %s: %s",
                                 source_id[:8], stats)
@@ -1929,9 +1935,9 @@ async def _index_source(source_id: str) -> None:
                 except RuntimeError as _bc_re:
                     logger.info("business_classifier retrain skipped for %s: %s", source_id[:8], _bc_re)
                 except Exception as _bc_exc:
-                    logger.warning("business_classifier retrain failed for %s: %s", source_id[:8], _bc_exc)
+                    logger.warning("business_classifier classify/retrain failed for %s: %s", source_id[:8], _bc_exc)
 
-            asyncio.create_task(_retrain_business_classifier_bg())
+            asyncio.create_task(_classify_and_retrain_bg())
         except Exception as _me:
             logger.warning("Metadata persistence failed for %s: %s", source_id[:8], _me)
 
@@ -3584,16 +3590,22 @@ async def patch_metadata_source(source_id: str, req: UpdateSourceRequest):
 
 
 @app.post("/metadata/sources/{source_id}/detect-business")
-async def detect_source_business(source_id: str):
+async def detect_source_business(source_id: str, force: bool = False):
     """
-    Predict the business/industry for one indexed source using the ML
-    classifier (falls back to the deterministic keyword scorer if no model
-    has been trained yet). Does not modify the source's stored domain —
-    use PATCH /metadata/sources/{source_id} to apply the result.
+    Classify one indexed source's business/industry against the OPEN taxonomy
+    (see business_classifier.py — labels are LLM-assigned and persisted, not a
+    fixed category list; a genuinely new kind of source gets a brand-new
+    category). force=true bypasses the cache and re-classifies live. Runs off
+    the event loop (asyncio.to_thread) since it may make a synchronous LLM
+    call. Does not modify the source's stored domain — use
+    PATCH /metadata/sources/{source_id} to apply the result there.
     """
     import business_classifier as _bc
     try:
-        result = _bc.predict(source_id)
+        if force:
+            result = await asyncio.to_thread(_bc.label_source, source_id, None, True)
+        else:
+            result = await asyncio.to_thread(_bc.predict, source_id)
         if result is None:
             raise HTTPException(status_code=404, detail="No indexed metadata for this source")
         return result
@@ -3605,10 +3617,10 @@ async def detect_source_business(source_id: str):
 
 @app.post("/metadata/business-classifier/train")
 async def train_business_classifier():
-    """Retrain the ML business/industry classifier on all currently indexed sources."""
+    """Retrain the ML business/industry classifier on all currently LLM-labeled sources."""
     import business_classifier as _bc
     try:
-        return _bc.train()
+        return await asyncio.to_thread(_bc.train)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:

@@ -55,13 +55,18 @@ export default function PipelineMonitor() {
   const [domainLoading, setDomainLoading] = useState(false);
 
   // Fetch the LLM-predicted business/industry whenever the selected source changes.
+  // A fetch failure (e.g. a transient 500/504 while the orchestrator's event
+  // loop is busy mid-reindex) is not proof the source has no label — it's the
+  // request that failed, not the classification — so on error we keep
+  // whatever was last successfully shown instead of clearing it, to avoid a
+  // "flashes then disappears" flicker. Only a genuine source switch resets it.
   useEffect(() => {
     setPredictedBusiness(null);
     if (!activeSourceId) return;
     setBusinessLoading(true);
     detectBusiness(activeSourceId)
       .then((r) => setPredictedBusiness(r))
-      .catch(() => setPredictedBusiness(null))
+      .catch(() => {})
       .finally(() => setBusinessLoading(false));
   }, [activeSourceId]);
 
@@ -73,7 +78,7 @@ export default function PipelineMonitor() {
     setDomainLoading(true);
     detectDomain(activeSourceId)
       .then((r) => setPredictedDomain(r))
-      .catch(() => setPredictedDomain(null))
+      .catch(() => {})
       .finally(() => setDomainLoading(false));
   }, [activeSourceId]);
 

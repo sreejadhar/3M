@@ -83,6 +83,7 @@ export const listRedundancies = () => apiGet('/metadata/redundancies');
 export const enrichTaxonomy = (id) => apiPost(`/metadata/sources/${id}/enrich-taxonomy`);
 export const classifyPII = (id) => apiPost(`/metadata/sources/${id}/classify-pii`);
 export const detectBusiness = (id) => apiPost(`/metadata/sources/${id}/detect-business`);
+export const detectDomain = (id) => apiPost(`/metadata/sources/${id}/detect-domain`);
 
 // ── KG bridges ──────────────────────────────────────────────────────────────
 export const listBridges = () => apiGet('/kg-bridges');

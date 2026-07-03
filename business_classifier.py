@@ -53,6 +53,13 @@ MODEL_PATH = os.environ.get("BUSINESS_MODEL_PATH", "data/business_classifier.job
 # last-resort fallback scorer to consider itself confident.
 _MIN_BOOTSTRAP_SCORE = 1.0
 
+# A cached label with a numeric confidence below this is treated as "wrongly
+# generated" — reindexing will re-classify it rather than trusting the cache.
+# A cached label with no confidence value at all (e.g. rule-fallback) is left
+# alone; this threshold only applies to LLM-scored labels. Tunable via env
+# for environments where the LLM tends to under/over-report confidence.
+_MIN_CONFIDENCE = float(os.environ.get("BUSINESS_MIN_CONFIDENCE", "0.7"))
+
 # ── Last-resort fallback ONLY (used when the LLM can't be reached) ─────────────
 # Kept in sync with orchestrator_api.py's _INDUSTRY_SIGNALS / _INDUSTRY_SAMPLE_SIGNALS
 # (industry tier only — copied rather than imported so this module stays free of
@@ -420,6 +427,16 @@ def _get_cached_label(source_id: str) -> Optional[Dict]:
     }
 
 
+def get_cached_label(source_id: str) -> Optional[Dict]:
+    """Public, LLM-free read of whatever label indexing already assigned this
+    source (or None if it hasn't been indexed/classified yet). Classification
+    itself only ever happens from the indexing/reindexing pipeline
+    (see orchestrator_api._index_source) — this is for callers (e.g. the UI)
+    that just want to display the current label without triggering a new
+    LLM call."""
+    return _get_cached_label(source_id)
+
+
 def _store_label(source_id: str, label: str, is_new: bool, confidence: Optional[float]) -> None:
     with _mc._cursor_ctx() as cur:
         _ensure_labels_table(cur)
@@ -496,12 +513,18 @@ def label_source(source_id: str, model: Optional[str] = None, force: bool = Fals
     """
     Classify one source purely from its own schema signals (no other source's
     label is shown to the LLM) and persist the result. Returns the cached
-    label without an LLM call unless force=True. Returns None if the source
-    has no metadata indexed, or the LLM is unreachable.
+    label without an LLM call unless force=True, or unless the cached label
+    is missing altogether, or was a low-confidence ("wrongly generated") LLM
+    call — either case re-classifies as if force=True. Returns None if the
+    source has no metadata indexed, or the LLM is unreachable.
     """
     if not force:
         cached = _get_cached_label(source_id)
-        if cached:
+        if cached and not (
+            cached.get("method") == "llm"
+            and cached.get("confidence") is not None
+            and cached["confidence"] < _MIN_CONFIDENCE
+        ):
             return cached
 
     per_source = _fetch_source_texts()

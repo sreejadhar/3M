@@ -1896,13 +1896,18 @@ async def _index_source(source_id: str) -> None:
                           f"Tables: {', '.join(src['table_names'][:10])}" + ("…" if src['table_count'] > 10 else ""))
 
         # ── Persist metadata to catalog store ──────────────────────────────────
+        # Both calls are synchronous, per-table/per-column SQLite work — for a
+        # large star schema (dozens of tables) that can take many seconds.
+        # Run off the event loop (asyncio.to_thread) so it can't block every
+        # other in-flight request (e.g. the UI's detect-business/detect-domain
+        # polling) for the entire duration.
         try:
-            n = _mc.persist(source_id, src.get("name", ""), report)
+            n = await asyncio.to_thread(_mc.persist, source_id, src.get("name", ""), report)
             logger.info("Persisted %d metadata entities for source %s", n, source_id[:8])
             # Run deterministic taxonomy inference immediately after persist
             # so taxonomy fields are populated even before the KG / LLM steps run.
             try:
-                n_inf = _mc.infer_taxonomy(source_id, domain=src.get("domain", ""))
+                n_inf = await asyncio.to_thread(_mc.infer_taxonomy, source_id, domain=src.get("domain", ""))
                 if n_inf:
                     _push_index_event(source_id, "taxonomy", "done",
                                       f"Taxonomy inferred — {n_inf} columns classified (pattern-based)")

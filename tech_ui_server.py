@@ -159,13 +159,25 @@ async def _proxy(request: Request, downstream_path: str) -> Response:
 
     body = await request.body()
 
-    async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT) as client:
-        upstream = await client.request(
-            method=request.method,
-            url=url,
-            headers=_req_headers(request),
-            content=body,
-        )
+    try:
+        async with httpx.AsyncClient(timeout=_PROXY_TIMEOUT) as client:
+            upstream = await client.request(
+                method=request.method,
+                url=url,
+                headers=_req_headers(request),
+                content=body,
+            )
+    except httpx.TimeoutException:
+        # The orchestrator can be unresponsive for a while during a heavy
+        # reindex (event loop busy with a large source) — surface a clean,
+        # retryable 504 instead of letting httpx's exception crash this route
+        # and fall through to Starlette's bare "Internal Server Error".
+        return Response(content=b'{"detail":"Upstream service timed out"}',
+                         status_code=504, media_type="application/json")
+    except httpx.HTTPError as exc:
+        log.warning("Proxy request to %s failed: %s", url, exc)
+        return Response(content=b'{"detail":"Upstream service unreachable"}',
+                         status_code=502, media_type="application/json")
 
     return Response(
         content=upstream.content,

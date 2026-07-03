@@ -6,6 +6,7 @@ import {
   enrichTaxonomy,
   classifyPII,
   detectBusiness,
+  detectDomain,
 } from '../api/clients.js';
 import { dbIcon, statusDotClass, fmtRelTime, fmtNum } from '../lib/utils.js';
 import { IconRefresh, IconPlus, IconDatabase, IconOntology, IconLock, IconExcel } from '../components/Icons.jsx';
@@ -50,8 +51,10 @@ export default function PipelineMonitor() {
   const selected = sources.find((s) => s.id === activeSourceId) || null;
   const [predictedBusiness, setPredictedBusiness] = useState(null); // { business, confidence, method } | null
   const [businessLoading, setBusinessLoading] = useState(false);
+  const [predictedDomain, setPredictedDomain] = useState(null); // { sub_domain, confidence, method } | null
+  const [domainLoading, setDomainLoading] = useState(false);
 
-  // Fetch the ML-predicted business/industry whenever the selected source changes.
+  // Fetch the LLM-predicted business/industry whenever the selected source changes.
   useEffect(() => {
     setPredictedBusiness(null);
     if (!activeSourceId) return;
@@ -60,6 +63,18 @@ export default function PipelineMonitor() {
       .then((r) => setPredictedBusiness(r))
       .catch(() => setPredictedBusiness(null))
       .finally(() => setBusinessLoading(false));
+  }, [activeSourceId]);
+
+  // Fetch the LLM-predicted sub-domain (nested under the business above)
+  // whenever the selected source changes — same pattern as business above.
+  useEffect(() => {
+    setPredictedDomain(null);
+    if (!activeSourceId) return;
+    setDomainLoading(true);
+    detectDomain(activeSourceId)
+      .then((r) => setPredictedDomain(r))
+      .catch(() => setPredictedDomain(null))
+      .finally(() => setDomainLoading(false));
   }, [activeSourceId]);
 
   // Open / re-open the SSE stream when the selected source changes or sseKey bumps.
@@ -101,6 +116,9 @@ export default function PipelineMonitor() {
       // prediction once that step reports done so the badge reflects it live.
       if (ev.step === 'business-classifier' && ev.status === 'done') {
         detectBusiness(activeSourceId).then(setPredictedBusiness).catch(() => {});
+      }
+      if (ev.step === 'domain-classifier' && ev.status === 'done') {
+        detectDomain(activeSourceId).then(setPredictedDomain).catch(() => {});
       }
       // Only close the EventSource for a *live* complete — not a replayed one from
       // a prior run, which would prematurely close before this run's events arrive.
@@ -239,7 +257,16 @@ export default function PipelineMonitor() {
             </div>
             <div id="detail-src-stats" style={{ display: 'flex', gap: 20, marginTop: 10, fontSize: 11, color: 'var(--text-2)' }}>
               <span>📋 {fmtNum(selected.table_count || 0)} tables</span>
-              {selected.domain && <span>🏷️ {selected.domain}</span>}
+              {domainLoading ? (
+                <span>🏷️ detecting sub-domain…</span>
+              ) : predictedDomain ? (
+                <span title={predictedDomain.method === 'llm' ? 'LLM-predicted' : 'Rule-based fallback (LLM unreachable)'}>
+                  🏷️ {predictedDomain.sub_domain}
+                  {predictedDomain.confidence != null && ` (${Math.round(predictedDomain.confidence * 100)}%)`}
+                </span>
+              ) : selected.domain ? (
+                <span>🏷️ {selected.domain}</span>
+              ) : null}
               {businessLoading ? (
                 <span>🤖 detecting business…</span>
               ) : predictedBusiness ? (

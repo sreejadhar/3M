@@ -1910,22 +1910,46 @@ async def _index_source(source_id: str) -> None:
             except Exception as _ti:
                 logger.warning("Pattern taxonomy inference failed for %s: %s", source_id[:8], _ti)
 
-            # (Re)classify this source's business/industry against the OPEN
-            # taxonomy — an LLM call, not a fixed category list — then retrain
-            # the ML fast-path model on whatever labels now exist. Fired as a
-            # detached background task (NOT awaited) so neither the LLM call
-            # nor training can add latency to this indexing run — the pipeline
+            # Classify this source's business/industry against the OPEN
+            # taxonomy — an LLM call, not a fixed category list — then its
+            # sub-domain (the function/process within that business, e.g.
+            # "Supply Chain") against its own OPEN taxonomy, then retrain the
+            # business ML fast-path model. Sub-domain classification runs
+            # AFTER business classification and is given the business label as
+            # context, so the two can never disagree the way the old
+            # independent keyword scorers could (e.g. business="Footwear
+            # Manufacturing & Retail" vs domain="CPG/Supply Chain"). Fired as a
+            # detached background task (NOT awaited) so neither LLM call nor
+            # training can add latency to this indexing run — the pipeline
             # proceeds straight to the ontology step below while this runs
-            # concurrently. force=True because a reindex may mean the schema
-            # changed, so the old cached label shouldn't just be kept as-is.
+            # concurrently. force=False — label_source() itself decides
+            # whether to actually call the LLM: a source with a good-
+            # confidence cached label just reads it back from
+            # md_business_labels/md_domain_labels (no LLM call, no added
+            # load), while a source with no cached label yet (new source, or
+            # one indexed before this classifier existed) or a low-confidence
+            # ("wrongly generated") one is (re)classified live. This is what
+            # makes reindexing self-healing: run it on any existing source and
+            # whichever of business/sub-domain is missing or was a bad
+            # low-confidence guess gets regenerated, everything else is left
+            # alone.
             async def _classify_and_retrain_bg() -> None:
                 try:
                     import business_classifier as _bc
-                    label_result = await asyncio.to_thread(_bc.label_source, source_id, None, True)
+                    label_result = await asyncio.to_thread(_bc.label_source, source_id, None, False)
                     if label_result:
                         tag = " (new category)" if label_result.get("is_new") else ""
                         _push_index_event(source_id, "business-classifier", "running",
                                           f"Business classified: {label_result['business']}{tag}")
+
+                    import domain_classifier as _dc
+                    subdomain_result = await asyncio.to_thread(_dc.label_source, source_id, None, False)
+                    if subdomain_result:
+                        src["domain"] = subdomain_result["sub_domain"]
+                        tag = " (new category)" if subdomain_result.get("is_new") else ""
+                        _push_index_event(source_id, "domain-classifier", "done",
+                                          f"Sub-domain classified: {subdomain_result['sub_domain']}{tag}")
+
                     stats = await asyncio.to_thread(_bc.train)
                     logger.info("business_classifier retrained after indexing %s: %s",
                                 source_id[:8], stats)
@@ -3590,24 +3614,46 @@ async def patch_metadata_source(source_id: str, req: UpdateSourceRequest):
 
 
 @app.post("/metadata/sources/{source_id}/detect-business")
-async def detect_source_business(source_id: str, force: bool = False):
+async def detect_source_business(source_id: str):
     """
-    Classify one indexed source's business/industry against the OPEN taxonomy
-    (see business_classifier.py — labels are LLM-assigned and persisted, not a
-    fixed category list; a genuinely new kind of source gets a brand-new
-    category). force=true bypasses the cache and re-classifies live. Runs off
-    the event loop (asyncio.to_thread) since it may make a synchronous LLM
-    call. Does not modify the source's stored domain — use
-    PATCH /metadata/sources/{source_id} to apply the result there.
+    Read back this source's business/industry label (see business_classifier.py
+    — labels are LLM-assigned and persisted, not a fixed category list).
+    Cache-only — never triggers an LLM call: classification itself only ever
+    happens as part of indexing/reindexing (see orchestrator_api._index_source),
+    so this just reports whatever that pipeline already decided (or 404 if the
+    source hasn't been indexed yet). Does not modify the source's stored
+    domain — use PATCH /metadata/sources/{source_id} to apply the result there.
     """
     import business_classifier as _bc
     try:
-        if force:
-            result = await asyncio.to_thread(_bc.label_source, source_id, None, True)
-        else:
-            result = await asyncio.to_thread(_bc.predict, source_id)
+        result = await asyncio.to_thread(_bc.get_cached_label, source_id)
         if result is None:
-            raise HTTPException(status_code=404, detail="No indexed metadata for this source")
+            raise HTTPException(status_code=404, detail="Source not yet classified — (re)index it first")
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/metadata/sources/{source_id}/detect-domain")
+async def detect_source_domain(source_id: str):
+    """
+    Read back this source's sub-domain label — the business function/process
+    within its already-classified main business (see domain_classifier.py —
+    labels are LLM-assigned and persisted, not the fixed _FUNCTION_SIGNALS
+    keyword list). Cache-only — never triggers an LLM call: classification
+    itself only ever happens as part of indexing/reindexing (see
+    orchestrator_api._index_source), so this just reports whatever that
+    pipeline already decided (or 404 if the source hasn't been indexed yet).
+    Does not modify the source's stored domain — use
+    PATCH /metadata/sources/{source_id} to apply the result there.
+    """
+    import domain_classifier as _dc
+    try:
+        result = await asyncio.to_thread(_dc.get_cached_label, source_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Source not yet classified — (re)index it first")
         return result
     except HTTPException:
         raise

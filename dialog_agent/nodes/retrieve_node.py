@@ -124,12 +124,30 @@ _CROSS_SPLIT_RE = re.compile(
 # "between X and Y" → normalise to "X and Y" so the splitter can split on " and "
 _BETWEEN_RE = re.compile(r'\bbetween\s+', re.IGNORECASE)
 
+# Limit / exceedance questions: "exceed the meal limit", "over budget", "breach
+# of policy", "amount exceeded", "exceed %". These are single-domain questions
+# (the dominant wording is usually about the fact being measured — meals,
+# spending, attendees — not the limit itself), so the embedding clusters
+# around that dominant domain and can miss a separate limit/threshold/policy
+# table entirely, exactly like the trailing-period case below. Domain-agnostic:
+# applies to expense caps, credit limits, rate limits, budget overages, SLA
+# breaches, or any other "did X exceed Y" question, not any one specific table.
+_EXCEED_LIMIT_PATTERN = re.compile(
+    r'\b(exceed\w*|excess\w*'
+    r'|over\s+(?:the\s+)?(?:limit|budget|cap|threshold|allowance|allotment)'
+    r'|above\s+(?:the\s+)?(?:limit|maximum|cap|threshold|allowance)'
+    r'|more\s+than\s+(?:allowed|permitted|authoriz\w*)'
+    r'|breach\w*|non.?compliant|out\s+of\s+policy|overspen\w*|overage\w*)\b',
+    re.IGNORECASE,
+)
+
 
 def _decompose_cross_query(query: str) -> List[str]:
     """
-    If the query is a cross-domain analytic question (correlation, vs, impact of…)
-    OR a multi-table analytical question (systematically X over trailing N periods,
-    dragging portfolio, etc.), return multiple sub-queries so all relevant tables
+    If the query is a cross-domain analytic question (correlation, vs, impact of…),
+    a multi-table analytical question (systematically X over trailing N periods,
+    dragging portfolio, etc.), or a limit/exceedance question ("exceed the meal
+    limit", "over budget"), return multiple sub-queries so all relevant tables
     get fair representation in the seed set.
     Otherwise return [query] (single-vector path).
 
@@ -140,7 +158,18 @@ def _decompose_cross_query(query: str) -> List[str]:
           → ["weather", "sales"]
       "customers showing systematically negative mix contribution over trailing 12 periods"
           → [original query, "customer mix contribution metrics", "period time trailing"]
+      "meals with HCPs which exceed the meal limit"
+          → [original query, "limit threshold maximum allowance cap policy rule compliance"]
     """
+    # ── Limit / exceedance questions ──────────────────────────────────────────
+    # Independent of the cross-domain gate below — this is a single-domain
+    # question needing one extra sub-query, not a two-way split.
+    if _EXCEED_LIMIT_PATTERN.search(query):
+        return [
+            query,
+            "limit threshold maximum allowance cap policy rule compliance",
+        ]
+
     if not _CROSS_DOMAIN_PATTERNS.search(query):
         return [query]
 
@@ -696,6 +725,31 @@ def retrieve_node(state: DialogState) -> DialogState:
     except Exception as exc:
         logger.warning("retrieve_node: query embedding failed (%s) — using full schema", exc)
         return state
+
+    # ── Widen the seed budget for decomposed (multi-concept) queries ─────────
+    # A query that _decompose_cross_query split into N sub-queries is asking
+    # about N distinct concepts at once (two domains being compared, a metric
+    # + a time dimension, or a fact + the limit/threshold it's being checked
+    # against). A single fixed top_k budget forces those concepts to compete
+    # for the same slots — e.g. several sibling "compliance/policy" tables can
+    # all score similarly on a limit-related sub-query and crowd out the one
+    # that's actually needed. This widens top_k/max_tables proportionally to
+    # the number of concepts detected, generic across ALL decomposition cases
+    # (cross-domain, trailing-period, exceedance) — not any one specific
+    # table or pattern. A non-decomposed query (the overwhelming majority)
+    # takes len(sub_queries) == 1 and this is a complete no-op: k and
+    # max_tables are byte-for-byte identical to before this change.
+    _extra_concepts = max(len(sub_queries) - 1, 0)
+    if _extra_concepts:
+        widened_top_k     = top_k + 4 * _extra_concepts
+        widened_max_tables = max_tables + 4 * _extra_concepts
+        logger.info(
+            "retrieve_node: query decomposed into %d concepts — widening "
+            "top_k %d→%d, max_tables %d→%d so no single concept crowds "
+            "out another",
+            len(sub_queries), top_k, widened_top_k, max_tables, widened_max_tables,
+        )
+        top_k, max_tables = widened_top_k, widened_max_tables
 
     # top-K seed node IDs
     k = min(top_k, len(nodes))

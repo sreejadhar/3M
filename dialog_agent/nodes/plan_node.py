@@ -578,6 +578,15 @@ General Rules:
    c. When unsure, prefer the table with more rows / more distinct time periods —
       this is usually indicated by higher unique_count on the year_month column in
       the schema context.
+   d. EXCEPTION — occurrence-counting questions ALWAYS override (b) and (c):
+      if the question asks to count/total occurrences of an entity (attendees,
+      transactions, visits, orders, line items), a wide "combined"/"primary"/
+      "master" table is frequently NOT one-row-per-occurrence — it may be built
+      at a different, narrower grain (e.g. one row per expense line, not one row
+      per attendee) even though it happens to contain a plausibly-named column.
+      See rule 23 for how to pick the correctly-grained table in that case —
+      do NOT apply the "prefer the comprehensive table" preference from (b)
+      when the question requires counting occurrences.
 8. If the question cannot be answered from the available schema, return [].
 9. Maximum {max_queries} queries total.
 10. Schema-qualified FROM/JOIN clauses: always write FROM schema.table.
@@ -1277,6 +1286,142 @@ General Rules:
        give it a separate business-concept label. Do not overlook a plainly-named
        flag column just because it has no concept annotation — read the raw column
        name and its distinct-value count directly from the schema context.
+
+20. NEVER FILTER A DIMENSION THE QUESTION DID NOT MENTION — UNIVERSAL, ALL
+    DOMAINS, ALL DATABASES. This is distinct from rule 6/6a (unnecessary JOINs)
+    and from the CATEGORICAL FILTERS rule (mapping a term the user DID use to
+    a real stored value) — this rule covers a different mistake: inventing a
+    WHERE filter on a column for a dimension the question never referenced at
+    all, using guessed values instead of the schema's real ones.
+    a. If the schema context shows a categorical column's cardinality (e.g.
+       "unique values=7") but does NOT list the actual stored values for it
+       (no [sample values] / top values shown), you do NOT know what those 7
+       values are. Do NOT guess them from the table/column name, domain
+       conventions, or general world knowledge (e.g. assuming a table whose
+       name suggests a region covers a specific, commonly-known list of
+       countries for that region).
+    b. If the user's question does not name a specific value — or even
+       mention that dimension at all — do NOT add a WHERE filter on it "to
+       scope the query sensibly". Leave that column unfiltered so the query
+       returns whatever values genuinely exist in the data. An unfiltered
+       query that surfaces the true, complete set of values is correct; a
+       filtered query built on guessed values is wrong even if the guessed
+       values happen to look plausible.
+    c. This applies to every kind of scoping dimension: geography/market,
+       time period, product line, business unit, customer segment, or any
+       other categorical column — not just the specific case of a region or
+       market name.
+    d. Only filter a dimension when either (i) the user's question explicitly
+       names a value for it (use the CATEGORICAL FILTERS rule to map it), or
+       (ii) a PRE-RESOLVED CATEGORY MAPPING / DEFINED KPI section above
+       instructs you to. Never filter a dimension solely because you inferred
+       from the table or column name what its "typical" values probably are.
+
+21. "COUNT OF X" / "NUMBER OF X" / "HEADCOUNT" QUESTIONS — STORED VALUE vs
+    COMPUTED AGGREGATE. UNIVERSAL, ALL DOMAINS, ALL DATABASES.
+    a. Before filtering any numeric column against a threshold implied by a
+       counting question ("more than N attendees", "fewer than N people",
+       "at least N transactions", "headcount above N"), check that column's
+       observed min/max range shown in the schema context (e.g. "min=0.0000,
+       max=6.0000"). If the threshold N falls outside — or even close to the
+       edge of — that column's real range, the column almost certainly does
+       NOT represent the count the question is asking about, even if its name
+       sounds like it should (e.g. a column literally named "no_of_people" or
+       "num_attendees" can still be the wrong signal if its real range is 0-6
+       while the question implies dozens).
+    b. A "count of X" question is asking for the number of rows/occurrences of
+       X for some entity (an event, an order, a customer, etc.) — that is
+       usually NOT a value stored directly on a single row. It has to be
+       COMPUTED: GROUP BY the entity's key on the table where X has one row
+       per occurrence, then COUNT(*) or COUNT(DISTINCT <id>), and apply the
+       question's threshold with HAVING, not WHERE.
+       WRONG:  SELECT * FROM expense_lines WHERE attendee_count_field > 20
+       RIGHT:  SELECT event_id, COUNT(*) AS attendee_count
+               FROM attendance_detail_table
+               GROUP BY event_id
+               HAVING COUNT(*) > 20
+    c. Only trust a stored numeric column as the answer to a "count of X"
+       question when its observed range in the schema context is actually
+       consistent with what the question implies (e.g. a "total_attendees"
+       column on an event-summary table whose max is in the hundreds IS a
+       legitimate stored aggregate — use it directly, do not recompute).
+    d. If you cannot find any column or table capable of producing the
+       requested count (no detail table with one row per occurrence, and no
+       stored aggregate column whose range fits), say so in the description
+       rather than filtering a column whose range makes the question
+       unanswerable — a query that runs and returns 0 rows is worse than an
+       honest "not available" because it looks like a real, verified answer.
+
+22. STATUS/VALIDITY COMPANION COLUMNS — AVOID DUPLICATE AMBIGUOUS ROWS.
+    UNIVERSAL, ALL DOMAINS, ALL DATABASES.
+    a. Some tables store one row per (entity, sub-dimension) combination —
+       e.g. one row per (market, category, business-unit) — where the
+       sub-dimension is often NOT applicable, so most rows are placeholder
+       rows with a zero/blank value, and only the applicable sub-dimension's
+       row holds the real number. This is visible in the schema as a
+       categorical "status" / "validity" column sitting alongside the
+       numeric value column, whose sample values look like an
+       applicability flag — e.g. "allowed" / "empty" (or "valid"/"invalid",
+       "active"/"inactive", "approved"/"n/a", a "1"/"0" flag, etc. — the
+       exact words vary by dataset, read the sample values shown).
+    b. If you query the numeric column WITHOUT filtering on that status
+       column (or without filtering the numeric column itself to exclude
+       the placeholder value, typically 0), you will get MULTIPLE rows per
+       entity with CONFLICTING values — some real, some placeholder — and
+       nothing in the result distinguishes which is which. This reads as
+       inconsistent/wrong data even though every individual row is real.
+    c. Before finalising a query that returns "the value of X for entity Y"
+       from a table like this, check whether a status/validity column exists
+       for that value. If it does, filter on it (e.g. status = 'allowed') or
+       filter the numeric column itself (e.g. amount > 0) — same principle as
+       the CATEGORICAL FILTERS rule, applied specifically to a
+       status-vs-value column pair. Also SELECT the status column in the
+       output so the answer's provenance is visible, not just the number.
+    d. Do NOT assume this applies universally to every table — many tables
+       have exactly one row per entity and no such ambiguity. Only apply
+       this rule when the schema context actually shows a categorical column
+       whose sample values look like an applicability/validity indicator
+       sitting next to the numeric column you are about to query.
+
+23. GRAIN-CORRECT TABLE SELECTION FOR OCCURRENCE-COUNTING QUESTIONS.
+    UNIVERSAL, ALL DOMAINS, ALL DATABASES. This is a TABLE-CHOICE rule, not a
+    column-choice rule — it applies BEFORE you decide which column to filter.
+    a. When the question asks to count/total OCCURRENCES of an entity
+       (attendees at an event, transactions on an account, visits to a site,
+       line items on an order — anything phrased as "how many X", "more/fewer
+       than N X", "total X"), the ONLY tables that can correctly answer it are
+       ones with genuinely ONE ROW PER OCCURRENCE of that entity. On such a
+       table, COUNT(*) or COUNT(DISTINCT <id>) IS the count.
+    b. A wide "combined"/"primary"/"master" table that also contains a
+       plausibly-named column (e.g. something that sounds like "headcount" or
+       "attendee count") is NOT automatically the right table — it is often
+       built at a DIFFERENT, narrower grain (e.g. one row per expense line, per
+       order line, or per transaction — not one row per occurrence of the
+       entity the question is asking about). A column merely CONTAINING a
+       matching word is not evidence it holds the full count; matching the
+       question's WORDING is not the same as matching its GRAIN.
+    c. Prefer a table whose name and columns describe the entity's own detail/
+       transaction/event record (e.g. an "attendance", "visit", "transaction",
+       "line_item" style table) for counting occurrences of that entity, even
+       when a wider combined table also exists and even when the combined
+       table's column name is a closer lexical match to the question. Do NOT
+       let rule 7's "prefer the comprehensive table" guidance override this —
+       rule 7(d) explicitly does not apply here.
+    d. A concrete tell that a candidate column is at the WRONG grain: its
+       observed min/max range in the schema context is implausibly small for
+       the real-world entity being counted (e.g. a "number of people" column
+       whose max is 6 cannot represent total attendance at an event that
+       plausibly draws dozens of people — see rule 21 and the numeric-range
+       guidance elsewhere in this prompt). When you see this mismatch, do not
+       just look for a different column on the SAME table — look for a
+       DIFFERENT table in the schema whose grain actually matches one row per
+       occurrence of the entity in question.
+    e. If the wide combined table and the detail/occurrence table share the
+       filter columns the question needs (e.g. both have a status/participation
+       flag), that is not a reason to prefer the combined table — it just means
+       the correctly-grained table can answer the ENTIRE question on its own,
+       with no join required. Check this before assuming you need to combine
+       both tables or join anything.
 """
 
 _USER_PROMPT = """\
@@ -1469,7 +1614,7 @@ _CHANGE_INTENT_WORDS = (
 )
 
 
-_SPARSE_NULL_RE = re.compile(r'^\s{2,4}(\w+)\s*:.*?\((\d+(?:\.\d+)?)%\s*null\)', re.MULTILINE)
+_SPARSE_NULL_RE = re.compile(r'^\s{2,4}"?(\w+)"?\s*:.*?\((\d+(?:\.\d+)?)%\s*null\)', re.MULTILINE)
 
 # A column this sparse, ANDed with any other filter condition, is high-risk on
 # its own: requiring a near-always-empty column to be non-null (or match a
@@ -1491,6 +1636,61 @@ def _extract_column_null_rates(schema_context: str) -> Dict[str, float]:
         if col not in rates:
             rates[col] = float(m.group(2))
     return rates
+
+
+# A column's property block spans several lines — the column declaration line,
+# then a "Semantic domain: ..." line and a "Statistics: ... min=X, max=Y, ..."
+# line of their own. In the ACTUAL text understand_node produces, column names
+# AND these landmark labels are double-quoted, e.g.:
+#     "no_of_people": string  -- TEXT descriptive text column (36.1% null)
+#     "Semantic domain": descriptive text
+#     "Statistics": unique values=4, null count=2253, min=0.0000, max=6.0000
+# Quotes are optional in the regex below (older/unquoted formats also occur)
+# so this matches either. "Statistics" itself would otherwise be misread as a
+# column declaration (it matches the same `"?word"?\s*:` shape) — excluded
+# explicitly rather than relied upon to fail the pattern.
+_COLUMN_DECL_RE = re.compile(r'^\s{2,4}"?(\w+)"?\s*:', re.MULTILINE)
+_STATS_LINE_RE = re.compile(r'^\s{2,4}"?Statistics"?\s*:\s*(.*)$', re.MULTILINE | re.IGNORECASE)
+_MINMAX_RE = re.compile(r'\bmin=(-?\d+(?:\.\d+)?)\s*,?\s*max=(-?\d+(?:\.\d+)?)')
+_NON_COLUMN_LABELS = {"statistics", "semantic", "business"}  # pseudo-entries, never real columns
+
+
+def _extract_column_numeric_ranges(schema_context: str) -> Dict[str, tuple]:
+    """
+    Map lowercase column name -> (min, max), parsed from schema_context.
+    A column's declaration line and its "Statistics: ... min=X, max=Y" line are
+    NOT on the same line, and are not even adjacent — a "Semantic domain" line
+    (and sometimes a "Business concept" line) sits between them. This finds
+    every column declaration, then associates it with the nearest "Statistics"
+    line that appears strictly BEFORE the next column declaration — robust to
+    however many landmark lines sit in between. This is the OBSERVED range in
+    the actual data — used by preflight Check 6 to catch a WHERE clause
+    comparing a column against a threshold the data can never satisfy (e.g.
+    "> 20" when the column's real max is 6). First occurrence wins if the same
+    column name appears under multiple tables.
+    """
+    ranges: Dict[str, tuple] = {}
+    text = schema_context or ""
+    col_matches = [
+        m for m in _COLUMN_DECL_RE.finditer(text)
+        if m.group(1).lower() not in _NON_COLUMN_LABELS
+    ]
+    stats_matches = list(_STATS_LINE_RE.finditer(text))
+    if not col_matches or not stats_matches:
+        return ranges
+
+    for i, cm in enumerate(col_matches):
+        col = cm.group(1).lower()
+        if col in ranges:
+            continue
+        span_end = col_matches[i + 1].start() if i + 1 < len(col_matches) else len(text)
+        for sm in stats_matches:
+            if cm.end() <= sm.start() < span_end:
+                mm = _MINMAX_RE.search(sm.group(1))
+                if mm:
+                    ranges[col] = (float(mm.group(1)), float(mm.group(2)))
+                break
+    return ranges
 
 
 def _preflight_check_plan(
@@ -1704,7 +1904,78 @@ def _preflight_check_plan(
                     f"classification column for the same entity) should be used instead."
                 )
 
+    # ── Check 6: impossible numeric-threshold filter ──────────────────────────
+    # Catches a WHERE clause comparing a column against a threshold the column's
+    # OWN observed data range can never satisfy — e.g. "> 20" on a column whose
+    # real max is 6. Such a query runs cleanly and returns 0 rows with no error,
+    # which reads as "there is no matching data" when the real problem is that
+    # the wrong column was used to answer a "count of X" / "number of Y" style
+    # question (the true count usually has to be computed via GROUP BY + HAVING
+    # COUNT(...) over a detail table, not read off a stored per-row value).
+    numeric_ranges = _extract_column_numeric_ranges(schema_context)
+    if numeric_ranges:
+        for item in sql_items:
+            msg = _detect_impossible_numeric_filter(item["sql"], numeric_ranges)
+            if msg:
+                gaps.append(f"Query {item.get('query_id', '?')!r}: {msg}")
+
     return gaps
+
+
+_IMPOSSIBLE_CMP_RE = re.compile(
+    r'(?:TRY_CAST|CAST|TRY_TO_NUMBER|TRY_TO_DOUBLE|TRY_TO_DECIMAL|SAFE_CAST)?\s*'
+    r'\(?\s*[\w]*\.?"?(\w+)"?\s*(?:AS\s+\w+\))?\s*'
+    r'(>=|<=|>|<|=)\s*'
+    r'(-?\d+(?:\.\d+)?)',
+    re.IGNORECASE,
+)
+
+
+def _detect_impossible_numeric_filter(sql: str, numeric_ranges: Dict[str, tuple]) -> Optional[str]:
+    """
+    Return a human-readable message if `sql` compares a column against a
+    threshold the column's OWN observed data range (from numeric_ranges) can
+    never satisfy — e.g. "> 20" when the real max is 6. None if no issue is
+    found. Shared by preflight Check 6 (detection/logging, in
+    _preflight_check_plan) and the corrective retry in plan_node (which uses
+    the identical logic to decide whether a one-shot LLM rewrite is needed,
+    and to verify the rewrite actually fixed it) — one detector, two callers,
+    so they can never silently drift apart.
+    """
+    if not numeric_ranges:
+        return None
+    for m in _IMPOSSIBLE_CMP_RE.finditer(sql):
+        col, op, thresh_str = m.group(1).lower(), m.group(2), m.group(3)
+        if col not in numeric_ranges:
+            continue
+        thresh = float(thresh_str)
+        lo, hi = numeric_ranges[col]
+        if op == ">":
+            impossible = thresh >= hi
+        elif op == ">=":
+            impossible = thresh > hi
+        elif op == "<":
+            impossible = thresh <= lo
+        elif op == "<=":
+            impossible = thresh < lo
+        else:  # "="
+            impossible = thresh < lo or thresh > hi
+        if impossible:
+            return (
+                f"filters '{col}' {op} {thresh_str}, but the schema context shows "
+                f"'{col}''s OBSERVED data range is min={lo} max={hi} — this comparison "
+                f"can NEVER match a row, so the query will silently return 0 results "
+                f"with no error. This usually means '{col}' is the WRONG column for "
+                f"what the question is actually asking (e.g. a per-row stored value "
+                f"being used where the question actually needs a COUNT/SUM computed "
+                f"via GROUP BY + HAVING over a detail/transaction table — a "
+                f"'headcount'/'number of X' question about an aggregate is rarely "
+                f"answerable by filtering a single stored column directly, and if the "
+                f"query already has a GROUP BY, the threshold likely belongs in HAVING "
+                f"against the aggregate result, not in WHERE against the raw column). "
+                f"Compute the count/sum with GROUP BY + HAVING {op} {thresh_str} instead."
+            )
+    return None
 
 
 _COST_PER_M = {
@@ -1742,6 +2013,103 @@ def _call_llm(
     )
     _log_cost("plan_node", model, msg.usage)
     return msg.content[0].text if msg.content else ""
+
+
+_FIX_THRESHOLD_SYSTEM = """\
+You are a SQL expert fixing a query that will silently return 0 rows due to \
+an impossible filter condition — it runs without error, but the threshold \
+can never be satisfied by the column's real data range.
+
+There are TWO possible root causes — check both, in this order:
+
+1. WRONG TABLE (check this first). The column's tiny/implausible range often \
+means the table you queried is at the WRONG GRAIN for what's being counted \
+— e.g. it has one row per expense line or transaction, not one row per \
+occurrence of the entity the question asks about (attendee, visit, order).
+   Look at the schema context below for a DIFFERENT table whose name and \
+   columns describe the entity's own detail/transaction/attendance record \
+   (one row per occurrence). If one exists and has the other columns this \
+   query needs (the same filters, keys, etc.), REWRITE THE QUERY AGAINST \
+   THAT TABLE INSTEAD — group by the entity key and use COUNT(*) or \
+   COUNT(DISTINCT <id>) as the count, then apply the threshold via HAVING.
+   Do not assume you need to JOIN both tables — the correctly-grained table
+   alone usually already has everything the query needs.
+
+2. WRONG CLAUSE (if the table is genuinely already correct). The question \
+needs a COUNT/SUM across multiple rows per entity (e.g. "attendees more \
+than N", "orders more than N"), but the threshold was applied with WHERE \
+against a raw per-row column instead of HAVING against the aggregated \
+result.
+   WRONG: SELECT entity_id, SUM(TRY_CAST(col AS NUMERIC)) AS total
+          FROM t WHERE TRY_CAST(col AS NUMERIC) > 20 GROUP BY entity_id
+   RIGHT: SELECT entity_id, SUM(TRY_CAST(col AS NUMERIC)) AS total
+          FROM t GROUP BY entity_id HAVING SUM(TRY_CAST(col AS NUMERIC)) > 20
+   If there is no GROUP BY at all, add one grouped by the natural entity key
+   for the question, aggregate with SUM or COUNT, and apply the threshold via
+   HAVING — never filter the raw column in WHERE for a per-entity total.
+
+Preserve the original question's intent exactly. Only change table/column
+choices when case 1 genuinely applies — do not swap tables speculatively if
+the original table can be fixed by case 2 alone. Return ONLY the corrected
+SQL — no explanation, no markdown fences, no commentary.
+"""
+
+
+def _fix_impossible_threshold_sql(
+    sql: str,
+    gap_message: str,
+    natural_query: str,
+    schema_context: str,
+    model: str,
+    temperature: float,
+) -> str:
+    """
+    One-shot LLM correction for a query flagged by
+    _detect_impossible_numeric_filter (Check 6) — a semantic mistake that
+    never surfaces as a runtime SQL error (the query runs cleanly and just
+    returns 0 rows), so execute_node's error-driven self-heal never gets a
+    chance to catch it. This has to happen at plan time, before execution.
+
+    Includes schema_context so the LLM can see whether a different,
+    correctly-grained table exists to switch to (see rule 23) rather than
+    only being able to patch WHERE/HAVING placement on the original table —
+    a small max value is often a sign the table itself is wrong, not just the
+    clause. schema_context is trimmed defensively; this call already runs
+    only when Check 6 fires, so it's rare enough that the extra token cost is
+    fine, but a runaway-huge schema must never crash this correction.
+
+    Returns the corrected SQL, or the original unchanged if the LLM call
+    fails, returns nothing usable, or (deliberately) doesn't change it.
+    Never raises — a failure here must never block the rest of planning.
+    """
+    _MAX_SCHEMA_CHARS = 120_000
+    trimmed_schema = schema_context[:_MAX_SCHEMA_CHARS]
+    user = (
+        f"Original question: {natural_query}\n\n"
+        f"Problem detected:\n{gap_message}\n\n"
+        f"Original SQL:\n{sql}\n\n"
+        f"SCHEMA CONTEXT (for checking whether a better-grained table exists):\n"
+        f"{trimmed_schema}\n\n"
+        "Return the corrected SQL only."
+    )
+    try:
+        from llm_client import get_client
+        client = get_client()
+        msg = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            temperature=temperature,
+            system=_FIX_THRESHOLD_SYSTEM,
+            messages=[{"role": "user", "content": user}],
+        )
+        _log_cost("plan_node.threshold_fix", model, msg.usage)
+        fixed = (msg.content[0].text if msg.content else "").strip()
+        fixed = re.sub(r"^```[a-z]*\s*", "", fixed, flags=re.IGNORECASE)
+        fixed = re.sub(r"\s*```$", "", fixed).strip()
+        return fixed if fixed else sql
+    except Exception as exc:
+        logger.warning("plan_node: impossible-threshold corrective LLM call failed — %s", exc)
+        return sql
 
 
 def _extract_json(text: str) -> List[Dict[str, Any]]:
@@ -3953,10 +4321,18 @@ def plan_node(state: DialogState) -> DialogState:
         resolution_section = ""
 
     # Build verified-examples section from human-corrected past queries for
-    # this data source (see dialog_agent/verified_queries.py). Falls back to
-    # the single-source kg_id convention used elsewhere (retrieve_node,
-    # kg_inference_engine) when no multi-KG list is active.
-    _default_kg_id = getattr(config, "graphrag_kg_id", "").strip() or "default"
+    # this data source (see dialog_agent/verified_queries.py).
+    # graphrag_kg_id is never populated by dialog_api.py (only used by the
+    # Neo4j-specific retrieval path) — it would resolve to the same "default"
+    # bucket for every single-KG production request, silently mixing verified
+    # examples across unrelated data sources. source_id IS populated on every
+    # /query request (dialog_api.py: DialogConfig(source_id=req.source_id...))
+    # and is unique per data source, so it's the correct scoping key here.
+    _default_kg_id = (
+        getattr(config, "graphrag_kg_id", "").strip()
+        or getattr(config, "source_id", "").strip()
+        or "default"
+    )
     _verified_kg_ids = active_kg_ids or [_default_kg_id]
     verified_examples: List[Dict] = []
     for _kgid in _verified_kg_ids:
@@ -4352,6 +4728,82 @@ def plan_node(state: DialogState) -> DialogState:
         logger.warning("plan_node: 0 SQL queries produced from LLM plan of %d item(s)", len(plan))
     else:
         logger.info("plan_node: %d SQL queries planned", len(sql_queries))
+
+    # ── Corrective retry: impossible numeric-threshold filter (Check 6) ──────
+    # A query filtering a column against a threshold its own data range can
+    # never satisfy (e.g. "> 20" when the real max is 6) runs cleanly and
+    # just returns 0 rows — no runtime error, so execute_node's error-driven
+    # self-heal never gets a chance to fix it. This has to be caught and
+    # corrected here, at plan time. Bounded to ONE corrective LLM call per
+    # affected query (never loops), and the rewrite is re-run through the
+    # exact same qualify/dialect/hallucination safety net as any other plan
+    # item before being trusted — if it can't be verified fixed, the original
+    # query is kept unchanged and the gap is still visible in state["errors"]
+    # via Check 6's preflight logging. Queries without this exact issue are
+    # never touched, so this cannot affect any other query pattern.
+    if sql_queries:
+        _threshold_ranges = _extract_column_numeric_ranges(schema_context)
+        if _threshold_ranges:
+            for q in sql_queries:
+                gap_msg = _detect_impossible_numeric_filter(q["sql"], _threshold_ranges)
+                if not gap_msg:
+                    continue
+                logger.info(
+                    "plan_node: query %s has an impossible numeric filter — "
+                    "attempting one corrective rewrite",
+                    q["query_id"],
+                )
+                fixed_sql = _fix_impossible_threshold_sql(
+                    q["sql"], gap_msg, natural_query, schema_context,
+                    config.plan_llm_model, config.llm_temperature,
+                )
+                if fixed_sql.strip().rstrip(";").strip() == q["sql"].strip().rstrip(";").strip():
+                    logger.info(
+                        "plan_node: corrective rewrite for %s made no change — "
+                        "keeping original query", q["query_id"],
+                    )
+                    continue
+
+                candidate = fixed_sql.strip().rstrip(";").strip()
+                candidate = _qualify_sql(candidate, db_schema, table_labels)
+                candidate = _fix_count_vs_sum(candidate, natural_query)
+                candidate = _fix_percentage(candidate, natural_query, config.db_type)
+                candidate = _enforce_sql_limits(candidate, config.row_limit, config.db_type)
+                candidate = _fix_dialect_syntax(candidate, config.db_type)
+                candidate = _fix_sqlserver_subquery_limits(candidate, config.db_type)
+                candidate = _fix_subquery_order_by(candidate, config.db_type)
+                candidate = _fix_window_functions(candidate, config.db_type)
+                candidate = _fix_multicolumn_subquery(candidate)
+                candidate = _fix_distinct_order_by(candidate)
+
+                if table_labels and _find_hallucinated_tables(candidate, table_labels):
+                    logger.warning(
+                        "plan_node: corrective rewrite for %s introduced a "
+                        "hallucinated table — keeping original query", q["query_id"],
+                    )
+                    continue
+                # A table-switch rewrite (rule 23) is a bigger change than a
+                # WHERE/HAVING tweak — also verify it didn't leave a stale
+                # alias.column reference pointing at the table it just left.
+                if _find_cross_table_columns(candidate, table_columns_map, known_columns_base):
+                    logger.warning(
+                        "plan_node: corrective rewrite for %s introduced a "
+                        "cross-table column reference — keeping original query",
+                        q["query_id"],
+                    )
+                    continue
+                if _detect_impossible_numeric_filter(candidate, _threshold_ranges):
+                    logger.warning(
+                        "plan_node: corrective rewrite for %s still has an "
+                        "impossible filter — keeping original query", q["query_id"],
+                    )
+                    continue
+
+                logger.info(
+                    "plan_node: query %s corrected (impossible-threshold fix applied)",
+                    q["query_id"],
+                )
+                q["sql"] = candidate
 
     # ── Inject COUNT companions for raw-row queries ───────────────────────────
     # For every sampled raw-row query (no aggregation), prepend a companion

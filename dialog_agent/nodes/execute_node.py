@@ -303,6 +303,14 @@ def _extract_dotted_literal_columns(schema_context: str) -> List[str]:
     return seen
 
 
+_PLAIN_QUOTED_RE = re.compile(r'"([A-Za-z0-9_]+)"')
+
+
+def _extract_plain_column_names(schema_context: str) -> set:
+    """Standalone (non-dotted) quoted column names appearing in schema_context."""
+    return {m.group(1).lower() for m in _PLAIN_QUOTED_RE.finditer(schema_context or "")}
+
+
 def _snowflake_quote_dotted_columns(sql: str, schema_context: str) -> str:
     """
     Deterministic pre-fix for Snowflake 'invalid identifier' errors caused by a
@@ -311,33 +319,66 @@ def _snowflake_quote_dotted_columns(sql: str, schema_context: str) -> str:
     (evt.event_key) or only the tail quoted (evt."event_key") — both of which
     Snowflake rejects because the real identifier is the ENTIRE dotted string.
 
-    Rewrites any such broken reference back into the single, correctly quoted
-    identifier "evt.event_key". Returns sql unchanged if schema_context has no
-    literal dotted columns, or none of the broken forms are present.
+    The planner assigns its OWN FROM/JOIN alias per query (e.g.
+    `SEA_IDISCOVER_EVENT_ATTENDANCE AS EA`), which usually does not match the
+    alias baked into the literal's name — so the broken reference is typically
+    `EA."event_key"`, not `evt_attn."event_key"`. This rewrite is alias-
+    agnostic: it matches ANY alias + the literal's tail and rewrites it to the
+    correct single quoted identifier, unless that tail is also a genuine
+    standalone column elsewhere in the schema (in which case only an exact
+    alias match is rewritten, to avoid clobbering unrelated real usage).
+
+    When a tail is ambiguous (e.g. both "evt.event_key" and
+    "evt_attn.event_key" exist for the same table — an artifact of an
+    unaliased master/child join in the source view), the candidate with the
+    shortest alias prefix is chosen; since these columns come from an
+    equi-join, either candidate holds the same value for matched rows.
+
+    Returns sql unchanged if schema_context has no literal dotted columns, or
+    none of the broken forms are present.
     """
     literals = _extract_dotted_literal_columns(schema_context)
     if not literals:
         return sql
 
-    fixed = sql
+    plain_columns = _extract_plain_column_names(schema_context)
+
+    by_tail: Dict[str, List[str]] = {}
     for lit in literals:
         alias, _, col = lit.partition(".")
         if not alias or not col:
             continue
-        # Tail-only-quoted form: alias."col"  →  "alias.col"
+        by_tail.setdefault(col.lower(), []).append(lit)
+
+    fixed = sql
+    for tail, candidates in by_tail.items():
+        if tail in plain_columns:
+            # Tail is also a genuine standalone column somewhere — only fix
+            # exact alias matches to avoid clobbering unrelated real usage.
+            for lit in candidates:
+                alias, _, col = lit.partition(".")
+                fixed = re.sub(
+                    r'\b' + re.escape(alias) + r'\s*\.\s*"' + re.escape(col) + r'"',
+                    f'"{lit}"', fixed, flags=re.IGNORECASE,
+                )
+                fixed = re.sub(
+                    r'(?<!["\w])' + re.escape(alias) + r'\.' + re.escape(col) + r'(?!["\w])',
+                    f'"{lit}"', fixed, flags=re.IGNORECASE,
+                )
+            continue
+
+        chosen = min(candidates, key=lambda l: len(l.split(".", 1)[0]))
+
+        # Any-alias tail-only-quoted form: <alias>."tail"  →  "chosen"
         fixed = re.sub(
-            r'\b' + re.escape(alias) + r'\s*\.\s*"' + re.escape(col) + r'"',
-            f'"{lit}"',
-            fixed,
-            flags=re.IGNORECASE,
+            r'\b\w+\s*\.\s*"' + re.escape(tail) + r'"',
+            f'"{chosen}"', fixed, flags=re.IGNORECASE,
         )
-        # Fully unquoted form: alias.col  →  "alias.col"  (word-boundary guarded
-        # so an already-fixed '"alias.col"' occurrence is left untouched)
+        # Any-alias fully-unquoted form: <alias>.tail  →  "chosen"  (word-
+        # boundary guarded so an already-fixed '"...tail"' is left untouched)
         fixed = re.sub(
-            r'(?<!["\w])' + re.escape(alias) + r'\.' + re.escape(col) + r'(?!["\w])',
-            f'"{lit}"',
-            fixed,
-            flags=re.IGNORECASE,
+            r'(?<!["\w])\w+\.' + re.escape(tail) + r'(?!["\w])',
+            f'"{chosen}"', fixed, flags=re.IGNORECASE,
         )
 
     if fixed != sql:
@@ -358,6 +399,7 @@ def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = N
         if not result.get("error"):
             if attempt > 0:
                 logger.info("self-heal: query fixed after %d attempt(s)", attempt)
+            result["sql"] = current_sql
             return result
 
         error_msg: str = result["error"] or ""
@@ -408,6 +450,7 @@ def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = N
             break
         current_sql = fixed
 
+    last_result["sql"] = current_sql
     return last_result
 
 
@@ -427,6 +470,7 @@ def _exec_on_conn_with_retry(
         if not result.get("error"):
             if attempt > 0:
                 logger.info("self-heal (file-db): query fixed after %d attempt(s)", attempt)
+            result["sql"] = current_sql
             return result
 
         error_msg: str = result["error"] or ""
@@ -452,6 +496,7 @@ def _exec_on_conn_with_retry(
             break
         current_sql = fixed
 
+    last_result["sql"] = current_sql
     return last_result
 
 
@@ -1029,6 +1074,92 @@ def _federation_merge(results: List[QueryResult], bridges: List[Dict]) -> List[Q
 
 # ── node ──────────────────────────────────────────────────────────────────────
 
+def _as_float_or_none(v: Any) -> Optional[float]:
+    try:
+        if v is None or v == "":
+            return 0.0
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dedupe_placeholder_rows(columns: List[str], rows: List[list]) -> List[list]:
+    """
+    Generic, domain-agnostic cleanup for a common data-quality pattern: a table
+    stores one row per (dimension..., sub-dimension) combination where the
+    sub-dimension is usually not applicable, so most rows carry a 0/blank
+    placeholder in a measure column and only the applicable row holds the real
+    value (e.g. a compliance-limits table with one row per business sector,
+    where only one sector's row has the real limit and every other sector's
+    row for the same market+category is 0/"not applicable").
+
+    A plain (non-aggregated) query against a table like this returns multiple
+    rows that are IDENTICAL across every column except one numeric-looking
+    column, where that column is 0 in some rows and a real nonzero value in
+    others for the exact same key — reading as contradictory data for the same
+    entity even though every individual row is real.
+
+    This is detected and fixed purely from the RETURNED ROWS after execution —
+    no schema knowledge, column-name assumptions, or LLM prompt cooperation
+    required. That matters because the categorical column that actually
+    distinguishes "real" from "placeholder" rows sometimes has no sample
+    values captured in the schema context at all (a real profiling gap seen
+    on some live DB connections) — a prompt rule telling the planner to filter
+    on that column cannot work reliably if the planner can never see what its
+    valid values are. Working on the actual data instead sidesteps that gap
+    entirely, for any domain, any dialect, any column naming convention.
+
+    Only fires when a group of rows sharing every OTHER column value contains
+    BOTH a zero/blank value and a nonzero value for one candidate column — a
+    narrow, specific signature. Aggregated results (GROUP BY / COUNT / SUM),
+    genuinely-unique rows (e.g. one row per primary key), and legitimate
+    multi-valued dimensions are never affected, since none of those produce a
+    zero-vs-nonzero conflict for an identical key. Returns rows unchanged if
+    no such pattern is found — a guaranteed no-op for every result shape that
+    doesn't match this exact pattern.
+    """
+    if len(rows) < 2 or len(columns) < 2:
+        return rows
+
+    n = len(columns)
+    # Try the LAST column first (measures are conventionally selected last),
+    # falling back to earlier columns only if the last one shows no conflict.
+    for c in range(n - 1, -1, -1):
+        parsed = [_as_float_or_none(r[c]) for r in rows]
+        numeric_count = sum(1 for p in parsed if p is not None)
+        if numeric_count < len(rows) * 0.8:
+            continue  # not consistently numeric — not a plausible measure column
+
+        groups: Dict[tuple, List[int]] = {}
+        for i, r in enumerate(rows):
+            key = tuple(r[j] for j in range(n) if j != c)
+            groups.setdefault(key, []).append(i)
+
+        drop_indices: set = set()
+        any_conflict = False
+        for idxs in groups.values():
+            if len(idxs) < 2:
+                continue
+            vals = [parsed[i] for i in idxs]
+            if any(v is None for v in vals):
+                continue
+            zero_idxs    = [i for i, v in zip(idxs, vals) if v == 0.0]
+            nonzero_idxs = [i for i, v in zip(idxs, vals) if v != 0.0]
+            if zero_idxs and nonzero_idxs:
+                any_conflict = True
+                drop_indices.update(zero_idxs)
+
+        if any_conflict:
+            logger.info(
+                "execute_node: dropped %d placeholder (zero-value) row(s) that "
+                "conflicted with a real value for the same key on column %r",
+                len(drop_indices), columns[c],
+            )
+            return [r for i, r in enumerate(rows) if i not in drop_indices]
+
+    return rows
+
+
 def execute_node(state: DialogState) -> DialogState:
     """Execute all planned SQL queries and store results."""
     logger.info("=== execute_node ===")
@@ -1071,21 +1202,41 @@ def execute_node(state: DialogState) -> DialogState:
             columns   = outcome.get("columns") or []
             error_msg: Optional[str] = outcome.get("error")
 
+            # Self-heal may have rewritten the SQL (deterministic pre-fix or LLM
+            # fix) before it actually ran. Use that final text everywhere so the
+            # displayed/audited query always matches what was executed — never
+            # silently show the original, pre-heal SQL as if it were what ran.
+            executed_sql = outcome.get("sql") or q["sql"]
+            if executed_sql != q["sql"]:
+                logger.info(
+                    "  %s: recording self-healed SQL (differs from planned SQL)",
+                    q["query_id"],
+                )
+                q["sql"] = executed_sql
+
             # For aggregation queries, return all rows — truncating would silently
             # drop groups and produce wrong totals.  For raw-row queries the SQL
             # already has a LIMIT clause added by plan_node, so Python truncation
             # is redundant; we keep it only as a safety cap for very large raw dumps.
             _is_agg = bool(re.search(
                 r'\b(GROUP\s+BY|COUNT\s*\(|SUM\s*\(|AVG\s*\(|MIN\s*\(|MAX\s*\()\b',
-                q.get("sql", ""), re.IGNORECASE,
+                executed_sql, re.IGNORECASE,
             ))
+            # Raw (non-aggregated) queries only: drop placeholder-zero duplicate
+            # rows that conflict with a real nonzero value for the same key (see
+            # _dedupe_placeholder_rows). Aggregated results are never touched —
+            # GROUP BY already collapses to one row per key, so this can only be
+            # a no-op there anyway, and skipping it avoids any ambiguity around
+            # HAVING-filtered aggregate semantics.
+            if not _is_agg and not error_msg:
+                rows = _dedupe_placeholder_rows(columns, rows)
             returned_rows = rows if _is_agg else rows[: config.row_limit]
 
             results.append(
                 QueryResult(
                     query_id    = q["query_id"],
                     description = q["description"],
-                    sql         = q["sql"],
+                    sql         = executed_sql,
                     columns     = columns,
                     rows        = returned_rows,
                     row_count   = len(rows),

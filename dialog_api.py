@@ -19,6 +19,9 @@ GET  /list                   list all dialog jobs
 GET  /cache                  list all cached NLQ entries
 DELETE /cache/{cache_key}    invalidate a specific cache entry
 DELETE /cache                clear the entire NLQ cache
+POST /verified-queries       save a human-corrected {question -> SQL} example for a KG
+GET  /verified-queries       list saved corrections, optionally filtered by kg_id
+DELETE /verified-queries/{id} delete a saved correction
 """
 from __future__ import annotations
 
@@ -743,6 +746,52 @@ def delete_kg_bridge(bridge_id: int):
         raise HTTPException(status_code=404, detail="Bridge not found")
     _del_bridge(bridge_id)
     return {"deleted": bridge_id}
+
+
+# ── Verified-query correction memory ─────────────────────────────────────────
+# Persists human-corrected {question -> SQL} pairs per data source. plan_node
+# retrieves the most similar ones on every future call for the same kg_id and
+# injects them as few-shot examples, so a mistake fixed once here does not
+# have to be re-diagnosed the next time a similar question is asked.
+
+class VerifiedQueryCreateRequest(BaseModel):
+    kg_id:    str
+    question: str
+    sql:      str
+    note:     str = ""
+    db_type:  str = ""
+
+
+@app.post("/verified-queries", status_code=201)
+def create_verified_query(req: VerifiedQueryCreateRequest):
+    """Save a human-confirmed correction for future planning on this KG."""
+    from dialog_agent.verified_queries import save as _save_verified
+    try:
+        vq_id = _save_verified(
+            kg_id=req.kg_id, question=req.question, sql=req.sql,
+            note=req.note, db_type=req.db_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"id": vq_id}
+
+
+@app.get("/verified-queries")
+def list_verified_queries(kg_id: Optional[str] = None):
+    """List saved verified-query corrections, optionally filtered by kg_id."""
+    from dialog_agent.verified_queries import list_all as _list_verified
+    return [v.to_dict() for v in _list_verified(kg_id)]
+
+
+@app.delete("/verified-queries/{vq_id}", status_code=200)
+def delete_verified_query(vq_id: int):
+    """Delete a saved verified-query correction."""
+    from dialog_agent.verified_queries import get_by_id as _get_verified, delete as _del_verified
+    v = _get_verified(vq_id)
+    if not v:
+        raise HTTPException(status_code=404, detail="Verified query not found")
+    _del_verified(vq_id)
+    return {"deleted": vq_id}
 
 
 # ── File-DB cache endpoints ────────────────────────────────────────────────────

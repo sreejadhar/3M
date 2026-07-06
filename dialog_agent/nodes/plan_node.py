@@ -18,6 +18,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+from .. import verified_queries
 from ..state import DialogState, SQLQuery
 from ..token_guard import guard_plan_prompt
 
@@ -152,6 +153,14 @@ NULL HANDLING     : COALESCE(col, 0) or IFNULL(col, 0)
 BOOLEAN           : use 1 / 0 integers — TRUE/FALSE literals are not reliable in SQLite
 TYPE CASTING      : CAST(col AS INTEGER), CAST(col AS REAL), CAST(col AS TEXT)
                     NEVER use :: PostgreSQL-style casting (col::int is a SYNTAX ERROR)
+                    ★ CRITICAL ★ SQLite's CAST does NOT raise an error on non-numeric text —
+                    CAST('abc' AS INTEGER) silently returns 0. This means a WHERE filter like
+                    CAST(col AS INTEGER) < 20 will silently match every dirty/non-numeric row
+                    (they all cast to 0, which is < 20) instead of excluding them. When a TEXT
+                    column may contain non-numeric values, add an explicit guard so dirty rows
+                    are excluded rather than silently coerced to 0:
+                      WHERE col GLOB '[0-9]*' AND CAST(col AS INTEGER) < 20   ← correct
+                      WHERE CAST(col AS INTEGER) < 20                        ← WRONG if col has junk
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() supported (SQLite ≥3.25)
                     ALL navigation functions MUST have ORDER BY inside OVER():
                       ROW_NUMBER() OVER (ORDER BY col)          ← correct
@@ -177,6 +186,13 @@ PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
                     ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Pct
 NULL HANDLING     : COALESCE(col, 0)
 TYPE CASTING      : value::integer, value::numeric, value::text  (:: casting IS supported)
+                    ★ CRITICAL ★ Redshift has NO TRY_CAST / TRY_CONVERT. Casting a TEXT column
+                    that may hold non-numeric values with :: or CAST() throws a hard error and
+                    aborts the ENTIRE query on the first bad value. Guard with a regex check in
+                    the WHERE clause (or a CASE expression) before casting:
+                      WHERE col ~ '^[0-9]+(\\.[0-9]+)?$' AND col::numeric < 20   ← correct
+                      WHERE col::numeric < 20                                    ← WRONG if col has junk
+                    Or inline: CASE WHEN col ~ '^[0-9]+(\\.[0-9]+)?$' THEN col::numeric ELSE NULL END
 CURRENT DATE/TIME : NOW() or CURRENT_TIMESTAMP
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
                     ALL navigation/offset functions MUST have ORDER BY inside OVER():
@@ -209,6 +225,13 @@ PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
                     ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Pct
 NULL HANDLING     : COALESCE(col, 0)
 TYPE CASTING      : value::integer, value::numeric, value::text
+                    ★ CRITICAL ★ PostgreSQL has NO TRY_CAST. Casting a TEXT column that may
+                    hold non-numeric values with :: or CAST() throws a hard error and aborts
+                    the ENTIRE query on the first bad value. Guard with a regex check before
+                    casting:
+                      WHERE col ~ '^[0-9]+(\\.[0-9]+)?$' AND col::numeric < 20   ← correct
+                      WHERE col::numeric < 20                                    ← WRONG if col has junk
+                    Or inline: CASE WHEN col ~ '^[0-9]+(\\.[0-9]+)?$' THEN col::numeric ELSE NULL END
 CURRENT DATE/TIME : NOW() or CURRENT_TIMESTAMP
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
                     ALL navigation/offset functions MUST have ORDER BY inside OVER():
@@ -242,6 +265,14 @@ PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
 NULL HANDLING     : ISNULL(col, 0) or COALESCE(col, 0)
 TYPE CASTING      : CAST(col AS INT), CAST(col AS DECIMAL(10,2)), CAST(col AS NVARCHAR(100))
                     NEVER use :: PostgreSQL-style casting (col::int is a SYNTAX ERROR)
+                    ★ CRITICAL ★ When casting a VARCHAR/NVARCHAR column that is NOT guaranteed
+                    to hold clean numeric strings, ALWAYS use TRY_CAST / TRY_CONVERT instead of
+                    CAST/CONVERT — plain CAST throws a hard error and aborts the entire query
+                    on the first non-numeric value:
+                      TRY_CAST(col AS INT)          ← correct — dirty values become NULL
+                      CAST(col AS INT)               ← WRONG for VARCHAR columns with any junk
+                    Use plain CAST only when the schema context shows the column's native type
+                    is already numeric (INT/DECIMAL/FLOAT/NUMERIC).
 STRING AGGREGATION: STRING_AGG(col, ', ') WITHIN GROUP (ORDER BY col)
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
                     ALL navigation/offset functions MUST have ORDER BY inside OVER():
@@ -280,6 +311,12 @@ NULL HANDLING     : NVL(col, 0) or COALESCE(col, 0)
 CURRENT DATE/TIME : SYSDATE  or  CURRENT_DATE  — do NOT use NOW()
 TYPE CASTING      : CAST(col AS NUMBER), CAST(col AS VARCHAR2(100))
                     NEVER use :: PostgreSQL-style casting (col::int is a SYNTAX ERROR)
+                    ★ CRITICAL ★ Oracle has NO TRY_CAST. Casting a VARCHAR2 column that may hold
+                    non-numeric values with CAST() throws a hard error (ORA-01722) and aborts the
+                    ENTIRE query on the first bad value. Guard with REGEXP_LIKE before casting:
+                      WHERE REGEXP_LIKE(col, '^[0-9]+(\\.[0-9]+)?$') AND CAST(col AS NUMBER) < 20
+                      WHERE CAST(col AS NUMBER) < 20   ← WRONG if col has any non-numeric value
+                    Oracle 12.2+ also has VALIDATE_CONVERSION(col AS NUMBER) which returns 1/0.
 STRING AGGREGATION: LISTAGG(col, ', ') WITHIN GROUP (ORDER BY col)
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
                     ALL navigation/offset functions MUST have ORDER BY inside OVER():
@@ -331,6 +368,17 @@ PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct
                     ROUND(SUM(col) * 100.0 / SUM(SUM(col)) OVER (), 2) AS Pct
 NULL HANDLING     : COALESCE(col, 0)
 TYPE CASTING      : value::integer, value::numeric, value::text  (:: casting IS supported)
+                    ★ CRITICAL ★ When casting a TEXT/VARCHAR column that is NOT
+                    guaranteed to hold clean numeric strings (i.e. any column
+                    whose declared type in the schema context is TEXT/VARCHAR/STRING
+                    rather than a native NUMBER/INTEGER/FLOAT type), ALWAYS use
+                    TRY_CAST / TRY_TO_NUMBER / TRY_TO_DECIMAL instead of CAST or ::.
+                      TRY_CAST(col AS NUMBER)      ← correct — dirty values become NULL
+                      CAST(col AS NUMBER)          ← WRONG for TEXT columns — throws a
+                                                       hard error on ANY non-numeric value
+                                                       and aborts the entire query
+                    Use plain CAST only when the schema context shows the column's
+                    native type is already numeric (NUMBER/INTEGER/FLOAT/DECIMAL).
 CURRENT DATE/TIME : CURRENT_TIMESTAMP  or  CURRENT_DATE  — do NOT use NOW()/GETDATE()
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
                     ALL navigation/offset functions MUST have ORDER BY inside OVER():
@@ -378,6 +426,13 @@ NULL HANDLING     : COALESCE(col, 0) or IFNULL(col, 0)
 TABLE REFERENCES  : use fully qualified `project.dataset.table` in FROM/JOIN
 TYPE CASTING      : CAST(col AS INT64), CAST(col AS FLOAT64), CAST(col AS STRING)
                     NEVER use :: PostgreSQL-style casting (col::int is a SYNTAX ERROR)
+                    ★ CRITICAL ★ When casting a STRING column that is NOT guaranteed to hold
+                    clean numeric strings, ALWAYS use SAFE_CAST instead of CAST — plain CAST
+                    throws a hard error and aborts the entire query on the first bad value:
+                      SAFE_CAST(col AS INT64)   ← correct — dirty values become NULL
+                      CAST(col AS INT64)        ← WRONG for STRING columns with any junk
+                    Use plain CAST only when the schema context shows the column's native type
+                    is already numeric (INT64/FLOAT64/NUMERIC).
 CURRENT DATE/TIME : CURRENT_DATE(), CURRENT_TIMESTAMP()  — do NOT use NOW() or GETDATE()
 STRING AGGREGATION: STRING_AGG(col, ', ' ORDER BY col)
 WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported
@@ -387,12 +442,52 @@ WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully 
 QUALIFY           : QUALIFY ROW_NUMBER() OVER (...) = 1  filters window results directly
                     (avoids wrapping in a subquery just to filter on window result)"""
 
-    # Fallback for unknown db types
+    if db in ("delta_lake", "databricks", "spark"):
+        return """\
+ROW LIMITING      : LIMIT N at the end of the query
+CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')  — ILIKE also supported
+DATE EXTRACTION   : YEAR(date_col), MONTH(date_col), DATE_TRUNC('MONTH', date_col)
+STRING CONCAT     : CONCAT(col1, col2)   or   col1 || col2
+NULL HANDLING     : COALESCE(col, 0) or IFNULL(col, 0)
+TYPE CASTING      : CAST(col AS INT), CAST(col AS DOUBLE), CAST(col AS STRING)
+                    ★ CRITICAL ★ When casting a STRING column that is NOT guaranteed to hold
+                    clean numeric strings, ALWAYS use TRY_CAST instead of CAST — plain CAST
+                    throws a hard error and aborts the entire query on the first bad value:
+                      TRY_CAST(col AS INT)   ← correct — dirty values become NULL
+                      CAST(col AS INT)       ← WRONG for STRING columns with any junk
+WINDOW FUNCTIONS  : ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD() — fully supported;
+                    ALL navigation/offset functions MUST have ORDER BY inside OVER()
+STRING AGGREGATION: COLLECT_LIST(col) or ARRAY_JOIN(COLLECT_LIST(col), ', ')"""
+
+    if db == "teradata":
+        return """\
+ROW LIMITING      : SELECT TOP N col FROM t   — LIMIT is not standard Teradata syntax
+CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')
+DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
+STRING CONCAT     : col1 || col2
+NULL HANDLING     : COALESCE(col, 0)
+TYPE CASTING      : CAST(col AS INTEGER), CAST(col AS DECIMAL(10,2))
+                    ★ CRITICAL ★ Teradata has NO TRY_CAST. Casting a VARCHAR column that may
+                    hold non-numeric values with CAST() throws a hard error and aborts the
+                    ENTIRE query on the first bad value. Guard with a pattern check before
+                    casting, e.g.: WHERE col NOT LIKE '%[^0-9.]%' (ESCAPE clause as needed)
+                    AND CAST(col AS DECIMAL(10,2)) < 20 — NEVER cast an unguarded free-text
+                    column directly in a numeric comparison."""
+
+    # Fallback for unknown/unlisted db types — assume the safest common denominator:
+    # do NOT assume TRY_CAST/SAFE_CAST exist here since we don't know the dialect.
     return """\
 ROW LIMITING      : LIMIT N at the end of the query
 CASE-INSENSITIVE  : LOWER(col) LIKE LOWER('%term%')
 STRING CONCAT     : col1 || col2
-NULL HANDLING     : COALESCE(col, 0)"""
+NULL HANDLING     : COALESCE(col, 0)
+TYPE CASTING      : ★ CRITICAL ★ This dialect is not explicitly profiled above, so do NOT
+                    assume TRY_CAST / SAFE_CAST / TRY_CONVERT exist. Before casting any TEXT
+                    column that is not guaranteed to hold clean numeric strings, add an
+                    explicit guard condition (e.g. a regex/LIKE pattern check) in the WHERE
+                    clause so a single dirty value cannot throw an error and abort the whole
+                    query. Only cast directly, unguarded, when the schema context shows the
+                    column's native type is already numeric."""
 
 
 _SYSTEM_PROMPT = """\
@@ -443,6 +538,32 @@ General Rules:
         channel dimension unless the question specifically asks to break down by channel).
       • Joining a date dimension when the fact table already has the period column.
       • Joining lookup tables to "enrich" the output with extra labels not asked for.
+6a. COUNT / DISTINCT-COUNT QUESTIONS — MANDATORY, UNIVERSAL (all databases):
+   a. If the question asks "how many <entities>" (policies, claims, customers,
+      accounts, products, etc.), first check whether it can be answered from a
+      SINGLE table. A plain count of one entity type NEVER requires a JOIN —
+      do not join related/child tables (adjusters, indicators, tracking logs,
+      line items, etc.) "for context". Apply rule 6 first: if no column from
+      another table is needed in SELECT/WHERE/GROUP BY, do not join it.
+   b. If a JOIN is unavoidable (a filter column lives in another table), you
+      MUST use COUNT(DISTINCT <primary_key_of_the_counted_entity>) — NEVER
+      COUNT(*) and NEVER COUNT(<non-distinct column>). A one-to-many JOIN
+      (e.g. one claim to many adjuster/fraud/tracking records) multiplies rows,
+      so COUNT(*) after such a JOIN overstates the true count.
+   c. Before finalizing a count query, ask: "Could any joined table have more
+      than one row per counted entity?" If yes (or uncertain), either drop the
+      JOIN if it isn't needed for filtering, or wrap it in DISTINCT counting.
+   d. Example — WRONG:
+        SELECT COUNT(c.claim_id) FROM claims c
+        LEFT JOIN adjuster a ON a.claim_id = c.claim_id
+        LEFT JOIN fraud_indicator f ON f.claim_id = c.claim_id
+        LEFT JOIN deductible_tracking d ON d.claim_id = c.claim_id
+      CORRECT (no filter needs those tables — drop the joins entirely):
+        SELECT COUNT(c.claim_id) FROM claims c
+      CORRECT (if a filter genuinely requires one of those tables):
+        SELECT COUNT(DISTINCT c.claim_id) FROM claims c
+        LEFT JOIN fraud_indicator f ON f.claim_id = c.claim_id
+        WHERE f.status = 'CONFIRMED'
 7. Sibling table disambiguation — when several tables share the same columns
    (e.g. the same schema has a "by_channel" table, a "by_category" table, and
    a "combined" table with maker+category+channel):
@@ -457,6 +578,15 @@ General Rules:
    c. When unsure, prefer the table with more rows / more distinct time periods —
       this is usually indicated by higher unique_count on the year_month column in
       the schema context.
+   d. EXCEPTION — occurrence-counting questions ALWAYS override (b) and (c):
+      if the question asks to count/total occurrences of an entity (attendees,
+      transactions, visits, orders, line items), a wide "combined"/"primary"/
+      "master" table is frequently NOT one-row-per-occurrence — it may be built
+      at a different, narrower grain (e.g. one row per expense line, not one row
+      per attendee) even though it happens to contain a plausibly-named column.
+      See rule 23 for how to pick the correctly-grained table in that case —
+      do NOT apply the "prefer the comprehensive table" preference from (b)
+      when the question requires counting occurrences.
 8. If the question cannot be answered from the available schema, return [].
 9. Maximum {max_queries} queries total.
 10. Schema-qualified FROM/JOIN clauses: always write FROM schema.table.
@@ -1123,6 +1253,206 @@ General Rules:
        - Use LAG() window function when comparing consecutive periods in a single query.
     d. If the KPI has no sql_expression yet, use the nl_formula as a hint and write
        your best SQL equivalent — note in "description" that the formula was inferred.
+
+19. COLUMN SELECTION FOR ENTITY-PRESENCE / FLAG FILTERS — UNIVERSAL, ALL DOMAINS,
+    ALL DATABASES. This rule applies regardless of industry or dialect.
+    a. When the question implies "does this row represent/involve entity X" (e.g.
+       "with customers", "involving employees", "for HCPs", "by supplier"), and
+       several columns in the schema relate to X by name, do NOT default to whichever
+       column merely contains X as a substring. Check the null-rate / completeness
+       annotation shown for each candidate column in the schema context (e.g.
+       "(99.0% null)" or "(0.3% null)") and prefer the column that:
+         - functions as an identifier/key for that entity (name ends in _key, _id, or
+           is marked PK/FK in the schema), AND
+         - has the LOWEST null rate among the candidates.
+       A descriptive/classification/category column for the same entity (e.g. a
+       "*_classification", "*_type", or "*_category" column) is frequently far
+       sparser than the entity's own key column and describes a subset of rows, not
+       presence of the entity — it is usually the WRONG signal for "does this row
+       involve entity X".
+    b. Before finalizing any WHERE clause that ANDs 2+ conditions together, check the
+       null-rate annotation for every filtered column. If any filtered column is
+       highly sparse (roughly >80% null), pause and verify it is genuinely the
+       column the question is asking about — a heavily-null column ANDed with other
+       filters can silently collapse a syntactically valid query to 0 rows, in any
+       domain and any database.
+    c. For yes/no, opt-in, eligibility, or participation-style questions (the
+       question uses a word like "attended", "opted in", "enrolled", "eligible",
+       "flagged", "active"), actively look in the schema context for a column with
+       exactly 2 (or very few) distinct values — these boolean/flag-style columns
+       are usually the intended filter target, even when their name does not
+       literally contain the question's wording, and even when the annotation
+       pipeline judged the column name "self-explanatory" and therefore did not
+       give it a separate business-concept label. Do not overlook a plainly-named
+       flag column just because it has no concept annotation — read the raw column
+       name and its distinct-value count directly from the schema context.
+
+20. NEVER FILTER A DIMENSION THE QUESTION DID NOT MENTION — UNIVERSAL, ALL
+    DOMAINS, ALL DATABASES. This is distinct from rule 6/6a (unnecessary JOINs)
+    and from the CATEGORICAL FILTERS rule (mapping a term the user DID use to
+    a real stored value) — this rule covers a different mistake: inventing a
+    WHERE filter on a column for a dimension the question never referenced at
+    all, using guessed values instead of the schema's real ones.
+    a. If the schema context shows a categorical column's cardinality (e.g.
+       "unique values=7") but does NOT list the actual stored values for it
+       (no [sample values] / top values shown), you do NOT know what those 7
+       values are. Do NOT guess them from the table/column name, domain
+       conventions, or general world knowledge (e.g. assuming a table whose
+       name suggests a region covers a specific, commonly-known list of
+       countries for that region).
+    b. If the user's question does not name a specific value — or even
+       mention that dimension at all — do NOT add a WHERE filter on it "to
+       scope the query sensibly". Leave that column unfiltered so the query
+       returns whatever values genuinely exist in the data. An unfiltered
+       query that surfaces the true, complete set of values is correct; a
+       filtered query built on guessed values is wrong even if the guessed
+       values happen to look plausible.
+    c. This applies to every kind of scoping dimension: geography/market,
+       time period, product line, business unit, customer segment, or any
+       other categorical column — not just the specific case of a region or
+       market name.
+    d. Only filter a dimension when either (i) the user's question explicitly
+       names a value for it (use the CATEGORICAL FILTERS rule to map it), or
+       (ii) a PRE-RESOLVED CATEGORY MAPPING / DEFINED KPI section above
+       instructs you to. Never filter a dimension solely because you inferred
+       from the table or column name what its "typical" values probably are.
+
+21. "COUNT OF X" / "NUMBER OF X" / "HEADCOUNT" QUESTIONS — STORED VALUE vs
+    COMPUTED AGGREGATE. UNIVERSAL, ALL DOMAINS, ALL DATABASES.
+    a. Before filtering any numeric column against a threshold implied by a
+       counting question ("more than N attendees", "fewer than N people",
+       "at least N transactions", "headcount above N"), check that column's
+       observed min/max range shown in the schema context (e.g. "min=0.0000,
+       max=6.0000"). If the threshold N falls outside — or even close to the
+       edge of — that column's real range, the column almost certainly does
+       NOT represent the count the question is asking about, even if its name
+       sounds like it should (e.g. a column literally named "no_of_people" or
+       "num_attendees" can still be the wrong signal if its real range is 0-6
+       while the question implies dozens).
+    b. A "count of X" question is asking for the number of rows/occurrences of
+       X for some entity (an event, an order, a customer, etc.) — that is
+       usually NOT a value stored directly on a single row. It has to be
+       COMPUTED: GROUP BY the entity's key on the table where X has one row
+       per occurrence, then COUNT(*) or COUNT(DISTINCT <id>), and apply the
+       question's threshold with HAVING, not WHERE.
+       WRONG:  SELECT * FROM expense_lines WHERE attendee_count_field > 20
+       RIGHT:  SELECT event_id, COUNT(*) AS attendee_count
+               FROM attendance_detail_table
+               GROUP BY event_id
+               HAVING COUNT(*) > 20
+    c. Only trust a stored numeric column as the answer to a "count of X"
+       question when its observed range in the schema context is actually
+       consistent with what the question implies (e.g. a "total_attendees"
+       column on an event-summary table whose max is in the hundreds IS a
+       legitimate stored aggregate — use it directly, do not recompute).
+    d. If you cannot find any column or table capable of producing the
+       requested count (no detail table with one row per occurrence, and no
+       stored aggregate column whose range fits), say so in the description
+       rather than filtering a column whose range makes the question
+       unanswerable — a query that runs and returns 0 rows is worse than an
+       honest "not available" because it looks like a real, verified answer.
+
+22. STATUS/VALIDITY COMPANION COLUMNS — AVOID DUPLICATE AMBIGUOUS ROWS.
+    UNIVERSAL, ALL DOMAINS, ALL DATABASES.
+    a. Some tables store one row per (entity, sub-dimension) combination —
+       e.g. one row per (market, category, business-unit) — where the
+       sub-dimension is often NOT applicable, so most rows are placeholder
+       rows with a zero/blank value, and only the applicable sub-dimension's
+       row holds the real number. This is visible in the schema as a
+       categorical "status" / "validity" column sitting alongside the
+       numeric value column, whose sample values look like an
+       applicability flag — e.g. "allowed" / "empty" (or "valid"/"invalid",
+       "active"/"inactive", "approved"/"n/a", a "1"/"0" flag, etc. — the
+       exact words vary by dataset, read the sample values shown).
+    b. If you query the numeric column WITHOUT filtering on that status
+       column (or without filtering the numeric column itself to exclude
+       the placeholder value, typically 0), you will get MULTIPLE rows per
+       entity with CONFLICTING values — some real, some placeholder — and
+       nothing in the result distinguishes which is which. This reads as
+       inconsistent/wrong data even though every individual row is real.
+    c. Before finalising a query that returns "the value of X for entity Y"
+       from a table like this, check whether a status/validity column exists
+       for that value. If it does, filter on it (e.g. status = 'allowed') or
+       filter the numeric column itself (e.g. amount > 0) — same principle as
+       the CATEGORICAL FILTERS rule, applied specifically to a
+       status-vs-value column pair. Also SELECT the status column in the
+       output so the answer's provenance is visible, not just the number.
+    d. Do NOT assume this applies universally to every table — many tables
+       have exactly one row per entity and no such ambiguity. Only apply
+       this rule when the schema context actually shows a categorical column
+       whose sample values look like an applicability/validity indicator
+       sitting next to the numeric column you are about to query.
+
+23. GRAIN-CORRECT TABLE SELECTION FOR OCCURRENCE-COUNTING QUESTIONS.
+    UNIVERSAL, ALL DOMAINS, ALL DATABASES. This is a TABLE-CHOICE rule, not a
+    column-choice rule — it applies BEFORE you decide which column to filter.
+    a. When the question asks to count/total OCCURRENCES of an entity
+       (attendees at an event, transactions on an account, visits to a site,
+       line items on an order — anything phrased as "how many X", "more/fewer
+       than N X", "total X"), the ONLY tables that can correctly answer it are
+       ones with genuinely ONE ROW PER OCCURRENCE of that entity. On such a
+       table, COUNT(*) or COUNT(DISTINCT <id>) IS the count.
+    b. A wide "combined"/"primary"/"master" table that also contains a
+       plausibly-named column (e.g. something that sounds like "headcount" or
+       "attendee count") is NOT automatically the right table — it is often
+       built at a DIFFERENT, narrower grain (e.g. one row per expense line, per
+       order line, or per transaction — not one row per occurrence of the
+       entity the question is asking about). A column merely CONTAINING a
+       matching word is not evidence it holds the full count; matching the
+       question's WORDING is not the same as matching its GRAIN.
+    c. Prefer a table whose name and columns describe the entity's own detail/
+       transaction/event record (e.g. an "attendance", "visit", "transaction",
+       "line_item" style table) for counting occurrences of that entity, even
+       when a wider combined table also exists and even when the combined
+       table's column name is a closer lexical match to the question. Do NOT
+       let rule 7's "prefer the comprehensive table" guidance override this —
+       rule 7(d) explicitly does not apply here.
+    d. A concrete tell that a candidate column is at the WRONG grain: its
+       observed min/max range in the schema context is implausibly small for
+       the real-world entity being counted (e.g. a "number of people" column
+       whose max is 6 cannot represent total attendance at an event that
+       plausibly draws dozens of people — see rule 21 and the numeric-range
+       guidance elsewhere in this prompt). When you see this mismatch, do not
+       just look for a different column on the SAME table — look for a
+       DIFFERENT table in the schema whose grain actually matches one row per
+       occurrence of the entity in question.
+    e. If the wide combined table and the detail/occurrence table share the
+       filter columns the question needs (e.g. both have a status/participation
+       flag), that is not a reason to prefer the combined table — it just means
+       the correctly-grained table can answer the ENTIRE question on its own,
+       with no join required. Check this before assuming you need to combine
+       both tables or join anything.
+
+24. HISTORICAL / VERSIONED DATA — USE THE LATEST RECORD PER ENTITY.
+    UNIVERSAL, ALL DOMAINS, ALL DATABASES.
+    a. Some tables genuinely track how a SINGLE entity's record changed over
+       TIME — e.g. a table literally named with "history", "log", "audit",
+       "snapshot", "versions", or "_hist" in the schema, or one where the FD/
+       join-key evidence shows the same entity key repeats across rows with a
+       date/timestamp column distinguishing them (an SCD-style table). For
+       these tables, when the question asks about an entity's CURRENT /
+       latest / present state (or doesn't specify a point in time at all),
+       return only the MOST RECENT row per entity — via
+       ROW_NUMBER()/QUALIFY (Snowflake/BigQuery) or a correlated
+       MAX(date_col) subquery (other dialects) partitioned/grouped by the
+       entity key — not every historical row, and not an arbitrary row.
+    b. Only return multiple historical rows per entity when the question
+       explicitly asks for a trend, history, timeline, or change over time
+       (e.g. "how has X changed", "show the history of Y").
+    c. ★ CRITICAL BOUNDARY — this rule does NOT apply to, and must never be
+       used to resolve, the pattern in rule 22 (status/validity companion
+       columns). Rule 22's tables are NOT time-series data — their duplicate
+       rows represent different SUB-DIMENSIONS at essentially the same point
+       in time (e.g. one row per business sector for the same market), most
+       of which are placeholder/not-applicable, not successive versions of
+       the same fact. "Most recent" is NOT a reliable signal for which
+       sub-dimension row is real in that pattern — recency and validity are
+       independent there. Only apply THIS rule (24) when the table is
+       genuinely about the same fact changing over time for one entity, and
+       apply rule 22 (status/validity filtering) when it's about disambiguating
+       which sub-dimension row is real — do not substitute one fix for the
+       other. When unsure which pattern you're looking at, prefer rule 22's
+       explicit status/validity filtering signal over guessing based on dates.
 """
 
 _USER_PROMPT = """\
@@ -1131,7 +1461,7 @@ SCHEMA CONTEXT:
 
 TARGET DATABASE TYPE: {db_type}
 {schema_line}
-{history_section}{multi_kg_section}{glossary_section}{kpi_section}{resolution_section}NATURAL LANGUAGE QUESTION:
+{history_section}{multi_kg_section}{glossary_section}{kpi_section}{resolution_section}{verified_section}NATURAL LANGUAGE QUESTION:
 {natural_query}
 
 CRITICAL REMINDERS:
@@ -1159,6 +1489,12 @@ CRITICAL REMINDERS:
   instructions. Always include both the raw value and the percentage column.
 - KPI FORMULAS: if a DEFINED KPIs section is shown above and the question mentions a
   KPI by name, use the pre-defined sql_expression verbatim — do not rewrite it.
+- VERIFIED EXAMPLES (see VERIFIED PAST CORRECTIONS section above if present): these are
+  SQL queries a human has already confirmed correct for a similar question on THIS EXACT
+  data source. They encode source-specific facts (which column is the real signal, which
+  one is a red herring) that cannot be derived from column names alone. When the current
+  question closely matches one, follow its column choices and filter pattern — do not
+  independently re-derive a different answer that contradicts a verified example.
 
 Return the JSON array of SQL queries now.
 """
@@ -1309,10 +1645,90 @@ _CHANGE_INTENT_WORDS = (
 )
 
 
+_SPARSE_NULL_RE = re.compile(r'^\s{2,4}"?(\w+)"?\s*:.*?\((\d+(?:\.\d+)?)%\s*null\)', re.MULTILINE)
+
+# A column this sparse, ANDed with any other filter condition, is high-risk on
+# its own: requiring a near-always-empty column to be non-null (or match a
+# value) alongside anything else collapses the result set almost regardless of
+# the other condition's selectivity. This is the anchor threshold for check 5.
+_SPARSE_NULL_THRESHOLD = 85.0
+
+
+def _extract_column_null_rates(schema_context: str) -> Dict[str, float]:
+    """
+    Map lowercase column name -> null percentage, parsed from schema_context
+    property lines such as:
+        "  id_hcp_classification: string  -- TEXT descriptive text column (99.0% null)"
+    First occurrence wins if the same column name appears under multiple tables.
+    """
+    rates: Dict[str, float] = {}
+    for m in _SPARSE_NULL_RE.finditer(schema_context or ""):
+        col = m.group(1).lower()
+        if col not in rates:
+            rates[col] = float(m.group(2))
+    return rates
+
+
+# A column's property block spans several lines — the column declaration line,
+# then a "Semantic domain: ..." line and a "Statistics: ... min=X, max=Y, ..."
+# line of their own. In the ACTUAL text understand_node produces, column names
+# AND these landmark labels are double-quoted, e.g.:
+#     "no_of_people": string  -- TEXT descriptive text column (36.1% null)
+#     "Semantic domain": descriptive text
+#     "Statistics": unique values=4, null count=2253, min=0.0000, max=6.0000
+# Quotes are optional in the regex below (older/unquoted formats also occur)
+# so this matches either. "Statistics" itself would otherwise be misread as a
+# column declaration (it matches the same `"?word"?\s*:` shape) — excluded
+# explicitly rather than relied upon to fail the pattern.
+_COLUMN_DECL_RE = re.compile(r'^\s{2,4}"?(\w+)"?\s*:', re.MULTILINE)
+_STATS_LINE_RE = re.compile(r'^\s{2,4}"?Statistics"?\s*:\s*(.*)$', re.MULTILINE | re.IGNORECASE)
+_MINMAX_RE = re.compile(r'\bmin=(-?\d+(?:\.\d+)?)\s*,?\s*max=(-?\d+(?:\.\d+)?)')
+_NON_COLUMN_LABELS = {"statistics", "semantic", "business"}  # pseudo-entries, never real columns
+
+
+def _extract_column_numeric_ranges(schema_context: str) -> Dict[str, tuple]:
+    """
+    Map lowercase column name -> (min, max), parsed from schema_context.
+    A column's declaration line and its "Statistics: ... min=X, max=Y" line are
+    NOT on the same line, and are not even adjacent — a "Semantic domain" line
+    (and sometimes a "Business concept" line) sits between them. This finds
+    every column declaration, then associates it with the nearest "Statistics"
+    line that appears strictly BEFORE the next column declaration — robust to
+    however many landmark lines sit in between. This is the OBSERVED range in
+    the actual data — used by preflight Check 6 to catch a WHERE clause
+    comparing a column against a threshold the data can never satisfy (e.g.
+    "> 20" when the column's real max is 6). First occurrence wins if the same
+    column name appears under multiple tables.
+    """
+    ranges: Dict[str, tuple] = {}
+    text = schema_context or ""
+    col_matches = [
+        m for m in _COLUMN_DECL_RE.finditer(text)
+        if m.group(1).lower() not in _NON_COLUMN_LABELS
+    ]
+    stats_matches = list(_STATS_LINE_RE.finditer(text))
+    if not col_matches or not stats_matches:
+        return ranges
+
+    for i, cm in enumerate(col_matches):
+        col = cm.group(1).lower()
+        if col in ranges:
+            continue
+        span_end = col_matches[i + 1].start() if i + 1 < len(col_matches) else len(text)
+        for sm in stats_matches:
+            if cm.end() <= sm.start() < span_end:
+                mm = _MINMAX_RE.search(sm.group(1))
+                if mm:
+                    ranges[col] = (float(mm.group(1)), float(mm.group(2)))
+                break
+    return ranges
+
+
 def _preflight_check_plan(
     plan_items: List[Dict],
     known_columns: set,
     natural_query: str,
+    schema_context: str = "",
 ) -> List[str]:
     """
     Pre-execution completeness checks on the raw LLM plan (list of dicts).
@@ -1332,6 +1748,11 @@ def _preflight_check_plan(
     3. Missing q_summary: a JOIN query exists but no query_id ends in "summary".
     4. YoY column in schema + change-intent question but no YoY column in any
        query SQL.
+    5. Sparse-column co-filter risk: WHERE clause ANDs two or more columns that
+       are each individually >50% null (per schema_context) — a near-guaranteed
+       0-row result when the columns belong to different record subtypes in a
+       wide/denormalised table (e.g. an HCP classification code and a meal
+       headcount field that are populated for disjoint sets of rows).
     """
     gaps: List[str] = []
     sql_items = [it for it in plan_items if it.get("sql")]
@@ -1464,7 +1885,128 @@ def _preflight_check_plan(
                     f"part of the question. See rules 10d and 10e."
                 )
 
+    # ── Check 5: sparse-column co-filter risk ─────────────────────────────────
+    null_rates = _extract_column_null_rates(schema_context)
+    if null_rates:
+        for item in sql_items:
+            sql = item["sql"]
+            qid = item.get("query_id", "?")
+
+            where_match = re.search(
+                r'\bWHERE\b(.*?)(?=\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bQUALIFY\b|$)',
+                sql, re.IGNORECASE | re.DOTALL,
+            )
+            if not where_match:
+                continue
+            where_clause = where_match.group(1)
+
+            # Need at least 2 AND-connected conditions for a co-filter risk to
+            # exist at all — a single filter on a sparse column is often exactly
+            # what the user asked for (e.g. "show me the flagged records").
+            and_condition_count = len(re.findall(r'\bAND\b', where_clause, re.IGNORECASE)) + 1
+            if and_condition_count < 2:
+                continue
+
+            # Columns referenced in a null-check or equality/inequality comparison
+            # inside the WHERE clause (quoted or bare identifier forms).
+            cols_in_where = set(re.findall(
+                r'"(\w+)"\s*(?:IS\s+(?:NOT\s+)?NULL|!?=)', where_clause, re.IGNORECASE,
+            ))
+            cols_in_where |= set(re.findall(
+                r'\b(\w+)\s+IS\s+(?:NOT\s+)?NULL\b', where_clause, re.IGNORECASE,
+            ))
+
+            sparse_cols = sorted(
+                {(c, null_rates[c.lower()]) for c in cols_in_where
+                 if c.lower() in null_rates and null_rates[c.lower()] >= _SPARSE_NULL_THRESHOLD},
+                key=lambda t: -t[1],
+            )
+            if sparse_cols:
+                detail = ", ".join(f"{c!r} ({pct:.0f}% null)" for c, pct in sparse_cols)
+                gaps.append(
+                    f"Query {qid!r}: WHERE clause ANDs a near-always-empty column with "
+                    f"{and_condition_count - 1} other condition(s) — {detail}. Requiring a "
+                    f"column this sparse to be non-null (or match a value) at the same time "
+                    f"as other filters is very likely to collapse the result to 0 rows, "
+                    f"especially in a wide/denormalised table where sparse columns often "
+                    f"belong to a different record subtype than the rest of the filter. "
+                    f"Re-check whether a more complete identifier column (e.g. a '_key' "
+                    f"column, usually populated far more consistently than a descriptive "
+                    f"classification column for the same entity) should be used instead."
+                )
+
+    # ── Check 6: impossible numeric-threshold filter ──────────────────────────
+    # Catches a WHERE clause comparing a column against a threshold the column's
+    # OWN observed data range can never satisfy — e.g. "> 20" on a column whose
+    # real max is 6. Such a query runs cleanly and returns 0 rows with no error,
+    # which reads as "there is no matching data" when the real problem is that
+    # the wrong column was used to answer a "count of X" / "number of Y" style
+    # question (the true count usually has to be computed via GROUP BY + HAVING
+    # COUNT(...) over a detail table, not read off a stored per-row value).
+    numeric_ranges = _extract_column_numeric_ranges(schema_context)
+    if numeric_ranges:
+        for item in sql_items:
+            msg = _detect_impossible_numeric_filter(item["sql"], numeric_ranges)
+            if msg:
+                gaps.append(f"Query {item.get('query_id', '?')!r}: {msg}")
+
     return gaps
+
+
+_IMPOSSIBLE_CMP_RE = re.compile(
+    r'(?:TRY_CAST|CAST|TRY_TO_NUMBER|TRY_TO_DOUBLE|TRY_TO_DECIMAL|SAFE_CAST)?\s*'
+    r'\(?\s*[\w]*\.?"?(\w+)"?\s*(?:AS\s+\w+\))?\s*'
+    r'(>=|<=|>|<|=)\s*'
+    r'(-?\d+(?:\.\d+)?)',
+    re.IGNORECASE,
+)
+
+
+def _detect_impossible_numeric_filter(sql: str, numeric_ranges: Dict[str, tuple]) -> Optional[str]:
+    """
+    Return a human-readable message if `sql` compares a column against a
+    threshold the column's OWN observed data range (from numeric_ranges) can
+    never satisfy — e.g. "> 20" when the real max is 6. None if no issue is
+    found. Shared by preflight Check 6 (detection/logging, in
+    _preflight_check_plan) and the corrective retry in plan_node (which uses
+    the identical logic to decide whether a one-shot LLM rewrite is needed,
+    and to verify the rewrite actually fixed it) — one detector, two callers,
+    so they can never silently drift apart.
+    """
+    if not numeric_ranges:
+        return None
+    for m in _IMPOSSIBLE_CMP_RE.finditer(sql):
+        col, op, thresh_str = m.group(1).lower(), m.group(2), m.group(3)
+        if col not in numeric_ranges:
+            continue
+        thresh = float(thresh_str)
+        lo, hi = numeric_ranges[col]
+        if op == ">":
+            impossible = thresh >= hi
+        elif op == ">=":
+            impossible = thresh > hi
+        elif op == "<":
+            impossible = thresh <= lo
+        elif op == "<=":
+            impossible = thresh < lo
+        else:  # "="
+            impossible = thresh < lo or thresh > hi
+        if impossible:
+            return (
+                f"filters '{col}' {op} {thresh_str}, but the schema context shows "
+                f"'{col}''s OBSERVED data range is min={lo} max={hi} — this comparison "
+                f"can NEVER match a row, so the query will silently return 0 results "
+                f"with no error. This usually means '{col}' is the WRONG column for "
+                f"what the question is actually asking (e.g. a per-row stored value "
+                f"being used where the question actually needs a COUNT/SUM computed "
+                f"via GROUP BY + HAVING over a detail/transaction table — a "
+                f"'headcount'/'number of X' question about an aggregate is rarely "
+                f"answerable by filtering a single stored column directly, and if the "
+                f"query already has a GROUP BY, the threshold likely belongs in HAVING "
+                f"against the aggregate result, not in WHERE against the raw column). "
+                f"Compute the count/sum with GROUP BY + HAVING {op} {thresh_str} instead."
+            )
+    return None
 
 
 _COST_PER_M = {
@@ -1502,6 +2044,103 @@ def _call_llm(
     )
     _log_cost("plan_node", model, msg.usage)
     return msg.content[0].text if msg.content else ""
+
+
+_FIX_THRESHOLD_SYSTEM = """\
+You are a SQL expert fixing a query that will silently return 0 rows due to \
+an impossible filter condition — it runs without error, but the threshold \
+can never be satisfied by the column's real data range.
+
+There are TWO possible root causes — check both, in this order:
+
+1. WRONG TABLE (check this first). The column's tiny/implausible range often \
+means the table you queried is at the WRONG GRAIN for what's being counted \
+— e.g. it has one row per expense line or transaction, not one row per \
+occurrence of the entity the question asks about (attendee, visit, order).
+   Look at the schema context below for a DIFFERENT table whose name and \
+   columns describe the entity's own detail/transaction/attendance record \
+   (one row per occurrence). If one exists and has the other columns this \
+   query needs (the same filters, keys, etc.), REWRITE THE QUERY AGAINST \
+   THAT TABLE INSTEAD — group by the entity key and use COUNT(*) or \
+   COUNT(DISTINCT <id>) as the count, then apply the threshold via HAVING.
+   Do not assume you need to JOIN both tables — the correctly-grained table
+   alone usually already has everything the query needs.
+
+2. WRONG CLAUSE (if the table is genuinely already correct). The question \
+needs a COUNT/SUM across multiple rows per entity (e.g. "attendees more \
+than N", "orders more than N"), but the threshold was applied with WHERE \
+against a raw per-row column instead of HAVING against the aggregated \
+result.
+   WRONG: SELECT entity_id, SUM(TRY_CAST(col AS NUMERIC)) AS total
+          FROM t WHERE TRY_CAST(col AS NUMERIC) > 20 GROUP BY entity_id
+   RIGHT: SELECT entity_id, SUM(TRY_CAST(col AS NUMERIC)) AS total
+          FROM t GROUP BY entity_id HAVING SUM(TRY_CAST(col AS NUMERIC)) > 20
+   If there is no GROUP BY at all, add one grouped by the natural entity key
+   for the question, aggregate with SUM or COUNT, and apply the threshold via
+   HAVING — never filter the raw column in WHERE for a per-entity total.
+
+Preserve the original question's intent exactly. Only change table/column
+choices when case 1 genuinely applies — do not swap tables speculatively if
+the original table can be fixed by case 2 alone. Return ONLY the corrected
+SQL — no explanation, no markdown fences, no commentary.
+"""
+
+
+def _fix_impossible_threshold_sql(
+    sql: str,
+    gap_message: str,
+    natural_query: str,
+    schema_context: str,
+    model: str,
+    temperature: float,
+) -> str:
+    """
+    One-shot LLM correction for a query flagged by
+    _detect_impossible_numeric_filter (Check 6) — a semantic mistake that
+    never surfaces as a runtime SQL error (the query runs cleanly and just
+    returns 0 rows), so execute_node's error-driven self-heal never gets a
+    chance to catch it. This has to happen at plan time, before execution.
+
+    Includes schema_context so the LLM can see whether a different,
+    correctly-grained table exists to switch to (see rule 23) rather than
+    only being able to patch WHERE/HAVING placement on the original table —
+    a small max value is often a sign the table itself is wrong, not just the
+    clause. schema_context is trimmed defensively; this call already runs
+    only when Check 6 fires, so it's rare enough that the extra token cost is
+    fine, but a runaway-huge schema must never crash this correction.
+
+    Returns the corrected SQL, or the original unchanged if the LLM call
+    fails, returns nothing usable, or (deliberately) doesn't change it.
+    Never raises — a failure here must never block the rest of planning.
+    """
+    _MAX_SCHEMA_CHARS = 120_000
+    trimmed_schema = schema_context[:_MAX_SCHEMA_CHARS]
+    user = (
+        f"Original question: {natural_query}\n\n"
+        f"Problem detected:\n{gap_message}\n\n"
+        f"Original SQL:\n{sql}\n\n"
+        f"SCHEMA CONTEXT (for checking whether a better-grained table exists):\n"
+        f"{trimmed_schema}\n\n"
+        "Return the corrected SQL only."
+    )
+    try:
+        from llm_client import get_client
+        client = get_client()
+        msg = client.messages.create(
+            model=model,
+            max_tokens=2048,
+            temperature=temperature,
+            system=_FIX_THRESHOLD_SYSTEM,
+            messages=[{"role": "user", "content": user}],
+        )
+        _log_cost("plan_node.threshold_fix", model, msg.usage)
+        fixed = (msg.content[0].text if msg.content else "").strip()
+        fixed = re.sub(r"^```[a-z]*\s*", "", fixed, flags=re.IGNORECASE)
+        fixed = re.sub(r"\s*```$", "", fixed).strip()
+        return fixed if fixed else sql
+    except Exception as exc:
+        logger.warning("plan_node: impossible-threshold corrective LLM call failed — %s", exc)
+        return sql
 
 
 def _extract_json(text: str) -> List[Dict[str, Any]]:
@@ -1570,10 +2209,120 @@ def _extract_known_columns(schema_context: str) -> set:
                     or stripped.startswith("-"):
                 in_columns = False
                 continue
-            col_name = stripped.split(":")[0].split("[")[0].strip()
+            col_name = stripped.split(":")[0].split("[")[0].strip().strip('"')
             if col_name:
                 known.add(col_name.lower())
     return known
+
+
+def _dotted_literal_parts(known_cols: set) -> set:
+    """
+    Return every individual prefix/tail token of literal dotted column names
+    in known_cols (e.g. "evt.event_key" -> {"evt", "event_key"}). These are
+    not real standalone columns, but the LLM sometimes mis-splits the single
+    literal identifier into alias.token or token.token — see the comment at
+    known_columns.update(_dotted_literal_parts(...)) for why callers need this.
+    """
+    parts: set = set()
+    for c in known_cols:
+        if "." in c:
+            parts.update(p for p in c.split(".") if p)
+    return parts
+
+
+def _extract_table_columns(schema_context: str) -> Dict[str, set]:
+    """
+    Parse schema_context into {BARE_TABLE_NAME (uppercase): {lowercased column
+    names}}. Unlike _extract_known_columns (a flat set across the whole
+    schema), this is scoped per table — it lets us catch a column that is a
+    genuine column SOMEWHERE in the schema but referenced against a table
+    alias that does not actually have it (e.g. filtering EVENT_ATTENDANCE on
+    "country_code" when only the HCP table has that column and
+    EVENT_ATTENDANCE has "country_key" instead). _find_hallucinated_columns
+    alone can't catch this because the column genuinely exists in the schema.
+    """
+    table_cols: Dict[str, set] = {}
+    current_table: Optional[str] = None
+    in_columns = False
+    for line in schema_context.splitlines():
+        stripped = line.strip()
+        m = re.match(r'^Table:\s*(.+)$', stripped)
+        if m:
+            bare = m.group(1).split(".")[-1].strip().strip('"').upper()
+            current_table = bare
+            table_cols.setdefault(current_table, set())
+            in_columns = False
+            continue
+        if stripped.lower() == "columns:":
+            in_columns = True
+            continue
+        if in_columns and current_table:
+            if not stripped or stripped.startswith("Table:") or stripped.startswith("FK:") \
+                    or stripped.startswith("--") or stripped.startswith("=") \
+                    or stripped.startswith("-"):
+                in_columns = False
+                continue
+            col_name = stripped.split(":")[0].split("[")[0].strip().strip('"')
+            if col_name:
+                table_cols[current_table].add(col_name.lower())
+    return table_cols
+
+
+def _extract_alias_table_map(sql: str) -> Dict[str, str]:
+    """
+    Map each table alias used in FROM/JOIN clauses to its bare table name
+    (uppercase), e.g. `FROM foo."SEA_IDISCOVER_HCPS" AS h` → {"h": "SEA_IDISCOVER_HCPS"}.
+    Skips matches where the "alias" is actually a SQL keyword (happens when a
+    table has no real alias and the regex greedily grabs the next clause word).
+    """
+    mapping: Dict[str, str] = {}
+    for m in re.finditer(
+        r'\b(?:FROM|JOIN)\s+(?:[\w]+\.)?"?(\w+)"?\s+(?:AS\s+)?"?(\w+)"?',
+        sql, re.IGNORECASE,
+    ):
+        table_tok, alias_tok = m.group(1), m.group(2)
+        if alias_tok.lower() in _SQL_KEYWORDS or alias_tok.upper() == table_tok.upper():
+            continue
+        mapping[alias_tok.lower()] = table_tok.upper()
+    return mapping
+
+
+def _find_cross_table_columns(
+    sql: str, table_col_map: Dict[str, set], known_cols: set,
+) -> List[str]:
+    """
+    Find alias.column references where `column` is a genuine column in the
+    schema (so _find_hallucinated_columns lets it through) but does NOT
+    belong to the specific table that alias refers to. Returns bare column
+    names (same shape as _find_hallucinated_columns) so callers can reuse
+    _strip_hallucinated_conditions / _has_hallucinated_join unchanged.
+    """
+    if not table_col_map:
+        return []
+    alias_table = _extract_alias_table_map(sql)
+    if not alias_table:
+        return []
+
+    sql_stripped = re.sub(r"'[^']*'", "''", sql)
+    bad: List[str] = []
+    seen: set = set()
+    for m in re.finditer(r'\b(\w+)\."?([A-Za-z_]\w*)"?(?!\s*\()', sql_stripped):
+        alias, col = m.group(1).lower(), m.group(2)
+        low = col.lower()
+        if low in _SQL_KEYWORDS or low in seen:
+            continue
+        table = alias_table.get(alias)
+        if not table:
+            continue
+        cols_for_table = table_col_map.get(table)
+        if cols_for_table is None or low in cols_for_table:
+            continue
+        # Not on this table — only flag if it's a real column elsewhere,
+        # otherwise it's plain hallucination already caught upstream.
+        if low in known_cols:
+            bad.append(col)
+            seen.add(low)
+    return bad
 
 
 # SQL keywords and functions that look like identifiers but are never column names
@@ -1605,6 +2354,44 @@ _SQL_KEYWORDS = {
 }
 
 
+def _extract_cte_names(sql: str) -> set:
+    """
+    Names defined by a WITH clause (CTEs) — these are legitimately referenced
+    later via FROM/JOIN like a table, but won't appear in table_labels, so
+    _find_hallucinated_tables must not flag them.
+    """
+    names: set = set()
+    m = re.search(r'\bWITH\b(.*)', sql, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return names
+    for cm in re.finditer(r'(\w+)\s+AS\s*\(', m.group(1), re.IGNORECASE):
+        names.add(cm.group(1).lower())
+    return names
+
+
+def _find_hallucinated_tables(sql: str, table_labels: List[str]) -> List[str]:
+    """
+    Find FROM/JOIN table names that don't match any real table in the schema
+    (case-insensitive), and aren't a CTE name defined earlier in the same
+    query. Catches the LLM inventing a plausible-sounding but nonexistent
+    table (e.g. SEA_IDISCOVER_EXPENSES when the real table is
+    SEA_IDISCOVER_EVENT_EXPENSE) — a mistake _find_hallucinated_columns can't
+    catch since it only looks at column references.
+    """
+    known = {t.lower() for t in table_labels}
+    cte_names = _extract_cte_names(sql)
+    bad: List[str] = []
+    seen: set = set()
+    for m in re.finditer(r'\b(?:FROM|JOIN)\s+(?:[\w]+\.)?"?(\w+)"?', sql, re.IGNORECASE):
+        tbl = m.group(1)
+        low = tbl.lower()
+        if low in known or low in cte_names or low in _SQL_KEYWORDS or low in seen:
+            continue
+        bad.append(tbl)
+        seen.add(low)
+    return bad
+
+
 def _find_hallucinated_columns(sql: str, known_cols: set) -> List[str]:
     """
     Find column references in the form  alias.ColumnName  where ColumnName is
@@ -1614,6 +2401,11 @@ def _find_hallucinated_columns(sql: str, known_cols: set) -> List[str]:
 
     We intentionally limit the check to dotted references to avoid false
     positives from table/alias names that are not in known_cols.
+
+    Tolerates the column being double-quoted (alias."Col") — the dominant
+    style this pipeline generates for Snowflake and other quote-preserving
+    dialects. Without this, the regex would never match real generated SQL
+    and this whole safety net would be silently inert for those dialects.
     """
     if not known_cols:
         return []
@@ -1624,7 +2416,7 @@ def _find_hallucinated_columns(sql: str, known_cols: set) -> List[str]:
     hallucinated = []
     seen: set = set()
     # Match   word.Identifier   where Identifier is not followed by '(' (functions)
-    for m in re.finditer(r'\b[A-Za-z_]\w*\.([A-Za-z_]\w*)(?!\s*\()', sql_stripped):
+    for m in re.finditer(r'\b[A-Za-z_]\w*\."?([A-Za-z_]\w*)"?(?!\s*\()', sql_stripped):
         col = m.group(1)
         low = col.lower()
         if low in _SQL_KEYWORDS:
@@ -1652,39 +2444,43 @@ def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
     """
     try:
         for col in bad_cols:
-            cp = re.escape(col)
+            # Column may appear bare (alias.col) or quoted (alias."col") in the
+            # generated SQL — the schema-quoting dialects (Snowflake, etc.) this
+            # pipeline targets always quote columns, so tolerate an optional
+            # quote on both sides of the bare name everywhere below.
+            cp = re.escape(col) + r'"?'
             val = r"""(?:'[^']*'|\([^)]*\)|[^\s,)]+)"""
             op  = r"(?:=|!=|<>|>=|<=|>|<|(?:NOT\s+)?LIKE|(?:NOT\s+)?IN|IS(?:\s+NOT)?)"
 
             # ── WHERE / AND / OR filters ──────────────────────────────────
             # Case: AND/OR arm
             sql = re.sub(
-                r"(?i)\s+(?:AND|OR)\s+\w+\." + cp + r"\s+" + op + r"\s*" + val,
+                r"(?i)\s+(?:AND|OR)\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val,
                 "", sql,
             )
             # Case: WHERE col ... AND next → convert to WHERE next
             sql = re.sub(
-                r"(?i)\bWHERE\s+\w+\." + cp + r"\s+" + op + r"\s*" + val + r"\s+AND\s+",
+                r"(?i)\bWHERE\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val + r"\s+AND\s+",
                 "WHERE ", sql,
             )
             # Case: sole WHERE condition
             sql = re.sub(
-                r"(?i)\s+WHERE\s+\w+\." + cp + r"\s+" + op + r"\s*" + val
+                r"(?i)\s+WHERE\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val
                 + r"(?=\s*(?:GROUP\b|ORDER\b|HAVING\b|LIMIT\b|$))",
                 "", sql,
             )
 
             # ── HAVING filters (same patterns as WHERE) ───────────────────
             sql = re.sub(
-                r"(?i)\s+(?:AND|OR)\s+\w+\." + cp + r"\s+" + op + r"\s*" + val,
+                r"(?i)\s+(?:AND|OR)\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val,
                 "", sql,
             )
             sql = re.sub(
-                r"(?i)\bHAVING\s+\w+\." + cp + r"\s+" + op + r"\s*" + val + r"\s+AND\s+",
+                r"(?i)\bHAVING\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val + r"\s+AND\s+",
                 "HAVING ", sql,
             )
             sql = re.sub(
-                r"(?i)\s+HAVING\s+\w+\." + cp + r"\s+" + op + r"\s*" + val
+                r"(?i)\s+HAVING\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val
                 + r"(?=\s*(?:GROUP\b|ORDER\b|LIMIT\b|$))",
                 "", sql,
             )
@@ -1692,12 +2488,12 @@ def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
             # ── SELECT list: remove   alias.col [AS label]  ───────────────
             # Mid-list: ", alias.col AS label" or ", alias.col"
             sql = re.sub(
-                r"(?i),\s*\w+\." + cp + r"(?:\s+AS\s+\w+)?(?=\s*[,\n]|\s*FROM\b)",
+                r"(?i),\s*\w+\.\"?" + cp + r"(?:\s+AS\s+\w+)?(?=\s*[,\n]|\s*FROM\b)",
                 "", sql,
             )
             # Leading item after SELECT [DISTINCT]: capture keyword, strip col + comma
             sql = re.sub(
-                r"(?i)(SELECT(?:\s+DISTINCT)?)\s+\w+\." + cp + r"(?:\s+AS\s+\w+)?\s*,\s*",
+                r"(?i)(SELECT(?:\s+DISTINCT)?)\s+\w+\.\"?" + cp + r"(?:\s+AS\s+\w+)?\s*,\s*",
                 r"\1 ", sql,
             )
 
@@ -1706,34 +2502,34 @@ def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
             # an ORDER BY clause, cleaning up surrounding commas.
             # Step 1: remove when preceded by a comma  ", alias.col [ASC|DESC]"
             sql = re.sub(
-                r"(?i),\s*\w+\." + cp + r"(?:\s+(?:ASC|DESC))?",
+                r"(?i),\s*\w+\.\"?" + cp + r"(?:\s+(?:ASC|DESC))?",
                 "", sql,
             )
             # Step 2: remove when it is the first (or only) term, followed by comma
             # "ORDER BY alias.col [ASC|DESC] ,"  →  "ORDER BY "
             sql = re.sub(
-                r"(?i)(ORDER\s+BY\s+)\w+\." + cp + r"(?:\s+(?:ASC|DESC))?\s*,\s*",
+                r"(?i)(ORDER\s+BY\s+)\w+\.\"?" + cp + r"(?:\s+(?:ASC|DESC))?\s*,\s*",
                 r"\1", sql,
             )
             # Step 3: remove when it is the only remaining term — drop entire ORDER BY
             sql = re.sub(
-                r"(?i)\s+ORDER\s+BY\s+\w+\." + cp + r"(?:\s+(?:ASC|DESC))?\s*[;]?\s*\Z",
+                r"(?i)\s+ORDER\s+BY\s+\w+\.\"?" + cp + r"(?:\s+(?:ASC|DESC))?\s*[;]?\s*\Z",
                 "", sql,
             )
             # Step 3b: same but not at \Z (something follows like LIMIT)
             sql = re.sub(
-                r"(?i)\s+ORDER\s+BY\s+\w+\." + cp + r"(?:\s+(?:ASC|DESC))?\s*(?=LIMIT|FETCH|OFFSET)",
+                r"(?i)\s+ORDER\s+BY\s+\w+\.\"?" + cp + r"(?:\s+(?:ASC|DESC))?\s*(?=LIMIT|FETCH|OFFSET)",
                 " ", sql,
             )
 
             # ── GROUP BY: remove the term ─────────────────────────────────
             # Mid-list
-            sql = re.sub(r"(?i),\s*\w+\." + cp + r"(?=\s*[,;]|\s*$|\s*(?:ORDER|HAVING|LIMIT)\b)", "", sql)
+            sql = re.sub(r"(?i),\s*\w+\.\"?" + cp + r"(?=\s*[,;]|\s*$|\s*(?:ORDER|HAVING|LIMIT)\b)", "", sql)
             # Leading item followed by comma
-            sql = re.sub(r"(?i)(GROUP\s+BY\s+)\w+\." + cp + r"\s*,\s*", r"\1", sql)
+            sql = re.sub(r"(?i)(GROUP\s+BY\s+)\w+\.\"?" + cp + r"\s*,\s*", r"\1", sql)
             # Sole term — drop entire GROUP BY clause
             sql = re.sub(
-                r"(?i)\s+GROUP\s+BY\s+\w+\." + cp
+                r"(?i)\s+GROUP\s+BY\s+\w+\.\"?" + cp
                 + r"(?=\s*(?:ORDER|HAVING|LIMIT|\s*;|\s*\Z))",
                 "", sql,
             )
@@ -1751,19 +2547,11 @@ def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
 
 def _strip_invalid_join(sql: str, invalid_join_descriptions: List[str]) -> Optional[str]:
     """
-    Attempt to salvage a query that contains an invalid JOIN by removing the
-    entire JOIN clause and any SELECT columns / WHERE conditions that reference
-    the joined table's alias.
+    Attempt to salvage a query that contains an invalid JOIN (one whose ON
+    condition is not a real, schema-listed FK pair) by removing the entire
+    JOIN clause and any SELECT/WHERE/GROUP BY/ORDER BY references to it.
 
-    Strategy:
-      1. Parse the first table alias from FROM ... AS alias.
-      2. Find each JOIN ... ON block that contains one of the invalid pairs.
-      3. Remove those JOIN blocks from the SQL.
-      4. Remove any SELECT columns, WHERE conditions, GROUP BY or ORDER BY
-         references that use the removed table's alias.
-
-    Returns the salvaged SQL string, or None if the query cannot be salvaged
-    (e.g. all SELECT columns came from the removed table).
+    Returns the salvaged SQL string, or None if the query cannot be salvaged.
     """
     try:
         # Extract aliases from JOIN clauses — "JOIN tbl AS alias" or "JOIN tbl alias"
@@ -1786,7 +2574,86 @@ def _strip_invalid_join(sql: str, invalid_join_descriptions: List[str]) -> Optio
         if not bad_aliases:
             return None
 
-        # Remove each JOIN ... ON block for bad aliases
+        return _strip_join_aliases(sql, bad_aliases)
+    except Exception:
+        return None
+
+
+def _find_unnecessary_joins(sql: str) -> List[str]:
+    """
+    Return aliases of joined tables whose columns are never referenced
+    outside their own JOIN...ON clause (not in SELECT/WHERE/GROUP BY/HAVING/
+    ORDER BY, and not used as a bridge by another JOIN's ON condition).
+
+    Such a JOIN contributes nothing to the result — it can only multiply
+    base-table rows (e.g. a one-to-many child table joined "for context")
+    and silently inflate COUNT(*)/SUM() results. See the claims/adjuster/
+    fraud_indicator/deductible_tracking bug this guards against.
+    """
+    try:
+        join_matches = list(re.finditer(
+            r'\b(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|FULL\s+)?JOIN\s+\S+\s+(?:AS\s+)?(\w+)\s+ON\s+(.+?)'
+            r'(?=\b(?:LEFT|RIGHT|INNER|OUTER|FULL|JOIN|WHERE|GROUP|ORDER|HAVING|LIMIT)\b|$)',
+            sql, re.IGNORECASE | re.DOTALL,
+        ))
+        if not join_matches:
+            return []
+
+        own_on_clauses = {m.group(1).lower(): m.group(2) for m in join_matches}
+
+        # Remove each JOIN...ON block so residual "alias." hits reflect real
+        # usage (SELECT/WHERE/GROUP BY/etc), not the join's own condition.
+        rest = sql
+        for m in join_matches:
+            rest = rest.replace(m.group(0), ' ', 1)
+
+        unnecessary = []
+        for alias, _ in own_on_clauses.items():
+            ae = re.escape(alias)
+            # \."? tolerates the quoted-column style this pipeline generates
+            # for Snowflake etc. (alias."col") — without it, EVERY usage of a
+            # quoted column looks unused and the join gets wrongly stripped,
+            # orphaning the alias and cascading into self-heal guessing a
+            # replacement table name.
+            if re.search(r'\b' + ae + r'\."?\w+', rest, re.IGNORECASE):
+                continue  # used in SELECT/WHERE/GROUP BY/HAVING/ORDER BY
+
+            # Don't strip if another JOIN's ON clause depends on this alias
+            # (it's a bridge table in a multi-hop join, not dead weight).
+            bridged = any(
+                other_alias != alias and re.search(r'\b' + ae + r'\."?\w+', on_body, re.IGNORECASE)
+                for other_alias, on_body in own_on_clauses.items()
+            )
+            if bridged:
+                continue
+
+            unnecessary.append(alias)
+        return unnecessary
+    except Exception:
+        return []
+
+
+def _strip_unnecessary_join(sql: str, aliases: List[str]) -> Optional[str]:
+    """Remove JOIN(s) identified by _find_unnecessary_joins as contributing nothing."""
+    return _strip_join_aliases(sql, {a.lower() for a in aliases})
+
+
+def _strip_join_aliases(sql: str, bad_aliases: set) -> Optional[str]:
+    """
+    Remove the JOIN clause(s) for the given table aliases, plus any SELECT
+    columns / WHERE / GROUP BY / ORDER BY references that use those aliases.
+
+    Shared removal core used by both _strip_invalid_join (aliases joined via
+    a non-existent FK pair) and _strip_unnecessary_join (aliases joined but
+    never referenced outside their own ON clause).
+
+    Returns the salvaged SQL string, or None if the query cannot be salvaged
+    (e.g. all SELECT columns came from the removed table).
+    """
+    try:
+        if not bad_aliases:
+            return None
+
         salvaged = sql
         for alias in bad_aliases:
             ae = re.escape(alias)
@@ -2095,6 +2962,56 @@ def _fix_count_vs_sum(sql: str, natural_query: str) -> str:
             "plan_node: headcount question detected — replaced SUM() with COUNT(*) in SQL"
         )
     return fixed
+
+
+_COUNT_ARG_PATTERN = re.compile(r'\bCOUNT\s*\(\s*([^()]+?)\s*\)', re.IGNORECASE)
+
+
+def _fix_count_after_join(sql: str) -> str:
+    """
+    A one-to-many JOIN duplicates base-table rows once per matching child row
+    (e.g. one claim JOINed to 3 adjuster records becomes 3 rows for that
+    claim). COUNT(col) or COUNT(*) after such a JOIN silently overcounts.
+
+    If the query contains a JOIN, rewrite any non-DISTINCT COUNT(<simple
+    column reference>) to COUNT(DISTINCT <same column>) — this is always
+    safe and never changes the result for a query that didn't need the
+    JOIN's fan-out in the first place.
+
+    COUNT(*) is left untouched here: there is no column to make DISTINCT, and
+    guessing a primary-key name would be unsafe. The caller flags remaining
+    COUNT(*)-after-JOIN cases via _has_unguarded_count_star_after_join so a
+    human/reviewer sees them instead of the query silently overcounting.
+    """
+    if not re.search(r'\bJOIN\b', sql, re.IGNORECASE):
+        return sql
+
+    def _wrap_distinct(m: re.Match) -> str:
+        arg = m.group(1).strip()
+        if re.match(r'(?i)^distinct\s', arg):
+            return m.group(0)  # already DISTINCT
+        if arg == '*':
+            return m.group(0)  # no safe column to guess — leave for caller to flag
+        # Only rewrite simple column references (col or alias.col) — never
+        # touch expressions, CASE, nested calls, etc.
+        if re.fullmatch(r'\w+(\.\w+)?', arg):
+            return f"COUNT(DISTINCT {arg})"
+        return m.group(0)
+
+    fixed = _COUNT_ARG_PATTERN.sub(_wrap_distinct, sql)
+    if fixed != sql:
+        logger.info(
+            "plan_node: JOIN present — rewrote non-distinct COUNT(col) to "
+            "COUNT(DISTINCT col) to prevent row-inflation from the JOIN"
+        )
+    return fixed
+
+
+def _has_unguarded_count_star_after_join(sql: str) -> bool:
+    """True if the query JOINs another table and uses COUNT(*) with no DISTINCT guard."""
+    if not re.search(r'\bJOIN\b', sql, re.IGNORECASE):
+        return False
+    return bool(re.search(r'\bCOUNT\s*\(\s*\*\s*\)', sql, re.IGNORECASE))
 
 
 _AGG_PATTERN = re.compile(
@@ -3247,7 +4164,29 @@ def plan_node(state: DialogState) -> DialogState:
     known_columns = _extract_known_columns(schema_context)
     # Add table labels as valid identifiers (they can appear bare in SQL too)
     known_columns.update(t.lower() for t in table_labels)
+    # Cross-table check needs the un-augmented set: a dotted-literal prefix
+    # like "evt" is not a genuine standalone column on ANY table, so if it
+    # were treated as "known", _find_cross_table_columns would misfire on
+    # every table alias that doesn't happen to own that exact dotted literal
+    # (see the note on the augmented known_columns below for why this
+    # exists at all, and why the two checks need different column sets).
+    known_columns_base = set(known_columns)
+    # Add the individual prefix/tail tokens of every literal dotted column
+    # name (e.g. "evt.event_key" -> "evt", "event_key"). The LLM sometimes
+    # mis-splits a single literal dotted identifier into alias.token or
+    # token.token, which would otherwise look like a hallucinated column and
+    # get the whole query dropped here — before it ever reaches execute_node's
+    # _snowflake_quote_dotted_columns self-heal, which is designed to repair
+    # exactly this mistake. Treating both halves as known lets those queries
+    # through so the runtime self-heal gets a chance to fix them. Used ONLY
+    # by _find_hallucinated_columns, not by _find_cross_table_columns.
+    known_columns.update(_dotted_literal_parts(known_columns))
     logger.debug("plan_node: %d known columns extracted from schema context", len(known_columns))
+
+    # Per-table column map — catches a column that's real SOMEWHERE in the
+    # schema but referenced against the wrong table's alias (see rule 6b note
+    # and _find_cross_table_columns docstring).
+    table_columns_map = _extract_table_columns(schema_context)
 
     _DB_LABELS = {
         "sqlite": "SQLite", "csv": "SQLite (CSV file)", "excel": "SQLite (Excel file)",
@@ -3412,6 +4351,56 @@ def plan_node(state: DialogState) -> DialogState:
     else:
         resolution_section = ""
 
+    # Build verified-examples section from human-corrected past queries for
+    # this data source (see dialog_agent/verified_queries.py).
+    # graphrag_kg_id is never populated by dialog_api.py (only used by the
+    # Neo4j-specific retrieval path) — it would resolve to the same "default"
+    # bucket for every single-KG production request, silently mixing verified
+    # examples across unrelated data sources. source_id IS populated on every
+    # /query request (dialog_api.py: DialogConfig(source_id=req.source_id...))
+    # and is unique per data source, so it's the correct scoping key here.
+    _default_kg_id = (
+        getattr(config, "graphrag_kg_id", "").strip()
+        or getattr(config, "source_id", "").strip()
+        or "default"
+    )
+    _verified_kg_ids = active_kg_ids or [_default_kg_id]
+    verified_examples: List[Dict] = []
+    for _kgid in _verified_kg_ids:
+        try:
+            verified_examples.extend(
+                verified_queries.get_similar(_kgid, natural_query, top_k=3)
+            )
+        except Exception as exc:
+            logger.debug(
+                "plan_node: verified_queries lookup failed for kg_id=%s — %s", _kgid, exc,
+            )
+    verified_examples.sort(key=lambda e: -e["similarity"])
+    verified_examples = verified_examples[:3]
+
+    if verified_examples:
+        ve_lines = [
+            "VERIFIED PAST CORRECTIONS — HUMAN-CONFIRMED EXAMPLES FOR THIS DATA SOURCE",
+            "=" * 60,
+            "A human previously corrected the system's SQL for a similar question on this",
+            "exact data source. Treat these as ground truth for this schema — when the",
+            "current question closely matches one, follow its column choices and filter",
+            "logic rather than independently re-deriving a different answer.",
+            "",
+        ]
+        for ex in verified_examples:
+            ve_lines.append(
+                f"  Similar question (similarity={ex['similarity']:.2f}): {ex['question']}"
+            )
+            ve_lines.append(f"  Verified SQL:\n    {ex['sql']}")
+            if ex.get("note"):
+                ve_lines.append(f"  Note: {ex['note']}")
+            ve_lines.append("")
+        ve_lines.append("=" * 60)
+        verified_section = "\n".join(ve_lines) + "\n\n"
+    else:
+        verified_section = ""
+
     user = _USER_PROMPT.format(
         schema_context=schema_context,
         db_type=config.db_type,
@@ -3421,6 +4410,7 @@ def plan_node(state: DialogState) -> DialogState:
         glossary_section=glossary_section,
         kpi_section=kpi_section,
         resolution_section=resolution_section,
+        verified_section=verified_section,
         natural_query=natural_query,
     )
 
@@ -3471,7 +4461,7 @@ def plan_node(state: DialogState) -> DialogState:
     # for observability; the real fix is grain annotations injected into the
     # schema context BEFORE the first LLM call (see _annotate_schema_grain).
     if plan:
-        preflight_gaps = _preflight_check_plan(plan, known_columns, natural_query)
+        preflight_gaps = _preflight_check_plan(plan, known_columns, natural_query, schema_context)
         if preflight_gaps:
             gap_text = "\n".join(f"  • {g}" for g in preflight_gaps)
             logger.warning(
@@ -3517,6 +4507,28 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _fix_window_functions(sql, config.db_type)
             sql = _fix_multicolumn_subquery(sql)
             sql = _fix_distinct_order_by(sql)
+
+            # Table hallucination check — a FROM/JOIN table name that doesn't
+            # exist in the schema at all (e.g. SEA_IDISCOVER_EXPENSES when the
+            # real table is SEA_IDISCOVER_EVENT_EXPENSE). Nothing else below
+            # can salvage this, so drop immediately.
+            if table_labels:
+                bad_tables = _find_hallucinated_tables(sql, table_labels)
+                if bad_tables:
+                    logger.warning(
+                        "plan_node: dropping query %s — hallucinated table name(s): %s",
+                        item.get("query_id", "?"), bad_tables,
+                    )
+                    state["errors"].append(
+                        f"plan_node: query {item.get('query_id','?')} skipped — "
+                        f"hallucinated table name(s) not in schema: {bad_tables}"
+                    )
+                    reasons.append(
+                        f"Query {item.get('query_id','?')} referenced table(s) {bad_tables} "
+                        "that do not exist in the schema. Use only the exact table names "
+                        "listed under AVAILABLE TABLES."
+                    )
+                    continue
 
             # Multi-table / no-join-key check
             sql_no_strings = re.sub(r"'[^']*'", "''", sql)
@@ -3576,6 +4588,48 @@ def plan_node(state: DialogState) -> DialogState:
                             f"stripped hallucinated condition(s) for column(s): {bad_cols}"
                         )
 
+            # Cross-table column check — a column that's real SOMEWHERE in the
+            # schema but referenced against a table alias that doesn't actually
+            # have it (e.g. filtering EVENT_ATTENDANCE on "country_code" when
+            # only the HCP table has that column). _find_hallucinated_columns
+            # above can't catch this since the column genuinely exists.
+            if table_columns_map:
+                cross_bad = _find_cross_table_columns(sql, table_columns_map, known_columns_base)
+                if cross_bad:
+                    if _has_hallucinated_join(sql, cross_bad):
+                        logger.warning(
+                            "plan_node: dropping query %s — cross-table column(s) %s in JOIN",
+                            item.get("query_id", "?"), cross_bad,
+                        )
+                        state["errors"].append(
+                            f"plan_node: query {item.get('query_id','?')} skipped — "
+                            f"cross-table column reference(s) in JOIN: {cross_bad}"
+                        )
+                        reasons.append(
+                            f"Query {item.get('query_id','?')} referenced column(s) "
+                            f"{cross_bad} against a table alias that does not have that "
+                            "column — that column belongs to a different table in the schema."
+                        )
+                        continue
+
+                    sql = _strip_hallucinated_conditions(sql, cross_bad)
+                    still_bad = _find_cross_table_columns(sql, table_columns_map, known_columns_base)
+                    if still_bad:
+                        logger.warning(
+                            "plan_node: dropping query %s — unremovable cross-table cols %s",
+                            item.get("query_id", "?"), still_bad,
+                        )
+                        state["errors"].append(
+                            f"plan_node: query {item.get('query_id','?')} skipped — "
+                            f"unremovable cross-table column(s): {still_bad}"
+                        )
+                        continue
+                    else:
+                        state["errors"].append(
+                            f"plan_node: query {item.get('query_id','?')} — "
+                            f"stripped cross-table column condition(s): {cross_bad}"
+                        )
+
             # Join pair validation
             if valid_join_pairs:
                 invalid_joins = _find_invalid_join_conditions(sql, valid_join_pairs)
@@ -3603,6 +4657,44 @@ def plan_node(state: DialogState) -> DialogState:
                             "unrelated FK columns from different dimension tables."
                         )
                         continue
+
+            # Unnecessary-join check — drop JOINs whose table contributes no
+            # column to SELECT/WHERE/GROUP BY/HAVING/ORDER BY. A join like this
+            # can only multiply base-table rows (fan-out) and inflate COUNT/SUM
+            # results without adding any data to the answer.
+            unnecessary_aliases = _find_unnecessary_joins(sql)
+            if unnecessary_aliases:
+                salvaged_sql = _strip_unnecessary_join(sql, unnecessary_aliases)
+                if salvaged_sql:
+                    logger.info(
+                        "plan_node: query %s — removed unnecessary JOIN(s) %s "
+                        "(no columns from these tables were used)",
+                        item.get("query_id", "?"), unnecessary_aliases,
+                    )
+                    state["errors"].append(
+                        f"plan_node: query {item.get('query_id','?')} — removed unnecessary "
+                        f"JOIN(s) {unnecessary_aliases}: no columns from these tables were "
+                        "referenced in SELECT/WHERE/GROUP BY/ORDER BY, so the JOIN could only "
+                        "inflate row counts (fan-out) without contributing data."
+                    )
+                    sql = salvaged_sql
+
+            # COUNT-after-JOIN guard — a remaining (necessary) JOIN can still be
+            # one-to-many, so any non-DISTINCT COUNT(col) must be made DISTINCT
+            # to avoid silently overcounting the base entity.
+            sql = _fix_count_after_join(sql)
+            if _has_unguarded_count_star_after_join(sql):
+                logger.warning(
+                    "plan_node: query %s uses COUNT(*) after a JOIN with no DISTINCT guard — "
+                    "result may be inflated if the joined table has multiple rows per base row",
+                    item.get("query_id", "?"),
+                )
+                state["errors"].append(
+                    f"plan_node: query {item.get('query_id','?')} uses COUNT(*) after a JOIN — "
+                    "if the joined table can have multiple rows per base-table row this count "
+                    "may be inflated. Could not auto-fix (no safe primary-key column identified); "
+                    "verify manually or prefer COUNT(DISTINCT <base_table_pk>)."
+                )
 
             valid.append(
                 SQLQuery(
@@ -3667,6 +4759,103 @@ def plan_node(state: DialogState) -> DialogState:
         logger.warning("plan_node: 0 SQL queries produced from LLM plan of %d item(s)", len(plan))
     else:
         logger.info("plan_node: %d SQL queries planned", len(sql_queries))
+
+    # ── Corrective retry: impossible numeric-threshold filter (Check 6) ──────
+    # A query filtering a column against a threshold its own data range can
+    # never satisfy (e.g. "> 20" when the real max is 6) runs cleanly and
+    # just returns 0 rows — no runtime error, so execute_node's error-driven
+    # self-heal never gets a chance to fix it. This has to be caught and
+    # corrected here, at plan time. Bounded to _MAX_THRESHOLD_FIX_ATTEMPTS
+    # corrective LLM calls per affected query (same retry-count convention as
+    # execute_node's self-heal, _MAX_RETRIES) — never unbounded. Each rewrite
+    # is re-run through the exact same qualify/dialect/hallucination/
+    # cross-table safety net as any other plan item before being trusted; if
+    # no attempt can be verified fixed, the original query is kept unchanged
+    # and the gap is still visible in state["errors"] via Check 6's preflight
+    # logging. Queries without this exact issue are never touched, so this
+    # cannot affect any other query pattern.
+    _MAX_THRESHOLD_FIX_ATTEMPTS = 2
+    if sql_queries:
+        _threshold_ranges = _extract_column_numeric_ranges(schema_context)
+        if _threshold_ranges:
+            for q in sql_queries:
+                gap_msg = _detect_impossible_numeric_filter(q["sql"], _threshold_ranges)
+                if not gap_msg:
+                    continue
+
+                current_sql = q["sql"]
+                for attempt in range(_MAX_THRESHOLD_FIX_ATTEMPTS):
+                    logger.info(
+                        "plan_node: query %s has an impossible numeric filter — "
+                        "corrective rewrite attempt %d/%d",
+                        q["query_id"], attempt + 1, _MAX_THRESHOLD_FIX_ATTEMPTS,
+                    )
+                    attempt_gap_msg = gap_msg if attempt == 0 else (
+                        f"{gap_msg}\n\nNote: a previous corrective attempt for this "
+                        f"exact problem ALSO failed to fix it (it kept filtering the "
+                        f"same wrong column/table). Do not repeat that attempt — "
+                        f"actively look for a DIFFERENT table in the schema context "
+                        f"whose grain is one-row-per-occurrence of the entity being "
+                        f"counted, even if it has no column with a similar name to "
+                        f"the one that failed."
+                    )
+                    fixed_sql = _fix_impossible_threshold_sql(
+                        current_sql, attempt_gap_msg, natural_query, schema_context,
+                        config.plan_llm_model, config.llm_temperature,
+                    )
+                    if fixed_sql.strip().rstrip(";").strip() == current_sql.strip().rstrip(";").strip():
+                        logger.info(
+                            "plan_node: corrective rewrite attempt %d for %s made "
+                            "no change", attempt + 1, q["query_id"],
+                        )
+                        continue
+
+                    candidate = fixed_sql.strip().rstrip(";").strip()
+                    candidate = _qualify_sql(candidate, db_schema, table_labels)
+                    candidate = _fix_count_vs_sum(candidate, natural_query)
+                    candidate = _fix_percentage(candidate, natural_query, config.db_type)
+                    candidate = _enforce_sql_limits(candidate, config.row_limit, config.db_type)
+                    candidate = _fix_dialect_syntax(candidate, config.db_type)
+                    candidate = _fix_sqlserver_subquery_limits(candidate, config.db_type)
+                    candidate = _fix_subquery_order_by(candidate, config.db_type)
+                    candidate = _fix_window_functions(candidate, config.db_type)
+                    candidate = _fix_multicolumn_subquery(candidate)
+                    candidate = _fix_distinct_order_by(candidate)
+
+                    if table_labels and _find_hallucinated_tables(candidate, table_labels):
+                        logger.warning(
+                            "plan_node: corrective rewrite attempt %d for %s "
+                            "introduced a hallucinated table — discarding",
+                            attempt + 1, q["query_id"],
+                        )
+                        continue
+                    # A table-switch rewrite (rule 23) is a bigger change than a
+                    # WHERE/HAVING tweak — also verify it didn't leave a stale
+                    # alias.column reference pointing at the table it just left.
+                    if _find_cross_table_columns(candidate, table_columns_map, known_columns_base):
+                        logger.warning(
+                            "plan_node: corrective rewrite attempt %d for %s "
+                            "introduced a cross-table column reference — discarding",
+                            attempt + 1, q["query_id"],
+                        )
+                        continue
+                    if _detect_impossible_numeric_filter(candidate, _threshold_ranges):
+                        logger.warning(
+                            "plan_node: corrective rewrite attempt %d for %s "
+                            "still has an impossible filter — %s",
+                            attempt + 1, q["query_id"],
+                            "trying again" if attempt + 1 < _MAX_THRESHOLD_FIX_ATTEMPTS
+                            else "giving up, keeping original query",
+                        )
+                        current_sql = candidate  # let the next attempt build on this one
+                        continue
+
+                    q["sql"] = candidate
+                    logger.info(
+                        "plan_node: query %s corrected (impossible-threshold fix "
+                        "applied on attempt %d)", q["query_id"], attempt + 1,
+                    )
+                    break
 
     # ── Inject COUNT companions for raw-row queries ───────────────────────────
     # For every sampled raw-row query (no aggregation), prepend a companion

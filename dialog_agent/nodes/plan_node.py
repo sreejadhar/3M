@@ -1422,6 +1422,37 @@ General Rules:
        the correctly-grained table can answer the ENTIRE question on its own,
        with no join required. Check this before assuming you need to combine
        both tables or join anything.
+
+24. HISTORICAL / VERSIONED DATA — USE THE LATEST RECORD PER ENTITY.
+    UNIVERSAL, ALL DOMAINS, ALL DATABASES.
+    a. Some tables genuinely track how a SINGLE entity's record changed over
+       TIME — e.g. a table literally named with "history", "log", "audit",
+       "snapshot", "versions", or "_hist" in the schema, or one where the FD/
+       join-key evidence shows the same entity key repeats across rows with a
+       date/timestamp column distinguishing them (an SCD-style table). For
+       these tables, when the question asks about an entity's CURRENT /
+       latest / present state (or doesn't specify a point in time at all),
+       return only the MOST RECENT row per entity — via
+       ROW_NUMBER()/QUALIFY (Snowflake/BigQuery) or a correlated
+       MAX(date_col) subquery (other dialects) partitioned/grouped by the
+       entity key — not every historical row, and not an arbitrary row.
+    b. Only return multiple historical rows per entity when the question
+       explicitly asks for a trend, history, timeline, or change over time
+       (e.g. "how has X changed", "show the history of Y").
+    c. ★ CRITICAL BOUNDARY — this rule does NOT apply to, and must never be
+       used to resolve, the pattern in rule 22 (status/validity companion
+       columns). Rule 22's tables are NOT time-series data — their duplicate
+       rows represent different SUB-DIMENSIONS at essentially the same point
+       in time (e.g. one row per business sector for the same market), most
+       of which are placeholder/not-applicable, not successive versions of
+       the same fact. "Most recent" is NOT a reliable signal for which
+       sub-dimension row is real in that pattern — recency and validity are
+       independent there. Only apply THIS rule (24) when the table is
+       genuinely about the same fact changing over time for one entity, and
+       apply rule 22 (status/validity filtering) when it's about disambiguating
+       which sub-dimension row is real — do not substitute one fix for the
+       other. When unsure which pattern you're looking at, prefer rule 22's
+       explicit status/validity filtering signal over guessing based on dates.
 """
 
 _USER_PROMPT = """\

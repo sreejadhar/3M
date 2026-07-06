@@ -4734,13 +4734,16 @@ def plan_node(state: DialogState) -> DialogState:
     # never satisfy (e.g. "> 20" when the real max is 6) runs cleanly and
     # just returns 0 rows — no runtime error, so execute_node's error-driven
     # self-heal never gets a chance to fix it. This has to be caught and
-    # corrected here, at plan time. Bounded to ONE corrective LLM call per
-    # affected query (never loops), and the rewrite is re-run through the
-    # exact same qualify/dialect/hallucination safety net as any other plan
-    # item before being trusted — if it can't be verified fixed, the original
-    # query is kept unchanged and the gap is still visible in state["errors"]
-    # via Check 6's preflight logging. Queries without this exact issue are
-    # never touched, so this cannot affect any other query pattern.
+    # corrected here, at plan time. Bounded to _MAX_THRESHOLD_FIX_ATTEMPTS
+    # corrective LLM calls per affected query (same retry-count convention as
+    # execute_node's self-heal, _MAX_RETRIES) — never unbounded. Each rewrite
+    # is re-run through the exact same qualify/dialect/hallucination/
+    # cross-table safety net as any other plan item before being trusted; if
+    # no attempt can be verified fixed, the original query is kept unchanged
+    # and the gap is still visible in state["errors"] via Check 6's preflight
+    # logging. Queries without this exact issue are never touched, so this
+    # cannot affect any other query pattern.
+    _MAX_THRESHOLD_FIX_ATTEMPTS = 2
     if sql_queries:
         _threshold_ranges = _extract_column_numeric_ranges(schema_context)
         if _threshold_ranges:
@@ -4748,62 +4751,80 @@ def plan_node(state: DialogState) -> DialogState:
                 gap_msg = _detect_impossible_numeric_filter(q["sql"], _threshold_ranges)
                 if not gap_msg:
                     continue
-                logger.info(
-                    "plan_node: query %s has an impossible numeric filter — "
-                    "attempting one corrective rewrite",
-                    q["query_id"],
-                )
-                fixed_sql = _fix_impossible_threshold_sql(
-                    q["sql"], gap_msg, natural_query, schema_context,
-                    config.plan_llm_model, config.llm_temperature,
-                )
-                if fixed_sql.strip().rstrip(";").strip() == q["sql"].strip().rstrip(";").strip():
+
+                current_sql = q["sql"]
+                for attempt in range(_MAX_THRESHOLD_FIX_ATTEMPTS):
                     logger.info(
-                        "plan_node: corrective rewrite for %s made no change — "
-                        "keeping original query", q["query_id"],
+                        "plan_node: query %s has an impossible numeric filter — "
+                        "corrective rewrite attempt %d/%d",
+                        q["query_id"], attempt + 1, _MAX_THRESHOLD_FIX_ATTEMPTS,
                     )
-                    continue
+                    attempt_gap_msg = gap_msg if attempt == 0 else (
+                        f"{gap_msg}\n\nNote: a previous corrective attempt for this "
+                        f"exact problem ALSO failed to fix it (it kept filtering the "
+                        f"same wrong column/table). Do not repeat that attempt — "
+                        f"actively look for a DIFFERENT table in the schema context "
+                        f"whose grain is one-row-per-occurrence of the entity being "
+                        f"counted, even if it has no column with a similar name to "
+                        f"the one that failed."
+                    )
+                    fixed_sql = _fix_impossible_threshold_sql(
+                        current_sql, attempt_gap_msg, natural_query, schema_context,
+                        config.plan_llm_model, config.llm_temperature,
+                    )
+                    if fixed_sql.strip().rstrip(";").strip() == current_sql.strip().rstrip(";").strip():
+                        logger.info(
+                            "plan_node: corrective rewrite attempt %d for %s made "
+                            "no change", attempt + 1, q["query_id"],
+                        )
+                        continue
 
-                candidate = fixed_sql.strip().rstrip(";").strip()
-                candidate = _qualify_sql(candidate, db_schema, table_labels)
-                candidate = _fix_count_vs_sum(candidate, natural_query)
-                candidate = _fix_percentage(candidate, natural_query, config.db_type)
-                candidate = _enforce_sql_limits(candidate, config.row_limit, config.db_type)
-                candidate = _fix_dialect_syntax(candidate, config.db_type)
-                candidate = _fix_sqlserver_subquery_limits(candidate, config.db_type)
-                candidate = _fix_subquery_order_by(candidate, config.db_type)
-                candidate = _fix_window_functions(candidate, config.db_type)
-                candidate = _fix_multicolumn_subquery(candidate)
-                candidate = _fix_distinct_order_by(candidate)
+                    candidate = fixed_sql.strip().rstrip(";").strip()
+                    candidate = _qualify_sql(candidate, db_schema, table_labels)
+                    candidate = _fix_count_vs_sum(candidate, natural_query)
+                    candidate = _fix_percentage(candidate, natural_query, config.db_type)
+                    candidate = _enforce_sql_limits(candidate, config.row_limit, config.db_type)
+                    candidate = _fix_dialect_syntax(candidate, config.db_type)
+                    candidate = _fix_sqlserver_subquery_limits(candidate, config.db_type)
+                    candidate = _fix_subquery_order_by(candidate, config.db_type)
+                    candidate = _fix_window_functions(candidate, config.db_type)
+                    candidate = _fix_multicolumn_subquery(candidate)
+                    candidate = _fix_distinct_order_by(candidate)
 
-                if table_labels and _find_hallucinated_tables(candidate, table_labels):
-                    logger.warning(
-                        "plan_node: corrective rewrite for %s introduced a "
-                        "hallucinated table — keeping original query", q["query_id"],
-                    )
-                    continue
-                # A table-switch rewrite (rule 23) is a bigger change than a
-                # WHERE/HAVING tweak — also verify it didn't leave a stale
-                # alias.column reference pointing at the table it just left.
-                if _find_cross_table_columns(candidate, table_columns_map, known_columns_base):
-                    logger.warning(
-                        "plan_node: corrective rewrite for %s introduced a "
-                        "cross-table column reference — keeping original query",
-                        q["query_id"],
-                    )
-                    continue
-                if _detect_impossible_numeric_filter(candidate, _threshold_ranges):
-                    logger.warning(
-                        "plan_node: corrective rewrite for %s still has an "
-                        "impossible filter — keeping original query", q["query_id"],
-                    )
-                    continue
+                    if table_labels and _find_hallucinated_tables(candidate, table_labels):
+                        logger.warning(
+                            "plan_node: corrective rewrite attempt %d for %s "
+                            "introduced a hallucinated table — discarding",
+                            attempt + 1, q["query_id"],
+                        )
+                        continue
+                    # A table-switch rewrite (rule 23) is a bigger change than a
+                    # WHERE/HAVING tweak — also verify it didn't leave a stale
+                    # alias.column reference pointing at the table it just left.
+                    if _find_cross_table_columns(candidate, table_columns_map, known_columns_base):
+                        logger.warning(
+                            "plan_node: corrective rewrite attempt %d for %s "
+                            "introduced a cross-table column reference — discarding",
+                            attempt + 1, q["query_id"],
+                        )
+                        continue
+                    if _detect_impossible_numeric_filter(candidate, _threshold_ranges):
+                        logger.warning(
+                            "plan_node: corrective rewrite attempt %d for %s "
+                            "still has an impossible filter — %s",
+                            attempt + 1, q["query_id"],
+                            "trying again" if attempt + 1 < _MAX_THRESHOLD_FIX_ATTEMPTS
+                            else "giving up, keeping original query",
+                        )
+                        current_sql = candidate  # let the next attempt build on this one
+                        continue
 
-                logger.info(
-                    "plan_node: query %s corrected (impossible-threshold fix applied)",
-                    q["query_id"],
-                )
-                q["sql"] = candidate
+                    q["sql"] = candidate
+                    logger.info(
+                        "plan_node: query %s corrected (impossible-threshold fix "
+                        "applied on attempt %d)", q["query_id"], attempt + 1,
+                    )
+                    break
 
     # ── Inject COUNT companions for raw-row queries ───────────────────────────
     # For every sampled raw-row query (no aggregation), prepend a companion

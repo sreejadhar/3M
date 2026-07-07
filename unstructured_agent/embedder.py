@@ -1,47 +1,35 @@
 """
-Semantic embedding generation for the unstructured data intelligence agent.
+Semantic embedding generation for uploaded documents.
 
-Embeds a short text representation of each document's fingerprint (title +
-summary + topics) so doc-to-doc similarity can use real semantic distance
-instead of exact topic-string overlap (Jaccard). Mirrors the backend
-detection pattern used by knowledge_graph_agent/nodes/embed_node.py so the
-two agents share the same optional-dependency story.
-
-Supported backends:
-  sentence-transformers  — all-MiniLM-L6-v2, 384 dims (default, local/offline)
-  openai                 — text-embedding-3-small, 1536 dims (needs OPENAI_API_KEY)
-
-Backend is best-effort: if neither package is installed, embed_text() returns
-None and callers skip the embedding step without failing the pipeline.
+Backends (auto-detected, best-effort):
+  sentence-transformers  — all-MiniLM-L6-v2, 384 dims (used when installed)
+  hashing                — deterministic feature-hashing bag-of-words, 256
+                           dims (always available, no dependency — offline
+                           fallback so the pipeline works out of the box)
 """
 from __future__ import annotations
 
-import logging
+import hashlib
+import math
 import os
-from typing import List, Optional, Tuple
-
-logger = logging.getLogger(__name__)
+import re
+from typing import List, Tuple
 
 _SENTENCE_TRANSFORMERS_MODEL = "all-MiniLM-L6-v2"
-_OPENAI_MODEL = "text-embedding-3-small"
+_HASHING_DIMS = 256
 
-# Lazily-loaded sentence-transformers model (loading it per-call is expensive)
 _st_model = None
 
 
-def _detect_backend(preferred: str) -> str:
+def _detect_backend() -> str:
+    preferred = os.environ.get("UNSTRUCTURED_EMBED_BACKEND", "auto")
     if preferred != "auto":
         return preferred
-    for candidate, pkg in [
-        ("sentence-transformers", "sentence_transformers"),
-        ("openai", "openai"),
-    ]:
-        try:
-            __import__(pkg)
-            return candidate
-        except ImportError:
-            continue
-    return "unsupported"
+    try:
+        import sentence_transformers  # noqa: F401
+        return "sentence-transformers"
+    except ImportError:
+        return "hashing"
 
 
 def _embed_sentence_transformers(text: str) -> List[float]:
@@ -53,51 +41,31 @@ def _embed_sentence_transformers(text: str) -> List[float]:
     return [float(x) for x in vec]
 
 
-def _embed_openai(text: str) -> List[float]:
-    from openai import OpenAI
-    resp = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "")).embeddings.create(
-        model=_OPENAI_MODEL, input=[text],
-    )
-    return [float(x) for x in resp.data[0].embedding]
+def _embed_hashing(text: str, dims: int = _HASHING_DIMS) -> List[float]:
+    """Deterministic bag-of-words embedding via feature hashing + TF weighting.
+    No external dependency — always works, used when no ML embedding backend
+    is installed."""
+    vec = [0.0] * dims
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    for tok in tokens:
+        h = int(hashlib.md5(tok.encode()).hexdigest(), 16)
+        idx = h % dims
+        sign = 1.0 if (h // dims) % 2 == 0 else -1.0
+        vec[idx] += sign
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
 
 
-def fingerprint_text(fp: dict) -> str:
-    """Build the text representation embedded for a document fingerprint."""
-    parts = [
-        fp.get("title", ""),
-        fp.get("summary", ""),
-        fp.get("doc_type", ""),
-        " ".join(fp.get("topics", []) or []),
-    ]
-    return " ".join(p for p in parts if p).strip()
-
-
-def embed_text(text: str) -> Optional[Tuple[List[float], str]]:
-    """
-    Embed a single text string.
-
-    Returns (vector, model_label) where model_label identifies the backend
-    and model (e.g. "sentence-transformers:all-MiniLM-L6-v2"), or None if no
-    embedding backend is available or the text is empty.
-    """
-    if not text or not text.strip():
-        return None
-
-    backend = _detect_backend(os.environ.get("UNSTRUCTURED_EMBED_BACKEND", "auto"))
-    if backend == "unsupported":
-        logger.debug("embedder: no embedding backend installed — skipping")
-        return None
-
-    try:
-        if backend == "sentence-transformers":
+def embed_text(text: str) -> Tuple[List[float], str]:
+    """Returns (vector, model_label). Always succeeds — falls back to the
+    hashing backend if no ML embedding library is installed."""
+    backend = _detect_backend()
+    if backend == "sentence-transformers":
+        try:
             return _embed_sentence_transformers(text), f"sentence-transformers:{_SENTENCE_TRANSFORMERS_MODEL}"
-        if backend == "openai":
-            return _embed_openai(text), f"openai:{_OPENAI_MODEL}"
-    except Exception as exc:
-        logger.warning("embedder: embedding failed (backend=%s): %s", backend, exc)
-        return None
-
-    return None
+        except Exception:
+            pass  # fall through to hashing backend
+    return _embed_hashing(text), f"hashing:{_HASHING_DIMS}d"
 
 
 def cosine_similarity(a: List[float], b: List[float]) -> float:
@@ -105,8 +73,8 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(y * y for y in b) ** 0.5
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
     return dot / (norm_a * norm_b)

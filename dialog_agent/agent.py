@@ -80,7 +80,6 @@ class DialogAgent:
             sql_queries          = [],
             query_results        = [],
             insights             = "",
-            doc_context          = "",
             errors               = [],
             phase                = "start",
             # Categorical resolution fields

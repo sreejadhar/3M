@@ -2890,6 +2890,85 @@ async def get_source_graph(source_id: str):
     }
 
 
+class DocumentGraphLink(BaseModel):
+    mention: str
+    mention_type: str = "ENTITY"
+    matched_table: str
+    matched_column: Optional[str] = None
+    confidence: float = 0.5
+    basis: str = "unknown"
+
+
+class LinkDocumentToGraphRequest(BaseModel):
+    asset_id: str
+    file_name: str
+    links: List[DocumentGraphLink] = []
+
+
+@app.post("/sources/{source_id}/graph/link-document")
+async def link_document_to_graph(source_id: str, req: LinkDocumentToGraphRequest):
+    """
+    Adds a Document Intelligence cross-modal link as a node + edges in this
+    source's in-memory KG, so linked documents show up in Graph Explorer
+    alongside the tables/columns they discuss.
+
+    Additive only: never removes or modifies existing table/column nodes or
+    edges. Re-linking the same document (e.g. after a reindex) replaces just
+    that document's own edges rather than accumulating duplicates.
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    nodes = s.setdefault("kg_nodes", [])
+    edges = s.setdefault("kg_edges", [])
+
+    doc_node_id = f"doc:{req.asset_id}"
+    table_node_id = {}
+    for n in nodes:
+        label = str(n.get("label") or "").strip().upper()
+        if label and label not in table_node_id:
+            table_node_id[label] = n["id"]
+
+    if not any(n.get("id") == doc_node_id for n in nodes):
+        nodes.append({
+            "id": doc_node_id,
+            "label": f"📄 {req.file_name}",
+            "title": f"Document: {req.file_name}\n(from Document Intelligence)",
+        })
+
+    # Drop this document's previous edges before adding the current set —
+    # keeps a reindex from piling up stale duplicates.
+    edges[:] = [e for e in edges if e.get("from") != doc_node_id]
+
+    linked = 0
+    unmatched = []
+    for link in req.links:
+        target = table_node_id.get(link.matched_table.strip().upper())
+        if not target:
+            unmatched.append(link.matched_table)
+            continue
+        detail = f"\"{link.mention}\" ({link.mention_type})"
+        if link.matched_column:
+            detail += f" → {link.matched_table}.{link.matched_column}"
+        else:
+            detail += f" → {link.matched_table}"
+        edges.append({
+            "from": doc_node_id,
+            "to": target,
+            "label": "mentions",
+            "title": f"{detail}\nconfidence={link.confidence} · basis={link.basis}",
+        })
+        linked += 1
+
+    try:
+        _kg_store.save(s)
+    except Exception as exc:
+        logger.warning("kg_store.save after document link failed (non-fatal): %s", exc)
+
+    return {"linked": linked, "unmatched_tables": sorted(set(unmatched)), "node_id": doc_node_id}
+
+
 @app.get("/sources/{source_id}/ontology")
 async def get_source_ontology(source_id: str):
     """Return the OWL/Turtle ontology text for an indexed source."""
@@ -4164,14 +4243,13 @@ async def proxy_glossary(request: Request, path: str):
         raise HTTPException(502, f"Glossary service unavailable: {exc}")
 
 
-# ── Unstructured agent proxy routes ──────────────────────────────────────────
-# Two additive routes that forward /unstructured/* to the unstructured service.
-# All other orchestrator routes and data are untouched.
+# ── Document Intelligence proxy route ─────────────────────────────────────────
+# Forwards /unstructured/* to the unstructured service. Additive route; all
+# other orchestrator routes and data are untouched.
 
 @app.api_route("/unstructured/{path:path}",
                methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_unstructured(request: Request, path: str):
-    """Forward /unstructured/{path} → UNSTRUCTURED_API/{path}."""
     body = await request.body()
     qs   = f"?{request.url.query}" if request.url.query else ""
     fwd_headers = {k: v for k, v in request.headers.items()

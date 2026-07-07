@@ -89,7 +89,6 @@ jobs:
           - { name: chat-ui,          image: datananite-chat,         dockerfile: Dockerfile.chat,         deployment: chat-ui,          container: chat-ui }
           - { name: tech-ui,          image: datananite-tech,         dockerfile: Dockerfile.tech,         deployment: tech-ui,          container: tech-ui }
           - { name: shacl-api,        image: datananite-shacl,        dockerfile: Dockerfile.shacl,        deployment: shacl-api,        container: shacl-api }
-          - { name: unstructured-api, image: datananite-unstructured, dockerfile: Dockerfile.unstructured, deployment: unstructured-api, container: unstructured-api }
           - { name: streamlit-ui,     image: datananite-ui,           dockerfile: Dockerfile.ui,           deployment: streamlit-ui,     container: streamlit-ui }
           - { name: orchestrator-api, image: datananite-orchestrator, dockerfile: Dockerfile.orchestrator, deployment: orchestrator-api, container: orchestrator-api }
 

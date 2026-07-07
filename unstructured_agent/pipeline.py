@@ -1,268 +1,317 @@
-"""
-End-to-end indexing pipeline for a document source.
-
-Steps:
-  1. Enumerate files via connector
-  2. Compare checksums (skip unchanged)
-  3. Parse each file (structural metadata + text window)
-  4. Quality gate
-  5. LLM semantic extraction (fingerprint)
-  6. Persist fingerprint
-  7. Cross-modal linking
-  8. Update job progress
-"""
+"""Indexing pipeline: enumerate a source's files via its connector and persist them as assets."""
 from __future__ import annotations
 
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+import tempfile
+from pathlib import Path
 
-from .connectors import make_connector, file_type_from_extension
-from .embedder import embed_text, fingerprint_text
-from .fingerprinter import quality_gate, extract_fingerprint
-from .linker import run_linking
-from .parsers import parse_file
-from .store import UnstructuredStore
+import httpx
+
+from .connectors import make_connector
+from .embedder import embed_text
+from .extractor import SUPPORTED_EXTENSIONS, ExtractionError, extract_text
+from .ner import extract_entities
+from .pii import detect_pii
+from .store import DocStore
+from .topics import extract_topics
+from .xref import ORCHESTRATOR_URL, XrefUnavailable, fetch_schema, link_mentions, push_to_knowledge_graph
 
 logger = logging.getLogger(__name__)
 
-_WORKER_THREADS = int(os.environ.get("UNSTRUCTURED_WORKERS", "4"))
+PROCESSING_STEPS = [
+    ("extract_text", "Text Extraction"),
+    ("embed", "Semantic Embeddings"),
+    ("tag_topics", "Topic Tagging"),
+    ("ner", "Named Entity Recognition"),
+    ("pii", "PII Detection"),
+    ("xref", "Cross-Modal Linking"),
+    ("kg_bridge", "KG Bridge Mapping"),
+]
+
+# Files larger than this are indexed (metadata only) but not auto-processed
+# during a bulk reindex — process them individually via Upload Document instead.
+_AUTO_PROCESS_MAX_BYTES = 15 * 1024 * 1024
 
 
-def run_index_job(job_id: str, source_id: str, store: UnstructuredStore,
-                  metadata_api: str, force: bool = False) -> None:
-    """
-    Execute an indexing run for a source. Runs in a background thread.
-    Updates job progress in the store throughout.
-    When force=True, all existing assets are cleared first so every file
-    is re-processed regardless of checksum.
-    """
+def _init_steps() -> list:
+    return [{"key": k, "label": label, "status": "pending", "detail": None} for k, label in PROCESSING_STEPS]
+
+
+def _set_step(steps: list, key: str, status: str, detail: str = None) -> list:
+    for s in steps:
+        if s["key"] == key:
+            s["status"] = status
+            s["detail"] = detail
+    return steps
+
+
+def run_index_job(job_id: str, source_id: str, store: DocStore) -> None:
+    """Runs synchronously in a background thread; updates job + source status as it goes."""
     source = store.get_source(source_id)
     if not source:
-        store.update_job(job_id, status="error",
-                         error_log=[f"Source {source_id} not found"],
-                         finished_at=_now())
+        store.update_job(job_id, status="error", finished_at=store.now())
         return
 
-    if force:
-        cleared = store.clear_source_assets(source_id)
-        logger.info("Job %s: force reindex — cleared %d existing assets", job_id, cleared)
-
+    store.set_source_status(source_id, "indexing")
+    is_local = source["connector_type"] == "local"
+    processed = 0
+    errors = 0
     try:
-        connection = _load_connection(source)
-    except Exception as exc:
-        store.update_job(job_id, status="error",
-                         error_log=[str(exc)], finished_at=_now())
-        return
-
-    domain = source.get("domain", "")
-
-    try:
-        connector = make_connector(source["source_type"], connection)
-    except ValueError as exc:
-        store.update_job(job_id, status="error",
-                         error_log=[str(exc)], finished_at=_now())
-        return
-
-    manifests = list(connector.enumerate())
-    store.update_job(job_id, total_files=len(manifests))
-    logger.info("Job %s: discovered %d files", job_id, len(manifests))
-
-    error_log: List[str] = []
-    processed = enriched = errors = 0
-
-    def _process_one(manifest):
-        nonlocal processed, enriched, errors
-        try:
-            file_type = file_type_from_extension(manifest.file_name)
-            structural = {
-                "size_bytes":       manifest.size_bytes,
-                "created_at_file":  manifest.created_at,
-                "modified_at_file": manifest.modified_at,
-            }
-
-            # Snapshot old version (if any) BEFORE upsert so we can diff later
-            old_version_snapshot = _get_old_snapshot(manifest, source_id, store)
-
-            asset_id = store.upsert_asset(
-                source_id=source_id,
-                file_path=manifest.path,
-                file_name=manifest.file_name,
-                file_type=file_type,
-                checksum=manifest.checksum,
-                structural=structural,
-                remote_path=manifest.remote_path,
-            )
-
-            # Parse file
-            parse_result = parse_file(manifest.path)
-            structural["title"]  = parse_result.title
-            structural["author"] = parse_result.author
-            structural["page_count"] = parse_result.page_count
-
-            # Quality gate
-            qr = quality_gate(manifest.size_bytes, parse_result, manifest.file_name)
-            if not qr.passes:
-                logger.debug("Skip LLM for %s: %s", manifest.file_name, qr.reason)
+        connector = make_connector(source["connector_type"], source["config"])
+        for manifest in connector.list_files():
+            # Snapshot the prior checksum/status BEFORE upsert_asset overwrites
+            # it, so we can tell whether this file actually changed since the
+            # last time it was indexed.
+            prior = store.get_prior_checksum(source_id, manifest.remote_id)
+            try:
+                asset_id = store.upsert_asset(
+                    source_id=source_id,
+                    remote_id=manifest.remote_id,
+                    file_name=manifest.file_name,
+                    size_bytes=manifest.size_bytes,
+                    mime_type=manifest.mime_type,
+                    checksum=manifest.checksum,
+                    modified_at=manifest.modified_at,
+                    local_path=manifest.remote_id if is_local else None,
+                )
                 processed += 1
-                store.update_job(job_id, processed=processed, enriched=enriched,
-                                 errors=errors)
-                return
+            except Exception as exc:
+                logger.warning("Failed to index %s: %s", manifest.file_name, exc)
+                errors += 1
+                store.update_job(job_id, processed=processed, errors=errors, total_files=processed + errors)
+                continue
+            store.update_job(job_id, processed=processed, errors=errors, total_files=processed + errors)
 
-            # LLM fingerprint
-            fp = extract_fingerprint(
-                parse_result=parse_result,
-                domain_hint=domain,
-                file_name=manifest.file_name,
+            # Skip reprocessing a file that already finished successfully and
+            # whose checksum hasn't changed since last indexed — avoids
+            # re-running extraction/embedding/NER/PII/xref/kg_bridge (and
+            # re-downloading cloud files) on every reindex for unchanged
+            # content. A missing checksum can't be compared reliably, so
+            # those always reprocess; a prior 'error'/'running' status also
+            # always retries.
+            prior_checksum, prior_status = prior or (None, None)
+            unchanged = (
+                prior_checksum is not None
+                and manifest.checksum is not None
+                and prior_checksum == manifest.checksum
+                and prior_status == "done"
             )
-            fp.setdefault("title", parse_result.title or manifest.file_name)
-            store.save_fingerprint(asset_id, fp)
+            if unchanged:
+                continue
 
-            # Semantic embedding (non-blocking, best-effort — no-ops if no
-            # embedding backend is installed)
-            try:
-                embedded = embed_text(fingerprint_text(fp))
-                if embedded is not None:
-                    vector, model = embedded
-                    store.save_embedding(asset_id, vector, model)
-            except Exception as embed_exc:
-                logger.warning("Embedding failed for %s: %s", asset_id, embed_exc)
+            # Run every connector type through the same extract/embed/tag
+            # pipeline as an explicit upload, right away, so a reindex ends
+            # with every file fully processed (not just enumerated). Local
+            # files are already on disk; cloud files are downloaded to a
+            # temp file first since extract_text needs a filesystem path.
+            _maybe_autoprocess(asset_id, manifest, store, connector, is_local)
 
-            # If this was a version update, compute and persist the change summary
-            if old_version_snapshot is not None:
-                asset = store.get_asset(asset_id)
-                old_ver = (asset.get("version_num") or 1) - 1
-                if old_ver >= 1:
-                    change_summary = _compute_change_summary(old_version_snapshot, fp)
-                    store.save_version_change_summary(asset_id, old_ver, change_summary)
-
-            # Cross-modal linking (non-blocking, best-effort)
-            try:
-                run_linking(asset_id, fp, store, metadata_api)
-            except Exception as link_exc:
-                logger.warning("Linking failed for %s: %s", asset_id, link_exc)
-
-            processed += 1
-            enriched  += 1
-            store.update_job(job_id, processed=processed, enriched=enriched,
-                             errors=errors)
-
-        except Exception as exc:
-            errors += 1
-            error_log.append(f"{manifest.file_name}: {exc}")
-            logger.warning("Error processing %s: %s", manifest.file_name, exc)
-            store.update_job(job_id, processed=processed, enriched=enriched,
-                             errors=errors, error_log=error_log)
-
-    with ThreadPoolExecutor(max_workers=_WORKER_THREADS) as pool:
-        futures = [pool.submit(_process_one, m) for m in manifests]
-        for _ in as_completed(futures):
-            pass  # progress tracked inside _process_one
-
-    # Clean up temp files created by cloud connectors (e.g. gdrive downloads)
-    if hasattr(connector, "cleanup"):
-        connector.cleanup()
-
-    store.touch_source_indexed(source_id)
-    store.update_job(
-        job_id,
-        status="done" if not errors else "done_with_errors",
-        processed=processed,
-        enriched=enriched,
-        errors=errors,
-        error_log=error_log,
-        finished_at=_now(),
-    )
-    logger.info("Job %s complete: %d processed, %d enriched, %d errors",
-                job_id, processed, enriched, errors)
+        store.update_job(job_id, status="done", total_files=processed + errors,
+                          processed=processed, errors=errors, finished_at=store.now())
+        store.set_source_status(source_id, "ready")
+    except Exception as exc:
+        logger.exception("Index job failed for source %s", source_id)
+        store.update_job(job_id, status="error", finished_at=store.now())
+        store.set_source_status(source_id, "error", error_message=str(exc))
 
 
-def _load_connection(source: dict) -> dict:
-    import json
-    raw = source.get("connection_json", "{}")
-    if isinstance(raw, str):
-        return json.loads(raw)
-    return raw or {}
+def _maybe_autoprocess(asset_id: str, manifest, store: DocStore, connector, is_local: bool) -> None:
+    """Runs process_uploaded_asset for an indexed file, unless it's a type
+    extract_text doesn't support or too large to process inline during a
+    bulk reindex — those are marked 'skipped' with a clear reason instead
+    of silently doing nothing. Cloud files are downloaded to a temp path
+    first, since extract_text requires a filesystem path; the temp file is
+    removed afterwards regardless of success or failure."""
+    ext = Path(manifest.file_name).suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        store.update_asset_processing(asset_id, status="skipped", steps=[
+            {"key": "skip", "label": "Processing", "status": "error",
+             "detail": f"unsupported file type for text extraction: {ext or '(none)'}"},
+        ])
+        return
+    if manifest.size_bytes > _AUTO_PROCESS_MAX_BYTES:
+        store.update_asset_processing(asset_id, status="skipped", steps=[
+            {"key": "skip", "label": "Processing", "status": "error",
+             "detail": f"file too large to auto-process ({manifest.size_bytes / 1_048_576:.1f} MB) "
+                       f"— re-upload it via Upload Document to process it individually"},
+        ])
+        return
 
+    if is_local:
+        process_uploaded_asset(asset_id, manifest.remote_id, store)
+        return
 
-def _now() -> str:
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _get_old_snapshot(manifest, source_id: str,
-                      store: UnstructuredStore) -> "dict | None":
-    """
-    Return the current enriched state of an asset before it is overwritten,
-    or None if this is a new file or the file hasn't changed.
-    Only called when we expect a potential version bump.
-    """
     try:
-        if manifest.remote_path:
-            row = store._conn().execute(
-                "SELECT * FROM unstructured_assets WHERE source_id=? AND remote_path=?",
-                (source_id, manifest.remote_path),
-            ).fetchone()
+        data = connector.read_bytes(manifest.remote_id)
+    except Exception as exc:
+        logger.warning("Failed to download %s for auto-processing: %s", manifest.file_name, exc)
+        store.update_asset_processing(asset_id, status="skipped", steps=[
+            {"key": "skip", "label": "Processing", "status": "error",
+             "detail": f"could not download file from source: {exc}"},
+        ])
+        return
+
+    fd, tmp_path = tempfile.mkstemp(suffix=ext)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        process_uploaded_asset(asset_id, tmp_path, store)
+    finally:
+        os.remove(tmp_path)
+
+
+def process_uploaded_asset(asset_id: str, local_path: str, store: DocStore) -> None:
+    """Runs the full processing pipeline for a single asset: text extraction
+    → semantic embeddings → topic tagging → named entity recognition → PII
+    detection → cross-modal linking. Updates processing_steps on the asset
+    after every step so the frontend can poll and show live progress. Never
+    raises — errors are recorded on the failing step instead."""
+    steps = _init_steps()
+    store.update_asset_processing(asset_id, status="running", steps=steps)
+
+    try:
+        _set_step(steps, "extract_text", "running")
+        store.update_asset_processing(asset_id, steps=steps)
+        text = extract_text(local_path)
+        _set_step(steps, "extract_text", "done", f"{len(text):,} characters extracted")
+        store.update_asset_processing(asset_id, steps=steps, extracted_text=text)
+    except ExtractionError as exc:
+        _set_step(steps, "extract_text", "error", str(exc))
+        store.update_asset_processing(asset_id, status="error", steps=steps)
+        return
+    except Exception as exc:
+        logger.exception("Text extraction failed for asset %s", asset_id)
+        _set_step(steps, "extract_text", "error", str(exc))
+        store.update_asset_processing(asset_id, status="error", steps=steps)
+        return
+
+    try:
+        _set_step(steps, "embed", "running")
+        store.update_asset_processing(asset_id, steps=steps)
+        vector, model_label = embed_text(text)
+        _set_step(steps, "embed", "done", f"{len(vector)}-dim vector ({model_label})")
+        store.update_asset_processing(asset_id, steps=steps, embedding_model=model_label,
+                                       embedding_dims=len(vector))
+    except Exception as exc:
+        logger.exception("Embedding failed for asset %s", asset_id)
+        _set_step(steps, "embed", "error", str(exc))
+        store.update_asset_processing(asset_id, status="error", steps=steps)
+        return
+
+    try:
+        _set_step(steps, "tag_topics", "running")
+        store.update_asset_processing(asset_id, steps=steps)
+        topics = extract_topics(text)
+        _set_step(steps, "tag_topics", "done", f"{len(topics)} topics")
+        store.update_asset_processing(asset_id, steps=steps, topics=topics)
+    except Exception as exc:
+        logger.exception("Topic tagging failed for asset %s", asset_id)
+        _set_step(steps, "tag_topics", "error", str(exc))
+        store.update_asset_processing(asset_id, status="error", steps=steps)
+        return
+
+    # Named entity recognition only starts once topic tagging has finished —
+    # it never runs ahead of or in place of the earlier steps.
+    try:
+        _set_step(steps, "ner", "running")
+        store.update_asset_processing(asset_id, steps=steps)
+        entities = extract_entities(text)
+        _set_step(steps, "ner", "done", f"{len(entities)} entities")
+        store.update_asset_processing(asset_id, steps=steps, entities=entities)
+    except Exception as exc:
+        logger.exception("Named entity recognition failed for asset %s", asset_id)
+        _set_step(steps, "ner", "error", str(exc))
+        store.update_asset_processing(asset_id, status="error", steps=steps)
+        return
+
+    # PII detection only starts once named entity recognition has finished.
+    try:
+        _set_step(steps, "pii", "running")
+        store.update_asset_processing(asset_id, steps=steps)
+        pii_findings = detect_pii(text)
+        _set_step(steps, "pii", "done", f"{len(pii_findings)} PII items found" if pii_findings else "no PII found")
+        store.update_asset_processing(asset_id, steps=steps, pii_findings=pii_findings)
+    except Exception as exc:
+        logger.exception("PII detection failed for asset %s", asset_id)
+        _set_step(steps, "pii", "error", str(exc))
+        store.update_asset_processing(asset_id, status="error", steps=steps)
+        return
+
+    # Cross-modal linking only starts once PII detection has finished. It
+    # needs at least one structured source linked to this document source —
+    # if none is configured, that's a clean skip, not an error (everything
+    # before it already succeeded). Each linked source is matched against
+    # independently — a document can genuinely relate to more than one
+    # database, and a table name collision between two linked sources must
+    # not cause a match to land against the wrong one.
+    linked_source_ids = []
+    try:
+        asset = store.get_asset(asset_id)
+        source = store.get_source(asset["source_id"]) if asset else None
+        linked_source_ids = (source.get("linked_source_ids") or []) if source else []
+
+        if not linked_source_ids:
+            _set_step(steps, "xref", "skipped", "no linked database source configured for this document source")
+            store.update_asset_processing(asset_id, status="done", steps=steps)
         else:
-            row = store._conn().execute(
-                "SELECT * FROM unstructured_assets WHERE source_id=? AND file_path=?",
-                (source_id, manifest.path),
-            ).fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        if d.get("checksum") == manifest.checksum:
-            return None  # file unchanged — no version bump
-        return d
-    except Exception:
-        return None
+            _set_step(steps, "xref", "running")
+            store.update_asset_processing(asset_id, steps=steps)
 
+            all_links = []
+            per_source_counts = []
+            for sid in linked_source_ids:
+                try:
+                    schema = fetch_schema(sid)
+                    links = link_mentions(entities, topics, schema)
+                except XrefUnavailable as exc:
+                    logger.warning("xref: skipping unreachable source %s for asset %s — %s", sid, asset_id, exc)
+                    continue
+                for link in links:
+                    all_links.append({**link, "source_id": sid})
+                per_source_counts.append(f"{len(links)} in {sid[:8]}")
+                if links:
+                    push_to_knowledge_graph(sid, asset_id, asset["file_name"], links)
 
-def _compute_change_summary(old: dict, new_fp: dict) -> str:
-    """
-    Produce a human-readable change summary by diffing the old asset state
-    against the newly computed fingerprint. No LLM call — pure structural diff.
-    """
-    parts: List[str] = []
+            detail = f"{len(all_links)} links across {len(linked_source_ids)} database(s)"
+            if per_source_counts:
+                detail += " (" + ", ".join(per_source_counts) + ")"
+            _set_step(steps, "xref", "done", detail)
+            store.update_asset_processing(asset_id, status="done", steps=steps, xref_links=all_links)
+    except Exception as exc:
+        logger.exception("Cross-modal linking failed for asset %s", asset_id)
+        _set_step(steps, "xref", "error", str(exc))
+        store.update_asset_processing(asset_id, status="error", steps=steps)
+        return
 
-    # Title change
-    old_title = (old.get("title") or "").strip()
-    new_title = (new_fp.get("title") or "").strip()
-    if old_title and new_title and old_title != new_title:
-        parts.append(f'Title changed from "{old_title}" to "{new_title}"')
-
-    # Doc type change
-    old_type = (old.get("doc_type") or "").strip()
-    new_type = (new_fp.get("doc_type") or "").strip()
-    if old_type and new_type and old_type != new_type:
-        parts.append(f"Document type changed from {old_type} to {new_type}")
-
-    # Topic changes
-    import json as _json
+    # KG Bridge Mapping only starts once cross-modal linking has finished. It
+    # needs at least 2 linked structured sources to have anything to bridge —
+    # a single linked source (or none) is a clean skip, not an error.
     try:
-        old_topics = set(_json.loads(old.get("topics_json") or "[]"))
-    except Exception:
-        old_topics = set()
-    new_topics = set(new_fp.get("topics") or [])
-
-    added   = new_topics - old_topics
-    removed = old_topics - new_topics
-    if added:
-        parts.append("New topics: " + ", ".join(sorted(added)))
-    if removed:
-        parts.append("Removed topics: " + ", ".join(sorted(removed)))
-
-    # Size change (significant = >10%)
-    old_size = old.get("size_bytes") or 0
-    new_size = new_fp.get("size_bytes") or 0
-    if old_size and new_size:
-        pct = abs(new_size - old_size) / old_size * 100
-        if pct >= 10:
-            direction = "grew" if new_size > old_size else "shrank"
-            parts.append(f"File {direction} by {pct:.0f}%")
-
-    if not parts:
-        parts.append("Content updated (no structural changes detected)")
-
-    return "; ".join(parts)
+        if len(linked_source_ids) < 2:
+            _set_step(steps, "kg_bridge", "skipped",
+                      "fewer than 2 linked structured sources - nothing to cross-map")
+            store.update_asset_processing(asset_id, status="done", steps=steps)
+        else:
+            _set_step(steps, "kg_bridge", "running")
+            store.update_asset_processing(asset_id, steps=steps)
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    f"{ORCHESTRATOR_URL}/kg-bridges/infer",
+                    json={"kg_ids": linked_source_ids},
+                )
+                resp.raise_for_status()
+                result = resp.json()
+            if result.get("status") == "skipped":
+                _set_step(steps, "kg_bridge", "skipped", result.get("reason", "skipped"))
+            else:
+                _set_step(steps, "kg_bridge", "done",
+                          f"inference queued across {result.get('kg_count', len(linked_source_ids))} "
+                          f"linked KGs ({result.get('pairs', 0)} pairs)")
+            store.update_asset_processing(asset_id, status="done", steps=steps)
+    except Exception as exc:
+        # Best-effort - a bridge-mapping failure never rolls back the
+        # successful extract/embed/ner/pii/xref work already recorded above.
+        logger.warning("kg_bridge: inference request failed for asset %s - %s", asset_id, exc)
+        _set_step(steps, "kg_bridge", "error", str(exc))
+        store.update_asset_processing(asset_id, status="done", steps=steps)

@@ -14,7 +14,7 @@ import Glossary from './views/Glossary.jsx';
 import Kpi from './views/Kpi.jsx';
 import SqlConsole from './views/SqlConsole.jsx';
 import ChangeLog from './views/ChangeLog.jsx';
-import DocumentIntelligence from './views/DocumentIntelligence.jsx'; // DI v1
+import DocumentIntelligence from './views/DocumentIntelligence.jsx';
 
 const VIEWS = {
   pipeline: PipelineMonitor,

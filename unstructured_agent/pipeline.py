@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
 from .connectors import make_connector, file_type_from_extension
+from .embedder import embed_text, fingerprint_text
 from .fingerprinter import quality_gate, extract_fingerprint
 from .linker import run_linking
 from .parsers import parse_file
@@ -117,6 +118,16 @@ def run_index_job(job_id: str, source_id: str, store: UnstructuredStore,
             )
             fp.setdefault("title", parse_result.title or manifest.file_name)
             store.save_fingerprint(asset_id, fp)
+
+            # Semantic embedding (non-blocking, best-effort — no-ops if no
+            # embedding backend is installed)
+            try:
+                embedded = embed_text(fingerprint_text(fp))
+                if embedded is not None:
+                    vector, model = embedded
+                    store.save_embedding(asset_id, vector, model)
+            except Exception as embed_exc:
+                logger.warning("Embedding failed for %s: %s", asset_id, embed_exc)
 
             # If this was a version update, compute and persist the change summary
             if old_version_snapshot is not None:

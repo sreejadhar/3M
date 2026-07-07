@@ -479,6 +479,45 @@ class UnstructuredStore:
         ).fetchall()
         return [self.get_asset(r["asset_id"]) for r in rows]
 
+    # ── doc_topic_embeddings ──────────────────────────────────────────────────
+
+    def save_embedding(self, asset_id: str, embedding: List[float], model: str) -> None:
+        self._conn().execute(
+            """INSERT INTO doc_topic_embeddings (asset_id,embedding_json,model,created_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(asset_id) DO UPDATE SET
+                 embedding_json=excluded.embedding_json,
+                 model=excluded.model,
+                 created_at=excluded.created_at""",
+            (asset_id, json.dumps(embedding), model, self._now()),
+        )
+        self._conn().commit()
+
+    def get_embedding(self, asset_id: str) -> Optional[Dict]:
+        row = self._conn().execute(
+            "SELECT * FROM doc_topic_embeddings WHERE asset_id=?", (asset_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["embedding"] = json.loads(d.pop("embedding_json") or "[]")
+        return d
+
+    def list_embeddings(self, exclude_asset_id: Optional[str] = None,
+                        limit: int = 500) -> List[Dict]:
+        where = "WHERE asset_id != ?" if exclude_asset_id else ""
+        params: List = [exclude_asset_id] if exclude_asset_id else []
+        rows = self._conn().execute(
+            f"SELECT * FROM doc_topic_embeddings {where} LIMIT ?",
+            params + [limit],
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["embedding"] = json.loads(d.pop("embedding_json") or "[]")
+            result.append(d)
+        return result
+
     # ── doc_relationships ────────────────────────────────────────────────────
 
     def save_relationship(self, from_asset_id: str, rel_type: str,

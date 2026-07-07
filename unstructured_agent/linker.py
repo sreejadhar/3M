@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from .embedder import cosine_similarity
 from .store import UnstructuredStore
 
 logger = logging.getLogger(__name__)
@@ -298,38 +299,51 @@ def detect_table_links(asset_id: str, entities: Dict, topics: List[str],
     return sorted(links, key=lambda x: -x["confidence"])
 
 
-# ── Doc↔Doc similarity (lightweight cosine on topic sets) ────────────────────
+# ── Doc↔Doc similarity (semantic embedding, falls back to topic Jaccard) ─────
 
 def detect_doc_similarity(asset_id: str, topics: List[str],
                            store: UnstructuredStore) -> List[Dict]:
     """
-    Compare topics of the current document against all other documents in the
-    same store using Jaccard similarity (no embedding needed for topic sets).
+    Compare the current document against all other documents in the same
+    store. Prefers cosine similarity over semantic embeddings when both
+    documents have one; falls back to Jaccard similarity over topic sets
+    for documents with no embedding (e.g. no embedding backend installed).
     """
-    if not topics:
+    own_embedding = store.get_embedding(asset_id)
+    topic_set = {t.lower() for t in topics if t}
+
+    if not own_embedding and not topic_set:
         return []
 
-    topic_set = {t.lower() for t in topics if t}
     all_assets = store.list_assets(enriched_only=True, limit=500)
-    links = []
+    other_embeddings = {
+        e["asset_id"]: e["embedding"] for e in store.list_embeddings(exclude_asset_id=asset_id)
+    } if own_embedding else {}
 
+    links = []
     for asset in all_assets:
         if asset["asset_id"] == asset_id:
             continue
-        other_topics = {t.lower() for t in (asset.get("topics") or []) if t}
-        if not other_topics:
-            continue
-        # Jaccard similarity
-        intersection = len(topic_set & other_topics)
-        union = len(topic_set | other_topics)
-        sim = intersection / union if union else 0.0
+
+        other_embedding = other_embeddings.get(asset["asset_id"])
+        if own_embedding and other_embedding:
+            sim = cosine_similarity(own_embedding["embedding"], other_embedding)
+            basis = f"embedding_cosine:{own_embedding['model']}"
+        else:
+            other_topics = {t.lower() for t in (asset.get("topics") or []) if t}
+            if not topic_set or not other_topics:
+                continue
+            intersection = len(topic_set & other_topics)
+            union = len(topic_set | other_topics)
+            sim = intersection / union if union else 0.0
+            basis = "jaccard_topics"
 
         if sim >= _DOC_SIM_WEAK:
             links.append({
                 "from_asset_id": asset_id,
                 "rel_type":      "SIMILAR_TOPIC" if sim >= _DOC_SIM_THRESHOLD else "WEAKLY_SIMILAR",
                 "confidence":    round(sim, 3),
-                "basis":         "jaccard_topics",
+                "basis":         basis,
                 "to_asset_id":   asset["asset_id"],
             })
 

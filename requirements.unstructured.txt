@@ -30,3 +30,9 @@ google-auth-httplib2>=0.2.0
 msal>=1.28.0
 
 # SQLite is stdlib — no extra driver needed
+
+# Semantic embeddings (embedder.py) — optional, auto-detected at runtime.
+# Neither installed → embedding step is skipped and doc similarity falls
+# back to Jaccard over topic sets.
+# sentence-transformers>=3.0.0   # local backend (default when installed), 384 dims
+# openai>=1.0.0                  # OpenAI backend, 1536 dims, needs OPENAI_API_KEY

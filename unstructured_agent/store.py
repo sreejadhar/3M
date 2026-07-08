@@ -21,9 +21,7 @@ CREATE TABLE IF NOT EXISTS doc_sources (
     status            TEXT NOT NULL DEFAULT 'idle',
     error_message     TEXT,
     created_at        TEXT NOT NULL,
-    indexed_at        TEXT,
-    linked_source_id  TEXT,
-    linked_source_ids_json TEXT
+    indexed_at        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS doc_assets (
@@ -60,6 +58,21 @@ CREATE TABLE IF NOT EXISTS index_jobs (
     started_at      TEXT NOT NULL,
     finished_at     TEXT
 );
+
+CREATE TABLE IF NOT EXISTS doc_embeddings (
+    asset_id        TEXT PRIMARY KEY,
+    embedding_json  TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS schema_embeddings (
+    source_id       TEXT PRIMARY KEY,
+    embedding_json  TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    profile_hash    TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 
@@ -76,12 +89,6 @@ _ASSET_MIGRATION_COLUMNS = [
     ("pii_findings_json", "TEXT"),
     ("xref_links_json", "TEXT"),
 ]
-
-_SOURCE_MIGRATION_COLUMNS = [
-    ("linked_source_id", "TEXT"),
-    ("linked_source_ids_json", "TEXT"),
-]
-
 
 class DocStore:
     def __init__(self, db_path: str):
@@ -151,10 +158,6 @@ class DocStore:
         for col, decl in _ASSET_MIGRATION_COLUMNS:
             if col not in existing:
                 conn.execute(f"ALTER TABLE doc_assets ADD COLUMN {col} {decl}")
-        existing = {row["name"] for row in conn.execute("PRAGMA table_info(doc_sources)")}
-        for col, decl in _SOURCE_MIGRATION_COLUMNS:
-            if col not in existing:
-                conn.execute(f"ALTER TABLE doc_sources ADD COLUMN {col} {decl}")
 
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -170,24 +173,15 @@ class DocStore:
 
     # ── sources ──────────────────────────────────────────────────────────────
 
-    def create_source(self, name: str, connector_type: str, config: dict,
-                       linked_source_ids: Optional[list] = None) -> dict:
+    def create_source(self, name: str, connector_type: str, config: dict) -> dict:
         source_id = str(uuid.uuid4())
         self._conn().execute(
-            "INSERT INTO doc_sources (source_id,name,connector_type,config_json,status,created_at,linked_source_ids_json) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (source_id, name, connector_type, json.dumps(config), "idle", self.now(),
-             json.dumps(linked_source_ids or [])),
+            "INSERT INTO doc_sources (source_id,name,connector_type,config_json,status,created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (source_id, name, connector_type, json.dumps(config), "idle", self.now()),
         )
         self._conn().commit()
         return self.get_source(source_id)
-
-    def set_linked_sources(self, source_id: str, linked_source_ids: list) -> None:
-        self._conn().execute(
-            "UPDATE doc_sources SET linked_source_ids_json=? WHERE source_id=?",
-            (json.dumps(linked_source_ids or []), source_id),
-        )
-        self._conn().commit()
 
     def get_source(self, source_id: str) -> Optional[dict]:
         row = self._conn().execute(
@@ -203,6 +197,15 @@ class DocStore:
 
     def delete_source(self, source_id: str) -> None:
         conn = self._conn()
+        # doc_embeddings is keyed by asset_id with no source_id column, so its
+        # rows must be deleted via subquery before doc_assets disappears —
+        # otherwise they're orphaned permanently (nothing else ever cleans
+        # them up, since asset_id no longer exists anywhere to join against).
+        conn.execute(
+            "DELETE FROM doc_embeddings WHERE asset_id IN "
+            "(SELECT asset_id FROM doc_assets WHERE source_id=?)",
+            (source_id,),
+        )
         conn.execute("DELETE FROM doc_assets WHERE source_id=?", (source_id,))
         conn.execute("DELETE FROM index_jobs WHERE source_id=?", (source_id,))
         conn.execute("DELETE FROM doc_sources WHERE source_id=?", (source_id,))
@@ -226,12 +229,6 @@ class DocStore:
         d = dict(row)
         d["config"] = json.loads(d.pop("config_json") or "{}")
         d["config"] = _redact(d["config"])
-        d["linked_source_ids"] = json.loads(d.pop("linked_source_ids_json") or "null") or []
-        # Legacy single-value column — folded into the list above so old rows
-        # created before multi-source linking still work; no longer written to.
-        legacy = d.pop("linked_source_id", None)
-        if legacy and legacy not in d["linked_source_ids"]:
-            d["linked_source_ids"].append(legacy)
         d["table_count"] = self._conn().execute(
             "SELECT COUNT(*) FROM doc_assets WHERE source_id=?", (d["source_id"],)
         ).fetchone()[0]
@@ -330,6 +327,54 @@ class DocStore:
             (*fields.values(), asset_id),
         )
         self._conn().commit()
+
+    # ── embeddings ───────────────────────────────────────────────────────────
+
+    def save_embedding(self, asset_id: str, embedding: List[float], model: str) -> None:
+        self._conn().execute(
+            """INSERT INTO doc_embeddings (asset_id,embedding_json,model,created_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(asset_id) DO UPDATE SET
+                 embedding_json=excluded.embedding_json,
+                 model=excluded.model,
+                 created_at=excluded.created_at""",
+            (asset_id, json.dumps(embedding), model, self.now()),
+        )
+        self._conn().commit()
+
+    def get_embedding(self, asset_id: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT * FROM doc_embeddings WHERE asset_id=?", (asset_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["embedding"] = json.loads(d.pop("embedding_json") or "[]")
+        return d
+
+    def save_schema_embedding(self, source_id: str, embedding: List[float], model: str,
+                               profile_hash: str) -> None:
+        self._conn().execute(
+            """INSERT INTO schema_embeddings (source_id,embedding_json,model,profile_hash,created_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(source_id) DO UPDATE SET
+                 embedding_json=excluded.embedding_json,
+                 model=excluded.model,
+                 profile_hash=excluded.profile_hash,
+                 created_at=excluded.created_at""",
+            (source_id, json.dumps(embedding), model, profile_hash, self.now()),
+        )
+        self._conn().commit()
+
+    def get_schema_embedding(self, source_id: str) -> Optional[dict]:
+        row = self._conn().execute(
+            "SELECT * FROM schema_embeddings WHERE source_id=?", (source_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["embedding"] = json.loads(d.pop("embedding_json") or "[]")
+        return d
 
     # ── index jobs ───────────────────────────────────────────────────────────
 

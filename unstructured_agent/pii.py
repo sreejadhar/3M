@@ -55,11 +55,11 @@ def _mask(value: str, kind: str) -> str:
     return "*" * len(value)
 
 
-def detect_pii(text: str, top_n: int = 20) -> list:
-    """Returns a list of {type, masked} dicts. Never returns raw PII values."""
-    findings = []
+def _find_pii_spans(text: str):
+    """Yields (span, kind, value) for each detected, non-overlapping PII
+    match, in type-priority order (see _TYPE_ORDER) — shared by detect_pii
+    and redact_text so both use identical detection logic."""
     seen_spans = set()
-
     for kind in _TYPE_ORDER:
         pattern = _PATTERNS[kind]
         for m in pattern.finditer(text):
@@ -70,6 +70,28 @@ def detect_pii(text: str, top_n: int = 20) -> list:
             if kind == "CREDIT_CARD" and not _luhn_valid(re.sub(r"\D", "", value)):
                 continue
             seen_spans.add(span)
-            findings.append({"type": kind, "masked": _mask(value, kind)})
+            yield span, kind, value
 
+
+def detect_pii(text: str, top_n: int = 20) -> list:
+    """Returns a list of {type, masked} dicts. Never returns raw PII values."""
+    findings = [{"type": kind, "masked": _mask(value, kind)}
+                for _, kind, value in _find_pii_spans(text)]
     return findings[:top_n]
+
+
+def redact_text(text: str) -> str:
+    """Returns text with every detected PII span replaced by its masked
+    form. Used when raw extracted text must be surfaced elsewhere (e.g.
+    document excerpts fed into DataChat answers) — detect_pii's output
+    intentionally never retains raw values or positions, so this re-runs
+    detection directly against the source text rather than reusing it."""
+    spans = sorted(_find_pii_spans(text), key=lambda item: item[0][0])
+    out = []
+    last_end = 0
+    for (start, end), kind, value in spans:
+        out.append(text[last_end:start])
+        out.append(_mask(value, kind))
+        last_end = end
+    out.append(text[last_end:])
+    return "".join(out)

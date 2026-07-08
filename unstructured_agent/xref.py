@@ -1,30 +1,40 @@
 """
 Cross-modal linking: matches a document's mentions (named entities + topics)
-against the schema (table/column names) of a linked structured data source,
-so a document's content can be traced to the database entities it discusses.
+against the schema (table/column names) of the structured data source it
+discusses.
 
-Runs after PII detection, once every earlier step has finished. Best-effort:
-if the document's source has no linked structured source, or the metadata
-service is unreachable, linking is skipped (not an error) — the rest of the
-pipeline already succeeded.
+Unlike the earlier version of this module, the datasource itself is not
+picked manually — it's inferred automatically from the document's meaning:
 
-Matching is LLM-based (same pattern as topics.py/ner.py): the model sees the
-document's mentions plus the full table/column list and proposes matches —
-catching synonyms and paraphrases ("reinsurers" ~ REINSURER_NAME, "policy
-tenure" ~ POLICY_START_DATE) that no literal string match ever could. Every
-LLM-proposed link is validated against the real schema (table/column must
-actually exist) to guard against hallucination. Falls back to lexical token
-overlap — exact substring/word matches only — if the LLM call is unavailable
-or fails.
+  1. Shortlist: ask the LLM which candidate datasources (by name/description/
+     domain/table names) this document is genuinely relevant to, based on
+     subject matter. Falls back to cosine similarity between the document's
+     and each candidate's cached schema-profile embeddings if the LLM call
+     is unavailable — note that fallback is only as semantic as the active
+     embedding backend (see embedder.py); the offline hashing fallback is
+     closer to keyword overlap than real semantic similarity.
+  2. Confirm: for each shortlisted candidate, run LLM-based mention matching
+     (same pattern as topics.py/ner.py) against its *real* schema, catching
+     synonyms and paraphrases ("reinsurers" ~ REINSURER_NAME) that no literal
+     string match ever could. Every LLM-proposed link is validated against
+     the real schema to guard against hallucination. Falls back to lexical
+     token overlap if the LLM call is unavailable or fails.
+
+Only matches that clear a confidence floor make it into the Knowledge Graph
+— see XREF_LINK_MIN_CONFIDENCE below. Best-effort throughout: an unreachable
+datasource or a schema-fetch failure is skipped, not an error.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 
 import httpx
+
+from .embedder import cosine_similarity, embed_text
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +46,16 @@ _STOPWORDS = {
 }
 
 _MIN_SCORE = 0.4
+
+# How many datasources the embedding shortlist keeps, and how similar a
+# datasource's schema profile must be to the document to be considered.
+SHORTLIST_TOP_K = int(os.environ.get("XREF_SHORTLIST_TOP_K", "3"))
+SHORTLIST_MIN_SCORE = float(os.environ.get("XREF_SHORTLIST_MIN_SCORE", "0.15"))
+
+# A shortlisted candidate's LLM/lexical-confirmed link confidence must clear
+# this floor before it's written into the Knowledge Graph — auto-linking
+# has no human in the loop, so this guards against noisy false positives.
+LINK_MIN_CONFIDENCE = float(os.environ.get("XREF_LINK_MIN_CONFIDENCE", "0.55"))
 
 
 class XrefUnavailable(RuntimeError):
@@ -71,6 +91,208 @@ def fetch_schema(source_id: str) -> list:
             return schema
     except httpx.HTTPError as exc:
         raise XrefUnavailable(f"metadata service unreachable: {exc}") from exc
+
+
+def fetch_all_sources() -> list:
+    """Returns every structured datasource the orchestrator knows about —
+    [{id, name, description, domain, table_names, ...}] — the candidate pool
+    for datasource inference."""
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(f"{ORCHESTRATOR_URL}/sources")
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPError as exc:
+        raise XrefUnavailable(f"orchestrator unreachable: {exc}") from exc
+
+
+def build_schema_profile_text(meta: dict, schema: list) -> str:
+    """Flattens a datasource's identity and schema into one string for
+    embedding: name/description/domain carry human-written meaning; table
+    and column names carry the literal structure."""
+    parts = []
+    for key in ("name", "description", "domain"):
+        v = meta.get(key)
+        if v:
+            parts.append(str(v))
+    for t in schema:
+        table = t.get("table")
+        if not table:
+            continue
+        cols = t.get("columns") or []
+        parts.append(f"{table}: {', '.join(cols)}" if cols else table)
+    return "\n".join(parts)
+
+
+def get_or_build_schema_embedding(source_id: str, meta: dict, store) -> tuple:
+    """Returns (vector, model_label) for a datasource's schema profile.
+    Cached in the DocStore — if a cached embedding already exists, it's
+    used as-is with NO schema fetch at all.
+
+    This deliberately skips staleness detection (which would require
+    calling fetch_schema() on every call just to compare hashes, and did
+    in an earlier version of this function) — shortlist_datasources() calls
+    this once per candidate datasource for every document processed, so
+    fetching each datasource's full schema over HTTP on every call floods
+    the orchestrator's metadata endpoints during a bulk reindex. A stale
+    shortlist ranking is a minor accuracy cost (it only affects which
+    datasources get considered, not the final links — link_mentions()
+    always fetches each shortlisted candidate's live schema before
+    confirming a match). Call store.save_schema_embedding() again directly
+    (e.g. from an admin action) to force a refresh for a specific source."""
+    cached = store.get_schema_embedding(source_id)
+    if cached:
+        return cached["embedding"], cached["model"]
+
+    schema = fetch_schema(source_id)
+    profile_text = build_schema_profile_text(meta, schema)
+    profile_hash = hashlib.sha1(profile_text.encode("utf-8")).hexdigest()
+    vector, model_label = embed_text(profile_text)
+    store.save_schema_embedding(source_id, vector, model_label, profile_hash)
+    return vector, model_label
+
+
+# Bonus added to a candidate's cosine score when its name literally appears
+# in the document's own text — a safety net for the offline hashing embedder
+# (no stemming/TF-IDF weighting), which can bury an exact-name match under
+# noise from a large schema profile. Harmless when sentence-transformers is
+# available too: a true name match should rank near the top regardless.
+_NAME_MATCH_BOOST = 0.3
+
+
+def _name_matches(name: str, doc_tokens: set) -> bool:
+    name_tokens = _tokenize(name or "")
+    return bool(name_tokens) and name_tokens <= doc_tokens
+
+
+def _llm_shortlist(doc_text: str, candidates: list, top_k: int) -> list:
+    """Uses the LLM to judge which candidate datasources this document is
+    genuinely relevant to, based on subject matter — not literal keyword
+    overlap. Given only each candidate's name/description/domain/table
+    names (no full column-level schema — that's the confirm step's job),
+    this is a single cheap call per document, and it's the only path in
+    this module that's actually semantic when no local embedding model is
+    available (see shortlist_datasources)."""
+    from llm_client import get_client
+
+    cand_by_id = {c.get("id"): c for c in candidates if c.get("id")}
+    if not cand_by_id:
+        return []
+
+    cand_text = "\n".join(
+        f"- id={cid}, name={c.get('name') or 'n/a'}, domain={c.get('domain') or 'n/a'}, "
+        f"description={c.get('description') or 'n/a'}, "
+        f"tables={', '.join((c.get('table_names') or [])[:20]) or 'n/a'}"
+        for cid, c in cand_by_id.items()
+    )
+
+    client = get_client()
+    msg = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=1000,
+        temperature=0,
+        timeout=20.0,
+        messages=[{
+            "role": "user",
+            "content": (
+                "A document's content is summarized below, followed by a list of candidate "
+                "databases. Identify which database(s), if any, this document is genuinely "
+                "relevant to — based on the actual subject matter it discusses, not just "
+                "literal keyword overlap with the database name.\n\n"
+                f"Document content:\n{doc_text[:3000]}\n\n"
+                f"Candidate databases:\n{cand_text}\n\n"
+                'Return ONLY a JSON array of objects like {"id": "...", "score": 0.0-1.0}, '
+                "sorted by relevance descending. id must be one of the exact ids above. Only "
+                "include databases with genuine, specific relevance — do not force a match. "
+                "Return an empty array [] if none are relevant."
+            ),
+        }],
+    )
+    raw = msg.content[0].text.strip()
+    raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.MULTILINE).strip()
+    proposed = json.loads(raw)
+    if not isinstance(proposed, list):
+        raise ValueError("LLM did not return a JSON array")
+
+    scored = []
+    seen = set()
+    for item in proposed:
+        if not isinstance(item, dict):
+            continue
+        sid = item.get("id")
+        if sid not in cand_by_id or sid in seen:
+            continue  # not one of our candidates, or a hallucinated/duplicate id
+        seen.add(sid)
+        try:
+            score = max(0.0, min(1.0, float(item.get("score", 0.6))))
+        except (TypeError, ValueError):
+            score = 0.6
+        scored.append({"source_id": sid, "name": cand_by_id[sid].get("name"), "score": round(score, 3)})
+
+    scored.sort(key=lambda x: -x["score"])
+    return scored[:top_k]
+
+
+def _embedding_shortlist(doc_vector: list, candidates: list, store, doc_text: str,
+                          top_k: int, min_score: float) -> list:
+    """Cosine-ranks candidate datasources against the document's embedding,
+    with a name-match boost. Only genuinely semantic when a real embedding
+    model (e.g. sentence-transformers) is available — with the offline
+    hashing fallback this degrades to near-keyword-overlap, so it's used
+    only as a fallback when the LLM shortlist is unavailable."""
+    doc_tokens = _tokenize(doc_text) if doc_text else set()
+    if not doc_vector:
+        return []
+
+    scored = []
+    for meta in candidates:
+        source_id = meta.get("id")
+        if not source_id:
+            continue
+        try:
+            vector, _ = get_or_build_schema_embedding(source_id, meta, store)
+        except XrefUnavailable as exc:
+            logger.warning("xref: skipping unreachable source %s during shortlist — %s", source_id, exc)
+            continue
+        cosine = cosine_similarity(doc_vector, vector)
+        name_matched = _name_matches(meta.get("name"), doc_tokens)
+        score = min(1.0, cosine + (_NAME_MATCH_BOOST if name_matched else 0.0))
+        if score >= min_score:
+            scored.append({"source_id": source_id, "name": meta.get("name"),
+                            "score": round(score, 3), "name_matched": name_matched})
+
+    scored.sort(key=lambda x: -x["score"])
+    return scored[:top_k]
+
+
+def shortlist_datasources(doc_vector: list, store, doc_text: str = "",
+                           top_k: int = None, min_score: float = None) -> list:
+    """Returns [{source_id, name, score}], ranked by relevance to the
+    document — the automatic "which database is this document about"
+    inference, no manual selection involved.
+
+    Tries LLM-based judgment first (genuinely semantic — reasons over each
+    candidate's name/description/domain/tables against the document's
+    actual content). Falls back to cosine similarity between embeddings
+    (only as semantic as the active embedding backend — see embedder.py)
+    if the LLM call is unavailable or fails."""
+    top_k = SHORTLIST_TOP_K if top_k is None else top_k
+    min_score = SHORTLIST_MIN_SCORE if min_score is None else min_score
+
+    try:
+        candidates = fetch_all_sources()
+    except XrefUnavailable as exc:
+        logger.warning("xref: could not list datasources for shortlisting — %s", exc)
+        return []
+
+    if doc_text:
+        try:
+            scored = _llm_shortlist(doc_text, candidates, top_k)
+            return [c for c in scored if c["score"] >= min_score]
+        except Exception as exc:
+            logger.debug("xref: LLM shortlist skipped, falling back to embeddings — %s", exc)
+
+    return _embedding_shortlist(doc_vector, candidates, store, doc_text, top_k, min_score)
 
 
 def _overlap(mention_tokens: set, target_tokens: set) -> float:
@@ -136,6 +358,7 @@ def _llm_link(mentions: list, schema: list, top_n: int) -> list:
         model="claude-haiku-4-5",
         max_tokens=1500,
         temperature=0,
+        timeout=20.0,
         messages=[{
             "role": "user",
             "content": (
@@ -216,7 +439,7 @@ def push_to_knowledge_graph(structured_source_id: str, asset_id: str, file_name:
     """Adds this document as a node in the structured source's Knowledge
     Graph, with edges to every table it was linked to, so it shows up in
     Graph Explorer. Best-effort — logs and returns on any failure; a KG push
-    problem should never affect the xref step's own success/failure."""
+    problem should never affect the caller's own success/failure."""
     if not links:
         return
     try:

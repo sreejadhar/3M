@@ -2969,6 +2969,40 @@ async def link_document_to_graph(source_id: str, req: LinkDocumentToGraphRequest
     return {"linked": linked, "unmatched_tables": sorted(set(unmatched)), "node_id": doc_node_id}
 
 
+@app.delete("/sources/{source_id}/graph/documents/{asset_id}")
+async def unlink_document_from_graph(source_id: str, asset_id: str):
+    """
+    Removes a Document Intelligence document's node + edges from this
+    source's KG — called when the document (or its whole document source)
+    is deleted in Document Intelligence, so a removed document doesn't keep
+    showing up as a "ghost" node in Graph Explorer or get pulled into
+    DataChat's document context after it no longer exists.
+
+    Not an error if the document was never linked to this source — deleting
+    something absent is a no-op, matching this KG's additive-only design.
+    """
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    doc_node_id = f"doc:{asset_id}"
+    nodes = s.setdefault("kg_nodes", [])
+    edges = s.setdefault("kg_edges", [])
+
+    before = len(nodes)
+    nodes[:] = [n for n in nodes if n.get("id") != doc_node_id]
+    edges[:] = [e for e in edges if e.get("from") != doc_node_id and e.get("to") != doc_node_id]
+    removed = before - len(nodes)
+
+    if removed:
+        try:
+            _kg_store.save(s)
+        except Exception as exc:
+            logger.warning("kg_store.save after document unlink failed (non-fatal): %s", exc)
+
+    return {"removed": bool(removed), "node_id": doc_node_id}
+
+
 @app.get("/sources/{source_id}/ontology")
 async def get_source_ontology(source_id: str):
     """Return the OWL/Turtle ontology text for an indexed source."""

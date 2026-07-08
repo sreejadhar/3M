@@ -6,27 +6,27 @@ import os
 import tempfile
 from pathlib import Path
 
-import httpx
-
 from .connectors import make_connector
-from .embedder import embed_text
+from .embedder import embed_text, fingerprint_text
 from .extractor import SUPPORTED_EXTENSIONS, ExtractionError, extract_text
 from .ner import extract_entities
 from .pii import detect_pii
 from .store import DocStore
 from .topics import extract_topics
-from .xref import ORCHESTRATOR_URL, XrefUnavailable, fetch_schema, link_mentions, push_to_knowledge_graph
+from .xref import (
+    LINK_MIN_CONFIDENCE, XrefUnavailable, fetch_schema, link_mentions,
+    push_to_knowledge_graph, shortlist_datasources,
+)
 
 logger = logging.getLogger(__name__)
 
 PROCESSING_STEPS = [
     ("extract_text", "Text Extraction"),
-    ("embed", "Semantic Embeddings"),
     ("tag_topics", "Topic Tagging"),
     ("ner", "Named Entity Recognition"),
     ("pii", "PII Detection"),
-    ("xref", "Cross-Modal Linking"),
-    ("kg_bridge", "KG Bridge Mapping"),
+    ("embed", "Semantic Embeddings"),
+    ("infer_link", "Cross-Modal Linking"),
 ]
 
 # Files larger than this are indexed (metadata only) but not auto-processed
@@ -85,7 +85,7 @@ def run_index_job(job_id: str, source_id: str, store: DocStore) -> None:
 
             # Skip reprocessing a file that already finished successfully and
             # whose checksum hasn't changed since last indexed — avoids
-            # re-running extraction/embedding/NER/PII/xref/kg_bridge (and
+            # re-running extraction/embedding/NER/PII (and
             # re-downloading cloud files) on every reindex for unchanged
             # content. A missing checksum can't be compared reliably, so
             # those always reprocess; a prior 'error'/'running' status also
@@ -163,8 +163,8 @@ def _maybe_autoprocess(asset_id: str, manifest, store: DocStore, connector, is_l
 
 def process_uploaded_asset(asset_id: str, local_path: str, store: DocStore) -> None:
     """Runs the full processing pipeline for a single asset: text extraction
-    → semantic embeddings → topic tagging → named entity recognition → PII
-    detection → cross-modal linking. Updates processing_steps on the asset
+    → topic tagging → named entity recognition → PII detection → semantic
+    embeddings → cross-modal linking. Updates processing_steps on the asset
     after every step so the frontend can poll and show live progress. Never
     raises — errors are recorded on the failing step instead."""
     steps = _init_steps()
@@ -183,19 +183,6 @@ def process_uploaded_asset(asset_id: str, local_path: str, store: DocStore) -> N
     except Exception as exc:
         logger.exception("Text extraction failed for asset %s", asset_id)
         _set_step(steps, "extract_text", "error", str(exc))
-        store.update_asset_processing(asset_id, status="error", steps=steps)
-        return
-
-    try:
-        _set_step(steps, "embed", "running")
-        store.update_asset_processing(asset_id, steps=steps)
-        vector, model_label = embed_text(text)
-        _set_step(steps, "embed", "done", f"{len(vector)}-dim vector ({model_label})")
-        store.update_asset_processing(asset_id, steps=steps, embedding_model=model_label,
-                                       embedding_dims=len(vector))
-    except Exception as exc:
-        logger.exception("Embedding failed for asset %s", asset_id)
-        _set_step(steps, "embed", "error", str(exc))
         store.update_asset_processing(asset_id, status="error", steps=steps)
         return
 
@@ -238,80 +225,70 @@ def process_uploaded_asset(asset_id: str, local_path: str, store: DocStore) -> N
         store.update_asset_processing(asset_id, status="error", steps=steps)
         return
 
-    # Cross-modal linking only starts once PII detection has finished. It
-    # needs at least one structured source linked to this document source —
-    # if none is configured, that's a clean skip, not an error (everything
-    # before it already succeeded). Each linked source is matched against
-    # independently — a document can genuinely relate to more than one
-    # database, and a table name collision between two linked sources must
-    # not cause a match to land against the wrong one.
-    linked_source_ids = []
+    # Embedding runs last so its fingerprint can draw on topics/entities —
+    # a semantic summary of the document, not just raw prose — which is what
+    # lets datasource matching key off what the document is actually about.
     try:
+        _set_step(steps, "embed", "running")
+        store.update_asset_processing(asset_id, steps=steps)
         asset = store.get_asset(asset_id)
-        source = store.get_source(asset["source_id"]) if asset else None
-        linked_source_ids = (source.get("linked_source_ids") or []) if source else []
-
-        if not linked_source_ids:
-            _set_step(steps, "xref", "skipped", "no linked database source configured for this document source")
-            store.update_asset_processing(asset_id, status="done", steps=steps)
-        else:
-            _set_step(steps, "xref", "running")
-            store.update_asset_processing(asset_id, steps=steps)
-
-            all_links = []
-            per_source_counts = []
-            for sid in linked_source_ids:
-                try:
-                    schema = fetch_schema(sid)
-                    links = link_mentions(entities, topics, schema)
-                except XrefUnavailable as exc:
-                    logger.warning("xref: skipping unreachable source %s for asset %s — %s", sid, asset_id, exc)
-                    continue
-                for link in links:
-                    all_links.append({**link, "source_id": sid})
-                per_source_counts.append(f"{len(links)} in {sid[:8]}")
-                if links:
-                    push_to_knowledge_graph(sid, asset_id, asset["file_name"], links)
-
-            detail = f"{len(all_links)} links across {len(linked_source_ids)} database(s)"
-            if per_source_counts:
-                detail += " (" + ", ".join(per_source_counts) + ")"
-            _set_step(steps, "xref", "done", detail)
-            store.update_asset_processing(asset_id, status="done", steps=steps, xref_links=all_links)
+        title = asset.get("file_name") if asset else None
+        fp_text = fingerprint_text(text, topics=topics, entities=entities, title=title)
+        vector, model_label = embed_text(fp_text)
+        store.save_embedding(asset_id, vector, model_label)
+        _set_step(steps, "embed", "done", f"{len(vector)}-dim vector ({model_label})")
+        store.update_asset_processing(asset_id, steps=steps, embedding_model=model_label,
+                                       embedding_dims=len(vector))
     except Exception as exc:
-        logger.exception("Cross-modal linking failed for asset %s", asset_id)
-        _set_step(steps, "xref", "error", str(exc))
+        logger.exception("Embedding failed for asset %s", asset_id)
+        _set_step(steps, "embed", "error", str(exc))
         store.update_asset_processing(asset_id, status="error", steps=steps)
         return
 
-    # KG Bridge Mapping only starts once cross-modal linking has finished. It
-    # needs at least 2 linked structured sources to have anything to bridge —
-    # a single linked source (or none) is a clean skip, not an error.
+    # Cross-modal linking only starts once the document has an embedding. It
+    # infers which datasource(s) the document is about automatically —
+    # shortlisting by embedding similarity to each datasource's schema
+    # profile, then confirming with LLM-based mention matching against the
+    # real schema — instead of relying on a manual datasource selection.
+    # Best-effort throughout: an unreachable datasource, a schema-fetch
+    # failure, or no confident match is a skip, never an error, since every
+    # earlier step already succeeded.
     try:
-        if len(linked_source_ids) < 2:
-            _set_step(steps, "kg_bridge", "skipped",
-                      "fewer than 2 linked structured sources - nothing to cross-map")
-            store.update_asset_processing(asset_id, status="done", steps=steps)
+        _set_step(steps, "infer_link", "running")
+        store.update_asset_processing(asset_id, steps=steps)
+
+        shortlist = shortlist_datasources(vector, store, doc_text=fp_text)
+        all_links = []
+        per_source_counts = []
+        for cand in shortlist:
+            sid = cand["source_id"]
+            try:
+                schema = fetch_schema(sid)
+            except XrefUnavailable as exc:
+                logger.warning("infer_link: skipping unreachable source %s for asset %s — %s",
+                                sid, asset_id, exc)
+                continue
+            links = link_mentions(entities, topics, schema)
+            confident_links = [l for l in links if l["confidence"] >= LINK_MIN_CONFIDENCE]
+            if not confident_links:
+                continue
+            for link in confident_links:
+                all_links.append({**link, "source_id": sid, "source_name": cand.get("name")})
+            per_source_counts.append(f"{len(confident_links)} in {cand.get('name') or sid[:8]}")
+            push_to_knowledge_graph(sid, asset_id, asset["file_name"], confident_links)
+
+        if all_links:
+            detail = f"{len(all_links)} link(s) across {len(per_source_counts)} datasource(s) (" \
+                      + ", ".join(per_source_counts) + ")"
+        elif shortlist:
+            detail = f"{len(shortlist)} candidate datasource(s) considered, no confident match"
         else:
-            _set_step(steps, "kg_bridge", "running")
-            store.update_asset_processing(asset_id, steps=steps)
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.post(
-                    f"{ORCHESTRATOR_URL}/kg-bridges/infer",
-                    json={"kg_ids": linked_source_ids},
-                )
-                resp.raise_for_status()
-                result = resp.json()
-            if result.get("status") == "skipped":
-                _set_step(steps, "kg_bridge", "skipped", result.get("reason", "skipped"))
-            else:
-                _set_step(steps, "kg_bridge", "done",
-                          f"inference queued across {result.get('kg_count', len(linked_source_ids))} "
-                          f"linked KGs ({result.get('pairs', 0)} pairs)")
-            store.update_asset_processing(asset_id, status="done", steps=steps)
+            detail = "no matching datasource found"
+        _set_step(steps, "infer_link", "done", detail)
+        store.update_asset_processing(asset_id, steps=steps, xref_links=all_links)
     except Exception as exc:
-        # Best-effort - a bridge-mapping failure never rolls back the
-        # successful extract/embed/ner/pii/xref work already recorded above.
-        logger.warning("kg_bridge: inference request failed for asset %s - %s", asset_id, exc)
-        _set_step(steps, "kg_bridge", "error", str(exc))
-        store.update_asset_processing(asset_id, status="done", steps=steps)
+        logger.exception("Cross-modal linking failed for asset %s", asset_id)
+        _set_step(steps, "infer_link", "error", str(exc))
+        store.update_asset_processing(asset_id, steps=steps)
+
+    store.update_asset_processing(asset_id, status="done", steps=steps)

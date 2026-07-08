@@ -3,7 +3,7 @@ import { useAppState } from '../state.jsx';
 import { IconDocuments, IconPlus, IconRefresh } from '../components/Icons.jsx';
 import {
   docListSources, docCreateSource, docDeleteSource, docStartIndex, docListAssets,
-  docGetAsset, docUploadDocument, docSetLinkedSources, fsBrowse,
+  docGetAsset, docUploadDocument, fsBrowse,
 } from '../api/clients.js';
 
 const STEP_ICON = { pending: '○', running: '◐', done: '●', error: '✖', skipped: '⊘' };
@@ -41,7 +41,7 @@ function statusView(status) {
 }
 
 export default function DocumentIntelligence() {
-  const { toast, sources: dbSources } = useAppState();
+  const { toast } = useAppState();
   const [sources, setSources] = useState([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
@@ -156,18 +156,6 @@ export default function DocumentIntelligence() {
     }
   }
 
-  async function linkSources(source, linkedSourceIds) {
-    try {
-      await docSetLinkedSources(source.source_id, linkedSourceIds);
-      toast(linkedSourceIds.length
-        ? `Linked "${source.name}" to ${linkedSourceIds.length} database(s) — reindex to compute cross-modal links`
-        : `Unlinked "${source.name}" from all databases`, 'info');
-      refresh();
-    } catch (e) {
-      toast(`Link failed: ${e.message}`, 'error');
-    }
-  }
-
   return (
     <div id="view-documents" className="view active">
       <div className="panel-header">
@@ -232,23 +220,6 @@ export default function DocumentIntelligence() {
                     Delete
                   </button>
                 </div>
-                <div style={{ marginTop: 6 }} onClick={(e) => e.stopPropagation()}>
-                  <div style={{ fontSize: 10, color: 'var(--text-2)', marginBottom: 2 }}>
-                    Linked databases (Ctrl/Cmd-click for multiple):
-                  </div>
-                  <select
-                    multiple
-                    value={s.linked_source_ids || []}
-                    onChange={(e) => linkSources(s, Array.from(e.target.selectedOptions, (o) => o.value))}
-                    style={{ fontSize: 11, width: '100%', height: Math.min(96, 22 * Math.max(dbSources.length, 1)) }}
-                    title="Cross-modal linking is computed against every selected database independently"
-                  >
-                    {dbSources.length === 0 && <option disabled>— no data sources available —</option>}
-                    {dbSources.map((db) => (
-                      <option key={db.id} value={db.id}>{db.name}</option>
-                    ))}
-                  </select>
-                </div>
                 {s.status === 'error' && s.error_message && (
                   <div style={{ fontSize: 10, color: 'var(--red, #f87171)', marginTop: 4 }}>
                     {s.error_message}
@@ -274,7 +245,7 @@ export default function DocumentIntelligence() {
               padding: '8px 16px', borderBottom: '1px solid var(--border)',
             }}>
               <span style={{ fontSize: 12, color: 'var(--text-2)' }}>
-                Upload a document to run it through text extraction, semantic embeddings, topic tagging, named entity recognition, PII detection & cross-modal linking to a database (if one is linked below).
+                Upload a document to run it through text extraction, topic tagging, named entity recognition, PII detection & semantic embeddings — the relevant database(s) are then detected automatically and cross-modal links are inferred.
               </span>
               <div>
                 <input
@@ -394,19 +365,16 @@ export default function DocumentIntelligence() {
                         ? <span style={{ color: 'var(--text-2)' }}>—</span>
                         : (
                           <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                            {a.xref_links.map((l, i) => {
-                              const dbName = dbSources.find((db) => db.id === l.source_id)?.name;
-                              return (
-                                <span
-                                  key={`${l.mention}-${i}`}
-                                  className="badge"
-                                  title={`"${l.mention}" (${l.mention_type}) → ${dbName || l.source_id || 'database'}: ${l.matched_table}${l.matched_column ? '.' + l.matched_column : ''} — confidence ${l.confidence}`}
-                                  style={{ fontSize: 10 }}
-                                >
-                                  {dbName ? `[${dbName}] ` : ''}{l.mention} → {l.matched_table}{l.matched_column ? `.${l.matched_column}` : ''}
-                                </span>
-                              );
-                            })}
+                            {a.xref_links.map((l, i) => (
+                              <span
+                                key={`${l.mention}-${i}`}
+                                className="badge"
+                                title={`Auto-detected: "${l.mention}" (${l.mention_type}) → ${l.source_name || l.source_id || 'database'}: ${l.matched_table}${l.matched_column ? '.' + l.matched_column : ''} — confidence ${l.confidence} (${l.basis})`}
+                                style={{ fontSize: 10 }}
+                              >
+                                {l.source_name ? `[${l.source_name}] ` : ''}{l.mention} → {l.matched_table}{l.matched_column ? `.${l.matched_column}` : ''}
+                              </span>
+                            ))}
                           </div>
                         )}
                     </td>

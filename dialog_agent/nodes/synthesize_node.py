@@ -195,6 +195,18 @@ ANALYTICAL DEPTH — mandatory
     does not exist, which is misleading when the column is in the schema but
     simply was not fetched in this turn.
 
+9c. SUPPORTING DOCUMENTS — when a SUPPORTING DOCUMENTS section is present below,
+    those excerpts come from documents linked (via Document Intelligence) to the
+    tables used in the query results. Use them to add qualitative context the
+    SQL results can't provide — definitions, policy/treaty language, narrative
+    explanations of why a number looks the way it does. Quote or paraphrase them
+    naturally in the Analysis section when they help answer the question.
+    This does NOT relax rule 1: every number, percentage, or metric you state
+    must still come from the query results, never from a document. If a document
+    and the query results appear to disagree on a specific figure, trust the
+    query results and note the discrepancy rather than reporting the document's
+    number as fact.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT — use this exact section structure
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -234,7 +246,7 @@ ORIGINAL QUESTION:
 {history_section}
 QUERY RESULTS:
 {results_text}
-
+{document_section}
 Instructions:
 - Use ONLY values present in the query results above.
 - Follow the exact output format from your instructions (Summary → Key Findings
@@ -456,6 +468,27 @@ def _build_history_section(history: list, model: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ── Document context (from Document Intelligence cross-modal linking) ─────────
+
+def _build_document_section(document_context: list) -> str:
+    """Build SUPPORTING DOCUMENTS section from documents linked (via the KG's
+    "mentions" edges) to the tables used in this query. Empty when the source
+    has no linked documents or none were relevant — a complete no-op in that
+    case, so behavior is unchanged for sources without Document Intelligence."""
+    if not document_context:
+        return ""
+    lines = ["\nSUPPORTING DOCUMENTS (linked to the tables above via Document "
+              "Intelligence — see rule 9c for how to use these):"]
+    for doc in document_context:
+        lines.append(f"\n### {doc.get('file_name', 'document')}")
+        if doc.get("topics"):
+            lines.append(f"Topics: {', '.join(doc['topics'])}")
+        excerpt = doc.get("excerpt", "").strip()
+        if excerpt:
+            lines.append(excerpt)
+    return "\n".join(lines) + "\n"
+
+
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
 _COST_PER_M = {
@@ -516,6 +549,29 @@ def synthesize_node(state: DialogState) -> DialogState:
             state["phase"] = "synthesize"
             return state
 
+        # No SQL results — but if documents are linked to this datasource,
+        # try answering from those alone rather than immediately giving up.
+        document_context = state.get("document_context") or []
+        if document_context:
+            document_section = _build_document_section(document_context)
+            try:
+                answer = _call_llm(
+                    _SYSTEM_PROMPT,
+                    f"ORIGINAL QUESTION:\n{natural_query}\n{document_section}\n"
+                    "No structured query results were available for this question. "
+                    "Answer using ONLY the supporting documents above — do not "
+                    "invent figures. If they don't contain enough information to "
+                    "answer, say so plainly rather than guessing.",
+                    getattr(config, "llm_model", "claude-haiku-4-5"),
+                    getattr(config, "llm_temperature", 0.0),
+                )
+                if answer.strip():
+                    state["insights"] = answer
+                    state["phase"] = "synthesize"
+                    return state
+            except Exception as exc:
+                logger.warning("synthesize_node: document-only synthesis failed — %s", exc)
+
         errors = state.get("errors") or []
         detail = (
             "\n\n**Why this happened:**\n" + "\n".join(f"- {e}" for e in errors)
@@ -547,6 +603,9 @@ def synthesize_node(state: DialogState) -> DialogState:
     haiku_model     = getattr(config, "plan_llm_model", "claude-haiku-4-5")
     history_section = _build_history_section(history, haiku_model)
 
+    # ── Document context (Document Intelligence cross-modal linking) ──────────
+    document_section = _build_document_section(state.get("document_context") or [])
+
     # ── Build system prompt (with optional analyst-role prefix) ───────────────
     analyst_role = getattr(config, "analyst_role", "").strip()
     if analyst_role:
@@ -560,7 +619,11 @@ def synthesize_node(state: DialogState) -> DialogState:
         system = _SYSTEM_PROMPT
 
     # ── Token guard ───────────────────────────────────────────────────────────
-    base_chars = len(system) + len(natural_query) + len(_USER_PROMPT) + 50
+    # document_section isn't trimmed by guard_synth_sections (it's small —
+    # capped at a few documents x ~1200 chars each), but it IS counted in
+    # base_chars so results_text/history_section still get trimmed correctly
+    # against the true remaining budget.
+    base_chars = len(system) + len(natural_query) + len(_USER_PROMPT) + len(document_section) + 50
     results_text, history_section = guard_synth_sections(
         system, results_text, history_section, base_chars
     )
@@ -569,6 +632,7 @@ def synthesize_node(state: DialogState) -> DialogState:
         question=natural_query,
         history_section=history_section,
         results_text=results_text,
+        document_section=document_section,
     )
 
     # ── LLM call ──────────────────────────────────────────────────────────────

@@ -144,8 +144,6 @@ export const docCreateSource    = (body)      => apiPost(`${_U}/sources`, body);
 export const docDeleteSource    = (id)        => apiDelete(`${_U}/sources/${id}`);
 export const docStartIndex      = (id)        => apiPost(`${_U}/sources/${id}/index`);
 export const docListJobs        = (id)        => apiGet(`${_U}/sources/${id}/jobs`);
-export const docSetLinkedSources = (id, linkedSourceIds) =>
-  apiPatch(`${_U}/sources/${id}`, { linked_source_ids: linkedSourceIds || [] });
 export const docListAssets      = (id)        => apiGet(`${_U}/sources/${id}/assets`);
 export const docGetAsset        = (assetId)   => apiGet(`${_U}/assets/${assetId}`);
 export const fsBrowse           = (path = '') => apiGet(`${_U}/fs/browse?path=${encodeURIComponent(path)}`);

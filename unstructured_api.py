@@ -17,12 +17,14 @@ import threading
 import uuid
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from unstructured_agent.connectors import CONNECTOR_TYPES, ConnectorError
 from unstructured_agent.extractor import SUPPORTED_EXTENSIONS
+from unstructured_agent.pii import redact_text
 from unstructured_agent.pipeline import process_uploaded_asset, run_index_job
 from unstructured_agent.store import DocStore
 
@@ -31,6 +33,7 @@ logger = logging.getLogger("unstructured_api")
 
 DATA_DIR = os.environ.get("DATA_DIR", str(Path(__file__).parent / "data"))
 DB_PATH = os.environ.get("UNSTRUCTURED_DB", str(Path(DATA_DIR) / "unstructured.db"))
+ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_API_URL", "http://localhost:8005")
 
 app = FastAPI(title="DataNanite Document Intelligence", docs_url="/docs", redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -48,11 +51,6 @@ class CreateSourceRequest(BaseModel):
     name: str
     connector_type: str
     config: dict = {}
-    linked_source_ids: list[str] = []
-
-
-class UpdateSourceRequest(BaseModel):
-    linked_source_ids: list[str] = []
 
 
 @app.get("/connectors")
@@ -102,20 +100,7 @@ async def create_source(body: CreateSourceRequest):
         raise HTTPException(400, f"unknown connector_type: {body.connector_type!r}")
     if not body.name.strip():
         raise HTTPException(400, "name is required")
-    return store.create_source(body.name.strip(), body.connector_type, body.config, body.linked_source_ids)
-
-
-@app.patch("/sources/{source_id}")
-async def update_source(source_id: str, body: UpdateSourceRequest):
-    """Currently only supports linking/unlinking structured (DataChat)
-    sources for cross-modal linking — can link to any number of them, and
-    each document's mentions get matched against every linked source's
-    schema independently. Does not re-run linking retroactively — click
-    Reindex afterwards to re-link already-processed files."""
-    if not store.get_source(source_id):
-        raise HTTPException(404, "source not found")
-    store.set_linked_sources(source_id, body.linked_source_ids)
-    return store.get_source(source_id)
+    return store.create_source(body.name.strip(), body.connector_type, body.config)
 
 
 @app.get("/sources")
@@ -135,7 +120,40 @@ async def get_source(source_id: str):
 async def delete_source(source_id: str):
     if not store.get_source(source_id):
         raise HTTPException(404, "source not found")
+
+    # Best-effort: strip each asset's node/edges from every structured
+    # datasource's KG it was ever linked into (via cross-modal linking),
+    # so deleting a document source here doesn't leave "ghost" document
+    # nodes behind in Graph Explorer / DataChat's document context. Must
+    # happen BEFORE store.delete_source() — that call wipes xref_links,
+    # which is the only record of which KGs each asset was pushed to.
+    for asset in store.list_assets(source_id, limit=10_000):
+        kg_targets = {link["source_id"] for link in (asset.get("xref_links") or []) if link.get("source_id")}
+        for kg_source_id in kg_targets:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.delete(
+                        f"{ORCHESTRATOR_URL}/sources/{kg_source_id}/graph/documents/{asset['asset_id']}"
+                    )
+            except Exception as exc:
+                logger.warning("delete_source: could not unlink asset %s from KG %s — %s",
+                                asset["asset_id"], kg_source_id, exc)
+
     store.delete_source(source_id)
+
+    # Remove any files copied here by the Upload Document endpoint (dest_dir
+    # in upload_document() below is always UPLOAD_DIR/source_id). Safe for
+    # every connector type: "local" sources index files in place at their
+    # own root_path and never copy them here; cloud connectors download to
+    # a temp file that's removed immediately after processing (see
+    # pipeline._maybe_autoprocess) — only uploaded files ever live here.
+    upload_dir = UPLOAD_DIR / source_id
+    if upload_dir.exists():
+        try:
+            shutil.rmtree(upload_dir)
+        except Exception as exc:
+            logger.warning("delete_source: could not remove upload dir %s — %s", upload_dir, exc)
+
     return {"deleted": True}
 
 
@@ -175,11 +193,33 @@ async def get_asset(asset_id: str):
     return asset
 
 
+@app.get("/assets/{asset_id}/excerpt")
+async def get_asset_excerpt(asset_id: str, max_chars: int = 1200):
+    """Returns a short, PII-redacted excerpt of this document's extracted
+    text, plus its topics and cross-modal links — built for DataChat to
+    quote from when answering a question about a linked datasource.
+    Redaction re-runs detect_pii's regex patterns directly against the raw
+    text (see pii.redact_text) rather than reusing the stored pii_findings,
+    which intentionally never retain raw values or positions."""
+    asset = store.get_asset(asset_id)
+    if not asset:
+        raise HTTPException(404, "asset not found")
+    text = asset.get("extracted_text") or ""
+    excerpt = redact_text(text)[:max_chars]
+    return {
+        "asset_id": asset_id,
+        "file_name": asset.get("file_name"),
+        "excerpt": excerpt,
+        "topics": asset.get("topics") or [],
+        "xref_links": asset.get("xref_links") or [],
+    }
+
+
 @app.post("/sources/{source_id}/upload")
 async def upload_document(source_id: str, file: UploadFile = File(...)):
     """Uploads a document to a source and runs it through the processing
-    pipeline: text extraction → semantic embeddings → topic tagging → named
-    entity recognition → PII detection → cross-modal linking."""
+    pipeline: text extraction → topic tagging → named entity recognition →
+    PII detection → semantic embeddings → cross-modal linking."""
     source = store.get_source(source_id)
     if not source:
         raise HTTPException(404, "source not found")

@@ -666,9 +666,34 @@ def retrieve_node(state: DialogState) -> DialogState:
     logger.info("=== retrieve_node ===")
 
     config        = state["config"]
-    nodes: List   = state.get("kg_nodes") or []
-    edges: List   = state.get("kg_edges") or []
+    raw_nodes: List = state.get("kg_nodes") or []
+    raw_edges: List = state.get("kg_edges") or []
     query: str    = state.get("natural_query", "").strip()
+
+    # Document Intelligence nodes (id "doc:<asset_id>") live in the same
+    # kg_nodes/kg_edges list as real tables, but they have no columns and
+    # aren't SQL-relevant — treating them as candidate tables here would
+    # feed a filename like "📄 Report.txt" through table-name expansion and
+    # risk it surviving into the subgraph passed to plan_node (which would
+    # then try to generate SQL against a table that doesn't exist). Strip
+    # them out up front, in every code path (including the early-exits
+    # below), and stash their "mentions" edges for document_context_node —
+    # which runs right after this node and needs the *original* linkage
+    # before it's gone, since state["kg_nodes"]/kg_edges get overwritten
+    # with the selected subgraph below.
+    nodes: List = [n for n in raw_nodes if not str(n.get("id", "")).startswith("doc:")]
+    edges: List = [
+        e for e in raw_edges
+        if not str(e.get("from", "")).startswith("doc:")
+        and not str(e.get("to", "")).startswith("doc:")
+    ]
+    doc_mention_edges: List = [
+        e for e in raw_edges
+        if str(e.get("from", "")).startswith("doc:") and e.get("label") == "mentions"
+    ]
+    state["kg_nodes"] = nodes
+    state["kg_edges"] = edges
+    state["doc_mention_edges"] = doc_mention_edges
 
     top_k       = getattr(config, "graphrag_top_k",       8)
     hop_depth   = getattr(config, "graphrag_hop_depth",   1)
@@ -850,4 +875,9 @@ def retrieve_node(state: DialogState) -> DialogState:
 
     state["kg_nodes"] = sub_nodes
     state["kg_edges"] = sub_edges
+    # Per-table query-relevance scores for the final selected tables — reused
+    # by document_context_node so that when several documents tie on how
+    # many selected tables they touch, the one linked to the MOST relevant
+    # table (not just an arbitrary insertion-order pick) wins.
+    state["table_relevance_scores"] = {n.get("id", ""): node_score.get(n.get("id", ""), 0.0) for n in sub_nodes}
     return state

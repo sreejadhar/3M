@@ -64,6 +64,7 @@ jobs:
           --from-literal=SEED_PASSWORD_JISHNU=${{ secrets.SEED_PASSWORD_JISHNU }} \
           --from-literal=SEED_PASSWORD_HEMANT=${{ secrets.SEED_PASSWORD_HEMANT }} \
           --from-literal=SEED_PASSWORD_SAMIR=${{ secrets.SEED_PASSWORD_SAMIR }} \
+          --from-literal=SEED_PASSWORD_SOUMEN=${{ secrets.SEED_PASSWORD_SOUMEN }} \
           --dry-run=client -o yaml | kubectl apply -f -
 
     - name: Apply Namespace, ConfigMap and PVCs

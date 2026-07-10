@@ -64,7 +64,7 @@ export default function ChatView() {
           break;
         case 'chat_response':
           setTyping(false);
-          setMessages((m) => [...m, { role: 'assistant', id: ev.msg_id || `a-${Date.now()}`, content: ev.content, results: ev.results, sql: ev.sql, errors: ev.errors, cache_hit: ev.cache_hit }]);
+          setMessages((m) => [...m, { role: 'assistant', id: ev.msg_id || `a-${Date.now()}`, content: ev.content, results: ev.results, sql: ev.sql, errors: ev.errors, sources: ev.sources, cache_hit: ev.cache_hit }]);
           setSending(false);
           scrollDown();
           break;

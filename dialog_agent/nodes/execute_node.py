@@ -185,29 +185,43 @@ def _llm_fix_sql(
     db_type: str,
     model: str,
     temperature: float,
+    schema_context: str = "",
 ) -> str:
     """
     Ask the LLM to repair *sql* based on the reported *error*.
     Returns the corrected SQL, or the original if the LLM call fails or returns
     the same SQL.
+
+    schema_context (when available) matters a lot for "invalid identifier" /
+    "no such column" errors: without it, the LLM can only guess at a syntax
+    or casing fix, which fails silently (and can loop forever toggling case)
+    when the real problem is a hallucinated column that doesn't exist under
+    ANY casing — the fix in that case is to remove or replace it, which the
+    LLM can only do correctly if it can see the table's actual columns.
     """
     import os
     import anthropic
 
     system = (
-        "You are a SQL expert. Fix the type-conversion, type-casting, or SQL-dialect "
-        "error in the query below so it executes without error.\n"
+        "You are a SQL expert. Fix the error in the query below so it executes "
+        "without error.\n"
         "Rules:\n"
         "1. Change ONLY what is necessary to fix the reported error — preserve all logic.\n"
         "2. Use correct syntax for the target database type.\n"
         "3. If an integer/numeric value is compared to a text column, add an explicit CAST.\n"
         "4. If the dialect is wrong (e.g. LIMIT used in SQL Server), rewrite to the correct form.\n"
-        "5. Return ONLY the corrected SQL — no explanation, no markdown fences."
+        "5. If the error is an invalid/unknown column and the schema below shows the column "
+        "genuinely does not exist under any name or casing in that table, REMOVE it from the "
+        "query (or use the closest real column if one is clearly the intended one) — do not "
+        "just retry the same name with different casing.\n"
+        "6. Return ONLY the corrected SQL — no explanation, no markdown fences."
     )
+    schema_section = f"\n\nActual database schema (only these tables/columns exist):\n{schema_context}" if schema_context else ""
     user = (
         f"Target database: {db_type}\n"
         f"Error message:\n{error}\n\n"
-        f"Original SQL:\n{sql}\n\n"
+        f"Original SQL:\n{sql}"
+        f"{schema_section}\n\n"
         "Return the corrected SQL only."
     )
     try:
@@ -311,6 +325,34 @@ def _extract_plain_column_names(schema_context: str) -> set:
     return {m.group(1).lower() for m in _PLAIN_QUOTED_RE.finditer(schema_context or "")}
 
 
+_SQL_TABLE_REF_RE = re.compile(r'\b(?:FROM|JOIN)\s+(?:"?\w+"?\.)?"?(\w+)"?', re.IGNORECASE)
+_SCHEMA_TABLE_BLOCK_RE = re.compile(r'\nTable:\s+(?:"?\w+"?\.)?"?(\w+)"?', re.IGNORECASE)
+
+
+def _referenced_tables(sql: str) -> List[str]:
+    """Table names referenced in FROM/JOIN clauses of sql (schema-qualified
+    prefixes and quoting stripped)."""
+    return [m.group(1) for m in _SQL_TABLE_REF_RE.finditer(sql)]
+
+
+def _schema_section_for_tables(schema_context: str, table_names: List[str]) -> str:
+    """Returns just the "Table: X ... Columns: ..." block(s) for table_names
+    from schema_context — scoping a column-existence check to the table(s)
+    actually being queried. Without this, a column that's genuinely absent
+    from the queried table but happens to exist in a completely different
+    table elsewhere in a multi-table schema would look "real", masking a
+    hallucinated column as a harmless case mismatch. Falls back to the full
+    schema_context if no matching block is found (e.g. table name couldn't
+    be parsed from the SQL) — same behavior as before this scoping existed."""
+    if not schema_context or not table_names:
+        return schema_context
+    wanted = {t.lower() for t in table_names}
+    blocks = re.split(r'(?=\nTable:\s)', schema_context)
+    matched = [b for b in blocks
+               if (m := _SCHEMA_TABLE_BLOCK_RE.match(b)) and m.group(1).lower() in wanted]
+    return "\n".join(matched) if matched else schema_context
+
+
 def _snowflake_quote_dotted_columns(sql: str, schema_context: str) -> str:
     """
     Deterministic pre-fix for Snowflake 'invalid identifier' errors caused by a
@@ -393,6 +435,7 @@ def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = N
     """
     current_sql = sql
     last_result: Dict[str, Any] = {}
+    schema_context = (state or {}).get("schema_context", "")
 
     for attempt in range(_MAX_RETRIES + 1):   # attempt 0 = original
         result = _run_sql(cfg, current_sql, state=state, kg_id=kg_id)
@@ -417,17 +460,36 @@ def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = N
         # pre-fixes before burning an LLM call:
         #   1. literal dotted column names split/mis-quoted by the LLM (e.g.
         #      "evt.event_key" written as evt."event_key" or evt.event_key)
-        #   2. the very common case-mismatch pattern (HCP_KEY vs hcp_key)
+        #   2. the very common case-mismatch pattern (HCP_KEY vs hcp_key) —
+        #      but ONLY when the column genuinely exists (under some other
+        #      casing) in the table(s) THIS query actually references. If it
+        #      doesn't exist there at all, it's a hallucinated column, not a
+        #      casing issue — toggling case will never fix that and just
+        #      burns retries bouncing between "PHONE" and "phone" forever.
+        #      Scoped to just the referenced table(s), not the whole schema —
+        #      otherwise a same-named column in a completely unrelated table
+        #      would incorrectly look "real" and mask the hallucination.
+        #      Skip straight to the schema-aware LLM fix below instead.
         if (
             cfg.db_type.lower() == "snowflake"
             and "invalid identifier" in error_msg.lower()
         ):
-            schema_context = (state or {}).get("schema_context", "")
             deterministic = _snowflake_quote_dotted_columns(current_sql, schema_context)
             fix_kind = "dotted-column quoting"
             if deterministic == current_sql:
-                deterministic = _snowflake_fix_identifier_case(current_sql, error_msg)
-                fix_kind = "identifier case"
+                m = _SF_INVALID_ID_RE.search(error_msg)
+                bad_col = m.group(1).split(".")[-1] if m else ""
+                table_scope = _schema_section_for_tables(schema_context, _referenced_tables(current_sql))
+                if bad_col and table_scope and bad_col.lower() not in _extract_plain_column_names(table_scope):
+                    logger.info(
+                        "self-heal: attempt %d/%d — %r doesn't exist under any casing in "
+                        "the schema (hallucinated column, not a case mismatch) — skipping "
+                        "case-fix, asking schema-aware LLM instead",
+                        attempt + 1, _MAX_RETRIES, bad_col,
+                    )
+                else:
+                    deterministic = _snowflake_fix_identifier_case(current_sql, error_msg)
+                    fix_kind = "identifier case"
             if deterministic != current_sql:
                 logger.info(
                     "self-heal: attempt %d/%d — Snowflake %s pre-fix applied",
@@ -444,6 +506,7 @@ def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = N
         fixed = _llm_fix_sql(
             current_sql, error_msg, cfg.db_type,
             cfg.plan_llm_model, cfg.llm_temperature,
+            schema_context=schema_context,
         )
         if fixed == current_sql:
             logger.info("self-heal: LLM returned unchanged SQL — stopping")

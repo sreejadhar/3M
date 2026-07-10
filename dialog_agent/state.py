@@ -14,6 +14,11 @@ class SQLQuery(TypedDict):
     kg_id: str  # which KG this query targets (empty = use default config)
 
 
+class Source(TypedDict):
+    type: str          # "table" | "document"
+    name: str          # table name (schema.table) or file name
+
+
 class QueryResult(TypedDict):
     query_id: str
     description: str
@@ -52,6 +57,24 @@ class DialogState(TypedDict, total=False):
     kg_nodes: List[Dict[str, Any]]     # knowledge graph nodes (from KG agent)
     kg_edges: List[Dict[str, Any]]     # knowledge graph edges
 
+    # Document Intelligence "mentions" edges (doc:<asset_id> -> table node),
+    # set aside by retrieve_node before it filters kg_nodes/kg_edges down to
+    # the selected table subgraph, so document_context_node can still find
+    # which documents are linked to whichever tables got selected.
+    doc_mention_edges: List[Dict[str, Any]]
+
+    # Per-table query-relevance scores for the tables retrieve_node selected
+    # (table node id -> score), reused by document_context_node to rank
+    # documents by their best-linked table's relevance rather than an
+    # arbitrary tie-break when several documents touch the same number of
+    # selected tables.
+    table_relevance_scores: Dict[str, float]
+
+    # Document excerpts linked to the selected tables, set by
+    # document_context_node — [{file_name, excerpt, topics, matched_tables}].
+    # Folded into synthesize_node's prompt alongside the SQL results.
+    document_context: List[Dict[str, Any]]
+
     # Conversation context (last N turns from the session)
     conversation_history: List[ConversationTurn]
 
@@ -62,7 +85,10 @@ class DialogState(TypedDict, total=False):
     # Output
     insights: str                      # LLM-derived narrative
     plan_explanation: str              # prose from plan LLM when it returns [] (unanswerable)
-    doc_context: str                   # supporting document context from unstructured service
+
+    # Where the answer's data came from — tables referenced by sql_queries
+    # plus document_context file names, deduped. Built by synthesize_node.
+    sources: List[Source]
 
     errors: List[str]
     phase: str                         # understand | plan | execute | synthesize | done | error

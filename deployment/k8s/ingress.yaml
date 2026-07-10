@@ -53,13 +53,6 @@ spec:
             name: shacl-api-service
             port:
               number: 8007
-      - path: /api/unstructured/*
-        pathType: ImplementationSpecific
-        backend:
-          service:
-            name: unstructured-api-service
-            port:
-              number: 8008
       - path: /tech/*
         pathType: ImplementationSpecific
         backend:

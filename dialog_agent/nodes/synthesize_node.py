@@ -48,8 +48,6 @@ import httpx
 from ..state import DialogState, QueryResult
 from ..token_guard import estimate_tokens, guard_synth_sections
 
-_UNSTRUCTURED_API = os.environ.get("UNSTRUCTURED_API_URL", "http://localhost:8008")
-
 logger = logging.getLogger(__name__)
 
 # ── History compression settings ─────────────────────────────────────────────
@@ -197,6 +195,18 @@ ANALYTICAL DEPTH — mandatory
     does not exist, which is misleading when the column is in the schema but
     simply was not fetched in this turn.
 
+9c. SUPPORTING DOCUMENTS — when a SUPPORTING DOCUMENTS section is present below,
+    those excerpts come from documents linked (via Document Intelligence) to the
+    tables used in the query results. Use them to add qualitative context the
+    SQL results can't provide — definitions, policy/treaty language, narrative
+    explanations of why a number looks the way it does. Quote or paraphrase them
+    naturally in the Analysis section when they help answer the question.
+    This does NOT relax rule 1: every number, percentage, or metric you state
+    must still come from the query results, never from a document. If a document
+    and the query results appear to disagree on a specific figure, trust the
+    query results and note the discrepancy rather than reporting the document's
+    number as fact.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 OUTPUT FORMAT — use this exact section structure
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -236,7 +246,7 @@ ORIGINAL QUESTION:
 {history_section}
 QUERY RESULTS:
 {results_text}
-
+{document_section}
 Instructions:
 - Use ONLY values present in the query results above.
 - Follow the exact output format from your instructions (Summary → Key Findings
@@ -458,6 +468,113 @@ def _build_history_section(history: list, model: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ── Document context (from Document Intelligence cross-modal linking) ─────────
+
+def _build_document_section(document_context: list) -> str:
+    """Build SUPPORTING DOCUMENTS section from documents linked (via the KG's
+    "mentions" edges) to the tables used in this query. Empty when the source
+    has no linked documents or none were relevant — a complete no-op in that
+    case, so behavior is unchanged for sources without Document Intelligence."""
+    if not document_context:
+        return ""
+    lines = ["\nSUPPORTING DOCUMENTS (linked to the tables above via Document "
+              "Intelligence — see rule 9c for how to use these):"]
+    for doc in document_context:
+        lines.append(f"\n### {doc.get('file_name', 'document')}")
+        if doc.get("topics"):
+            lines.append(f"Topics: {', '.join(doc['topics'])}")
+        excerpt = doc.get("excerpt", "").strip()
+        if excerpt:
+            lines.append(excerpt)
+    lines.append(
+        "\nNot every document above is necessarily relevant to this question — "
+        "they are simply all documents linked to the tables involved. After "
+        "your Analysis section, on its own line, list ONLY the filenames (exactly "
+        "as shown in the ### headers above) whose content you actually drew on "
+        "to write this answer, e.g.:\n"
+        "DOCS_USED: Underwriting_Guidelines.txt\n"
+        "Use DOCS_USED: none if you didn't end up using any of them. "
+        "This line is required and will be removed before the user sees it."
+    )
+    return "\n".join(lines) + "\n"
+
+
+_TABLE_REF_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+((?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_table_refs_from_sql(sql: str) -> List[str]:
+    """Best-effort fallback when the planner LLM's JSON omits table_refs for a
+    query that nonetheless ran and returned real rows — pull table names
+    straight out of FROM/JOIN clauses so a source is never silently dropped."""
+    return [m.group(1).replace('"', "") for m in _TABLE_REF_RE.finditer(sql or "")]
+
+
+def _build_sources(state: DialogState, used_documents: Optional[set] = None) -> list:
+    """Dedup list of {type, name} for the tables and documents that fed this
+    answer — table_refs from sql_queries (falling back to parsing the SQL
+    itself when the LLM omitted table_refs), plus file_name from
+    document_context.
+
+    document_context holds every document linked (via KG "mentions" edges) to
+    the tables retrieve_node selected — not necessarily documents the answer
+    actually drew on. used_documents, when provided, is the set of file names
+    the LLM self-reported actually using (see DOCS_USED parsing below) and is
+    used to filter document_context down to just those. None means "no
+    filtering info available" (e.g. no document_section was ever shown to the
+    LLM for this branch) — falls back to including everything attached.
+
+    Tables get the same "actually contributed" standard: sql_queries lists
+    every query the planner produced, but a query that errored out never fed
+    any data into the answer, so its table(s) are excluded — only queries with
+    a matching, error-free query_result count as a real source."""
+    succeeded_query_ids = {
+        qr["query_id"] for qr in (state.get("query_results") or [])
+        if not qr.get("error")
+    }
+    sources = []
+    seen = set()
+    for q in state.get("sql_queries") or []:
+        if q.get("query_id") not in succeeded_query_ids:
+            continue
+        table_refs = q.get("table_refs") or _extract_table_refs_from_sql(q.get("sql", ""))
+        for table in table_refs:
+            key = ("table", table)
+            if table and key not in seen:
+                seen.add(key)
+                sources.append({"type": "table", "name": table})
+    for doc in state.get("document_context") or []:
+        file_name = doc.get("file_name")
+        if not file_name or (used_documents is not None and file_name not in used_documents):
+            continue
+        key = ("document", file_name)
+        if key not in seen:
+            seen.add(key)
+            sources.append({"type": "document", "name": file_name})
+    return sources
+
+
+_DOCS_USED_RE = re.compile(r"^[ \t]*DOCS_USED:[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def _extract_docs_used(llm_output: str) -> "tuple[str, Optional[set]]":
+    """Strip the trailing DOCS_USED: line the LLM was instructed to append and
+    return (cleaned_output, set_of_file_names_actually_used). Returns
+    (llm_output, None) if the LLM didn't comply — callers should treat None as
+    'unknown' and fall back to the permissive (include-everything) behavior
+    rather than silently dropping legitimate sources."""
+    m = _DOCS_USED_RE.search(llm_output)
+    if not m:
+        return llm_output, None
+    cleaned = _DOCS_USED_RE.sub("", llm_output).rstrip()
+    raw = m.group(1).strip()
+    if not raw or raw.lower() in ("none", "n/a"):
+        return cleaned, set()
+    return cleaned, {n.strip() for n in re.split(r"[,|]", raw) if n.strip()}
+
+
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
 _COST_PER_M = {
@@ -475,51 +592,6 @@ def _log_cost(node: str, model: str, usage) -> None:
         "COST %s [%s] in=%d out=%d  $%.5f",
         node, model, inp, out, cost,
     )
-
-
-def _extract_kpi_names(state: DialogState) -> List[str]:
-    """
-    Collect KPI names relevant to this query from two sources:
-      1. active_kpis loaded for this session
-      2. Column names from query results that look like metrics
-    """
-    names: List[str] = []
-    for kpi in (state.get("active_kpis") or []):
-        name = kpi.get("kpi_name") or kpi.get("name") or ""
-        if name:
-            names.append(name)
-    for qr in (state.get("query_results") or []):
-        for col in (qr.get("columns") or []):
-            col_str = str(col).lower()
-            # Heuristic: metric column names contain common KPI keywords
-            if any(kw in col_str for kw in (
-                "revenue", "rsv", "gsv", "nsv", "nsr", "margin", "spend",
-                "volume", "price", "discount", "trade", "promo", "lift",
-                "growth", "share", "rate", "ratio", "index", "nii", "nii",
-                "profit", "cost", "income", "sales", "ebitda", "roi",
-            )):
-                names.append(str(col))
-    return list(dict.fromkeys(names))  # deduplicate preserving order
-
-
-def _fetch_doc_context(question: str, kpi_names: List[str]) -> Optional[str]:
-    """
-    Call the unstructured service /query endpoint.
-    Returns the formatted markdown context string, or None if unavailable.
-    Silently suppresses all errors — the structured answer is never degraded.
-    """
-    try:
-        resp = httpx.post(
-            f"{_UNSTRUCTURED_API}/query",
-            json={"question": question, "kpi_names": kpi_names},
-            timeout=5.0,
-        )
-        if resp.is_success:
-            data = resp.json()
-            return data.get("doc_context")
-    except Exception as exc:
-        logger.debug("synthesize_node: unstructured query skipped — %s", exc)
-    return None
 
 
 def _call_llm(system: str, user: str, model: str, temperature: float) -> str:
@@ -560,8 +632,36 @@ def synthesize_node(state: DialogState) -> DialogState:
             plan_explanation = ""
         if plan_explanation:
             state["insights"] = plan_explanation
+            # No document_section was ever shown to the LLM here — exclude
+            # documents entirely rather than falling back to "include all".
+            state["sources"] = _build_sources(state, used_documents=set())
             state["phase"] = "synthesize"
             return state
+
+        # No SQL results — but if documents are linked to this datasource,
+        # try answering from those alone rather than immediately giving up.
+        document_context = state.get("document_context") or []
+        if document_context:
+            document_section = _build_document_section(document_context)
+            try:
+                answer = _call_llm(
+                    _SYSTEM_PROMPT,
+                    f"ORIGINAL QUESTION:\n{natural_query}\n{document_section}\n"
+                    "No structured query results were available for this question. "
+                    "Answer using ONLY the supporting documents above — do not "
+                    "invent figures. If they don't contain enough information to "
+                    "answer, say so plainly rather than guessing.",
+                    getattr(config, "llm_model", "claude-haiku-4-5"),
+                    getattr(config, "llm_temperature", 0.0),
+                )
+                if answer.strip():
+                    cleaned, used_documents = _extract_docs_used(answer)
+                    state["insights"] = cleaned
+                    state["sources"] = _build_sources(state, used_documents=used_documents)
+                    state["phase"] = "synthesize"
+                    return state
+            except Exception as exc:
+                logger.warning("synthesize_node: document-only synthesis failed — %s", exc)
 
         errors = state.get("errors") or []
         detail = (
@@ -575,6 +675,7 @@ def synthesize_node(state: DialogState) -> DialogState:
             "or all generated queries were rejected during validation."
             + detail
         )
+        state["sources"] = _build_sources(state, used_documents=set())
         state["phase"] = "synthesize"
         return state
 
@@ -594,6 +695,9 @@ def synthesize_node(state: DialogState) -> DialogState:
     haiku_model     = getattr(config, "plan_llm_model", "claude-haiku-4-5")
     history_section = _build_history_section(history, haiku_model)
 
+    # ── Document context (Document Intelligence cross-modal linking) ──────────
+    document_section = _build_document_section(state.get("document_context") or [])
+
     # ── Build system prompt (with optional analyst-role prefix) ───────────────
     analyst_role = getattr(config, "analyst_role", "").strip()
     if analyst_role:
@@ -607,7 +711,11 @@ def synthesize_node(state: DialogState) -> DialogState:
         system = _SYSTEM_PROMPT
 
     # ── Token guard ───────────────────────────────────────────────────────────
-    base_chars = len(system) + len(natural_query) + len(_USER_PROMPT) + 50
+    # document_section isn't trimmed by guard_synth_sections (it's small —
+    # capped at a few documents x ~1200 chars each), but it IS counted in
+    # base_chars so results_text/history_section still get trimmed correctly
+    # against the true remaining budget.
+    base_chars = len(system) + len(natural_query) + len(_USER_PROMPT) + len(document_section) + 50
     results_text, history_section = guard_synth_sections(
         system, results_text, history_section, base_chars
     )
@@ -616,6 +724,7 @@ def synthesize_node(state: DialogState) -> DialogState:
         question=natural_query,
         history_section=history_section,
         results_text=results_text,
+        document_section=document_section,
     )
 
     # ── LLM call ──────────────────────────────────────────────────────────────
@@ -629,6 +738,8 @@ def synthesize_node(state: DialogState) -> DialogState:
         logger.exception("synthesize_node: LLM call failed")
         llm_output = f"*Insight generation failed: {exc}*"
         state["errors"].append(f"synthesize_node: {exc}")
+
+    llm_output, used_documents = _extract_docs_used(llm_output)
 
     # ── Append programmatic ## Data section ───────────────────────────────────
     data_section = _build_data_section(query_results)
@@ -703,21 +814,7 @@ def synthesize_node(state: DialogState) -> DialogState:
     except Exception:
         pass
 
-    # ── Cross-modal: fetch supporting document context ─────────────────────
-    # Runs after structured synthesis; never delays or degrades the answer.
-    kpi_names   = _extract_kpi_names(state)
-    doc_context = _fetch_doc_context(natural_query, kpi_names)
-    if doc_context:
-        insights = (
-            insights.rstrip()
-            + "\n\n---\n## Supporting Context from Documents\n"
-            + doc_context
-        )
-        state["doc_context"] = doc_context
-        logger.info("synthesize_node: appended document context (%d chars)", len(doc_context))
-    else:
-        state["doc_context"] = ""
-
     state["insights"] = insights
+    state["sources"] = _build_sources(state, used_documents=used_documents)
     state["phase"] = "synthesize"
     return state

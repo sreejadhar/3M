@@ -1,647 +1,607 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { IconDocuments, IconSearch, IconPlus, IconRefresh } from '../components/Icons.jsx';
+import { useEffect, useRef, useState } from 'react';
+import { useAppState } from '../state.jsx';
+import { IconDocuments, IconPlus, IconRefresh } from '../components/Icons.jsx';
 import {
-  docListSources, docCreateSource, docStartIndex, docGetJob,
-  docListAssets, docGetAsset, docSearch, docQuery,
+  docListSources, docCreateSource, docDeleteSource, docStartIndex, docListAssets,
+  docGetAsset, docUploadDocument, fsBrowse,
 } from '../api/clients.js';
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-const DOC_TYPE_BADGE = {
-  report: 'badge-blue', policy: 'badge-purple', contract: 'badge-cyan',
-  presentation: 'badge-amber', research: 'badge-blue', manual: 'badge-gray',
-  correspondence: 'badge-green', other: 'badge-gray',
-};
-const SENS_BADGE = {
-  public: 'badge-green', internal: 'badge-cyan',
-  confidential: 'badge-amber', restricted: 'badge-red',
-};
-const SRC_TYPE_BADGE = {
-  local: 'badge-gray', s3: 'badge-blue', gcs: 'badge-cyan',
-  azure: 'badge-blue', gdrive: 'badge-green', sharepoint: 'badge-purple',
+const STEP_ICON = { pending: '○', running: '◐', done: '●', error: '✖', skipped: '⊘' };
+const STEP_COLOR = {
+  pending: 'var(--text-2)', running: 'var(--amber, #f59e0b)',
+  done: 'var(--green, #22c55e)', error: 'var(--red, #f87171)', skipped: 'var(--text-2)',
 };
 
-function fmtDate(iso) {
-  if (!iso) return '—';
-  try { return new Date(iso).toLocaleString(); } catch { return iso; }
-}
-function relTime(iso) {
-  if (!iso) return null;
-  const s = Math.floor((Date.now() - new Date(iso)) / 1000);
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-  return `${Math.floor(s / 86400)}d ago`;
-}
+const CONNECTORS = [
+  ['local', 'Local Filesystem'],
+  ['s3', 'Amazon S3'],
+  ['gdrive', 'Google Drive'],
+  ['sharepoint', 'SharePoint'],
+  ['onedrive', 'OneDrive'],
+];
 
-const EMPTY_SOURCE = { name: '', source_type: 'local', path: '', bucket: '',
-  prefix: '', folder_id: '', domain: '' };
+const CONNECTOR_FIELDS = {
+  local:      [['root_path', 'Folder path', 'C:\\path\\to\\documents']],
+  s3:         [['bucket', 'Bucket'], ['prefix', 'Prefix (optional)'], ['region', 'Region (optional)'],
+               ['aws_access_key_id', 'Access key ID'], ['aws_secret_access_key', 'Secret access key', 'password']],
+  gdrive:     [['folder_id', 'Folder ID'], ['access_token', 'OAuth access token', 'password']],
+  sharepoint: [['site_id', 'Site ID'], ['drive_id', 'Drive ID (optional)'], ['access_token', 'Graph access token', 'password']],
+  onedrive:   [['user_id', 'User (email or "me")'], ['access_token', 'Graph access token', 'password']],
+};
 
-// ── Icons used only here ──────────────────────────────────────────────────────
-const S = (p) => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" {...p} />;
-const IconShield = (p) => (
-  <S {...p}><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></S>
-);
-const IconFile = (p) => (
-  <S {...p}>
-    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-    <polyline points="14 2 14 8 20 8" />
-  </S>
-);
-const IconClose = (p) => (
-  <S {...p}><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></S>
-);
-const IconQuery = (p) => (
-  <S {...p}><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></S>
-);
-const IconLink = (p) => (
-  <S {...p}><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /></S>
-);
+const STATUS_LABEL = {
+  ready:    ['● Ready', 'var(--green, #22c55e)'],
+  indexing: ['◐ Indexing…', 'var(--amber, #f59e0b)'],
+  error:    ['✖ Error', 'var(--red, #f87171)'],
+  idle:     ['○ Not indexed', 'var(--text-2)'],
+};
 
-// ── Add Source modal ──────────────────────────────────────────────────────────
-function AddSourceModal({ onClose, onCreated }) {
-  const [form, setForm] = useState(EMPTY_SOURCE);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState('');
-
-  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
-
-  const submit = async () => {
-    if (!form.name.trim()) { setErr('Name is required'); return; }
-    setBusy(true); setErr('');
-    try {
-      const conn = {};
-      if (form.source_type === 'local') conn.path = form.path;
-      else if (form.source_type === 's3') { conn.bucket = form.bucket; if (form.prefix) conn.prefix = form.prefix; }
-      else if (form.source_type === 'gdrive') conn.folder_id = form.folder_id;
-      const src = await docCreateSource({ name: form.name.trim(), source_type: form.source_type, connection: conn, domain: form.domain.trim() });
-      onCreated(src);
-    } catch (e) { setErr(e.message); }
-    finally { setBusy(false); }
-  };
-
-  return (
-    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="modal-box" style={{ width: 460 }}>
-        <div className="modal-header">
-          <span>Add Document Source</span>
-          <button className="btn btn-ghost" style={{ padding: '2px 6px' }} onClick={onClose}><IconClose /></button>
-        </div>
-        <div className="modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <div className="form-row">
-            <label>Source Name</label>
-            <input className="form-input" value={form.name} onChange={e => set('name', e.target.value)} placeholder="e.g. PNC Policy Docs" />
-          </div>
-          <div className="form-row">
-            <label>Type</label>
-            <select className="form-input" value={form.source_type} onChange={e => set('source_type', e.target.value)}>
-              <option value="local">Local Folder</option>
-              <option value="s3">Amazon S3</option>
-              <option value="gdrive">Google Drive</option>
-            </select>
-          </div>
-          {form.source_type === 'local' && (
-            <div className="form-row">
-              <label>Folder Path</label>
-              <input className="form-input" value={form.path} onChange={e => set('path', e.target.value)} placeholder="C:/Documents/PNC or /data/docs" />
-            </div>
-          )}
-          {form.source_type === 's3' && (
-            <>
-              <div className="form-row">
-                <label>Bucket</label>
-                <input className="form-input" value={form.bucket} onChange={e => set('bucket', e.target.value)} placeholder="my-docs-bucket" />
-              </div>
-              <div className="form-row">
-                <label>Prefix (optional)</label>
-                <input className="form-input" value={form.prefix} onChange={e => set('prefix', e.target.value)} placeholder="pnc/policies/" />
-              </div>
-            </>
-          )}
-          {form.source_type === 'gdrive' && (
-            <div className="form-row">
-              <label>Folder ID</label>
-              <input className="form-input" value={form.folder_id} onChange={e => set('folder_id', e.target.value)} placeholder="Google Drive folder ID" />
-            </div>
-          )}
-          <div className="form-row">
-            <label>Domain Hint (optional)</label>
-            <input className="form-input" value={form.domain} onChange={e => set('domain', e.target.value)} placeholder="e.g. Banking, Insurance, CPG" />
-          </div>
-          {err && <div className="err-msg">{err}</div>}
-        </div>
-        <div className="modal-footer">
-          <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" onClick={submit} disabled={busy}>
-            {busy ? 'Creating…' : 'Create Source'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
+function statusView(status) {
+  return STATUS_LABEL[status] || STATUS_LABEL.idle;
 }
 
-// ── Asset detail drawer ───────────────────────────────────────────────────────
-function AssetDrawer({ assetId, onClose }) {
-  const [asset, setAsset] = useState(null);
+export default function DocumentIntelligence() {
+  const { toast } = useAppState();
+  const [sources, setSources] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [selectedId, setSelectedId] = useState(null);
+  const [assets, setAssets] = useState([]);
+  const [assetsLoading, setAssetsLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const pollRef = useRef(null);
+  const assetPollRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const selected = sources.find((s) => s.source_id === selectedId);
+
+  async function refresh() {
+    try {
+      const data = await docListSources();
+      setSources(data);
+    } catch (e) {
+      toast(`Failed to load sources: ${e.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    if (!assetId) return;
-    setLoading(true);
-    docGetAsset(assetId)
-      .then(setAsset)
-      .catch(() => setAsset(null))
-      .finally(() => setLoading(false));
-  }, [assetId]);
-
-  if (!assetId) return null;
-
-  const piiEntities = asset?.pii_entities || [];
-  const topics = asset?.topics || [];
-  const entities = asset?.named_entities || {};
-  const timeRefs = asset?.time_references || [];
-
-  return (
-    <div className="di-drawer">
-      <div className="di-drawer-header">
-        <IconFile style={{ width: 14, height: 14, flexShrink: 0 }} />
-        <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {loading ? 'Loading…' : (asset?.title || asset?.file_name || assetId)}
-        </span>
-        <button className="btn btn-ghost" style={{ padding: '2px 4px' }} onClick={onClose}><IconClose /></button>
-      </div>
-      {loading ? (
-        <div style={{ padding: 20, color: 'var(--text-2)', textAlign: 'center' }}>Loading…</div>
-      ) : !asset ? (
-        <div style={{ padding: 20, color: 'var(--red)' }}>Failed to load asset.</div>
-      ) : (
-        <div className="di-drawer-body">
-          {/* Badges row */}
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
-            <span className={`badge ${DOC_TYPE_BADGE[asset.doc_type] || 'badge-gray'}`}>{asset.doc_type || 'other'}</span>
-            <span className={`badge ${SENS_BADGE[asset.sensitivity] || 'badge-gray'}`}>{asset.sensitivity || 'internal'}</span>
-            {asset.language && <span className="badge badge-gray">{asset.language?.toUpperCase()}</span>}
-            {asset.pii_risk && (
-              <span className="badge badge-red" style={{ gap: 4 }}>
-                <IconShield style={{ width: 10, height: 10 }} /> PII
-              </span>
-            )}
-          </div>
-
-          {/* Summary */}
-          {asset.summary && (
-            <div className="di-section">
-              <div className="di-section-title">Summary</div>
-              <p style={{ color: 'var(--text-0)', lineHeight: 1.6, fontSize: 12 }}>{asset.summary}</p>
-            </div>
-          )}
-
-          {/* Topics */}
-          {topics.length > 0 && (
-            <div className="di-section">
-              <div className="di-section-title">Topics</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-                {topics.map((t, i) => <span key={i} className="badge badge-blue">{t}</span>)}
-              </div>
-            </div>
-          )}
-
-          {/* Named entities */}
-          {Object.entries(entities).some(([, v]) => v?.length > 0) && (
-            <div className="di-section">
-              <div className="di-section-title">Named Entities</div>
-              {Object.entries(entities).map(([kind, vals]) =>
-                vals?.length > 0 ? (
-                  <div key={kind} style={{ marginBottom: 6 }}>
-                    <span style={{ fontSize: 10, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{kind}</span>
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 3 }}>
-                      {vals.map((v, i) => <span key={i} className="badge badge-gray">{v}</span>)}
-                    </div>
-                  </div>
-                ) : null
-              )}
-            </div>
-          )}
-
-          {/* Time references */}
-          {timeRefs.length > 0 && (
-            <div className="di-section">
-              <div className="di-section-title">Time References</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
-                {timeRefs.map((t, i) => <span key={i} className="badge badge-cyan">{t}</span>)}
-              </div>
-            </div>
-          )}
-
-          {/* PII entities */}
-          <div className="di-section">
-            <div className="di-section-title" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <IconShield style={{ width: 12, height: 12, color: piiEntities.length > 0 ? 'var(--red)' : 'var(--green)' }} />
-              PII Scan
-              <span className={`badge ${piiEntities.length > 0 ? 'badge-red' : 'badge-green'}`} style={{ marginLeft: 2 }}>
-                {piiEntities.length > 0 ? `${piiEntities.length} entity${piiEntities.length > 1 ? 'ies' : ''}` : 'Clean'}
-              </span>
-            </div>
-            {piiEntities.length > 0 ? (
-              <table className="data-table" style={{ marginTop: 6 }}>
-                <thead>
-                  <tr>
-                    <th>Type</th>
-                    <th>Masked Value</th>
-                    <th>Confidence</th>
-                    <th>Source</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {piiEntities.map((e, i) => (
-                    <tr key={i}>
-                      <td><span className="badge badge-red">{e.type}</span></td>
-                      <td className="mono">{e.masked_value}</td>
-                      <td>{e.confidence != null ? `${Math.round(e.confidence * 100)}%` : '—'}</td>
-                      <td><span className={`badge ${e.source === 'regex' ? 'badge-amber' : 'badge-purple'}`}>{e.source || '—'}</span></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-              <p style={{ color: 'var(--text-2)', fontSize: 12, marginTop: 4 }}>No PII detected in this document.</p>
-            )}
-          </div>
-
-          {/* File meta */}
-          <div className="di-section">
-            <div className="di-section-title">File Info</div>
-            <div className="di-meta-grid">
-              <span className="di-meta-key">File</span><span className="di-meta-val mono">{asset.file_name}</span>
-              <span className="di-meta-key">Indexed</span><span className="di-meta-val">{fmtDate(asset.updated_at)}</span>
-              {asset.page_count != null && <><span className="di-meta-key">Pages</span><span className="di-meta-val">{asset.page_count}</span></>}
-              {asset.domain && <><span className="di-meta-key">Domain</span><span className="di-meta-val">{asset.domain}</span></>}
-              {asset.ocr_used && <><span className="di-meta-key">OCR</span><span className="di-meta-val">Yes {asset.ocr_confidence != null ? `(${Math.round(asset.ocr_confidence * 100)}% confidence)` : ''}</span></>}
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Main view ─────────────────────────────────────────────────────────────────
-export default function DocumentIntelligence() {
-  const [sources, setSources] = useState([]);
-  const [selectedSrc, setSelectedSrc] = useState(null);
-  const [showAdd, setShowAdd] = useState(false);
-
-  // assets tab
-  const [assets, setAssets] = useState(null);
-  const [selectedAsset, setSelectedAsset] = useState(null);
-  const [loadingAssets, setLoadingAssets] = useState(false);
-
-  // search tab
-  const [searchQ, setSearchQ] = useState('');
-  const [searchResults, setSearchResults] = useState(null);
-  const [searching, setSearching] = useState(false);
-
-  // query tab
-  const [queryQ, setQueryQ] = useState('');
-  const [queryResult, setQueryResult] = useState(null);
-  const [querying, setQuerying] = useState(false);
-
-  // tabs
-  const [tab, setTab] = useState('assets');
-
-  // running jobs polling
-  const [runningJobs, setRunningJobs] = useState({}); // sourceId → jobId
-  const pollRef = useRef(null);
-
-  const loadSources = useCallback(() => {
-    docListSources()
-      .then(r => setSources(Array.isArray(r) ? r : []))
-      .catch(() => setSources([]));
+    refresh();
+    return () => clearInterval(pollRef.current);
   }, []);
 
-  useEffect(() => { loadSources(); }, [loadSources]);
-
-  // auto-select first source
   useEffect(() => {
-    if (!selectedSrc && sources.length > 0) setSelectedSrc(sources[0].id);
-  }, [sources, selectedSrc]);
-
-  // load assets when source changes
-  useEffect(() => {
-    if (!selectedSrc) { setAssets([]); return; }
-    setLoadingAssets(true);
-    setSelectedAsset(null);
-    docListAssets(selectedSrc)
-      .then(r => setAssets(Array.isArray(r) ? r : []))
-      .catch(() => setAssets([]))
-      .finally(() => setLoadingAssets(false));
-  }, [selectedSrc]);
-
-  // poll running jobs
-  useEffect(() => {
-    if (Object.keys(runningJobs).length === 0) return;
-    pollRef.current = setInterval(async () => {
-      const updates = {};
-      let changed = false;
-      for (const [srcId, jobId] of Object.entries(runningJobs)) {
-        try {
-          const job = await docGetJob(jobId);
-          if (job.status !== 'running') {
-            changed = true;
-            loadSources();
-            if (srcId === selectedSrc) {
-              docListAssets(srcId).then(r => setAssets(Array.isArray(r) ? r : [])).catch(() => {});
-            }
-          } else {
-            updates[srcId] = jobId;
-          }
-        } catch { /* ignore */ }
-      }
-      if (changed) setRunningJobs(updates);
-    }, 3000);
+    const anyIndexing = sources.some((s) => s.status === 'indexing');
+    clearInterval(pollRef.current);
+    if (anyIndexing) {
+      pollRef.current = setInterval(refresh, 3000);
+    }
     return () => clearInterval(pollRef.current);
-  }, [runningJobs, selectedSrc, loadSources]);
+  }, [sources]);
 
-  const handleIndex = async (srcId) => {
+  async function openAssets(source) {
+    setSelectedId(source.source_id);
+    setAssetsLoading(true);
     try {
-      const job = await docStartIndex(srcId);
-      setRunningJobs(j => ({ ...j, [srcId]: job.job_id }));
-    } catch (e) { alert(`Index failed: ${e.message}`); }
-  };
+      const data = await docListAssets(source.source_id);
+      setAssets(data);
+    } catch (e) {
+      toast(`Failed to load assets: ${e.message}`, 'error');
+      setAssets([]);
+    } finally {
+      setAssetsLoading(false);
+    }
+  }
 
-  const handleSearch = async () => {
-    if (!searchQ.trim()) return;
-    setSearching(true); setSearchResults(null);
+  // While the selected source is still indexing, re-fetch its full asset
+  // list periodically — a bulk reindex enumerates + processes files one at a
+  // time, so newly-appearing files (and their processing_status flipping
+  // from 'none' to 'running') wouldn't otherwise be picked up.
+  useEffect(() => {
+    if (!selected || selected.status !== 'indexing') return;
+    const t = setInterval(() => docListAssets(selected.source_id).then(setAssets).catch(() => {}), 3000);
+    return () => clearInterval(t);
+  }, [selected?.source_id, selected?.status]);
+
+  // Poll assets that are still processing (extract/embed/tag), updating just
+  // those rows in place so the pipeline steps update live in the table.
+  useEffect(() => {
+    const pending = assets.filter((a) => a.processing_status === 'running');
+    clearInterval(assetPollRef.current);
+    if (pending.length === 0) return;
+    assetPollRef.current = setInterval(async () => {
+      const updates = await Promise.all(pending.map((a) => docGetAsset(a.asset_id).catch(() => null)));
+      setAssets((prev) => prev.map((a) => updates.find((u) => u && u.asset_id === a.asset_id) || a));
+    }, 1500);
+    return () => clearInterval(assetPollRef.current);
+  }, [assets]);
+
+  async function uploadFile(file) {
+    if (!selected) return;
+    setUploading(true);
     try {
-      const r = await docSearch(searchQ.trim());
-      setSearchResults(r.results || []);
-    } catch { setSearchResults([]); }
-    finally { setSearching(false); }
-  };
+      const asset = await docUploadDocument(selected.source_id, file);
+      toast(`Uploaded "${file.name}" — processing started`, 'info');
+      setAssets((prev) => {
+        const rest = prev.filter((a) => a.asset_id !== asset.asset_id);
+        return [asset, ...rest];
+      });
+    } catch (e) {
+      toast(`Upload failed: ${e.message}`, 'error');
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
 
-  const handleQuery = async () => {
-    if (!queryQ.trim()) return;
-    setQuerying(true); setQueryResult(null);
+  async function reindex(source) {
     try {
-      const r = await docQuery(queryQ.trim());
-      setQueryResult(r);
-    } catch (e) { setQueryResult({ error: e.message }); }
-    finally { setQuerying(false); }
-  };
+      await docStartIndex(source.source_id);
+      toast(`Indexing started for "${source.name}"`, 'info');
+      refresh();
+    } catch (e) {
+      toast(`Reindex failed: ${e.message}`, 'error');
+    }
+  }
 
-  const activeSrc = sources.find(s => s.id === selectedSrc);
-  const totalDocs = assets?.length ?? 0;
-  const piiDocs = assets?.filter(a => a.pii_risk).length ?? 0;
+  async function remove(source) {
+    if (!window.confirm(`Delete source "${source.name}"? This removes its indexed assets too.`)) return;
+    try {
+      await docDeleteSource(source.source_id);
+      toast(`Deleted "${source.name}"`, 'info');
+      if (selectedId === source.source_id) { setSelectedId(null); setAssets([]); }
+      refresh();
+    } catch (e) {
+      toast(`Delete failed: ${e.message}`, 'error');
+    }
+  }
 
   return (
-    <div className="di-root">
-      {/* ── Left: sources panel ─────────────────────────────────────── */}
-      <div className="di-left">
-        <div className="panel-header" style={{ justifyContent: 'space-between' }}>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <IconDocuments /> Document Sources
-          </span>
-          <button className="btn btn-primary" style={{ padding: '3px 8px', fontSize: 11 }} onClick={() => setShowAdd(true)}>
-            <IconPlus /> Add
+    <div id="view-documents" className="view active">
+      <div className="panel-header">
+        <IconDocuments width="16" height="16" />
+        Document Intelligence
+        <div className="panel-actions">
+          <button className="btn btn-secondary" onClick={refresh} title="Refresh">
+            <IconRefresh width="14" height="14" />
+          </button>
+          <button className="btn btn-primary" onClick={() => setModalOpen(true)}>
+            <IconPlus width="14" height="14" />
+            Add Source
           </button>
         </div>
-        <div className="di-sources-list">
-          {sources.length === 0 ? (
-            <div style={{ padding: '20px 14px', color: 'var(--text-2)', fontSize: 12, textAlign: 'center' }}>
-              No document sources yet.<br />Click <strong>Add</strong> to register one.
+      </div>
+
+      <div style={{ display: 'flex', height: 'calc(100% - 44px)' }}>
+        {/* ── Source list ─────────────────────────────────────────── */}
+        <div style={{ width: 340, borderRight: '1px solid var(--border)', overflowY: 'auto' }}>
+          {loading && <div className="empty-state" style={{ fontSize: 13 }}>Loading…</div>}
+          {!loading && sources.length === 0 && (
+            <div className="empty-state" style={{ fontSize: 13, padding: 24, textAlign: 'center' }}>
+              No document sources yet.<br />Click <b>Add Source</b> to connect one.
             </div>
-          ) : sources.map(s => {
-            const isRunning = !!runningJobs[s.id];
+          )}
+          {sources.map((s) => {
+            const [label, color] = statusView(s.status);
+            const connectorLabel = CONNECTORS.find((c) => c[0] === s.connector_type)?.[1] || s.connector_type;
             return (
               <div
-                key={s.id}
-                className={`source-card ${selectedSrc === s.id ? 'selected' : ''}`}
-                onClick={() => setSelectedSrc(s.id)}
+                key={s.source_id}
+                onClick={() => openAssets(s)}
+                style={{
+                  padding: '12px 16px',
+                  borderBottom: '1px solid var(--border)',
+                  cursor: 'pointer',
+                  background: selectedId === s.source_id ? 'var(--bg-1)' : 'transparent',
+                }}
               >
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="src-name">{s.name}</div>
-                  <div className="src-meta" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 3 }}>
-                    <span className={`badge ${SRC_TYPE_BADGE[s.source_type] || 'badge-gray'}`}>{s.source_type}</span>
-                    {s.domain && <span className="badge badge-purple">{s.domain}</span>}
-                  </div>
-                  <div className="src-meta" style={{ marginTop: 4 }}>
-                    {s.last_indexed_at ? `Indexed ${relTime(s.last_indexed_at)}` : 'Never indexed'}
-                  </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+                  <span style={{ fontWeight: 600, fontSize: 13 }}>{s.name}</span>
+                  <span className="badge" style={{ fontSize: 10 }}>{connectorLabel}</span>
                 </div>
-                <button
-                  className={`btn ${isRunning ? 'btn-secondary' : 'btn-ghost'}`}
-                  style={{ fontSize: 11, padding: '3px 8px', flexShrink: 0 }}
-                  disabled={isRunning}
-                  onClick={e => { e.stopPropagation(); handleIndex(s.id); }}
-                  title="Trigger indexing"
-                >
-                  {isRunning ? (
-                    <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                      <span className="status-dot indexing" /> Running
-                    </span>
-                  ) : 'Index'}
-                </button>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                  <span style={{ fontSize: 11, color }}>{label}</span>
+                  <span style={{ fontSize: 11, color: 'var(--text-2)' }}>{s.table_count} files</span>
+                </div>
+                <div style={{ marginTop: 6, display: 'flex', gap: 8 }}>
+                  <button
+                    className="btn btn-ghost"
+                    style={{ fontSize: 11, padding: '2px 8px' }}
+                    disabled={s.status === 'indexing'}
+                    onClick={(e) => { e.stopPropagation(); reindex(s); }}
+                  >
+                    Reindex
+                  </button>
+                  <button
+                    className="btn btn-ghost"
+                    style={{ fontSize: 11, padding: '2px 8px', color: 'var(--red, #f87171)' }}
+                    onClick={(e) => { e.stopPropagation(); remove(s); }}
+                  >
+                    Delete
+                  </button>
+                </div>
+                {s.status === 'error' && s.error_message && (
+                  <div style={{ fontSize: 10, color: 'var(--red, #f87171)', marginTop: 4 }}>
+                    {s.error_message}
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
+
+        {/* ── Asset list ──────────────────────────────────────────── */}
+        <div style={{ flex: 1, overflowY: 'auto' }}>
+          {!selected && (
+            <div className="empty-state" style={{ fontSize: 13 }}>
+              <IconDocuments width="36" height="36" strokeWidth="1.5" style={{ opacity: 0.25 }} />
+              Select a source to view its indexed files.
+            </div>
+          )}
+
+          {selected && (
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '8px 16px', borderBottom: '1px solid var(--border)',
+            }}>
+              <span style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                Upload a document to run it through text extraction, topic tagging, named entity recognition, PII detection & semantic embeddings — the relevant database(s) are then detected automatically and cross-modal links are inferred.
+              </span>
+              <div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".txt,.md,.csv,.html,.htm,.rst,.docx,.doc,.pdf,.pptx,.ppt,.xlsx,.xls"
+                  style={{ display: 'none' }}
+                  onChange={(e) => e.target.files[0] && uploadFile(e.target.files[0])}
+                />
+                <button
+                  className="btn btn-primary"
+                  disabled={uploading}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  <IconPlus width="14" height="14" />
+                  {uploading ? 'Uploading…' : 'Upload Document'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {selected && !assetsLoading && assets.length > 0 && (
+            <ProcessingSummary assets={assets} sourceStatus={selected.status} />
+          )}
+
+          {selected && assetsLoading && (
+            <div className="empty-state" style={{ fontSize: 13 }}>Loading files…</div>
+          )}
+          {selected && !assetsLoading && assets.length === 0 && (
+            <div className="empty-state" style={{ fontSize: 13 }}>
+              No files yet. Click <b>Reindex</b> to enumerate the source, or <b>Upload Document</b> to add one directly.
+            </div>
+          )}
+          {selected && !assetsLoading && assets.length > 0 && (
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th>Size</th>
+                  <th>Processing</th>
+                  <th>Topics</th>
+                  <th>Entities</th>
+                  <th>PII</th>
+                  <th>Database Links</th>
+                </tr>
+              </thead>
+              <tbody>
+                {assets.map((a) => (
+                  <tr key={a.asset_id}>
+                    <td>{a.file_name}</td>
+                    <td>{fmtBytes(a.size_bytes)}</td>
+                    <td>
+                      {a.processing_steps && a.processing_steps.length > 0 ? (
+                        <div style={{ display: 'flex', gap: 10 }}>
+                          {a.processing_steps.map((s) => (
+                            <span
+                              key={s.key}
+                              title={s.detail || s.label}
+                              style={{ fontSize: 11, color: STEP_COLOR[s.status], whiteSpace: 'nowrap' }}
+                            >
+                              {STEP_ICON[s.status]} {s.label}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <span style={{ fontSize: 11, color: 'var(--text-2)' }}>— indexed only —</span>
+                      )}
+                    </td>
+                    <td>
+                      {(a.topics || []).length === 0
+                        ? <span style={{ color: 'var(--text-2)' }}>—</span>
+                        : (
+                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                            {a.topics.map((t) => (
+                              <span key={t} className="badge" style={{ fontSize: 10 }}>{t}</span>
+                            ))}
+                          </div>
+                        )}
+                    </td>
+                    <td>
+                      {(a.entities || []).length === 0
+                        ? <span style={{ color: 'var(--text-2)' }}>—</span>
+                        : (
+                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                            {a.entities.slice(0, 8).map((e, i) => (
+                              <span key={`${e.text}-${i}`} className="badge" style={{ fontSize: 10 }}>
+                                {e.type}: {e.text}
+                              </span>
+                            ))}
+                            {a.entities.length > 8 && (
+                              <span style={{ fontSize: 10, color: 'var(--text-2)' }}>
+                                +{a.entities.length - 8} more
+                              </span>
+                            )}
+                          </div>
+                        )}
+                    </td>
+                    <td>
+                      {(a.pii_findings || []).length === 0
+                        ? <span style={{ color: 'var(--text-2)' }}>—</span>
+                        : (
+                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                            {a.pii_findings.map((p, i) => (
+                              <span
+                                key={`${p.type}-${i}`}
+                                className="badge"
+                                style={{ fontSize: 10, color: 'var(--red, #f87171)', borderColor: 'var(--red, #f87171)' }}
+                              >
+                                ⚠ {p.type}: {p.masked}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                    </td>
+                    <td>
+                      {(a.xref_links || []).length === 0
+                        ? <span style={{ color: 'var(--text-2)' }}>—</span>
+                        : (
+                          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                            {a.xref_links.map((l, i) => (
+                              <span
+                                key={`${l.mention}-${i}`}
+                                className="badge"
+                                title={`Auto-detected: "${l.mention}" (${l.mention_type}) → ${l.source_name || l.source_id || 'database'}: ${l.matched_table}${l.matched_column ? '.' + l.matched_column : ''} — confidence ${l.confidence} (${l.basis})`}
+                                style={{ fontSize: 10 }}
+                              >
+                                {l.source_name ? `[${l.source_name}] ` : ''}{l.mention} → {l.matched_table}{l.matched_column ? `.${l.matched_column}` : ''}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
       </div>
 
-      {/* ── Right: content ──────────────────────────────────────────── */}
-      <div className="di-right">
-        {/* Header */}
-        <div className="di-right-header">
-          <div>
-            <span className="page-title">{activeSrc ? activeSrc.name : 'Document Intelligence'}</span>
-            {activeSrc && (
-              <span className="page-sub" style={{ marginLeft: 10 }}>
-                {totalDocs} documents{piiDocs > 0 ? ` · ${piiDocs} with PII` : ''}
-              </span>
-            )}
-          </div>
-          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-            <button className="btn btn-ghost" onClick={loadSources} title="Refresh">
-              <IconRefresh />
-            </button>
-          </div>
+      {modalOpen && (
+        <AddDocSourceModal
+          onClose={() => setModalOpen(false)}
+          onCreated={() => { setModalOpen(false); refresh(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ProcessingSummary({ assets, sourceStatus }) {
+  const counts = { none: 0, running: 0, done: 0, error: 0, skipped: 0 };
+  for (const a of assets) {
+    const s = a.processing_status || 'none';
+    counts[s] = (counts[s] || 0) + 1;
+  }
+  const stillWorking = sourceStatus === 'indexing' || counts.running > 0;
+
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 14, padding: '8px 16px',
+      borderBottom: '1px solid var(--border)', fontSize: 12, background: 'var(--bg-1)',
+    }}>
+      <strong style={{ fontSize: 12 }}>
+        {stillWorking ? '◐ Processing…' : '● All files processed'}
+      </strong>
+      {counts.done > 0 && <span style={{ color: STEP_COLOR.done }}>● {counts.done} done</span>}
+      {counts.running > 0 && <span style={{ color: STEP_COLOR.running }}>◐ {counts.running} running</span>}
+      {counts.error > 0 && <span style={{ color: STEP_COLOR.error }}>✖ {counts.error} error</span>}
+      {counts.skipped > 0 && <span style={{ color: 'var(--text-2)' }}>⊘ {counts.skipped} skipped</span>}
+      {counts.none > 0 && <span style={{ color: 'var(--text-2)' }}>○ {counts.none} not processed</span>}
+    </div>
+  );
+}
+
+function fmtBytes(n) {
+  if (n == null) return '—';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function AddDocSourceModal({ onClose, onCreated }) {
+  const { toast } = useAppState();
+  const [name, setName] = useState('');
+  const [connectorType, setConnectorType] = useState('local');
+  const [config, setConfig] = useState({});
+  const [busy, setBusy] = useState(false);
+  const [browserOpen, setBrowserOpen] = useState(false);
+
+  const fields = CONNECTOR_FIELDS[connectorType] || [];
+
+  function onTypeChange(t) {
+    setConnectorType(t);
+    setConfig({});
+  }
+
+  async function submit() {
+    if (!name.trim()) {
+      toast('Source name is required', 'warn');
+      return;
+    }
+    setBusy(true);
+    try {
+      const created = await docCreateSource({ name: name.trim(), connector_type: connectorType, config });
+      await docStartIndex(created.source_id);
+      toast(`Source "${name.trim()}" added — indexing started`, 'success');
+      onCreated();
+    } catch (e) {
+      toast(`Add source failed: ${e.message}`, 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div id="modal-overlay" className="open" onMouseDown={(e) => e.target.id === 'modal-overlay' && onClose()}>
+      <div className="modal">
+        <div className="modal-title">
+          <IconDocuments width="18" height="18" />
+          Connect Document Source
         </div>
 
-        {/* Tabs */}
-        <div className="di-tabs">
-          {[['assets', IconFile, 'Assets'], ['search', IconSearch, 'Search'], ['query', IconQuery, 'Cross-Modal Query']].map(([id, Icon, label]) => (
-            <button key={id} className={`di-tab ${tab === id ? 'active' : ''}`} onClick={() => setTab(id)}>
-              <Icon style={{ width: 13, height: 13 }} /> {label}
-            </button>
+        <div className="form-row">
+          <label>Source Name</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Contracts Repository" />
+        </div>
+
+        <div className="form-row">
+          <label>Connector</label>
+          <select value={connectorType} onChange={(e) => onTypeChange(e.target.value)}>
+            {CONNECTORS.map(([v, label]) => (
+              <option key={v} value={v}>{label}</option>
+            ))}
+          </select>
+        </div>
+
+        {fields.map(([key, label, type]) => (
+          <div className="form-row" key={key}>
+            <label>{label}</label>
+            {connectorType === 'local' && key === 'root_path' ? (
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input
+                  style={{ flex: 1 }}
+                  value={config[key] || ''}
+                  onChange={(e) => setConfig((c) => ({ ...c, [key]: e.target.value }))}
+                  placeholder="C:\path\to\documents"
+                />
+                <button type="button" className="btn btn-secondary" onClick={() => setBrowserOpen(true)}>
+                  Browse…
+                </button>
+              </div>
+            ) : (
+              <input
+                type={type === 'password' ? 'password' : 'text'}
+                value={config[key] || ''}
+                onChange={(e) => setConfig((c) => ({ ...c, [key]: e.target.value }))}
+              />
+            )}
+          </div>
+        ))}
+
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
+          <button className="btn btn-primary" onClick={submit} disabled={busy}>
+            <IconPlus width="14" height="14" />
+            {busy ? 'Working…' : 'Connect & Index'}
+          </button>
+        </div>
+      </div>
+
+      {browserOpen && (
+        <FolderBrowserModal
+          initialPath={config.root_path || ''}
+          onClose={() => setBrowserOpen(false)}
+          onSelect={(path) => { setConfig((c) => ({ ...c, root_path: path })); setBrowserOpen(false); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function FolderBrowserModal({ initialPath, onClose, onSelect }) {
+  const { toast } = useAppState();
+  const [current, setCurrent] = useState(null);   // { path, parent, entries }
+  const [loading, setLoading] = useState(true);
+
+  async function load(path) {
+    setLoading(true);
+    try {
+      const data = await fsBrowse(path);
+      setCurrent(data);
+    } catch (e) {
+      toast(`Could not browse folder: ${e.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { load(initialPath); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <div
+      id="modal-overlay"
+      className="open"
+      style={{ zIndex: 10001 }}
+      onMouseDown={(e) => e.target.id === 'modal-overlay' && onClose()}
+    >
+      <div className="modal" style={{ maxWidth: 480 }}>
+        <div className="modal-title">Choose a Folder</div>
+
+        <div style={{
+          fontSize: 12, color: 'var(--text-2)', marginBottom: 8, wordBreak: 'break-all',
+          fontFamily: 'var(--font-mono)',
+        }}>
+          {current?.path || '(drives)'}
+        </div>
+
+        <div style={{
+          border: '1px solid var(--border)', borderRadius: 'var(--radius)',
+          height: 260, overflowY: 'auto',
+        }}>
+          {loading && <div className="empty-state" style={{ fontSize: 13 }}>Loading…</div>}
+          {!loading && current?.parent != null && (
+            <div
+              onClick={() => load(current.parent)}
+              style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid var(--border)', fontSize: 13 }}
+            >
+              .. (up)
+            </div>
+          )}
+          {!loading && current?.entries?.length === 0 && (
+            <div className="empty-state" style={{ fontSize: 13 }}>No subfolders here.</div>
+          )}
+          {!loading && current?.entries?.map((entry) => (
+            <div
+              key={entry.path}
+              onClick={() => load(entry.path)}
+              style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid var(--border)', fontSize: 13 }}
+            >
+              📁 {entry.name}
+            </div>
           ))}
         </div>
 
-        {/* Tab content */}
-        <div className="di-tab-content">
-
-          {/* ASSETS TAB */}
-          {tab === 'assets' && (
-            <div className="di-assets-pane">
-              <div className="di-assets-table-wrap">
-                {!selectedSrc ? (
-                  <div className="di-empty">Select a document source from the left panel.</div>
-                ) : loadingAssets ? (
-                  <div className="di-empty">Loading documents…</div>
-                ) : assets?.length === 0 ? (
-                  <div className="di-empty">No documents indexed yet. Click <strong>Index</strong> on the source to start.</div>
-                ) : (
-                  <table className="data-table">
-                    <thead>
-                      <tr>
-                        <th>Title</th>
-                        <th>Type</th>
-                        <th>Sensitivity</th>
-                        <th>PII</th>
-                        <th>Domain</th>
-                        <th>Indexed</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {assets.map(a => (
-                        <tr
-                          key={a.id}
-                          style={{ cursor: 'pointer' }}
-                          onClick={() => setSelectedAsset(a.id === selectedAsset ? null : a.id)}
-                        >
-                          <td>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                              <IconFile style={{ width: 13, height: 13, flexShrink: 0, color: 'var(--text-2)' }} />
-                              <div>
-                                <div style={{ fontWeight: 600 }}>{a.title || a.file_name}</div>
-                                {a.summary && <div className="dim" style={{ fontSize: 11, maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.summary}</div>}
-                              </div>
-                            </div>
-                          </td>
-                          <td><span className={`badge ${DOC_TYPE_BADGE[a.doc_type] || 'badge-gray'}`}>{a.doc_type || '—'}</span></td>
-                          <td><span className={`badge ${SENS_BADGE[a.sensitivity] || 'badge-gray'}`}>{a.sensitivity || '—'}</span></td>
-                          <td>
-                            {a.pii_risk ? (
-                              <span className="badge badge-red" style={{ gap: 4 }}>
-                                <IconShield style={{ width: 10, height: 10 }} /> Yes
-                              </span>
-                            ) : (
-                              <span className="badge badge-green">Clean</span>
-                            )}
-                          </td>
-                          <td className="muted">{a.domain || '—'}</td>
-                          <td className="dim">{relTime(a.updated_at) || '—'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-              <AssetDrawer assetId={selectedAsset} onClose={() => setSelectedAsset(null)} />
-            </div>
-          )}
-
-          {/* SEARCH TAB */}
-          {tab === 'search' && (
-            <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 12, height: '100%', overflow: 'hidden' }}>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <input
-                  className="form-input"
-                  style={{ flex: 1 }}
-                  placeholder="Search title, summary, topics…"
-                  value={searchQ}
-                  onChange={e => setSearchQ(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleSearch()}
-                />
-                <button className="btn btn-primary" onClick={handleSearch} disabled={searching}>
-                  <IconSearch style={{ width: 13, height: 13 }} />
-                  {searching ? 'Searching…' : 'Search'}
-                </button>
-              </div>
-              <div style={{ flex: 1, overflow: 'auto' }}>
-                {searchResults === null && !searching && (
-                  <div className="di-empty">Enter a query and press Search.</div>
-                )}
-                {searchResults?.length === 0 && (
-                  <div className="di-empty">No results found.</div>
-                )}
-                {searchResults?.length > 0 && (
-                  <table className="data-table">
-                    <thead>
-                      <tr><th>Title</th><th>Type</th><th>Sensitivity</th><th>PII</th><th>Domain</th></tr>
-                    </thead>
-                    <tbody>
-                      {searchResults.map(a => (
-                        <tr key={a.id} style={{ cursor: 'pointer' }} onClick={() => { setTab('assets'); setSelectedSrc(a.source_id); setSelectedAsset(a.id); }}>
-                          <td>
-                            <div style={{ fontWeight: 600 }}>{a.title || a.file_name}</div>
-                            {a.summary && <div className="dim" style={{ fontSize: 11 }}>{a.summary.slice(0, 120)}…</div>}
-                          </td>
-                          <td><span className={`badge ${DOC_TYPE_BADGE[a.doc_type] || 'badge-gray'}`}>{a.doc_type || '—'}</span></td>
-                          <td><span className={`badge ${SENS_BADGE[a.sensitivity] || 'badge-gray'}`}>{a.sensitivity || '—'}</span></td>
-                          <td>{a.pii_risk ? <span className="badge badge-red">PII</span> : <span className="badge badge-green">Clean</span>}</td>
-                          <td className="muted">{a.domain || '—'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* CROSS-MODAL QUERY TAB */}
-          {tab === 'query' && (
-            <div style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 12, height: '100%', overflow: 'hidden' }}>
-              <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '10px 14px', fontSize: 12, color: 'var(--text-1)', display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-                <IconLink style={{ width: 14, height: 14, flexShrink: 0, marginTop: 1, color: 'var(--cyan)' }} />
-                <span>Cross-modal query finds document context that enriches structured data answers. Ask a business question and get relevant document passages back.</span>
-              </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <input
-                  className="form-input"
-                  style={{ flex: 1 }}
-                  placeholder="e.g. What are the key underwriting risks in our PNC portfolio?"
-                  value={queryQ}
-                  onChange={e => setQueryQ(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleQuery()}
-                />
-                <button className="btn btn-primary" onClick={handleQuery} disabled={querying}>
-                  {querying ? 'Querying…' : 'Query'}
-                </button>
-              </div>
-              <div style={{ flex: 1, overflow: 'auto' }}>
-                {queryResult === null && !querying && (
-                  <div className="di-empty">Ask a question to retrieve relevant document context.</div>
-                )}
-                {queryResult?.error && (
-                  <div className="err-msg">{queryResult.error}</div>
-                )}
-                {queryResult?.doc_context && (
-                  <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 14 }}>
-                    <div style={{ fontSize: 11, color: 'var(--text-2)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                      {queryResult.doc_count} document{queryResult.doc_count !== 1 ? 's' : ''} matched
-                    </div>
-                    <pre style={{ whiteSpace: 'pre-wrap', fontFamily: 'var(--font-sans)', fontSize: 12, color: 'var(--text-0)', lineHeight: 1.7 }}>
-                      {queryResult.doc_context}
-                    </pre>
-                  </div>
-                )}
-                {queryResult?.doc_count === 0 && (
-                  <div className="di-empty">No relevant documents found for this query.</div>
-                )}
-              </div>
-            </div>
-          )}
+        <div className="modal-actions">
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button
+            className="btn btn-primary"
+            disabled={!current?.path}
+            onClick={() => onSelect(current.path)}
+          >
+            Select This Folder
+          </button>
         </div>
       </div>
-
-      {/* Add source modal */}
-      {showAdd && (
-        <AddSourceModal
-          onClose={() => setShowAdd(false)}
-          onCreated={(src) => { setShowAdd(false); loadSources(); setSelectedSrc(src.id); }}
-        />
-      )}
     </div>
   );
 }

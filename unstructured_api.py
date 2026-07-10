@@ -1,467 +1,256 @@
 """
-FastAPI service for the Unstructured Data Intelligence Agent — port 8008
+Document Intelligence service — connects to document repositories (local
+filesystem, S3, Google Drive, SharePoint, OneDrive), enumerates and indexes
+their files, and exposes sources/assets over HTTP.
 
-Indexes enterprise documents (PDF, DOCX, PPTX, XLSX, HTML, MD, TXT),
-extracts semantic fingerprints, and builds cross-modal links to the
-structured data model already known to DataNanite.
-
-Raw document text is NEVER persisted. Only semantic metadata is stored.
-
-Endpoints
----------
-GET  /health
-POST /sources                         register a new document source
-GET  /sources                         list all sources
-GET  /sources/{id}                    get source detail
-POST /sources/{id}/index              trigger async indexing run
-GET  /sources/{id}/jobs               list indexing jobs for source
-
-GET  /jobs/{job_id}                   get job status
-GET  /assets                          list all indexed assets  (?source_id, ?enriched_only)
-GET  /assets/{id}                     get asset detail + topics/entities
-GET  /assets/{id}/links               get cross-modal relationships for asset
-GET  /search                          full-text search over title+summary+topics (?q)
-POST /query                           cross-modal query (question + kpi_names)
-
-Google Drive auth (OAuth2)
---------------------------
-GET  /auth/google/url                 generate OAuth2 consent URL
-POST /auth/google/token               exchange auth code → save token to disk
-
-Environment variables
----------------------
-UNSTRUCTURED_DB      path to unstructured.db   (default: data/unstructured.db)
-METADATA_API_URL     upstream metadata service  (default: http://localhost:8000)
-ANTHROPIC_API_KEY    required for LLM extraction
-UNSTRUCTURED_PORT    port to bind               (default: 8008)
-UNSTRUCTURED_WORKERS parallel indexing threads  (default: 4)
-GDRIVE_TOKEN_DIR     directory to store OAuth2 tokens (default: data/gdrive_tokens)
-GDRIVE_CLIENT_SECRETS path to OAuth2 client secrets JSON from Google Cloud Console
+Runs standalone on port 8008. The orchestrator (orchestrator_api.py) proxies
+/unstructured/* to this service so the frontend never talks to it directly.
 """
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
-import sys
+import shutil
+import string
 import threading
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+import httpx
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-sys.path.insert(0, str(Path(__file__).parent))
+from unstructured_agent.connectors import CONNECTOR_TYPES, ConnectorError
+from unstructured_agent.extractor import SUPPORTED_EXTENSIONS
+from unstructured_agent.pii import redact_text
+from unstructured_agent.pipeline import process_uploaded_asset, run_index_job
+from unstructured_agent.store import DocStore
 
-from unstructured_agent.store import UnstructuredStore
-from unstructured_agent.pipeline import run_index_job
-from unstructured_agent.query import query_for_context
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "info").upper())
+logger = logging.getLogger("unstructured_api")
 
-logging.basicConfig(
-    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
+DATA_DIR = os.environ.get("DATA_DIR", str(Path(__file__).parent / "data"))
+DB_PATH = os.environ.get("UNSTRUCTURED_DB", str(Path(DATA_DIR) / "unstructured.db"))
+ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_API_URL", "http://localhost:8005")
 
-_DB_PATH          = os.environ.get("UNSTRUCTURED_DB",        "data/unstructured.db")
-_METADATA_API     = os.environ.get("METADATA_API_URL",       "http://localhost:8000")
-_PORT             = int(os.environ.get("UNSTRUCTURED_PORT",  "8008"))
-_GDRIVE_TOKEN_DIR = os.environ.get("GDRIVE_TOKEN_DIR",       "data/gdrive_tokens")
-_GDRIVE_SECRETS   = os.environ.get("GDRIVE_CLIENT_SECRETS",  "")
-_PUBLIC_URL       = os.environ.get("UNSTRUCTURED_PUBLIC_URL", f"http://localhost:{int(os.environ.get('UNSTRUCTURED_PORT', '8008'))}")
+app = FastAPI(title="DataNanite Document Intelligence", docs_url="/docs", redoc_url=None)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-Path(_GDRIVE_TOKEN_DIR).mkdir(parents=True, exist_ok=True)
-
-store = UnstructuredStore(_DB_PATH)
-
-app = FastAPI(
-    title="DataNanite Unstructured Intelligence API",
-    version="1.0.0",
-    description=(
-        "Semantic fingerprinting and cross-modal linking for enterprise documents. "
-        "Raw document text is never stored — only metadata."
-    ),
-    docs_url="/docs",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+store = DocStore(DB_PATH)
+UPLOAD_DIR = Path(DATA_DIR) / "uploads"
 
 
-# ── Request / Response models ─────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "unstructured-api"}
+
 
 class CreateSourceRequest(BaseModel):
     name: str
-    source_type: str = "local"         # local | s3 | gcs | azure
-    connection: Dict[str, Any] = {}    # source_type-specific config
-    nanite_source_id: Optional[str] = None
-    domain: str = ""
+    connector_type: str
+    config: dict = {}
 
 
-class QueryRequest(BaseModel):
-    question: str
-    kpi_names: List[str] = []          # KPI names extracted from the structured answer
+@app.get("/connectors")
+async def list_connectors():
+    return {"connectors": list(CONNECTOR_TYPES)}
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+@app.get("/fs/browse")
+async def browse_filesystem(path: str = ""):
+    """Lists subdirectories under `path` so the frontend can offer a folder
+    picker for the local connector. Browsers can't expose absolute OS paths
+    from a native file dialog for security reasons, so this walks the
+    server's filesystem instead — safe here since the local connector can
+    already read any path the caller supplies; this only aids discovery.
+    Empty path lists drive roots (Windows) or '/' (POSIX)."""
+    if not path:
+        if os.name == "nt":
+            roots = [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+            return {"path": "", "parent": None,
+                    "entries": [{"name": r, "path": r, "is_dir": True} for r in roots]}
+        path = "/"
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "service": "unstructured-agent", "port": _PORT}
+    p = Path(path)
+    if not p.exists() or not p.is_dir():
+        raise HTTPException(400, f"not a directory: {path}")
+
+    entries = []
+    try:
+        for child in sorted(p.iterdir(), key=lambda x: x.name.lower()):
+            if child.name.startswith("."):
+                continue
+            try:
+                if child.is_dir():
+                    entries.append({"name": child.name, "path": str(child), "is_dir": True})
+            except OSError:
+                continue
+    except PermissionError:
+        raise HTTPException(403, f"permission denied: {path}")
+
+    parent = str(p.parent) if p.parent != p else None
+    return {"path": str(p), "parent": parent, "entries": entries}
 
 
-# ── Sources ───────────────────────────────────────────────────────────────────
-
-@app.post("/sources", status_code=201)
-def create_source(req: CreateSourceRequest):
-    source = store.create_source(
-        name=req.name,
-        source_type=req.source_type,
-        connection=req.connection,
-        nanite_source_id=req.nanite_source_id,
-        domain=req.domain,
-    )
-    return source
+@app.post("/sources")
+async def create_source(body: CreateSourceRequest):
+    if body.connector_type not in CONNECTOR_TYPES:
+        raise HTTPException(400, f"unknown connector_type: {body.connector_type!r}")
+    if not body.name.strip():
+        raise HTTPException(400, "name is required")
+    return store.create_source(body.name.strip(), body.connector_type, body.config)
 
 
 @app.get("/sources")
-def list_sources():
+async def list_sources():
     return store.list_sources()
 
 
 @app.get("/sources/{source_id}")
-def get_source(source_id: str):
-    src = store.get_source(source_id)
-    if not src:
-        raise HTTPException(404, f"Source {source_id!r} not found")
-    return src
+async def get_source(source_id: str):
+    source = store.get_source(source_id)
+    if not source:
+        raise HTTPException(404, "source not found")
+    return source
 
 
-# ── Indexing ──────────────────────────────────────────────────────────────────
+@app.delete("/sources/{source_id}")
+async def delete_source(source_id: str):
+    if not store.get_source(source_id):
+        raise HTTPException(404, "source not found")
 
-@app.post("/sources/{source_id}/index", status_code=202)
-def start_index(source_id: str, background_tasks: BackgroundTasks,
-                force: bool = Query(False, description="Clear existing assets before indexing")):
-    src = store.get_source(source_id)
-    if not src:
-        raise HTTPException(404, f"Source {source_id!r} not found")
+    # Best-effort: strip each asset's node/edges from every structured
+    # datasource's KG it was ever linked into (via cross-modal linking),
+    # so deleting a document source here doesn't leave "ghost" document
+    # nodes behind in Graph Explorer / DataChat's document context. Must
+    # happen BEFORE store.delete_source() — that call wipes xref_links,
+    # which is the only record of which KGs each asset was pushed to.
+    for asset in store.list_assets(source_id, limit=10_000):
+        kg_targets = {link["source_id"] for link in (asset.get("xref_links") or []) if link.get("source_id")}
+        for kg_source_id in kg_targets:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.delete(
+                        f"{ORCHESTRATOR_URL}/sources/{kg_source_id}/graph/documents/{asset['asset_id']}"
+                    )
+            except Exception as exc:
+                logger.warning("delete_source: could not unlink asset %s from KG %s — %s",
+                                asset["asset_id"], kg_source_id, exc)
 
-    job_id = store.create_job(source_id)
-    background_tasks.add_task(
-        run_index_job, job_id, source_id, store, _METADATA_API, force
-    )
-    return {"job_id": job_id, "status": "running", "source_id": source_id, "force": force}
+    store.delete_source(source_id)
+
+    # Remove any files copied here by the Upload Document endpoint (dest_dir
+    # in upload_document() below is always UPLOAD_DIR/source_id). Safe for
+    # every connector type: "local" sources index files in place at their
+    # own root_path and never copy them here; cloud connectors download to
+    # a temp file that's removed immediately after processing (see
+    # pipeline._maybe_autoprocess) — only uploaded files ever live here.
+    upload_dir = UPLOAD_DIR / source_id
+    if upload_dir.exists():
+        try:
+            shutil.rmtree(upload_dir)
+        except Exception as exc:
+            logger.warning("delete_source: could not remove upload dir %s — %s", upload_dir, exc)
+
+    return {"deleted": True}
 
 
-@app.get("/sources/{source_id}/jobs")
-def list_source_jobs(source_id: str):
-    return store.list_jobs(source_id)
+@app.post("/sources/{source_id}/index")
+async def start_index(source_id: str):
+    source = store.get_source(source_id)
+    if not source:
+        raise HTTPException(404, "source not found")
+    if source["status"] == "indexing":
+        raise HTTPException(409, "indexing already in progress")
 
-
-# ── Jobs ──────────────────────────────────────────────────────────────────────
-
-@app.get("/jobs/{job_id}")
-def get_job(job_id: str):
-    job = store.get_job(job_id)
-    if not job:
-        raise HTTPException(404, f"Job {job_id!r} not found")
+    job = store.create_job(source_id)
+    thread = threading.Thread(target=run_index_job, args=(job["job_id"], source_id, store), daemon=True)
+    thread.start()
     return job
 
 
-@app.get("/jobs")
-def list_all_jobs():
-    return store.list_jobs()
+@app.get("/sources/{source_id}/jobs")
+async def list_jobs(source_id: str):
+    if not store.get_source(source_id):
+        raise HTTPException(404, "source not found")
+    return store.list_jobs(source_id)
 
 
-# ── Assets ────────────────────────────────────────────────────────────────────
-
-@app.get("/assets")
-def list_assets(
-    source_id: Optional[str] = Query(None),
-    enriched_only: bool = Query(False),
-    limit: int = Query(100, le=500),
-):
-    return store.list_assets(source_id=source_id, enriched_only=enriched_only, limit=limit)
+@app.get("/sources/{source_id}/assets")
+async def list_assets(source_id: str, limit: int = 500):
+    if not store.get_source(source_id):
+        raise HTTPException(404, "source not found")
+    return store.list_assets(source_id, limit=limit)
 
 
 @app.get("/assets/{asset_id}")
-def get_asset(asset_id: str):
+async def get_asset(asset_id: str):
     asset = store.get_asset(asset_id)
     if not asset:
-        raise HTTPException(404, f"Asset {asset_id!r} not found")
+        raise HTTPException(404, "asset not found")
     return asset
 
 
-@app.get("/assets/{asset_id}/links")
-def get_asset_links(asset_id: str):
+@app.get("/assets/{asset_id}/excerpt")
+async def get_asset_excerpt(asset_id: str, max_chars: int = 1200):
+    """Returns a short, PII-redacted excerpt of this document's extracted
+    text, plus its topics and cross-modal links — built for DataChat to
+    quote from when answering a question about a linked datasource.
+    Redaction re-runs detect_pii's regex patterns directly against the raw
+    text (see pii.redact_text) rather than reusing the stored pii_findings,
+    which intentionally never retain raw values or positions."""
     asset = store.get_asset(asset_id)
     if not asset:
-        raise HTTPException(404, f"Asset {asset_id!r} not found")
+        raise HTTPException(404, "asset not found")
+    text = asset.get("extracted_text") or ""
+    excerpt = redact_text(text)[:max_chars]
     return {
         "asset_id": asset_id,
-        "title":    asset.get("title", ""),
-        "links":    store.get_relationships(asset_id),
+        "file_name": asset.get("file_name"),
+        "excerpt": excerpt,
+        "topics": asset.get("topics") or [],
+        "xref_links": asset.get("xref_links") or [],
     }
 
 
-@app.get("/assets/{asset_id}/versions")
-def list_asset_versions(asset_id: str):
-    """Return all previous version snapshots for an asset, newest first."""
-    if not store.get_asset(asset_id):
-        raise HTTPException(404, f"Asset {asset_id!r} not found")
-    return store.list_asset_versions(asset_id)
-
-
-@app.get("/assets/{asset_id}/versions/{version_num}")
-def get_asset_version(asset_id: str, version_num: int):
-    """Return a specific version snapshot."""
-    snap = store.get_asset_version(asset_id, version_num)
-    if not snap:
-        raise HTTPException(404, f"Version {version_num} not found for asset {asset_id!r}")
-    return snap
-
-
-# ── Asset download ────────────────────────────────────────────────────────────
-
-@app.get("/assets/{asset_id}/download")
-def download_asset(asset_id: str):
-    """
-    Redirect to a presigned S3 URL (S3 sources), stream the file (local),
-    or return a Google Drive download URL (gdrive sources).
-    """
-    import json as _json
-    from fastapi.responses import RedirectResponse, FileResponse
-
-    asset = store.get_asset(asset_id)
-    if not asset:
-        raise HTTPException(404, f"Asset {asset_id!r} not found")
-
-    source = store.get_source(asset["source_id"])
+@app.post("/sources/{source_id}/upload")
+async def upload_document(source_id: str, file: UploadFile = File(...)):
+    """Uploads a document to a source and runs it through the processing
+    pipeline: text extraction → topic tagging → named entity recognition →
+    PII detection → semantic embeddings → cross-modal linking."""
+    source = store.get_source(source_id)
     if not source:
-        raise HTTPException(404, "Source not found")
+        raise HTTPException(404, "source not found")
 
-    src_type = source["source_type"]
-    conn = source["connection_json"]
-    connection = _json.loads(conn) if isinstance(conn, str) else conn
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(400, f"unsupported file type: {ext or '(none)'} — "
+                                  f"supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
 
-    if src_type == "s3":
-        import boto3
-        remote_path = asset.get("remote_path")
-        if not remote_path:
-            raise HTTPException(404, "S3 key not recorded for this asset — re-index the source")
-        s3 = boto3.client(
-            "s3",
-            region_name=connection.get("region", "us-east-1"),
-            aws_access_key_id=connection.get("aws_access_key_id") or None,
-            aws_secret_access_key=connection.get("aws_secret_access_key") or None,
-        )
-        url = s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": connection["bucket"], "Key": remote_path},
-            ExpiresIn=3600,
-        )
-        return RedirectResponse(url)
+    dest_dir = UPLOAD_DIR / source_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / f"{uuid.uuid4()}_{file.filename}"
+    with open(dest_path, "wb") as out:
+        shutil.copyfileobj(file.file, out)
 
-    if src_type == "local":
-        path = asset["file_path"]
-        if not os.path.exists(path):
-            raise HTTPException(404, "File not found on disk")
-        return FileResponse(path, filename=asset["file_name"])
-
-    if src_type == "gdrive":
-        remote_path = asset.get("remote_path")
-        if not remote_path:
-            raise HTTPException(404, "Drive file ID not recorded — re-index the source")
-        drive_url = f"https://drive.google.com/uc?export=download&id={remote_path}"
-        return RedirectResponse(drive_url)
-
-    if src_type in ("sharepoint", "onedrive"):
-        remote_path = asset.get("remote_path")
-        if not remote_path or ":" not in remote_path:
-            raise HTTPException(404, "Graph drive/item ID not recorded — re-index the source")
-        from unstructured_agent.connectors import _ms_token, _GRAPH_BASE
-        drive_id, item_id = remote_path.split(":", 1)
-        token = _ms_token(
-            connection["tenant_id"],
-            connection["client_id"],
-            connection["client_secret"],
-        )
-        # Graph returns a redirect to the actual download URL — follow it
-        import httpx as _httpx
-        resp = _httpx.get(
-            f"{_GRAPH_BASE}/drives/{drive_id}/items/{item_id}/content",
-            headers={"Authorization": f"Bearer {token}"},
-            follow_redirects=False,
-            timeout=10,
-        )
-        location = resp.headers.get("location") or str(resp.url)
-        return RedirectResponse(location)
-
-    raise HTTPException(400, f"Download not supported for source type '{src_type}'")
-
-
-# ── Cross-modal query ─────────────────────────────────────────────────────────
-
-@app.post("/query")
-def cross_modal_query(req: QueryRequest):
-    """
-    Given a natural-language question and optional KPI names from a structured
-    answer, return the most relevant document context as a formatted markdown
-    block. Used by synthesize_node to enrich structured insights with document
-    evidence.
-
-    Returns {"doc_context": "<markdown>", "doc_count": N} or
-            {"doc_context": null, "doc_count": 0} when nothing relevant found.
-    """
-    if not req.question.strip():
-        raise HTTPException(400, "question must not be empty")
-    try:
-        ctx = query_for_context(
-            question=req.question,
-            kpi_names=req.kpi_names,
-            store=store,
-            base_url=_PUBLIC_URL,
-        )
-    except Exception as exc:
-        logger.warning("cross_modal_query failed: %s", exc)
-        ctx = None
-
-    # Count how many doc blocks are in the context (each ends with a blank line)
-    doc_count = ctx.count("\n\n") + 1 if ctx else 0
-    return {"doc_context": ctx, "doc_count": doc_count}
-
-
-# ── Search ────────────────────────────────────────────────────────────────────
-
-@app.get("/search")
-def search(q: str = Query(..., min_length=2), limit: int = Query(20, le=100)):
-    try:
-        results = store.search_assets(q, limit=limit)
-    except Exception as exc:
-        logger.warning("FTS search failed: %s", exc)
-        results = []
-    return {"query": q, "results": results, "count": len(results)}
-
-
-# ── Google Drive OAuth2 ───────────────────────────────────────────────────────
-
-_GDRIVE_SCOPES    = ["https://www.googleapis.com/auth/drive.readonly"]
-_GDRIVE_AUTH_URI  = "https://accounts.google.com/o/oauth2/auth"
-_GDRIVE_TOKEN_URI = "https://oauth2.googleapis.com/token"
-
-
-class GoogleTokenRequest(BaseModel):
-    auth_code:     str
-    redirect_uri:  str = "urn:ietf:wg:oauth:2.0:oob"
-    token_name:    str = "default"   # logical name — token saved as {token_name}.json
-
-
-@app.get("/auth/google/url")
-def gdrive_auth_url(
-    redirect_uri: str = "urn:ietf:wg:oauth:2.0:oob",
-    token_name: str = "default",
-):
-    """
-    Generate a Google OAuth2 consent URL.
-
-    Steps:
-      1. GET /auth/google/url  → copy the 'url' from the response
-      2. Open the URL in a browser, sign in, grant read-only Drive access
-      3. Copy the authorisation code Google shows
-      4. POST /auth/google/token {auth_code, redirect_uri, token_name}
-      5. Register a source with source_type='gdrive',
-         connection.token_path = the path returned by step 4
-    """
-    if not _GDRIVE_SECRETS:
-        raise HTTPException(
-            400,
-            "GDRIVE_CLIENT_SECRETS env var not set. "
-            "Download OAuth2 client secrets JSON from Google Cloud Console and "
-            "set GDRIVE_CLIENT_SECRETS=/path/to/client_secrets.json"
-        )
-    try:
-        from google_auth_oauthlib.flow import Flow  # type: ignore
-    except ImportError:
-        raise HTTPException(500, "google-auth-oauthlib not installed")
-
-    flow = Flow.from_client_secrets_file(
-        _GDRIVE_SECRETS,
-        scopes=_GDRIVE_SCOPES,
-        redirect_uri=redirect_uri,
+    size_bytes = dest_path.stat().st_size
+    mime_type = file.content_type or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
+    asset_id = store.upsert_asset(
+        source_id=source_id, remote_id=str(dest_path), file_name=file.filename,
+        size_bytes=size_bytes, mime_type=mime_type, checksum=None, modified_at=None,
+        local_path=str(dest_path),
     )
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
+
+    thread = threading.Thread(
+        target=process_uploaded_asset, args=(asset_id, str(dest_path), store), daemon=True,
     )
-    token_path = str(Path(_GDRIVE_TOKEN_DIR) / f"{token_name}.json")
-    return {
-        "url":          auth_url,
-        "instructions": (
-            "1. Open the URL in a browser and sign in with your Google account. "
-            "2. Grant 'View files from Google Drive' access. "
-            "3. Copy the authorisation code shown. "
-            "4. POST /auth/google/token with {auth_code, redirect_uri, token_name}."
-        ),
-        "token_will_be_saved_to": token_path,
-    }
+    thread.start()
+    return store.get_asset(asset_id)
 
 
-@app.post("/auth/google/token")
-def gdrive_exchange_token(req: GoogleTokenRequest):
-    """
-    Exchange an OAuth2 authorisation code for a refresh token and save it.
-    After this call, register a source with:
-      source_type = 'gdrive'
-      connection  = { 'folder_id': '...', 'token_path': '<returned path>' }
-    """
-    if not _GDRIVE_SECRETS:
-        raise HTTPException(400, "GDRIVE_CLIENT_SECRETS env var not set")
-    try:
-        from google_auth_oauthlib.flow import Flow  # type: ignore
-    except ImportError:
-        raise HTTPException(500, "google-auth-oauthlib not installed")
-
-    try:
-        flow = Flow.from_client_secrets_file(
-            _GDRIVE_SECRETS,
-            scopes=_GDRIVE_SCOPES,
-            redirect_uri=req.redirect_uri,
-        )
-        flow.fetch_token(code=req.auth_code)
-        creds = flow.credentials
-    except Exception as exc:
-        raise HTTPException(400, f"Token exchange failed: {exc}")
-
-    token_path = str(Path(_GDRIVE_TOKEN_DIR) / f"{req.token_name}.json")
-    import json
-    with open(token_path, "w") as f:
-        json.dump({
-            "token":         creds.token,
-            "refresh_token": creds.refresh_token,
-            "token_uri":     creds.token_uri,
-            "client_id":     creds.client_id,
-            "client_secret": creds.client_secret,
-            "scopes":        list(creds.scopes or _GDRIVE_SCOPES),
-        }, f)
-
-    return {
-        "status":     "token saved",
-        "token_path": token_path,
-        "next_step":  (
-            f"Register a source: POST /sources with "
-            f"source_type='gdrive', "
-            f"connection={{folder_id:'<your folder id>',token_path:'{token_path}'}}"
-        ),
-    }
-
-
-# ── Run ───────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("unstructured_api:app", host="0.0.0.0", port=_PORT,
-                reload=False, log_level="info")
+@app.exception_handler(ConnectorError)
+async def connector_error_handler(request, exc: ConnectorError):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=400, content={"detail": str(exc)})

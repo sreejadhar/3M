@@ -237,6 +237,7 @@ def _run_dialog(
                 "sql_queries":     sql_queries,
                 "query_results":   result.get("query_results") or [],
                 "errors":          result.get("errors") or [],
+                "sources":         result.get("sources") or [],
                 "session_id":      session_id,
                 # Debug fields — available via /jobs/{job_id}/debug
                 "_schema_context": result.get("schema_context", ""),
@@ -307,6 +308,7 @@ def _run_dialog(
                     "sql_queries":    result.get("sql_queries") or [],
                     "query_results":  result.get("query_results") or [],
                     "errors":         result.get("errors") or [],
+                    "sources":        result.get("sources") or [],
                 }
                 logger.info("NLQ cached: key=%s", cache_key[:12])
         else:
@@ -392,6 +394,7 @@ def start_query(req: QueryRequest, background_tasks: BackgroundTasks):
                     "sql_queries":     cached.get("sql_queries") or [],
                     "query_results":   cached.get("query_results") or [],
                     "errors":          cached.get("errors") or [],
+                    "sources":         cached.get("sources") or [],
                     "error":           None,
                     "cache_hit":       True,
                     "cache_key":       ck,
@@ -453,6 +456,7 @@ def get_results(job_id: str):
         "sql_queries":    job["sql_queries"],
         "query_results":  job["query_results"],
         "errors":         job["errors"],
+        "sources":        job.get("sources") or [],
         "cache_hit":      job.get("cache_hit", False),
     }
 

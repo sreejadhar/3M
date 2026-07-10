@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # Keyed by (schema_hash, backend, _NODE_TEXT_VERSION) so cache is invalidated
 # when the schema changes OR when _node_text() logic is updated.
 _EMBED_CACHE: Dict[str, "_Cache"] = {}
-_NODE_TEXT_VERSION = "5"   # bump when _node_text() or _expand_table_name() changes
+_NODE_TEXT_VERSION = "6"   # bump when _node_text() or _expand_table_name() changes, or the tokenizer changes
 
 
 class _Cache:
@@ -375,12 +375,34 @@ def _node_text(node: Dict) -> str:
 
 # ── Embedding backends ────────────────────────────────────────────────────────
 
+def _stem_token(tok: str) -> str:
+    """
+    Minimal suffix-stripping stemmer — no external dependency. Normalises
+    simple plural/verb-form variance ("treaties" -> "treaty", "reinsurers" ->
+    "reinsurer") so a query and a schema column/table name that differ only
+    by grammatical form still land close together in TF-IDF / keyword space.
+    This is the fix for retrieval missing REINSURANCE for "Which reinsurers
+    carry the most exposure?" and similar term-form mismatches.
+    """
+    if len(tok) > 4 and tok.endswith('ies'):
+        return tok[:-3] + 'y'
+    if len(tok) > 4 and tok.endswith('es') and tok[-3] not in 'aeiou':
+        return tok[:-2]
+    if len(tok) > 3 and tok.endswith('s') and not tok.endswith('ss'):
+        return tok[:-1]
+    return tok
+
+
+def _tokenize_stemmed(text: str) -> List[str]:
+    return [_stem_token(w) for w in re.findall(r'\w+', text.lower())]
+
+
 def _keyword_embed(texts: List[str], vocab_texts: Optional[List[str]] = None) -> np.ndarray:
     """
     Bag-of-words binary vectors.  Vocabulary is built from vocab_texts (corpus);
     if None, vocabulary is built from texts itself.
     """
-    tokenize = lambda t: re.findall(r'\w+', t.lower())
+    tokenize = _tokenize_stemmed
     source   = vocab_texts if vocab_texts is not None else texts
     vocab    = sorted({w for t in source for w in tokenize(t)})
     idx      = {w: i for i, w in enumerate(vocab)}
@@ -436,7 +458,13 @@ def _build_cache(
 
     if backend == "tfidf":
         from sklearn.feature_extraction.text import TfidfVectorizer
-        vect   = TfidfVectorizer(max_features=3000, sublinear_tf=True)
+        # token_pattern=None + custom tokenizer: apply _stem_token so plural/
+        # verb-form variance between the NLQ and schema names ("treaties" vs
+        # "TREATY_TYPE", "reinsurers" vs "REINSURER_NAME") doesn't cause a
+        # zero-overlap retrieval miss. transform() at query time reuses the
+        # same fitted tokenizer automatically.
+        vect   = TfidfVectorizer(max_features=3000, sublinear_tf=True,
+                                  tokenizer=_tokenize_stemmed, token_pattern=None)
         raw    = vect.fit_transform(texts).toarray().astype(np.float32)
         norms  = np.linalg.norm(raw, axis=1, keepdims=True)
         matrix = raw / np.maximum(norms, 1e-9)
@@ -638,9 +666,34 @@ def retrieve_node(state: DialogState) -> DialogState:
     logger.info("=== retrieve_node ===")
 
     config        = state["config"]
-    nodes: List   = state.get("kg_nodes") or []
-    edges: List   = state.get("kg_edges") or []
+    raw_nodes: List = state.get("kg_nodes") or []
+    raw_edges: List = state.get("kg_edges") or []
     query: str    = state.get("natural_query", "").strip()
+
+    # Document Intelligence nodes (id "doc:<asset_id>") live in the same
+    # kg_nodes/kg_edges list as real tables, but they have no columns and
+    # aren't SQL-relevant — treating them as candidate tables here would
+    # feed a filename like "📄 Report.txt" through table-name expansion and
+    # risk it surviving into the subgraph passed to plan_node (which would
+    # then try to generate SQL against a table that doesn't exist). Strip
+    # them out up front, in every code path (including the early-exits
+    # below), and stash their "mentions" edges for document_context_node —
+    # which runs right after this node and needs the *original* linkage
+    # before it's gone, since state["kg_nodes"]/kg_edges get overwritten
+    # with the selected subgraph below.
+    nodes: List = [n for n in raw_nodes if not str(n.get("id", "")).startswith("doc:")]
+    edges: List = [
+        e for e in raw_edges
+        if not str(e.get("from", "")).startswith("doc:")
+        and not str(e.get("to", "")).startswith("doc:")
+    ]
+    doc_mention_edges: List = [
+        e for e in raw_edges
+        if str(e.get("from", "")).startswith("doc:") and e.get("label") == "mentions"
+    ]
+    state["kg_nodes"] = nodes
+    state["kg_edges"] = edges
+    state["doc_mention_edges"] = doc_mention_edges
 
     top_k       = getattr(config, "graphrag_top_k",       8)
     hop_depth   = getattr(config, "graphrag_hop_depth",   1)
@@ -822,4 +875,9 @@ def retrieve_node(state: DialogState) -> DialogState:
 
     state["kg_nodes"] = sub_nodes
     state["kg_edges"] = sub_edges
+    # Per-table query-relevance scores for the final selected tables — reused
+    # by document_context_node so that when several documents tie on how
+    # many selected tables they touch, the one linked to the MOST relevant
+    # table (not just an arbitrary insertion-order pick) wins.
+    state["table_relevance_scores"] = {n.get("id", ""): node_score.get(n.get("id", ""), 0.0) for n in sub_nodes}
     return state

@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unstructured-api
+  namespace: datananite2
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: unstructured-api
+  template:
+    metadata:
+      labels:
+        app: unstructured-api
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - datananite-pool
+      containers:
+      - name: unstructured-api
+        image: gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-unstructured:latest
+        ports:
+        - containerPort: 8008
+        envFrom:
+        - configMapRef:
+            name: datananite-config
+        - secretRef:
+            name: datananite-secrets
+        volumeMounts:
+        - name: shared-data
+          mountPath: /data
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8008
+          initialDelaySeconds: 60
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8008
+          initialDelaySeconds: 60
+          periodSeconds: 10
+      volumes:
+      - name: shared-data
+        persistentVolumeClaim:
+          claimName: datananite2-shared-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: unstructured-api-service
+  namespace: datananite2
+  annotations:
+    cloud.google.com/neg: '{"ingress":true}'
+spec:
+  selector:
+    app: unstructured-api
+  ports:
+  - port: 8008
+    targetPort: 8008
+  type: ClusterIP

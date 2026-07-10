@@ -74,6 +74,7 @@ jobs:
         kubectl apply -f deployment/k8s/pvc2.yaml
         kubectl apply -f deployment/k8s/configmap.yaml
         kubectl apply -f deployment/k8s/orchestrator-api.yaml
+        kubectl apply -f deployment/k8s/unstructured-api.yaml
 
   # ── Job 1: Build → Push → Deploy each service fully in parallel ───────────────
   build-push-deploy:
@@ -93,6 +94,7 @@ jobs:
           - { name: shacl-api,        image: datananite-shacl,        dockerfile: Dockerfile.shacl,        deployment: shacl-api,        container: shacl-api }
           - { name: streamlit-ui,     image: datananite-ui,           dockerfile: Dockerfile.ui,           deployment: streamlit-ui,     container: streamlit-ui }
           - { name: orchestrator-api, image: datananite-orchestrator, dockerfile: Dockerfile.orchestrator, deployment: orchestrator-api, container: orchestrator-api }
+          - { name: unstructured-api, image: datananite-unstructured, dockerfile: Dockerfile.unstructured, deployment: unstructured-api, container: unstructured-api }
 
     steps:
     - name: Checkout code

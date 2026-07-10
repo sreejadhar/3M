@@ -18,3 +18,6 @@ data:
   SHACL_API_URL: "http://shacl-api-service:8007"
   ORCHESTRATOR_URL: "http://chat-ui-service:8005"
   KG_FEDERATION_DB: "/data/kg_federation.db"
+  UNSTRUCTURED_API_URL: "http://unstructured-api-service:8008"
+  UNSTRUCTURED_DB: "/data/unstructured.db"
+  UNSTRUCTURED_WORKERS: "4"

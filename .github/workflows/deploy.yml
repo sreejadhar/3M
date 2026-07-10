@@ -153,6 +153,24 @@ jobs:
         kubectl rollout restart deployment/${{ matrix.service.deployment }} -n $NAMESPACE
         kubectl rollout status deployment/${{ matrix.service.deployment }} -n $NAMESPACE --timeout=10m
 
+    - name: Diagnose ${{ matrix.service.name }} rollout failure
+      if: failure()
+      run: |
+        echo "=== Node capacity ==="
+        kubectl describe nodes -l cloud.google.com/gke-nodepool=datananite-pool | grep -A5 "Allocated resources"
+        echo ""
+        echo "=== Pods ==="
+        kubectl get pods -n $NAMESPACE -l app=${{ matrix.service.deployment }} -o wide
+        echo ""
+        echo "=== Pod describe (events) ==="
+        kubectl describe pods -n $NAMESPACE -l app=${{ matrix.service.deployment }}
+        echo ""
+        echo "=== Pod logs ==="
+        kubectl logs -n $NAMESPACE -l app=${{ matrix.service.deployment }} --tail=200 --all-containers || true
+        echo ""
+        echo "=== Pod logs (previous container, if crashed) ==="
+        kubectl logs -n $NAMESPACE -l app=${{ matrix.service.deployment }} --tail=200 --all-containers --previous || true
+
   # ── Job 2: Final status check after all services deployed ─────────────────────
   status:
     name: Deployment Status

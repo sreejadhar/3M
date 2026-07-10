@@ -90,6 +90,12 @@ _ASSET_MIGRATION_COLUMNS = [
     ("xref_links_json", "TEXT"),
 ]
 
+_SOURCE_MIGRATION_COLUMNS = [
+    ("status", "TEXT NOT NULL DEFAULT 'idle'"),
+    ("error_message", "TEXT"),
+    ("indexed_at", "TEXT"),
+]
+
 class DocStore:
     def __init__(self, db_path: str):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -154,10 +160,15 @@ class DocStore:
         """Adds columns introduced after these tables already existed (SQLite
         has no `ALTER TABLE ADD COLUMN IF NOT EXISTS`)."""
         conn = self._conn()
-        existing = {row["name"] for row in conn.execute("PRAGMA table_info(doc_assets)")}
+        existing_assets = {row["name"] for row in conn.execute("PRAGMA table_info(doc_assets)")}
         for col, decl in _ASSET_MIGRATION_COLUMNS:
-            if col not in existing:
+            if col not in existing_assets:
                 conn.execute(f"ALTER TABLE doc_assets ADD COLUMN {col} {decl}")
+
+        existing_sources = {row["name"] for row in conn.execute("PRAGMA table_info(doc_sources)")}
+        for col, decl in _SOURCE_MIGRATION_COLUMNS:
+            if col not in existing_sources:
+                conn.execute(f"ALTER TABLE doc_sources ADD COLUMN {col} {decl}")
 
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)

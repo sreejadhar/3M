@@ -14,6 +14,11 @@ class SQLQuery(TypedDict):
     kg_id: str  # which KG this query targets (empty = use default config)
 
 
+class Source(TypedDict):
+    type: str          # "table" | "document"
+    name: str          # table name (schema.table) or file name
+
+
 class QueryResult(TypedDict):
     query_id: str
     description: str
@@ -80,6 +85,10 @@ class DialogState(TypedDict, total=False):
     # Output
     insights: str                      # LLM-derived narrative
     plan_explanation: str              # prose from plan LLM when it returns [] (unanswerable)
+
+    # Where the answer's data came from — tables referenced by sql_queries
+    # plus document_context file names, deduped. Built by synthesize_node.
+    sources: List[Source]
 
     errors: List[str]
     phase: str                         # understand | plan | execute | synthesize | done | error

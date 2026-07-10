@@ -486,7 +486,93 @@ def _build_document_section(document_context: list) -> str:
         excerpt = doc.get("excerpt", "").strip()
         if excerpt:
             lines.append(excerpt)
+    lines.append(
+        "\nNot every document above is necessarily relevant to this question — "
+        "they are simply all documents linked to the tables involved. After "
+        "your Analysis section, on its own line, list ONLY the filenames (exactly "
+        "as shown in the ### headers above) whose content you actually drew on "
+        "to write this answer, e.g.:\n"
+        "DOCS_USED: Underwriting_Guidelines.txt\n"
+        "Use DOCS_USED: none if you didn't end up using any of them. "
+        "This line is required and will be removed before the user sees it."
+    )
     return "\n".join(lines) + "\n"
+
+
+_TABLE_REF_RE = re.compile(
+    r"\b(?:FROM|JOIN)\s+((?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_table_refs_from_sql(sql: str) -> List[str]:
+    """Best-effort fallback when the planner LLM's JSON omits table_refs for a
+    query that nonetheless ran and returned real rows — pull table names
+    straight out of FROM/JOIN clauses so a source is never silently dropped."""
+    return [m.group(1).replace('"', "") for m in _TABLE_REF_RE.finditer(sql or "")]
+
+
+def _build_sources(state: DialogState, used_documents: Optional[set] = None) -> list:
+    """Dedup list of {type, name} for the tables and documents that fed this
+    answer — table_refs from sql_queries (falling back to parsing the SQL
+    itself when the LLM omitted table_refs), plus file_name from
+    document_context.
+
+    document_context holds every document linked (via KG "mentions" edges) to
+    the tables retrieve_node selected — not necessarily documents the answer
+    actually drew on. used_documents, when provided, is the set of file names
+    the LLM self-reported actually using (see DOCS_USED parsing below) and is
+    used to filter document_context down to just those. None means "no
+    filtering info available" (e.g. no document_section was ever shown to the
+    LLM for this branch) — falls back to including everything attached.
+
+    Tables get the same "actually contributed" standard: sql_queries lists
+    every query the planner produced, but a query that errored out never fed
+    any data into the answer, so its table(s) are excluded — only queries with
+    a matching, error-free query_result count as a real source."""
+    succeeded_query_ids = {
+        qr["query_id"] for qr in (state.get("query_results") or [])
+        if not qr.get("error")
+    }
+    sources = []
+    seen = set()
+    for q in state.get("sql_queries") or []:
+        if q.get("query_id") not in succeeded_query_ids:
+            continue
+        table_refs = q.get("table_refs") or _extract_table_refs_from_sql(q.get("sql", ""))
+        for table in table_refs:
+            key = ("table", table)
+            if table and key not in seen:
+                seen.add(key)
+                sources.append({"type": "table", "name": table})
+    for doc in state.get("document_context") or []:
+        file_name = doc.get("file_name")
+        if not file_name or (used_documents is not None and file_name not in used_documents):
+            continue
+        key = ("document", file_name)
+        if key not in seen:
+            seen.add(key)
+            sources.append({"type": "document", "name": file_name})
+    return sources
+
+
+_DOCS_USED_RE = re.compile(r"^[ \t]*DOCS_USED:[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def _extract_docs_used(llm_output: str) -> "tuple[str, Optional[set]]":
+    """Strip the trailing DOCS_USED: line the LLM was instructed to append and
+    return (cleaned_output, set_of_file_names_actually_used). Returns
+    (llm_output, None) if the LLM didn't comply — callers should treat None as
+    'unknown' and fall back to the permissive (include-everything) behavior
+    rather than silently dropping legitimate sources."""
+    m = _DOCS_USED_RE.search(llm_output)
+    if not m:
+        return llm_output, None
+    cleaned = _DOCS_USED_RE.sub("", llm_output).rstrip()
+    raw = m.group(1).strip()
+    if not raw or raw.lower() in ("none", "n/a"):
+        return cleaned, set()
+    return cleaned, {n.strip() for n in re.split(r"[,|]", raw) if n.strip()}
 
 
 # ── LLM call ──────────────────────────────────────────────────────────────────
@@ -546,6 +632,9 @@ def synthesize_node(state: DialogState) -> DialogState:
             plan_explanation = ""
         if plan_explanation:
             state["insights"] = plan_explanation
+            # No document_section was ever shown to the LLM here — exclude
+            # documents entirely rather than falling back to "include all".
+            state["sources"] = _build_sources(state, used_documents=set())
             state["phase"] = "synthesize"
             return state
 
@@ -566,7 +655,9 @@ def synthesize_node(state: DialogState) -> DialogState:
                     getattr(config, "llm_temperature", 0.0),
                 )
                 if answer.strip():
-                    state["insights"] = answer
+                    cleaned, used_documents = _extract_docs_used(answer)
+                    state["insights"] = cleaned
+                    state["sources"] = _build_sources(state, used_documents=used_documents)
                     state["phase"] = "synthesize"
                     return state
             except Exception as exc:
@@ -584,6 +675,7 @@ def synthesize_node(state: DialogState) -> DialogState:
             "or all generated queries were rejected during validation."
             + detail
         )
+        state["sources"] = _build_sources(state, used_documents=set())
         state["phase"] = "synthesize"
         return state
 
@@ -646,6 +738,8 @@ def synthesize_node(state: DialogState) -> DialogState:
         logger.exception("synthesize_node: LLM call failed")
         llm_output = f"*Insight generation failed: {exc}*"
         state["errors"].append(f"synthesize_node: {exc}")
+
+    llm_output, used_documents = _extract_docs_used(llm_output)
 
     # ── Append programmatic ## Data section ───────────────────────────────────
     data_section = _build_data_section(query_results)
@@ -721,5 +815,6 @@ def synthesize_node(state: DialogState) -> DialogState:
         pass
 
     state["insights"] = insights
+    state["sources"] = _build_sources(state, used_documents=used_documents)
     state["phase"] = "synthesize"
     return state

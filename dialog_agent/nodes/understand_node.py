@@ -359,6 +359,20 @@ _COL_DOMAIN_PATTERNS: List[tuple] = [
 ]
 
 
+# ETL/audit housekeeping columns (row-load timestamps, etc.) are present on
+# almost every table by convention and will therefore always look like a
+# "shared column" — but they never encode a real relationship between two
+# entities, so a plan_node join on them silently matches nothing (or matches
+# spuriously) instead of erroring, which is worse than no join key at all.
+_AUDIT_COLUMN_RE = re.compile(
+    r"^(dw_)?(created|updated|modified|inserted|loaded)_?(at|date|ts|time|on)?$"
+    r"|^(etl_load|load|dw_load)_(date|ts|time)$"
+    r"|^(row|record)_(created|updated|inserted)_?(at|date)?$"
+    r"|^last_(updated|modified)_?(at|date)?$",
+    re.IGNORECASE,
+)
+
+
 def _infer_col_domain(col_name: str) -> Optional[str]:
     """
     Return a short domain role tag for a column based on its name alone.
@@ -740,7 +754,7 @@ def _summarise_graph(
     shared_cols = {
         col: tbls
         for col, tbls in col_to_tables.items()
-        if len(tbls) >= 2
+        if len(tbls) >= 2 and not _AUDIT_COLUMN_RE.match(col)
     }
 
     # 2. Explicit FK join pairs parsed from ObjectProperty rdfs:comments.

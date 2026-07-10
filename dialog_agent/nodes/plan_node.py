@@ -664,6 +664,21 @@ General Rules:
     d. If a column you need (e.g. SBU1) is only in Table A, write a query for
        Table A that retrieves it.  Write a second query for Table B with its
        own columns.  Do NOT try to bridge them without a valid join key.
+    e. NEVER join on an ETL/audit housekeeping column, even if it happens to
+       exist in both tables — these record when a row was loaded/modified,
+       not a relationship between two entities, so joining on them silently
+       returns zero (or spuriously wrong) rows instead of erroring loudly.
+       Column names to treat as ALWAYS INVALID join keys, regardless of what
+       "POSSIBLE JOIN KEYS" lists: DW_CREATED_AT, DW_UPDATED_AT, CREATED_AT,
+       UPDATED_AT, MODIFIED_AT, INSERTED_AT, LOAD_DATE, ETL_LOAD_DATE,
+       LAST_UPDATED, LAST_MODIFIED, ROW_CREATED_AT, ROW_UPDATED_AT, and any
+       column matching that *_CREATED_*/*_UPDATED_*/*_MODIFIED_*/*_LOAD_*
+       audit-timestamp pattern.
+       WRONG: JOIN table_b b ON a.DW_CREATED_AT = b.DW_CREATED_AT
+       If the only column two tables share is one of these, treat it as if
+       no join key exists at all — apply rule 10b.c (query separately), or
+       check whether the table you're already querying has a column of its
+       own that answers the question directly, without needing a join at all.
 10c. CO-OCCURRENCE QUESTIONS — when the question asks "did A and B happen together
     in the SAME period / same row / same entity", you MUST prove co-occurrence with
     a JOIN, not with two independent queries.
@@ -2707,6 +2722,32 @@ def _strip_join_aliases(sql: str, bad_aliases: set) -> Optional[str]:
         return None
 
 
+_AUDIT_JOIN_COL_RE = re.compile(
+    r"^(dw_)?(created|updated|modified|inserted|loaded)_?(at|date|ts|time|on)?$"
+    r"|^(etl_load|load|dw_load)_(date|ts|time)$"
+    r"|^(row|record)_(created|updated|inserted)_?(at|date)?$"
+    r"|^last_(updated|modified)_?(at|date)?$",
+    re.IGNORECASE,
+)
+
+
+def _find_audit_column_joins(sql: str) -> List[str]:
+    """Return audit/ETL housekeeping column names (e.g. DW_CREATED_AT,
+    UPDATED_AT) used in a JOIN ON clause. These are row-load/modify
+    timestamps, not real foreign keys — joining on them silently returns
+    zero or spuriously wrong rows instead of erroring, so a hard reject here
+    (rather than trusting the LLM to have followed rule 10b.e) is needed."""
+    on_blocks = re.findall(
+        r'\bON\b\s+(.+?)(?=\bWHERE\b|\bGROUP\b|\bORDER\b|\bHAVING\b|\bLIMIT\b|\bJOIN\b|$)',
+        sql, re.IGNORECASE | re.DOTALL,
+    )
+    if not on_blocks:
+        return []
+    on_text = " ".join(on_blocks)
+    col_refs = re.findall(r'\b\w+\.\"?([A-Za-z_][A-Za-z0-9_]*)\"?', on_text)
+    return sorted({c for c in col_refs if _AUDIT_JOIN_COL_RE.match(c.lower())})
+
+
 def _has_hallucinated_join(sql: str, bad_cols: List[str]) -> bool:
     """
     Return True if any of bad_cols appear in a context that cannot be salvaged
@@ -4548,6 +4589,31 @@ def plan_node(state: DialogState) -> DialogState:
                 reasons.append(
                     f"Query {item.get('query_id','?')} referenced {tables_in_sql} but "
                     "there are no valid join keys between those tables."
+                )
+                continue
+
+            # Audit/ETL housekeeping column used as a join key — e.g.
+            # DW_CREATED_AT. Always invalid regardless of what POSSIBLE JOIN
+            # KEYS lists, since these are row-load timestamps, not real FKs.
+            audit_join_cols = _find_audit_column_joins(sql)
+            if audit_join_cols:
+                logger.warning(
+                    "plan_node: dropping query %s — joined on audit/ETL column(s) %s",
+                    item.get("query_id", "?"), audit_join_cols,
+                )
+                state["errors"].append(
+                    f"plan_node: query {item.get('query_id','?')} skipped — "
+                    f"joined on audit/ETL housekeeping column(s) {audit_join_cols} "
+                    "(row-load timestamps, not a real relationship)"
+                )
+                reasons.append(
+                    f"Query {item.get('query_id','?')} joined on {audit_join_cols}, "
+                    "which are ETL/audit load-timestamp columns, not real foreign "
+                    "keys — they exist on almost every table but never encode a "
+                    "relationship between entities. If no other valid join key "
+                    "exists between these tables, query each one separately, or "
+                    "check whether the table you're already querying has its own "
+                    "column that answers the question without a join at all."
                 )
                 continue
 

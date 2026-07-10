@@ -222,6 +222,22 @@ function SqlDisclosure({ sql, open }) {
   );
 }
 
+function SourcesNote({ sources }) {
+  const tables = sources.filter((s) => s.type === 'table');
+  const documents = sources.filter((s) => s.type === 'document');
+  return (
+    <div className="sources-note">
+      <span className="sources-label">Sources:</span>
+      {tables.map((s, i) => (
+        <span key={`t-${i}`} className="source-chip source-chip-table" title="Database table">🗄️ {s.name}</span>
+      ))}
+      {documents.map((s, i) => (
+        <span key={`d-${i}`} className="source-chip source-chip-document" title="Document">📄 {s.name}</span>
+      ))}
+    </div>
+  );
+}
+
 export default function Message({ msg, showSQL }) {
   if (msg.role === 'user') {
     return (
@@ -246,6 +262,7 @@ export default function Message({ msg, showSQL }) {
   const results = msg.results || [];
   const sql = msg.sql || [];
   const errors = msg.errors || [];
+  const sources = msg.sources || [];
   const hasData = results.some((r) => (r.rows || []).length);
 
   const doPdf = () => {
@@ -286,6 +303,7 @@ export default function Message({ msg, showSQL }) {
           </div>
         )}
         {sql.length > 0 && <SqlDisclosure sql={sql} open={showSQL} />}
+        {sources.length > 0 && <SourcesNote sources={sources} />}
         {msg.cache_hit && <div className="cache-note">⚡ Served from cache</div>}
         <div className="insight-action-bar">
           <span className="insight-action-label">Export:</span>

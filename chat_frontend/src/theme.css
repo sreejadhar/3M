@@ -1566,6 +1566,20 @@ body {
 }
 .chart-wrap canvas { width: 100% !important; height: 100% !important; }
 
+/* Sources */
+.sources-note {
+  display:flex; align-items:center; gap:6px; flex-wrap:wrap;
+  margin-top:10px; font-size:12px; color:var(--clr-text-mute);
+}
+.sources-label { font-weight:600; }
+.source-chip {
+  display:inline-flex; align-items:center; gap:4px;
+  padding:2px 8px; border-radius:12px; background:var(--clr-surface-2, #f1f4f9);
+  border:1px solid var(--clr-border, #e3e8f0); font-size:12px;
+}
+.source-chip-table { color:var(--clr-primary); }
+.source-chip-document { color:#8a5cf6; }
+
 /* SQL disclosure */
 .sql-disclosure { margin-top:10px; }
 .sql-toggle {

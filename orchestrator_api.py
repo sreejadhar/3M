@@ -266,6 +266,7 @@ _AUTH_DB_PATH = Path(os.environ.get("DATA_DIR", "./data")) / "auth.db"
 
 # Seed users: env var name → email
 _SEED_USERS = [
+    ("SEED_PASSWORD_ANNAL",      "Annal.Tamizhnambi@cognizant.com"),
     ("SEED_PASSWORD_RIMNA",      "Rimna.Radhakrishnan@cognizant.com"),
     ("SEED_PASSWORD_IYER",       "Iyer.Kasinath@cognizant.com"),
     ("SEED_PASSWORD_SENTHEESH",  "Sentheesh.Lingam@cognizant.com"),
@@ -2597,6 +2598,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
         query_results = result.get("query_results") or []
         sql_queries   = result.get("sql_queries") or []
         errors        = result.get("errors") or []
+        sources       = result.get("sources") or []
 
         # Internal pipeline errors (plan_node SQL generation failures, schema
         # gaps, etc.) are useful for engineers but confusing to business users.
@@ -2619,6 +2621,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
             "results":       query_results,
             "sql":           sql_queries,
             "errors":        visible_errors,
+            "sources":       sources,
             "ts":            ai_ts,
         })
         _persist_session(session_id)
@@ -2630,6 +2633,7 @@ async def _run_dialog(session_id: str, msg_id: str, message: str, skip_cache: bo
             "results":       query_results,
             "sql":           sql_queries,
             "errors":        visible_errors,
+            "sources":       sources,
             "ts":            ai_ts,
             "cache_hit":     result.get("cache_hit", False),
         })

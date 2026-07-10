@@ -123,7 +123,51 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-buildx-${{ matrix.service.name }}-
 
-    - name: Build & Push ${{ matrix.service.name }}
+    # GCR pushes intermittently time out during the final auth/manifest-commit
+    # handshake (layers finish uploading, then "failed to authorize: DeadlineExceeded")
+    # — a transient flake on Google's side (GCR is being wound down in favor of
+    # Artifact Registry), unrelated to this service's own code. Retry up to 3
+    # times before actually failing the job.
+    - name: Build & Push ${{ matrix.service.name }} (attempt 1)
+      id: build_1
+      uses: docker/build-push-action@v5
+      continue-on-error: true
+      with:
+        context: .
+        file: ${{ matrix.service.dockerfile }}
+        push: true
+        tags: |
+          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:${{ github.sha }}
+          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:latest
+        cache-from: type=local,src=/tmp/.buildx-cache-${{ matrix.service.name }}
+        cache-to: type=local,dest=/tmp/.buildx-cache-${{ matrix.service.name }}-new,mode=max
+
+    - name: Wait before retry ${{ matrix.service.name }} (1)
+      if: steps.build_1.outcome == 'failure'
+      run: sleep 20
+
+    - name: Build & Push ${{ matrix.service.name }} (attempt 2)
+      id: build_2
+      if: steps.build_1.outcome == 'failure'
+      uses: docker/build-push-action@v5
+      continue-on-error: true
+      with:
+        context: .
+        file: ${{ matrix.service.dockerfile }}
+        push: true
+        tags: |
+          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:${{ github.sha }}
+          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:latest
+        cache-from: type=local,src=/tmp/.buildx-cache-${{ matrix.service.name }}
+        cache-to: type=local,dest=/tmp/.buildx-cache-${{ matrix.service.name }}-new,mode=max
+
+    - name: Wait before retry ${{ matrix.service.name }} (2)
+      if: steps.build_1.outcome == 'failure' && steps.build_2.outcome == 'failure'
+      run: sleep 20
+
+    - name: Build & Push ${{ matrix.service.name }} (attempt 3)
+      id: build_3
+      if: steps.build_1.outcome == 'failure' && steps.build_2.outcome == 'failure'
       uses: docker/build-push-action@v5
       with:
         context: .

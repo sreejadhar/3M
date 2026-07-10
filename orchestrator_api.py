@@ -267,6 +267,7 @@ _AUTH_DB_PATH = Path(os.environ.get("DATA_DIR", "./data")) / "auth.db"
 # Seed users: env var name → email
 _SEED_USERS = [
     ("SEED_PASSWORD_ANNAL",      "Annal.Tamizhnambi@cognizant.com"),
+    ("SEED_PASSWORD_SIVAKUMAR",      "Sivakumar.Shanmugam2@cognizant.com"),
     ("SEED_PASSWORD_RIMNA",      "Rimna.Radhakrishnan@cognizant.com"),
     ("SEED_PASSWORD_IYER",       "Iyer.Kasinath@cognizant.com"),
     ("SEED_PASSWORD_SENTHEESH",  "Sentheesh.Lingam@cognizant.com"),

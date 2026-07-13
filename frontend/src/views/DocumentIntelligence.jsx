@@ -3,7 +3,7 @@ import { useAppState } from '../state.jsx';
 import { IconDocuments, IconPlus, IconRefresh } from '../components/Icons.jsx';
 import {
   docListSources, docCreateSource, docDeleteSource, docStartIndex, docListAssets,
-  docGetAsset, docUploadDocument, fsBrowse,
+  docGetAsset, docUploadDocument,
 } from '../api/clients.js';
 
 const STEP_ICON = { pending: '○', running: '◐', done: '●', error: '✖', skipped: '⊘' };
@@ -21,7 +21,7 @@ const CONNECTORS = [
 ];
 
 const CONNECTOR_FIELDS = {
-  local:      [['root_path', 'Folder path', 'C:\\path\\to\\documents']],
+  local:      [],
   s3:         [['bucket', 'Bucket'], ['prefix', 'Prefix (optional)'], ['region', 'Region (optional)'],
                ['aws_access_key_id', 'Access key ID'], ['aws_secret_access_key', 'Secret access key', 'password']],
   gdrive:     [['folder_id', 'Folder ID'], ['access_token', 'OAuth access token', 'password']],
@@ -434,13 +434,28 @@ function AddDocSourceModal({ onClose, onCreated }) {
   const [connectorType, setConnectorType] = useState('local');
   const [config, setConfig] = useState({});
   const [busy, setBusy] = useState(false);
-  const [browserOpen, setBrowserOpen] = useState(false);
+  const [localFiles, setLocalFiles] = useState([]);
+  const localFileInputRef = useRef(null);
 
   const fields = CONNECTOR_FIELDS[connectorType] || [];
 
   function onTypeChange(t) {
     setConnectorType(t);
     setConfig({});
+    setLocalFiles([]);
+  }
+
+  function addLocalFiles(fileList) {
+    const picked = Array.from(fileList);
+    setLocalFiles((prev) => {
+      const key = (f) => `${f.name}:${f.size}`;
+      const seen = new Set(prev.map(key));
+      return [...prev, ...picked.filter((f) => !seen.has(key(f)))];
+    });
+  }
+
+  function removeLocalFile(index) {
+    setLocalFiles((prev) => prev.filter((_, i) => i !== index));
   }
 
   async function submit() {
@@ -448,11 +463,31 @@ function AddDocSourceModal({ onClose, onCreated }) {
       toast('Source name is required', 'warn');
       return;
     }
+    if (connectorType === 'local' && localFiles.length === 0) {
+      toast('Choose at least one file to upload', 'warn');
+      return;
+    }
     setBusy(true);
     try {
-      const created = await docCreateSource({ name: name.trim(), connector_type: connectorType, config });
-      await docStartIndex(created.source_id);
-      toast(`Source "${name.trim()}" added — indexing started`, 'success');
+      if (connectorType === 'local') {
+        const created = await docCreateSource({ name: name.trim(), connector_type: connectorType, config: {} });
+        let failed = 0;
+        for (const file of localFiles) {
+          try {
+            await docUploadDocument(created.source_id, file);
+          } catch (e) {
+            failed += 1;
+            toast(`"${file.name}" failed to upload: ${e.message}`, 'error');
+          }
+        }
+        const okCount = localFiles.length - failed;
+        toast(`Source "${name.trim()}" added — ${okCount} file(s) uploaded${failed ? `, ${failed} failed` : ''}`,
+          failed ? 'warn' : 'success');
+      } else {
+        const created = await docCreateSource({ name: name.trim(), connector_type: connectorType, config });
+        await docStartIndex(created.source_id);
+        toast(`Source "${name.trim()}" added — indexing started`, 'success');
+      }
       onCreated();
     } catch (e) {
       toast(`Add source failed: ${e.message}`, 'error');
@@ -483,28 +518,53 @@ function AddDocSourceModal({ onClose, onCreated }) {
           </select>
         </div>
 
+        {connectorType === 'local' && (
+          <div className="form-row">
+            <label>Files</label>
+            <div>
+              <input
+                ref={localFileInputRef}
+                type="file"
+                multiple
+                accept=".txt,.md,.csv,.html,.htm,.rst,.docx,.doc,.pdf,.pptx,.ppt,.xlsx,.xls"
+                style={{ display: 'none' }}
+                onChange={(e) => { addLocalFiles(e.target.files); e.target.value = ''; }}
+              />
+              <button type="button" className="btn btn-secondary" onClick={() => localFileInputRef.current?.click()}>
+                Upload Files
+              </button>
+              {localFiles.length > 0 && (
+                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  {localFiles.map((f, i) => (
+                    <div key={`${f.name}-${f.size}-${i}`} style={{
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                      fontSize: 12, padding: '4px 8px', background: 'var(--bg-1)', borderRadius: 'var(--radius)',
+                    }}>
+                      <span>{f.name} <span style={{ color: 'var(--text-2)' }}>({fmtBytes(f.size)})</span></span>
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        style={{ fontSize: 11, padding: '0 6px', color: 'var(--red, #f87171)' }}
+                        onClick={() => removeLocalFile(i)}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {fields.map(([key, label, type]) => (
           <div className="form-row" key={key}>
             <label>{label}</label>
-            {connectorType === 'local' && key === 'root_path' ? (
-              <div style={{ display: 'flex', gap: 6 }}>
-                <input
-                  style={{ flex: 1 }}
-                  value={config[key] || ''}
-                  onChange={(e) => setConfig((c) => ({ ...c, [key]: e.target.value }))}
-                  placeholder="C:\path\to\documents"
-                />
-                <button type="button" className="btn btn-secondary" onClick={() => setBrowserOpen(true)}>
-                  Browse…
-                </button>
-              </div>
-            ) : (
-              <input
-                type={type === 'password' ? 'password' : 'text'}
-                value={config[key] || ''}
-                onChange={(e) => setConfig((c) => ({ ...c, [key]: e.target.value }))}
-              />
-            )}
+            <input
+              type={type === 'password' ? 'password' : 'text'}
+              value={config[key] || ''}
+              onChange={(e) => setConfig((c) => ({ ...c, [key]: e.target.value }))}
+            />
           </div>
         ))}
 
@@ -512,96 +572,11 @@ function AddDocSourceModal({ onClose, onCreated }) {
           <button className="btn btn-ghost" onClick={onClose} disabled={busy}>Cancel</button>
           <button className="btn btn-primary" onClick={submit} disabled={busy}>
             <IconPlus width="14" height="14" />
-            {busy ? 'Working…' : 'Connect & Index'}
-          </button>
-        </div>
-      </div>
-
-      {browserOpen && (
-        <FolderBrowserModal
-          initialPath={config.root_path || ''}
-          onClose={() => setBrowserOpen(false)}
-          onSelect={(path) => { setConfig((c) => ({ ...c, root_path: path })); setBrowserOpen(false); }}
-        />
-      )}
-    </div>
-  );
-}
-
-function FolderBrowserModal({ initialPath, onClose, onSelect }) {
-  const { toast } = useAppState();
-  const [current, setCurrent] = useState(null);   // { path, parent, entries }
-  const [loading, setLoading] = useState(true);
-
-  async function load(path) {
-    setLoading(true);
-    try {
-      const data = await fsBrowse(path);
-      setCurrent(data);
-    } catch (e) {
-      toast(`Could not browse folder: ${e.message}`, 'error');
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => { load(initialPath); }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  return (
-    <div
-      id="modal-overlay"
-      className="open"
-      style={{ zIndex: 10001 }}
-      onMouseDown={(e) => e.target.id === 'modal-overlay' && onClose()}
-    >
-      <div className="modal" style={{ maxWidth: 480 }}>
-        <div className="modal-title">Choose a Folder</div>
-
-        <div style={{
-          fontSize: 12, color: 'var(--text-2)', marginBottom: 8, wordBreak: 'break-all',
-          fontFamily: 'var(--font-mono)',
-        }}>
-          {current?.path || '(drives)'}
-        </div>
-
-        <div style={{
-          border: '1px solid var(--border)', borderRadius: 'var(--radius)',
-          height: 260, overflowY: 'auto',
-        }}>
-          {loading && <div className="empty-state" style={{ fontSize: 13 }}>Loading…</div>}
-          {!loading && current?.parent != null && (
-            <div
-              onClick={() => load(current.parent)}
-              style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid var(--border)', fontSize: 13 }}
-            >
-              .. (up)
-            </div>
-          )}
-          {!loading && current?.entries?.length === 0 && (
-            <div className="empty-state" style={{ fontSize: 13 }}>No subfolders here.</div>
-          )}
-          {!loading && current?.entries?.map((entry) => (
-            <div
-              key={entry.path}
-              onClick={() => load(entry.path)}
-              style={{ padding: '8px 12px', cursor: 'pointer', borderBottom: '1px solid var(--border)', fontSize: 13 }}
-            >
-              📁 {entry.name}
-            </div>
-          ))}
-        </div>
-
-        <div className="modal-actions">
-          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
-          <button
-            className="btn btn-primary"
-            disabled={!current?.path}
-            onClick={() => onSelect(current.path)}
-          >
-            Select This Folder
+            {busy ? 'Working…' : (connectorType === 'local' ? 'Connect & Upload' : 'Connect & Index')}
           </button>
         </div>
       </div>
     </div>
   );
 }
+

@@ -4518,6 +4518,18 @@ def plan_node(state: DialogState) -> DialogState:
     valid_join_pairs = _extract_valid_join_pairs(schema_context)
     logger.debug("plan_node: %d valid join pair(s) extracted from schema context", len(valid_join_pairs))
 
+    # Mandatory-filter enforcement setup (PostgreSQL only — see the drop check
+    # inside _validate_plan_items below for why this exists).
+    _pg_dialect = config.db_type.lower() in ("postgres", "postgresql")
+    _mandatory_fragments = [
+        r.get("sql_fragment", "").strip()
+        for r in term_resolution
+        if r.get("sql_fragment") and not r.get("no_match")
+    ]
+
+    def _normalize_sql_fragment(s: str) -> str:
+        return re.sub(r"\s+", " ", s or "").strip().lower()
+
     def _validate_plan_items(
         plan_items: List[Dict],
         offset: int = 0,
@@ -4616,6 +4628,42 @@ def plan_node(state: DialogState) -> DialogState:
                     "column that answers the question without a join at all."
                 )
                 continue
+
+            # Mandatory entity/category filter enforcement (PostgreSQL only) —
+            # resolve_node pre-resolves free-text terms (e.g. a customer name)
+            # into an exact sql_fragment that the prompt tells the LLM is
+            # MANDATORY for every query in this plan. That instruction is only
+            # prose, so nothing previously stopped one query in a multi-query
+            # plan (e.g. a supplementary aggregate) from silently dropping the
+            # fragment and returning an unfiltered, whole-table number that
+            # synthesize_node then narrates as if it were entity-scoped. Drop
+            # any query that omits a mandatory fragment rather than execute it.
+            if _pg_dialect and _mandatory_fragments:
+                missing_fragments = [
+                    frag for frag in _mandatory_fragments
+                    if _normalize_sql_fragment(frag) not in _normalize_sql_fragment(sql)
+                ]
+                if missing_fragments:
+                    logger.warning(
+                        "plan_node: dropping query %s — missing mandatory pre-resolved "
+                        "filter fragment(s) required for this question: %s",
+                        item.get("query_id", "?"), missing_fragments,
+                    )
+                    state["errors"].append(
+                        f"plan_node: query {item.get('query_id','?')} skipped — "
+                        f"omitted mandatory filter fragment(s) {missing_fragments} from "
+                        "PRE-RESOLVED CATEGORY MAPPINGS, which would have returned an "
+                        "unfiltered/whole-table result mislabeled as entity-scoped."
+                    )
+                    reasons.append(
+                        f"Query {item.get('query_id','?')} did not include the "
+                        f"required filter fragment(s) {missing_fragments} from the "
+                        "PRE-RESOLVED CATEGORY MAPPINGS section. Every query in this "
+                        "plan MUST include every mandatory sql_fragment verbatim, "
+                        "unless the query is explicitly an unfiltered benchmark/"
+                        "comparison the user asked for by name."
+                    )
+                    continue
 
             # Column hallucination check
             if known_columns:

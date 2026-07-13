@@ -215,6 +215,20 @@ async def get_asset_excerpt(asset_id: str, max_chars: int = 1200):
     }
 
 
+def _run_upload_pipeline(asset_id: str, dest_path: str, store: DocStore, source_id: str) -> None:
+    """Runs the per-asset processing pipeline, then flips the source's status
+    back to 'ready' only once every asset on it has finished — so the source
+    list's status doesn't say "Ready" while files are still processing, and
+    correctly shows "Indexing…" for the whole time any upload on it is still
+    running (including other files uploaded concurrently)."""
+    process_uploaded_asset(asset_id, dest_path, store)
+    still_running = any(
+        a.get("processing_status") == "running" for a in store.list_assets(source_id, limit=10_000)
+    )
+    if not still_running:
+        store.set_source_status(source_id, "ready")
+
+
 @app.post("/sources/{source_id}/upload")
 async def upload_document(source_id: str, file: UploadFile = File(...)):
     """Uploads a document to a source and runs it through the processing
@@ -243,8 +257,9 @@ async def upload_document(source_id: str, file: UploadFile = File(...)):
         local_path=str(dest_path),
     )
 
+    store.set_source_status(source_id, "indexing")
     thread = threading.Thread(
-        target=process_uploaded_asset, args=(asset_id, str(dest_path), store), daemon=True,
+        target=_run_upload_pipeline, args=(asset_id, str(dest_path), store, source_id), daemon=True,
     )
     thread.start()
     return store.get_asset(asset_id)

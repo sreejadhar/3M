@@ -4518,9 +4518,14 @@ def plan_node(state: DialogState) -> DialogState:
     valid_join_pairs = _extract_valid_join_pairs(schema_context)
     logger.debug("plan_node: %d valid join pair(s) extracted from schema context", len(valid_join_pairs))
 
-    # Mandatory-filter enforcement setup (PostgreSQL only — see the drop check
-    # inside _validate_plan_items below for why this exists).
-    _pg_dialect = config.db_type.lower() in ("postgres", "postgresql")
+    # Mandatory-filter enforcement setup — applies to PostgreSQL and every
+    # file-based dialect (Excel/CSV/SQLite all load into the same in-memory
+    # SQLite engine via _is_file_based), since the underlying bug (an LLM-
+    # generated sub-query silently dropping a resolved mandatory filter) is
+    # dialect-agnostic. See the drop check inside _validate_plan_items below.
+    _enforce_mandatory_filters = (
+        config.db_type.lower() in ("postgres", "postgresql") or _is_file_based
+    )
     _mandatory_fragments = [
         r.get("sql_fragment", "").strip()
         for r in term_resolution
@@ -4629,16 +4634,18 @@ def plan_node(state: DialogState) -> DialogState:
                 )
                 continue
 
-            # Mandatory entity/category filter enforcement (PostgreSQL only) —
-            # resolve_node pre-resolves free-text terms (e.g. a customer name)
-            # into an exact sql_fragment that the prompt tells the LLM is
-            # MANDATORY for every query in this plan. That instruction is only
-            # prose, so nothing previously stopped one query in a multi-query
-            # plan (e.g. a supplementary aggregate) from silently dropping the
-            # fragment and returning an unfiltered, whole-table number that
-            # synthesize_node then narrates as if it were entity-scoped. Drop
-            # any query that omits a mandatory fragment rather than execute it.
-            if _pg_dialect and _mandatory_fragments:
+            # Mandatory entity/category filter enforcement (PostgreSQL + every
+            # file-based dialect — Excel/CSV/SQLite) — resolve_node pre-resolves
+            # free-text terms (e.g. a customer name) into an exact sql_fragment
+            # that the prompt tells the LLM is MANDATORY for every query in this
+            # plan. That instruction is only prose, so nothing previously
+            # stopped one query in a multi-query plan (e.g. a supplementary
+            # aggregate) from silently dropping the fragment and returning an
+            # unfiltered, whole-table number that synthesize_node then narrates
+            # as if it were entity-scoped — regardless of which entity was
+            # actually asked about. Drop any query that omits a mandatory
+            # fragment rather than execute it.
+            if _enforce_mandatory_filters and _mandatory_fragments:
                 missing_fragments = [
                     frag for frag in _mandatory_fragments
                     if _normalize_sql_fragment(frag) not in _normalize_sql_fragment(sql)

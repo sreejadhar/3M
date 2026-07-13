@@ -1,10 +1,12 @@
-"""Isolated test for the new mandatory-filter drop check in plan_node.py.
+"""Isolated test for the mandatory-filter drop check in plan_node.py.
 
 Mocks the LLM call so no network/API access is needed, and exercises the
 real plan_node() function end-to-end against a canned 2-query plan: one
-query correctly includes the resolved customer filter, the other omits it
-(the exact shape of the reported bug). Asserts the offending query is
-dropped and the compliant one survives.
+query correctly includes a resolved entity filter, the other omits it
+(the general shape of the reported bug — not tied to any specific person).
+Asserts the offending query is dropped for every dialect the check now
+covers (PostgreSQL + every file-based dialect: Excel, CSV, SQLite), and
+left alone for dialects outside that scope.
 """
 import json
 import sys
@@ -38,17 +40,24 @@ from dialog_agent.state import DialogState
 CANNED_PLAN = json.dumps([
     {
         "query_id": "q1",
-        "description": "Kevin Taylor's claim count",
-        "sql": "SELECT COUNT(*) AS claim_count FROM fact_claim WHERE customer_key = 7",
+        "description": "Resolved entity's claim count",
+        "sql": "SELECT COUNT(*) AS claim_count FROM fact_claim WHERE customer_key = 42",
         "table_refs": ["fact_claim"],
     },
     {
         "query_id": "q2",
-        "description": "Total appeals filed (BUG: forgot the customer filter)",
+        "description": "Total appeals filed (BUG: forgot the resolved entity filter)",
         "sql": "SELECT COUNT(*) AS appeal_count FROM fact_claim_appeal",
         "table_refs": ["fact_claim_appeal"],
     },
 ])
+
+# Dialects the mandatory-filter check now covers (Postgres + all file-based
+# sources — Excel/CSV/SQLite all route through the same in-memory SQLite
+# engine per _is_file_based in plan_node.py).
+COVERED_DIALECTS = ["postgres", "postgresql", "excel", "csv", "sqlite"]
+# Dialects it deliberately does NOT touch.
+UNCOVERED_DIALECTS = ["snowflake", "redshift", "bigquery", "sqlserver"]
 
 
 def run_case(db_type: str):
@@ -64,7 +73,7 @@ def run_case(db_type: str):
     config = DialogConfig(db_type=db_type, db_schema="claim_underwriting")
     state = DialogState(
         config=config,
-        natural_query="Give me insight on Kevin Taylor's claims and appeals",
+        natural_query="Give me insight on this customer's claims and appeals",
         schema_context="TABLE fact_claim (claim_key, customer_key, ...)\nTABLE fact_claim_appeal (appeal_key, claim_key, ...)",
         kg_nodes=[],
         kg_edges=[],
@@ -77,10 +86,10 @@ def run_case(db_type: str):
         categorical_columns={},
         column_hierarchy={},
         term_resolution=[{
-            "user_term": "Kevin Taylor",
+            "user_term": "<resolved entity>",
             "column": "customer_key",
-            "matched_values": [7],
-            "sql_fragment": "customer_key = 7",
+            "matched_values": [42],
+            "sql_fragment": "customer_key = 42",
             "reasoning": "matched DIM_CUSTOMER.customer_key",
             "no_match": False,
         }],
@@ -100,12 +109,16 @@ def run_case(db_type: str):
 
 
 if __name__ == "__main__":
-    pg_ids, pg_errors = run_case("postgres")
-    assert "q1" in pg_ids, "q1 (correctly filtered) should survive"
-    assert "q2" not in pg_ids, "q2 (missing mandatory filter) should be DROPPED for postgres"
-    assert any("omitted mandatory filter fragment" in e for e in pg_errors), "expected drop reason logged"
-    print("\nPASS: postgres — q2 correctly dropped, q1 survives.")
+    for dialect in COVERED_DIALECTS:
+        ids, errors = run_case(dialect)
+        assert "q1" in ids, f"q1 (correctly filtered) should survive for {dialect}"
+        assert "q2" not in ids, f"q2 (missing mandatory filter) should be DROPPED for {dialect}"
+        assert any("omitted mandatory filter fragment" in e for e in errors), f"expected drop reason logged for {dialect}"
+        print(f"PASS: {dialect} — q2 correctly dropped, q1 survives.")
 
-    other_ids, _ = run_case("snowflake")
-    assert "q1" in other_ids and "q2" in other_ids, "non-postgres dialects must be unaffected by this fix"
-    print("PASS: snowflake — unaffected (both queries survive), confirming the fix is scoped to postgres only.")
+    for dialect in UNCOVERED_DIALECTS:
+        ids, _ = run_case(dialect)
+        assert "q1" in ids and "q2" in ids, f"{dialect} must be unaffected by this fix"
+        print(f"PASS: {dialect} — unaffected (both queries survive), confirming the fix's scope.")
+
+    print("\nALL PASS")

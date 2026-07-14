@@ -173,8 +173,22 @@ class DocStore:
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            # Every upload spins up its own background thread that writes to
+            # this same file (create_source, then several update_asset_processing
+            # calls per file as it moves through the pipeline) — with several
+            # files uploaded close together, that's several threads writing
+            # concurrently. The default rollback-journal mode takes an
+            # exclusive lock on the whole file per write and a 5s busy
+            # timeout, which isn't enough headroom once a handful of threads
+            # are contending; a writer that loses the race raises
+            # "database is locked" as an unhandled OperationalError. WAL
+            # lets readers and a writer proceed concurrently, and the longer
+            # timeout gives queued writers more room to wait their turn
+            # instead of failing outright.
+            conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=30.0)
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
             self._local.conn = conn
         return conn
 

@@ -269,3 +269,16 @@ async def upload_document(source_id: str, file: UploadFile = File(...)):
 async def connector_error_handler(request, exc: ConnectorError):
     from fastapi.responses import JSONResponse
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc: Exception):
+    """Without this, FastAPI's default 500 response body is just
+    {"detail": "Internal Server Error"} — the real exception only shows up
+    in the pod's stdout, which isn't reachable without cluster access. This
+    logs the full traceback (still visible via `kubectl logs` when someone
+    has access) *and* returns the actual message to the caller, so the
+    toast the user sees is actually actionable."""
+    from fastapi.responses import JSONResponse
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})

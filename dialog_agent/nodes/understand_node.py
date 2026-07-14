@@ -358,6 +358,15 @@ _COL_DOMAIN_PATTERNS: List[tuple] = [
      )),
 ]
 
+# claim_underwriting-only: a person's name column (applicant, beneficiary, agent,
+# underwriter, reviewer, policyholder) must never be confused with an identifier
+# column like policy_id. Scoped to this one schema via the db_schema check in
+# _infer_col_domain so it cannot change tagging for any other data source.
+_CLAIM_UNDERWRITING_PERSON_NAME_RE = re.compile(
+    r'(applicant|customer|beneficiary|agent|underwriter|reviewer|policyholder|insured)_name$',
+    re.I,
+)
+
 
 # ETL/audit housekeeping columns (row-load timestamps, etc.) are present on
 # almost every table by convention and will therefore always look like a
@@ -373,12 +382,15 @@ _AUDIT_COLUMN_RE = re.compile(
 )
 
 
-def _infer_col_domain(col_name: str) -> Optional[str]:
+def _infer_col_domain(col_name: str, db_schema: str = "") -> Optional[str]:
     """
     Return a short domain role tag for a column based on its name alone.
     Returns None if no pattern matches (to avoid noisy annotations).
     """
     lower = col_name.lower()
+    # claim_underwriting-only override — see _CLAIM_UNDERWRITING_PERSON_NAME_RE.
+    if (db_schema or "").lower() == "claim_underwriting" and _CLAIM_UNDERWRITING_PERSON_NAME_RE.search(lower):
+        return "person_name"
     for role, pat in _COL_DOMAIN_PATTERNS:
         if pat.search(lower):
             return role
@@ -911,7 +923,7 @@ def _summarise_graph(
                     # and semantic concept hint so the planner can identify metric
                     # numerators/denominators and bridge column names to business terms.
                     col_name_for_domain = sql_col if samples is not None else original_col
-                    domain_tag = _infer_col_domain(col_name_for_domain)
+                    domain_tag = _infer_col_domain(col_name_for_domain, db_schema)
 
                     # Concept resolution: prefer KG-stored LLM annotation (stored
                     # at index time by build_node as "Business concept: <label>")

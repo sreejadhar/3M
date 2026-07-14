@@ -504,6 +504,7 @@ DO NOT use syntax from any other database.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {dialect_rules}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{schema_specific_rules}\
 
 General Rules:
 1. Return ONLY a JSON array — no prose, no markdown fences.
@@ -4256,12 +4257,38 @@ def plan_node(state: DialogState) -> DialogState:
     else:
         analyst_role_prefix = ""
 
+    # claim_underwriting-only rule: policy_id is an identifier, never a name-match
+    # target, and "policy evaluation/decision" questions mean FACT_UNDERWRITING_DECISION,
+    # not fact_claim/dim_policy (a claim filed against an already-issued policy is a
+    # different concept). Gated on db_schema so no other data source's prompt changes.
+    if db_schema.lower() == "claim_underwriting":
+        schema_specific_rules = (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CLAIM_UNDERWRITING SCHEMA — DOMAIN-SPECIFIC RULES\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "- A person's name (applicant, customer, beneficiary, agent, underwriter,\n"
+            "  reviewer, policyholder) must be filtered against a *_name column — e.g.\n"
+            "  FACT_UNDERWRITING_DECISION.applicant_name. NEVER filter a person's name\n"
+            "  against an *_id / *_key / *_code identifier column such as\n"
+            "  dim_policy.policy_id, even if no exact *_name column filter was found\n"
+            "  in another candidate table.\n"
+            "- Questions about a policy \"evaluation\", \"decision\", \"approval\",\n"
+            "  \"rejection\", \"underwriting\", or \"risk assessment\" refer to\n"
+            "  FACT_UNDERWRITING_DECISION (decision, uw_status, risk_score,\n"
+            "  applicant_name, ...) — NOT fact_claim / dim_policy, which represent a\n"
+            "  claim filed against an already-issued policy, a different concept.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+    else:
+        schema_specific_rules = ""
+
     system = _SYSTEM_PROMPT.format(
         row_limit=config.row_limit,
         max_queries=config.max_sql_queries,
         db_label=db_label,
         dialect_rules=_build_dialect_rules(config.db_type),
         analyst_role_prefix=analyst_role_prefix,
+        schema_specific_rules=schema_specific_rules,
     )
     schema_line = (
         f"TARGET SCHEMA: {db_schema}"

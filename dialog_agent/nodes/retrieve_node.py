@@ -257,6 +257,16 @@ def _expand_table_name(label: str) -> str:
         hints.append("customer account client buyer")
     if re.search(r'\bperiod\b|\btime\b|\bdate\b|\bcalendar\b|\bfiscal\b', lower):
         hints.append("period time date calendar fiscal trailing rolling")
+    # claim_underwriting-only: FACT_UNDERWRITING_DECISION otherwise loses retrieval
+    # ranking to dim_policy for any question containing the word "policy" (e.g.
+    # "evaluation of the policy requested by <name>") because "policy" never
+    # appears in this table's own name/columns. Gated on the literal "underwriting"
+    # token in the table name, so this cannot affect any other schema's tables.
+    if re.search(r'\bunderwriting\b', lower):
+        hints.append(
+            "policy application evaluation underwriting decision risk assessment "
+            "approval rejection applicant"
+        )
 
     if hints:
         return f"{parts} {' '.join(hints)}"

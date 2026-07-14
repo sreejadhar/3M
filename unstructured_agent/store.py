@@ -94,6 +94,11 @@ _SOURCE_MIGRATION_COLUMNS = [
     ("status", "TEXT NOT NULL DEFAULT 'idle'"),
     ("error_message", "TEXT"),
     ("indexed_at", "TEXT"),
+    # Added after doc_sources already existed on some deployed DBs — those
+    # rows predate connector types other than "local", so that's the safe
+    # backfill default rather than leaving it NULL (the column is NOT NULL
+    # in _SCHEMA for fresh tables).
+    ("connector_type", "TEXT NOT NULL DEFAULT 'local'"),
 ]
 
 class DocStore:

@@ -125,10 +125,29 @@ class DocStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
         self._local = threading.local()
-        self._conn().executescript(_SCHEMA)
+        # Must run before executescript(_SCHEMA): "CREATE TABLE IF NOT
+        # EXISTS doc_sources/doc_assets" would otherwise silently conjure a
+        # fresh empty table the moment a prior rebuild crashed between
+        # DROP TABLE and the final rename, masking the "table is missing"
+        # signal _finish_interrupted_rebuild relies on to recover the
+        # fully-migrated data still sitting in the "*__rebuild" table.
+        conn = self._conn()
+        for table in ("doc_sources", "doc_assets"):
+            self._finish_interrupted_rebuild(conn, table)
+        conn.executescript(_SCHEMA)
         self._migrate()
         self._conn().commit()
         self._sweep_orphaned_running()
+
+    @staticmethod
+    def _finish_interrupted_rebuild(conn: sqlite3.Connection, table: str) -> None:
+        rebuilt = f"{table}__rebuild"
+        live_tables = {row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?, ?)", (table, rebuilt)
+        )}
+        if table not in live_tables and rebuilt in live_tables:
+            conn.execute(f"ALTER TABLE {rebuilt} RENAME TO {table}")
+            conn.commit()
 
     def _sweep_orphaned_running(self) -> None:
         """Marks anything left in 'running' as failed on startup.
@@ -181,18 +200,66 @@ class DocStore:
             )
 
     def _migrate(self) -> None:
-        """Adds columns introduced after these tables already existed (SQLite
-        has no `ALTER TABLE ADD COLUMN IF NOT EXISTS`). Schema-driven against
-        _SOURCE_COLUMNS/_ASSET_COLUMNS rather than a one-off list, so a
-        deployed DB that's missing several generations of columns catches up
-        to the current shape in a single pass instead of one column per
-        deploy."""
+        """Brings a deployed table's actual shape in line with _SCHEMA.
+
+        Past rewrites renamed/dropped columns in _SCHEMA (source_type ->
+        connector_type, connection_json -> config_json, plus domain/enabled/
+        nanite_source_id/updated_at dropped entirely) without ever touching
+        already-deployed DB files — SQLite doesn't rename or drop columns on
+        its own, and ADD-COLUMN-only migration can't remove them either. The
+        orphaned old columns stay behind, some still NOT NULL with no
+        default, so any INSERT that (correctly) doesn't set them raises
+        IntegrityError. That already hit source_type; updated_at is the same
+        trap waiting on the same legacy rows.
+
+        Rebuilding is the only way to guarantee the on-disk shape actually
+        matches _SOURCE_COLUMNS/_ASSET_COLUMNS: create a table with exactly
+        that shape, copy over whatever columns still exist — under their
+        current name, or under a known former name via `renames` so a real
+        connector_type like "s3" (stored as source_type pre-rewrite) isn't
+        silently reset to the "local" default — then swap it in. Columns
+        with neither a current nor a former match come from their own
+        DEFAULT since they're absent from the INSERT's column list. No-ops
+        (PRAGMA table_info + a set comparison) when the table already
+        matches, which is the common case on every startup after the first
+        rebuild."""
         conn = self._conn()
-        for table, columns in (("doc_assets", _ASSET_COLUMNS), ("doc_sources", _SOURCE_COLUMNS)):
-            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-            for col, decl in columns:
-                if col not in existing:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        self._rebuild_if_stale(conn, "doc_sources", "source_id", _SOURCE_COLUMNS,
+                                renames={"connector_type": "source_type", "config_json": "connection_json"})
+        self._rebuild_if_stale(conn, "doc_assets", "asset_id", _ASSET_COLUMNS,
+                                extra_sql=", UNIQUE(source_id, remote_id)")
+
+    @staticmethod
+    def _rebuild_if_stale(conn: sqlite3.Connection, table: str, pk: str,
+                           columns: list, extra_sql: str = "", renames: dict = None) -> None:
+        renames = renames or {}
+        rebuilt = f"{table}__rebuild"
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        target = {pk} | {col for col, _ in columns}
+        if existing == target:
+            return
+        conn.execute(f"DROP TABLE IF EXISTS {rebuilt}")
+        col_decls = ",\n    ".join(f"{col} {decl}" for col, decl in columns)
+        conn.execute(
+            f"CREATE TABLE {rebuilt} (\n"
+            f"    {pk} TEXT PRIMARY KEY,\n    {col_decls}{extra_sql}\n)"
+        )
+        insert_cols, select_exprs = [pk], [pk]
+        for col, _ in columns:
+            if col in existing:
+                insert_cols.append(col)
+                select_exprs.append(col)
+            elif renames.get(col) in existing:
+                insert_cols.append(col)
+                select_exprs.append(renames[col])
+        conn.execute(
+            f"INSERT INTO {rebuilt} ({', '.join(insert_cols)}) "
+            f"SELECT {', '.join(select_exprs)} FROM {table}"
+        )
+        conn.commit()
+        conn.execute(f"DROP TABLE {table}")
+        conn.execute(f"ALTER TABLE {rebuilt} RENAME TO {table}")
+        conn.commit()
 
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)

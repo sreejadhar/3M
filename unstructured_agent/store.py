@@ -76,7 +76,37 @@ CREATE TABLE IF NOT EXISTS schema_embeddings (
 """
 
 
-_ASSET_MIGRATION_COLUMNS = [
+# Full column list per table, in the exact declarations _SCHEMA above uses.
+# _migrate() diffs this against PRAGMA table_info and ALTER TABLEs in
+# whatever is missing — so a deployed DB stuck on an old table shape (e.g.
+# one created before connector_type or config_json existed) self-heals for
+# *every* column in one pass, not just the one column someone happened to
+# add to a hand-picked list last time. Hand-picked "migration columns"
+# lists silently go stale the moment _SCHEMA gains a column that isn't also
+# appended here-there-and-everywhere; that mismatch is exactly what caused
+# doc_sources to be missing connector_type, then config_json, on the same
+# deployed database across successive fixes. Every NOT NULL column here
+# must carry a literal DEFAULT — SQLite's ALTER TABLE ADD COLUMN requires
+# one for NOT NULL columns, and it's what backfills existing rows.
+_SOURCE_COLUMNS = [
+    ("name", "TEXT NOT NULL DEFAULT ''"),
+    ("connector_type", "TEXT NOT NULL DEFAULT 'local'"),
+    ("config_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("status", "TEXT NOT NULL DEFAULT 'idle'"),
+    ("error_message", "TEXT"),
+    ("created_at", "TEXT NOT NULL DEFAULT ''"),
+    ("indexed_at", "TEXT"),
+]
+
+_ASSET_COLUMNS = [
+    ("source_id", "TEXT NOT NULL DEFAULT ''"),
+    ("remote_id", "TEXT NOT NULL DEFAULT ''"),
+    ("file_name", "TEXT NOT NULL DEFAULT ''"),
+    ("size_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ("mime_type", "TEXT"),
+    ("checksum", "TEXT"),
+    ("modified_at", "TEXT"),
+    ("indexed_at", "TEXT NOT NULL DEFAULT ''"),
     ("local_path", "TEXT"),
     ("processing_status", "TEXT NOT NULL DEFAULT 'none'"),
     ("processing_steps_json", "TEXT"),
@@ -88,12 +118,6 @@ _ASSET_MIGRATION_COLUMNS = [
     ("entities_json", "TEXT"),
     ("pii_findings_json", "TEXT"),
     ("xref_links_json", "TEXT"),
-]
-
-_SOURCE_MIGRATION_COLUMNS = [
-    ("status", "TEXT NOT NULL DEFAULT 'idle'"),
-    ("error_message", "TEXT"),
-    ("indexed_at", "TEXT"),
 ]
 
 class DocStore:
@@ -158,23 +182,37 @@ class DocStore:
 
     def _migrate(self) -> None:
         """Adds columns introduced after these tables already existed (SQLite
-        has no `ALTER TABLE ADD COLUMN IF NOT EXISTS`)."""
+        has no `ALTER TABLE ADD COLUMN IF NOT EXISTS`). Schema-driven against
+        _SOURCE_COLUMNS/_ASSET_COLUMNS rather than a one-off list, so a
+        deployed DB that's missing several generations of columns catches up
+        to the current shape in a single pass instead of one column per
+        deploy."""
         conn = self._conn()
-        existing_assets = {row["name"] for row in conn.execute("PRAGMA table_info(doc_assets)")}
-        for col, decl in _ASSET_MIGRATION_COLUMNS:
-            if col not in existing_assets:
-                conn.execute(f"ALTER TABLE doc_assets ADD COLUMN {col} {decl}")
-
-        existing_sources = {row["name"] for row in conn.execute("PRAGMA table_info(doc_sources)")}
-        for col, decl in _SOURCE_MIGRATION_COLUMNS:
-            if col not in existing_sources:
-                conn.execute(f"ALTER TABLE doc_sources ADD COLUMN {col} {decl}")
+        for table, columns in (("doc_assets", _ASSET_COLUMNS), ("doc_sources", _SOURCE_COLUMNS)):
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for col, decl in columns:
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            # Every upload spins up its own background thread that writes to
+            # this same file (create_source, then several update_asset_processing
+            # calls per file as it moves through the pipeline) — with several
+            # files uploaded close together, that's several threads writing
+            # concurrently. The default rollback-journal mode takes an
+            # exclusive lock on the whole file per write and a 5s busy
+            # timeout, which isn't enough headroom once a handful of threads
+            # are contending; a writer that loses the race raises
+            # "database is locked" as an unhandled OperationalError. WAL
+            # lets readers and a writer proceed concurrently, and the longer
+            # timeout gives queued writers more room to wait their turn
+            # instead of failing outright.
+            conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=30.0)
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
             self._local.conn = conn
         return conn
 

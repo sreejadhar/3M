@@ -499,6 +499,22 @@ async def _startup() -> None:
             if src["id"] not in _sources:
                 _sources[src["id"]] = src
         logger.info("kg_store: restored %d sources from persistent store", len(restored))
+
+        # Self-heal kg_registry — a source only gets registered there inside
+        # _index_source(), so a source restored here from a PAST server run
+        # (rather than indexed in this one) would otherwise never appear in
+        # kg_registry, and therefore never get cross-source bridges: the
+        # startup bridge-inference pass below reads its candidate KGs from
+        # kg_registry, not from `restored`. Re-upsert every restored KG so
+        # it's idempotently present regardless of when it was first indexed.
+        registered_n = 0
+        for src in restored:
+            if src.get("kg_nodes"):
+                if _register_source_kg(src) is not None:
+                    registered_n += 1
+        if registered_n:
+            logger.info("kg_registry: self-healed %d restored source(s) into the registry", registered_n)
+
         # Back-fill taxonomy annotations for all restored sources whose
         # md_attributes have not yet been annotated.
         for src in restored:
@@ -1794,6 +1810,38 @@ def _sync_taxonomy_from_kg_nodes(source_id: str, kg_nodes: List[Dict]) -> int:
     return updated
 
 
+def _register_source_kg(src: Dict) -> Optional["KGEntry"]:
+    """
+    Upsert `src` into the KG federation registry (kg_registry) and return the
+    entry, or None on failure. Shared by the live indexing pipeline and the
+    startup restore path — a source only reaches kg_registry through one of
+    these two call sites, so restored-but-never-reindexed sources need this
+    called for them too, or they (and any bridges to them) never surface.
+    """
+    try:
+        from dialog_agent.kg_registry import upsert as _reg_upsert, KGEntry
+        from dialog_agent.kg_router import embed_kg_description
+
+        entry = KGEntry(
+            kg_id=src["id"],
+            display_name=src["name"],
+            description=src.get("description", ""),
+            domain_keywords=[src.get("domain", "")],
+            entity_types=list({n.get("label", "") for n in src.get("kg_nodes", []) if n.get("label")}),
+            source_id=src["id"],
+            source_db_type=src.get("db_type", ""),
+            source_db_host=src.get("connection", {}).get("host", ""),
+            source_db_name=src.get("connection", {}).get("database", ""),
+            source_schema=src.get("connection", {}).get("schema_", ""),
+        )
+        entry.embedding = embed_kg_description(entry)
+        _reg_upsert(entry)
+        return entry
+    except Exception as exc:
+        logger.warning("KG registry: upsert failed for %s (non-fatal): %s", src.get("id", "?")[:8], exc)
+        return None
+
+
 async def _index_source(source_id: str) -> None:
     """Full pipeline for a registered data source: extract → ontology → KG."""
     src = _sources.get(source_id)
@@ -2081,24 +2129,12 @@ async def _index_source(source_id: str) -> None:
 
         # ── Register KG in federation registry ────────────────────────────────
         try:
-            from dialog_agent.kg_registry import upsert as _reg_upsert, KGEntry, list_all as _reg_list
+            from dialog_agent.kg_registry import list_all as _reg_list
             from dialog_agent.kg_bridges import run_inference_and_save as _infer_bridges
-            from dialog_agent.kg_router import embed_kg_description
 
-            entry = KGEntry(
-                kg_id=src["id"],
-                display_name=src["name"],
-                description=src.get("description", ""),
-                domain_keywords=[src.get("domain", "")],
-                entity_types=list({n.get("label", "") for n in src.get("kg_nodes", []) if n.get("label")}),
-                source_id=src["id"],
-                source_db_type=src.get("db_type", ""),
-                source_db_host=src.get("connection", {}).get("host", ""),
-                source_db_name=src.get("connection", {}).get("database", ""),
-                source_schema=src.get("connection", {}).get("schema_", ""),
-            )
-            entry.embedding = embed_kg_description(entry)
-            _reg_upsert(entry)
+            entry = _register_source_kg(src)
+            if entry is None:
+                raise RuntimeError("kg_registry upsert failed — see prior warning")
             logger.info("KG registry: registered %s (%s)", entry.kg_id[:8], entry.display_name)
 
             # Run enterprise bridge inference against all other registered KGs

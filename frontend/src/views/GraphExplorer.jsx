@@ -158,7 +158,13 @@ export default function GraphExplorer() {
   const load = async (id) => {
     if (!id) return;
     try {
-      const [g, allBridges] = await Promise.all([getGraph(id), listBridges().catch(() => [])]);
+      const [g, allBridges] = await Promise.all([
+        getGraph(id),
+        listBridges().catch((e) => {
+          toast(`Failed to load cross-source bridges: ${e.message}`, 'error');
+          return [];
+        }),
+      ]);
       const allBridgesArr = Array.isArray(allBridges) ? allBridges : [];
       setBridges(allBridgesArr);
 

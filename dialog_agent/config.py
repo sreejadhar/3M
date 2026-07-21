@@ -57,6 +57,11 @@ class DialogConfig:
     # companion COUNT(*) query so the user sees the total matching row count,
     # not just the size of the sampled page.
     raw_row_count_companion: bool = True
+    # When two queries in the same turn return results for the same entity
+    # (matched by a shared *_id key column) and one has a null first/last/full
+    # name while another has it populated, backfill the gap in place before
+    # synthesis sees the results. See execute_node._backfill_identity_columns.
+    identity_backfill_enabled: bool = True
 
     # ── User context ──────────────────────────────────────────────────────────
     analyst_role: str = ""             # e.g. "Financial Analyst" — personalises insights

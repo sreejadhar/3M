@@ -26,11 +26,13 @@ import re
 import sqlite3
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..config import DialogConfig
 from ..state import DialogState, QueryResult
+from .plan_node import _extract_valid_join_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -762,6 +764,7 @@ def _run_sql(cfg: DialogConfig, sql: str, state: Optional[Dict] = None, kg_id: s
                 break
 
     db = cfg.db_type.lower()
+    t0 = time.perf_counter()
     try:
         if db in ("postgres", "redshift"):
             return _run_postgres(cfg, sql)
@@ -790,6 +793,9 @@ def _run_sql(cfg: DialogConfig, sql: str, state: Optional[Dict] = None, kg_id: s
     except Exception as exc:
         logger.exception("execute_node: SQL failed")
         return {"columns": [], "rows": [], "error": str(exc)}
+    finally:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info("dialog_timing db_type=%s elapsed_ms=%.1f", db, elapsed_ms)
 
 
 def _cursor_to_result(cursor) -> Dict[str, Any]:
@@ -1223,6 +1229,189 @@ def _dedupe_placeholder_rows(columns: List[str], rows: List[list]) -> List[list]
     return rows
 
 
+# ── Cross-query identity backfill ─────────────────────────────────────────────
+# Root cause this guards against (confirmed via an HRData "who is the top
+# performer?" case): plan_node writes independent queries against sibling
+# tables that split identity data across a schema (e.g. a career-history
+# table vs. a current-employment table) — one table can have a null
+# first_name/last_name for a given employee_id while another table has it
+# populated for the very same id — and nothing ever cross-references them.
+# The result: the final answer reports "name unavailable" for an entity whose
+# name was already sitting in a different query's result set from the same
+# turn. Confirmed case: job_history.first_name_en was NULL for employee
+# 00000022 (the top-ranked employee by career breadth), but job_current —
+# queried in the very same turn — had "Jirapat"/"Archalaka" for that same
+# employee_id.
+#
+# Key matching is grounded in the REAL, data-verified join relationships the
+# KG pipeline already computed for this schema (cardinality/FK analysis —
+# see cardinality_analyzer.py), not a naming guess: understand_node writes
+# every confirmed shared-column and FK pair into schema_context as
+# "- col: shared by table_a, table_b" / "JOIN ON a.col1 = b.col2" lines, and
+# plan_node already parses those via _extract_valid_join_pairs to validate
+# generated SQL joins — reused here as the primary signal, including
+# cross-name FKs (e.g. "order_id" on one side, "fk_order" on the other) via
+# a small union-find over every pair, so a transitive chain of relationships
+# resolves to one group regardless of which two tables happen to share it.
+# Only when schema_context has no verified relationship for a column at all
+# (thin/newly-added sources, or file-based schemas with weaker profiling)
+# does this fall back to the plain "*_id" naming heuristic — so the fix still
+# degrades gracefully rather than doing nothing. Deliberately excludes a bare
+# "id" column from that fallback: every table here has its own generic
+# auto-increment "id" primary key with no cross-table meaning at all, so
+# matching on it would treat two UNRELATED rows as the same entity purely
+# because their local serial PKs happen to coincide (verified: without this
+# exclusion, "id"=5 in one table and "id"=5 in an unrelated table got merged
+# incorrectly). A prefixed "*_id" (employee_id, customer_id, ...) is a
+# business/foreign key and stays eligible; a bare "id" never is.
+_IDENTITY_COL_CANON = {"first_name", "last_name", "full_name", "employee_name", "nickname"}
+_IDENTITY_COL_LOCALE_SUFFIX_RE = re.compile(r'_(en|local|th)$', re.IGNORECASE)
+_ID_KEY_COL_RE = re.compile(r'.+_id$', re.IGNORECASE)
+
+
+def _identity_col_canon(col: str) -> Optional[str]:
+    """
+    Return the canonical identity-field name for a column (e.g.
+    "first_name_en" -> "first_name"), or None if it isn't a person-name
+    column. Only strips a known locale suffix, then requires an EXACT match
+    against the canonical set — never a substring match — so this can never
+    fire on an unrelated column like "org_full_name_en" ("org_full_name" is
+    not in the canonical set) or "position_title".
+    """
+    base = _IDENTITY_COL_LOCALE_SUFFIX_RE.sub('', (col or "").strip().lower())
+    return base if base in _IDENTITY_COL_CANON else None
+
+
+class _UnionFind:
+    """Minimal disjoint-set so a transitive chain of join-key relationships
+    (A=B, B=C) resolves to one group (A=B=C) instead of two disconnected
+    pairs — schemas are small enough here that this never needs to be fast,
+    only correct."""
+
+    def __init__(self) -> None:
+        self.parent: Dict[str, str] = {}
+
+    def find(self, x: str) -> str:
+        self.parent.setdefault(x, x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, x: str, y: str) -> None:
+        rx, ry = self.find(x), self.find(y)
+        if rx != ry:
+            self.parent[rx] = ry
+
+
+def _key_column_groups(schema_context: str) -> Dict[str, str]:
+    """
+    Map every lower-cased column name that appears in a real, data-verified
+    join relationship (per schema_context) to a canonical group id, so two
+    differently-named but FK-linked columns are recognised as the same
+    entity key. Returns {} when schema_context is empty or has no such
+    relationships — callers fall back to the naming heuristic in that case.
+    """
+    uf = _UnionFind()
+    pairs = _extract_valid_join_pairs(schema_context) if schema_context else set()
+    for pair in pairs:
+        cols = list(pair)
+        for c in cols[1:]:
+            uf.union(cols[0], c)
+        if len(cols) == 1:
+            uf.find(cols[0])  # register a same-name shared column too
+    return {c: uf.find(c) for c in uf.parent}
+
+
+def _backfill_identity_columns(
+    results: List[QueryResult], schema_context: str = "",
+) -> List[QueryResult]:
+    """
+    When the same entity (matched by a real join key, see _key_column_groups —
+    falling back to a shared "*_id"/"id" column name when no verified
+    relationship is known) appears in more than one of this turn's query
+    results, and one result has a null/blank person-name column while another
+    has that same entity's name populated, fill the gap in place.
+
+    Purely additive: only ever fills an empty/null cell using a value found
+    elsewhere for the same key — never overwrites a non-null value, never
+    drops/reorders rows or columns, never touches aggregated results any
+    differently than raw ones. A turn with only one query, no shared key
+    across queries, or no identity-name columns at all is a complete no-op —
+    the overwhelming majority of questions.
+    """
+    if len(results) < 2:
+        return results
+
+    key_groups = _key_column_groups(schema_context)
+
+    def key_group_for(col: str) -> Optional[str]:
+        lc = (col or "").lower()
+        if lc in key_groups:
+            return key_groups[lc]
+        # No verified relationship for this exact column — fall back to the
+        # naming heuristic, keyed by its own exact name so two differently
+        # named "*_id" columns are never assumed to be the same key without
+        # real join evidence.
+        return lc if _ID_KEY_COL_RE.match(col or "") else None
+
+    # lookup[group][key_value][canonical_identity_field] = value
+    lookup: Dict[str, Dict[Any, Dict[str, Any]]] = {}
+    for r in results:
+        cols = r.get("columns") or []
+        rows = r.get("rows") or []
+        if r.get("error") or not cols or not rows:
+            continue
+        key_idxs      = [(i, key_group_for(c)) for i, c in enumerate(cols)]
+        key_idxs      = [(i, g) for i, g in key_idxs if g]
+        identity_idxs = [(i, _identity_col_canon(c)) for i, c in enumerate(cols) if _identity_col_canon(c)]
+        if not key_idxs or not identity_idxs:
+            continue
+        for row in rows:
+            for key_i, group in key_idxs:
+                if key_i >= len(row) or row[key_i] in (None, ""):
+                    continue
+                key_val = row[key_i]
+                entity  = lookup.setdefault(group, {}).setdefault(key_val, {})
+                for id_i, canon in identity_idxs:
+                    if id_i < len(row) and row[id_i] not in (None, ""):
+                        entity.setdefault(canon, row[id_i])
+
+    if not lookup:
+        return results
+
+    filled = 0
+    for r in results:
+        cols = r.get("columns") or []
+        rows = r.get("rows") or []
+        if r.get("error") or not cols or not rows:
+            continue
+        key_idxs      = [(i, key_group_for(c)) for i, c in enumerate(cols)]
+        key_idxs      = [(i, g) for i, g in key_idxs if g and g in lookup]
+        identity_idxs = [(i, _identity_col_canon(c)) for i, c in enumerate(cols) if _identity_col_canon(c)]
+        if not key_idxs or not identity_idxs:
+            continue
+        for row in rows:
+            for key_i, group in key_idxs:
+                if key_i >= len(row):
+                    continue
+                entity = lookup.get(group, {}).get(row[key_i])
+                if not entity:
+                    continue
+                for id_i, canon in identity_idxs:
+                    if id_i < len(row) and row[id_i] in (None, "") and canon in entity:
+                        row[id_i] = entity[canon]
+                        filled += 1
+
+    if filled:
+        logger.info(
+            "execute_node: backfilled %d identity-column cell(s) across %d "
+            "query result(s) using cross-query entity matches",
+            filled, len(results),
+        )
+    return results
+
+
 def execute_node(state: DialogState) -> DialogState:
     """Execute all planned SQL queries and store results."""
     logger.info("=== execute_node ===")
@@ -1325,6 +1514,10 @@ def execute_node(state: DialogState) -> DialogState:
     if len(state.get("active_kg_ids") or []) > 1:
         bridges = state.get("kg_bridges_active") or []
         results = _federation_merge(results, bridges)
+
+    # Cross-query identity backfill (see _backfill_identity_columns)
+    if getattr(config, "identity_backfill_enabled", True):
+        results = _backfill_identity_columns(results, state.get("schema_context", ""))
 
     state["query_results"] = results
     state["phase"] = "execute"

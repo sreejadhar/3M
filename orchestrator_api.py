@@ -2139,6 +2139,35 @@ async def _index_source(source_id: str) -> None:
                 raise RuntimeError("kg_registry upsert failed — see prior warning")
             logger.info("KG registry: registered %s (%s)", entry.kg_id[:8], entry.display_name)
 
+            sample_fn = _make_bridge_sample_fn()
+
+            # Intra-KG pass: relationships between tables *within* this source
+            # itself (e.g. education.personal_no <-> job_current.employee_id) —
+            # the cross-source loop below never looks at this, since it always
+            # skips pairing a KG against itself.
+            try:
+                from dialog_agent.kg_inference_engine import (
+                    KGContext as _SelfKGContext,
+                    run_enterprise_inference_and_save as _run_self_infer,
+                )
+                self_ctx = _SelfKGContext(
+                    kg_id=entry.kg_id, display_name=entry.display_name,
+                    domain=src.get("domain", ""),
+                    nodes=src.get("kg_nodes", []), report=src.get("report"),
+                )
+                self_saved = _run_self_infer(self_ctx, self_ctx, sample_fn=sample_fn)
+                if self_saved:
+                    high = sum(1 for b in self_saved if b.enabled)
+                    logger.info(
+                        "KG intra-source bridges for %s: %d found (%d auto-enabled)",
+                        entry.kg_id[:8], len(self_saved), high,
+                    )
+            except Exception as _self_exc:
+                logger.warning(
+                    "Intra-KG bridge inference failed for %s (non-fatal): %s",
+                    entry.kg_id[:8], _self_exc,
+                )
+
             # Run enterprise bridge inference against all other registered KGs
             for other in _reg_list():
                 if other.kg_id == entry.kg_id:
@@ -2176,6 +2205,7 @@ async def _index_source(source_id: str) -> None:
                         kg_b_report   = other_src.get("report"),
                         kg_a_domain   = src.get("domain", ""),
                         kg_b_domain   = other_src.get("domain", ""),
+                        sample_fn     = sample_fn,
                     )
                     if saved:
                         high = sum(1 for b in saved if b.enabled)
@@ -4037,6 +4067,26 @@ def _build_dialog_config_for_kg(entry) -> Optional["object"]:
     )
 
 
+# Per-dialect random-row-order function, for empirical (randomised) sampling
+# rather than "whatever the first N rows happen to be in storage order" —
+# storage order can be badly non-representative (e.g. rows loaded in batches
+# where an early batch all shares one value, or a clustered/sorted table).
+_RANDOM_FN_BY_DB_TYPE = {
+    "postgres":   "RANDOM()",
+    "redshift":   "RANDOM()",
+    "sqlite":     "RANDOM()",
+    "csv":        "RANDOM()",
+    "excel":      "RANDOM()",
+    "snowflake":  "RANDOM()",
+    "mysql":      "RAND()",
+    "bigquery":   "RAND()",
+    "databricks": "RAND()",
+    "sqlserver":  "NEWID()",
+    "oracle":     "DBMS_RANDOM.VALUE",
+    "teradata":   "RANDOM()",
+}
+
+
 def _make_bridge_sample_fn():
     """
     Build the Tier-V value-overlap sampler for kg_inference_engine.
@@ -4047,6 +4097,14 @@ def _make_bridge_sample_fn():
     file-based sources, ...) without any new backend-specific code here.
     kg_inference_engine itself never imports this or talks to a database
     directly; it only calls the injected closure.
+
+    Sampling is EMPIRICAL — a randomised subset of the column's actual rows,
+    not just the first N in whatever order the table happens to store them.
+    `SELECT DISTINCT col ... ORDER BY RANDOM() LIMIT N` is invalid on several
+    dialects (Postgres rejects DISTINCT combined with an ORDER BY expression
+    that isn't in the select list — verified against the live RDS instance),
+    so the random ORDER BY is applied to a raw row sample in a subquery, and
+    DISTINCT is taken on top of that.
     """
     from dialog_agent.kg_registry import get as _reg_get
     from dialog_agent.nodes.execute_node import _run_sql
@@ -4058,16 +4116,43 @@ def _make_bridge_sample_fn():
         cfg = _build_dialog_config_for_kg(entry)
         if cfg is None:
             return None
-        table = f"{cfg.db_schema}.{entity}" if cfg.db_schema else entity
-        sql = f"SELECT DISTINCT {col} FROM {table}"
-        try:
-            result = _run_sql(cfg, sql)
-        except Exception as exc:
-            logger.debug("bridge sampler: query failed for %s.%s — %s", entity, col, exc)
-            return None
-        if not result or result.get("error"):
-            return None
-        rows = result.get("rows") or []
+        # Snowflake auto-uppercases unquoted identifiers. kg_inference_engine's
+        # ColumnProfile always lowercases column names regardless of source
+        # (see _profiles_from_nodes), so on Snowflake an unquoted column
+        # reference silently resolves to the WRONG (uppercased) identifier
+        # whenever the real column was created quoted-lowercase — reproduced
+        # directly against the live Snowflake instance. Quote both table and
+        # column, matching the same quote_ids convention plan_node/
+        # understand_node already use for Snowflake elsewhere.
+        quote_ids = cfg.db_type.lower() == "snowflake"
+        entity_ref = f'"{entity}"' if quote_ids else entity
+        col_ref    = f'"{col}"'    if quote_ids else col
+        table = f"{cfg.db_schema}.{entity_ref}" if cfg.db_schema else entity_ref
+        rand_fn = _RANDOM_FN_BY_DB_TYPE.get(cfg.db_type.lower())
+
+        def _query(sql: str):
+            try:
+                r = _run_sql(cfg, sql)
+            except Exception as exc:
+                logger.debug("bridge sampler: query failed for %s.%s — %s", entity, col, exc)
+                return None
+            if not r or r.get("error"):
+                return None
+            return r.get("rows") or []
+
+        rows = None
+        if rand_fn:
+            rows = _query(
+                f"SELECT DISTINCT {col_ref} FROM "
+                f"(SELECT {col_ref} FROM {table} ORDER BY {rand_fn} LIMIT 2000) sub_sample"
+            )
+        if rows is None:
+            # No known random function for this dialect, or the randomised
+            # form errored (unsupported syntax on this specific backend) —
+            # fall back to a plain deterministic sample rather than failing
+            # the whole tier for this column.
+            rows = _query(f"SELECT DISTINCT {col_ref} FROM {table} LIMIT 2000") or []
+
         values = {str(r[0]) for r in rows[:2000] if r and r[0] is not None}
         return values or None
 

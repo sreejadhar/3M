@@ -23,10 +23,25 @@ Tier 2  Semantic similarity  (embedding-based, conf 0.55 – 0.82)
         TF-IDF cosine similarity as fallback.
         Only runs for column pairs NOT already matched in Tier 1.
 
+Tier V  Data value-overlap  (name-agnostic, conf 0.65 – 0.96)
+        Ignores column names entirely. Samples actual values from candidate
+        ID-like columns (via an injected ``sample_fn``, backend-agnostic —
+        this module never talks to a database itself) and checks containment
+        overlap. Catches join keys whose names share nothing in common, e.g.
+        "personal_no" ↔ "employee_id" holding the same identifiers — a case
+        Tiers 1 and 2 cannot see no matter how their thresholds are tuned.
+        Skipped entirely when no ``sample_fn`` is supplied.
+
 Tier 3  LLM validation  (async, conf refinement for 0.55 – 0.78 candidates)
         Batch medium-confidence candidates and validate with Claude.
         Runs as a background coroutine — does NOT block bridge saving.
         On completion it updates confidence + enabled status in the DB.
+
+Intra-KG relationships
+        run_all_pairs() also runs each KG against itself by default
+        (include_intra_kg=True), discovering relationships between tables
+        *within* one source — not just across different sources. Trivial
+        self-column matches are filtered out automatically.
 
 Domain partitioning
         KGs carry a primary domain tag.  Cross-domain pairs require a higher
@@ -60,7 +75,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +93,9 @@ class InferenceOptions:
     llm_model: str = "claude-haiku-4-5"  # fast + cheap for validation
     llm_batch_size: int = 20              # max candidates per LLM call
     embedding_sim_threshold: float = 0.78  # min cosine sim for Tier 2 candidate
+    run_tier_value_overlap: bool = True   # Tier V — data value-overlap (name-agnostic)
+    value_overlap_threshold: float = 0.70  # min containment ratio for Tier V candidate
+    value_overlap_sample_size: int = 500   # rows sampled per column when checking overlap
     transitivity_decay: float = 0.90      # conf(A→C) = conf(A→B)×conf(B→C)×decay
     transitivity_min_conf: float = 0.70   # don't bother below this for transitive
 
@@ -174,6 +192,16 @@ def _type_family(dtype: str) -> Optional[str]:
         if dt in members:
             return fam
     return None
+
+
+def _is_self(cp_a: "ColumnProfile", cp_b: "ColumnProfile") -> bool:
+    """True when both profiles are literally the same column (same entity+col).
+
+    Only possible when a KG is paired against itself (intra-KG relationship
+    discovery — see run_all_pairs' self-pair loop). A column trivially
+    "matches" itself, which isn't a relationship worth surfacing.
+    """
+    return cp_a.entity == cp_b.entity and cp_a.col == cp_b.col
 
 
 def _type_compat(ta: str, tb: str) -> float:
@@ -374,6 +402,8 @@ def _structural_pass(
         # 1a. Exact match
         if cp_a.col in exact_b:
             for cp_b in exact_b[cp_a.col]:
+                if _is_self(cp_a, cp_b):
+                    continue
                 key = (cp_a.entity, cp_a.col, cp_b.entity, cp_b.col)
                 if key in seen:
                     continue
@@ -394,6 +424,8 @@ def _structural_pass(
             for cp_b in norm_b[cp_a.col_norm]:
                 if cp_b.col == cp_a.col:
                     continue   # already handled as exact
+                if _is_self(cp_a, cp_b):
+                    continue
                 key = (cp_a.entity, cp_a.col, cp_b.entity, cp_b.col)
                 if key in seen:
                     continue
@@ -477,8 +509,12 @@ def _semantic_pass(
     results: List[Tuple[ColumnProfile, ColumnProfile, float, str]] = []
 
     for i, cp_a in enumerate(unmatched_a):
-        best_j   = int(np.argmax(sim_matrix[i]))
-        best_sim = float(sim_matrix[i, best_j])
+        row = sim_matrix[i].copy()
+        for j, cp_b in enumerate(unmatched_b):
+            if _is_self(cp_a, cp_b):
+                row[j] = -1.0   # exclude trivial self-match from argmax (intra-KG pairing)
+        best_j   = int(np.argmax(row))
+        best_sim = float(row[best_j])
         if best_sim < sim_threshold:
             continue
         cp_b = unmatched_b[best_j]
@@ -496,6 +532,119 @@ def _semantic_pass(
         conf = min(round(conf, 3), 0.82)
         if conf >= min_conf:
             results.append((cp_a, cp_b, conf, f"semantic_sim={best_sim:.3f}"))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tier V: Data value-overlap matching (name-agnostic)
+# ---------------------------------------------------------------------------
+# Column names can diverge completely between tables that still share a real
+# join key (e.g. "personal_no" in one table vs "employee_id" in another,
+# holding the same identifiers). Tiers 1 and 2 only ever compare column
+# *names* — exact, normalised, or semantically — so a pairing like that is
+# invisible to both of them no matter how the thresholds are tuned.
+#
+# This tier ignores names entirely: it samples actual values from candidate
+# ID-like columns and checks whether they overlap. High containment between
+# two high-uniqueness columns is strong, name-independent evidence of a join
+# key — the one signal none of the other tiers check.
+#
+# Sampling is injected via `sample_fn(kg_id, entity, col) -> Set[str] | None`
+# so this module stays backend-agnostic. Callers wire up a real sampler once
+# (e.g. routed through whichever SQL runner the platform already uses for a
+# given source — Postgres, Snowflake, a CSV-backed SQLite file, etc.); this
+# tier itself never talks to a database directly.
+
+def _is_id_like(cp: "ColumnProfile") -> bool:
+    """Heuristic gate for columns worth value-sampling: unique-ish, not floats/booleans."""
+    fam = _type_family(cp.data_type) if cp.data_type else None
+    if fam in ('float', 'boolean'):
+        return False
+    if cp.unique_ratio is not None and cp.unique_ratio < 0.5:
+        return False
+    return True
+
+
+def _value_overlap_pass(
+    profs_a: List[ColumnProfile],
+    profs_b: List[ColumnProfile],
+    sample_fn: Optional[Callable[[str, str, str], Optional[Set[str]]]],
+    overlap_threshold: float,
+    min_conf: float,
+) -> List[Tuple[ColumnProfile, ColumnProfile, float, str]]:
+    """Find column pairs whose sampled data values overlap heavily, regardless of name.
+
+    Deliberately does NOT exclude columns already matched by Tiers 1/2 (unlike
+    the semantic pass). A column can have more than one real relationship —
+    e.g. "personal_no" legitimately joins to another table's "personal_no"
+    (caught by Tier 1's exact-name match) AND to a *different* table's
+    "employee_id" holding the same identifiers (only value overlap catches
+    that one). Filtering by already_matched here would hide exactly the
+    cross-convention relationships this tier exists to find. Duplicate
+    (from_col, to_col) results are still deduped by confidence downstream in
+    run_enterprise_inference.
+    """
+    if sample_fn is None:
+        return []
+
+    cand_a = [cp for cp in profs_a if _is_id_like(cp)]
+    cand_b = [cp for cp in profs_b if _is_id_like(cp)]
+    if not cand_a or not cand_b:
+        return []
+
+    sample_cache: Dict[Tuple[str, str, str], Optional[Set[str]]] = {}
+
+    def _get_sample(cp: ColumnProfile) -> Optional[Set[str]]:
+        key = (cp.kg_id, cp.entity, cp.col)
+        if key not in sample_cache:
+            try:
+                sample_cache[key] = sample_fn(cp.kg_id, cp.entity, cp.col)
+            except Exception as exc:
+                logger.debug(
+                    "value_overlap: sample_fn failed for %s.%s.%s — %s",
+                    cp.kg_id[:8], cp.entity, cp.col, exc,
+                )
+                sample_cache[key] = None
+        return sample_cache[key]
+
+    results: List[Tuple[ColumnProfile, ColumnProfile, float, str]] = []
+    seen: Set[Tuple[str, str, str, str]] = set()
+
+    for cp_a in cand_a:
+        sample_a = _get_sample(cp_a)
+        if not sample_a:
+            continue
+        for cp_b in cand_b:
+            if _is_self(cp_a, cp_b):
+                continue
+            tc = _type_compat(cp_a.data_type, cp_b.data_type)
+            if tc == 0.0:
+                continue
+            key = (cp_a.entity, cp_a.col, cp_b.entity, cp_b.col)
+            if key in seen:
+                continue
+            seen.add(key)
+            sample_b = _get_sample(cp_b)
+            if not sample_b:
+                continue
+            inter = sample_a & sample_b
+            denom = min(len(sample_a), len(sample_b))
+            if denom == 0:
+                continue
+            overlap = len(inter) / denom
+            if overlap < overlap_threshold:
+                continue
+            # Overlap is the strongest signal available — it's ground truth on
+            # the actual data — so it can reach high confidence even with zero
+            # name similarity.
+            conf = 0.65 + (overlap - overlap_threshold) / (1.0 - overlap_threshold) * 0.28
+            conf += _uniqueness_boost(cp_a) + _uniqueness_boost(cp_b)
+            if tc == 1.0:
+                conf += 0.03
+            conf = min(round(conf, 3), 0.96)
+            if conf >= min_conf:
+                results.append((cp_a, cp_b, conf, f"value_overlap={overlap:.2f}"))
 
     return results
 
@@ -625,9 +774,21 @@ def run_enterprise_inference(
     ctx_a: KGContext,
     ctx_b: KGContext,
     options: Optional[InferenceOptions] = None,
+    sample_fn: Optional[Callable[[str, str, str], Optional[Set[str]]]] = None,
 ) -> Tuple[List["Bridge"], List["Bridge"]]:
     """
     Run the full inference pipeline between two KG contexts.
+
+    ``sample_fn(kg_id, entity, col) -> set_of_sampled_values | None`` is optional;
+    when provided it powers Tier V (data value-overlap matching), which can find
+    join keys whose names have nothing in common (e.g. "personal_no" ↔
+    "employee_id"). Wire it to a real sampler backed by whatever SQL runner the
+    platform already uses for a given source — this module makes no assumption
+    about the backend. When omitted, Tier V is simply skipped.
+
+    ``ctx_a is ctx_b`` (or same kg_id) is a valid call — it runs the pipeline
+    intra-KG, discovering relationships between tables *within* the same
+    source. Trivial self-column matches are filtered out automatically.
 
     Returns (high_conf, medium_conf):
         high_conf   — bridges with confidence ≥ auto_enable_threshold (enabled=True)
@@ -691,7 +852,20 @@ def run_enterprise_inference(
         except Exception as exc:
             logger.warning("Tier 2 embedding pass failed: %s", exc)
 
-    all_matches = t1_matches + t2_matches
+    # ── Tier V: data value-overlap (name-agnostic) ────────────────────────────
+    tv_matches: List[Tuple[ColumnProfile, ColumnProfile, float, str]] = []
+    if opts.run_tier_value_overlap and sample_fn is not None:
+        try:
+            tv_matches = _value_overlap_pass(
+                profs_a, profs_b,
+                sample_fn,
+                opts.value_overlap_threshold,
+                min_conf,
+            )
+        except Exception as exc:
+            logger.warning("Tier V value-overlap pass failed: %s", exc)
+
+    all_matches = t1_matches + t2_matches + tv_matches
 
     # ── Deduplicate: keep highest-confidence per (from_col, to_col) ───────────
     best: Dict[Tuple[str, str], Tuple[ColumnProfile, ColumnProfile, float, str]] = {}
@@ -736,6 +910,7 @@ def run_enterprise_inference_and_save(
     ctx_b: KGContext,
     options: Optional[InferenceOptions] = None,
     background_tasks: Any = None,   # fastapi.BackgroundTasks or None
+    sample_fn: Optional[Callable[[str, str, str], Optional[Set[str]]]] = None,
 ) -> List["Bridge"]:
     """
     Run inference, persist all results, schedule LLM validation as a
@@ -744,7 +919,7 @@ def run_enterprise_inference_and_save(
     """
     from dialog_agent.kg_bridges import Bridge, _find_existing, upsert
 
-    high_conf, medium_conf = run_enterprise_inference(ctx_a, ctx_b, options)
+    high_conf, medium_conf = run_enterprise_inference(ctx_a, ctx_b, options, sample_fn)
     saved: List[Bridge] = []
 
     for b in high_conf + medium_conf:
@@ -873,20 +1048,41 @@ def run_all_pairs(
     kg_contexts: List[KGContext],
     options: Optional[InferenceOptions] = None,
     background_tasks: Any = None,
+    sample_fn: Optional[Callable[[str, str, str], Optional[Set[str]]]] = None,
+    include_intra_kg: bool = True,
 ) -> Dict[str, int]:
     """
-    Run enterprise inference over every ordered pair of KGs.
+    Run enterprise inference over every ordered pair of KGs, AND (when
+    ``include_intra_kg``) over each KG against itself.
+
+    The self-pass discovers relationships between tables *within* the same
+    source (e.g. an "education" table joined to a "job_current" table by
+    columns with unrelated names) — the cross-source passes alone never look
+    at this, since they only ever compare different KGs to each other.
+
     Returns {"pairs_processed": N, "bridges_saved": M}.
     """
     total_saved = 0
     pairs = 0
     n = len(kg_contexts)
+
+    if include_intra_kg:
+        for ctx in kg_contexts:
+            try:
+                saved = run_enterprise_inference_and_save(
+                    ctx, ctx, options, background_tasks, sample_fn
+                )
+                total_saved += len(saved)
+                pairs += 1
+            except Exception as exc:
+                logger.warning("Intra-KG inference failed for %s: %s", ctx.kg_id[:8], exc)
+
     for i in range(n):
         for j in range(i + 1, n):
             ctx_a, ctx_b = kg_contexts[i], kg_contexts[j]
             try:
                 saved = run_enterprise_inference_and_save(
-                    ctx_a, ctx_b, options, background_tasks
+                    ctx_a, ctx_b, options, background_tasks, sample_fn
                 )
                 total_saved += len(saved)
                 pairs += 1

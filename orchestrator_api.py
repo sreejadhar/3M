@@ -630,17 +630,19 @@ async def _startup() -> None:
             name="startup-sf-col-validate",
         ).start()
 
-        # Startup bridge inference — run across all restored KG pairs so bridges
-        # are available immediately after restart without requiring a re-index.
-        # Only runs when ≥2 KGs are registered.  Non-blocking: runs in a thread
-        # so it does not delay server startup.
-        if len(restored) >= 2:
+        # Startup bridge inference — run across all restored KGs so bridges are
+        # available immediately after restart without requiring a re-index.
+        # Runs whenever ≥1 KG is registered: with a single KG it still finds
+        # relationships between tables *within* that source (intra-KG pass);
+        # with ≥2 it also finds cross-source relationships. Non-blocking: runs
+        # in a thread so it does not delay server startup.
+        if len(restored) >= 1:
             def _startup_bridge_inference():
                 try:
                     from dialog_agent.kg_registry import list_all as _reg_list
                     from dialog_agent.kg_inference_engine import KGContext, run_all_pairs
                     entries = _reg_list()
-                    if len(entries) < 2:
+                    if not entries:
                         return
                     contexts = []
                     for entry in entries:
@@ -652,7 +654,7 @@ async def _startup() -> None:
                             nodes=src.get("kg_nodes") or [],
                             report=src.get("report"),
                         ))
-                    result = run_all_pairs(contexts)
+                    result = run_all_pairs(contexts, sample_fn=_make_bridge_sample_fn())
                     logger.info(
                         "Startup bridge inference: %d pairs processed, %d bridges saved",
                         result["pairs_processed"], result["bridges_saved"],
@@ -4003,6 +4005,75 @@ async def activate_kpi(kpi_id: str, req: ActivateKpiRequest = ActivateKpiRequest
 
 # ── KG Bridge Inference endpoints ─────────────────────────────────────────────
 
+def _build_dialog_config_for_kg(entry) -> Optional["object"]:
+    """
+    Build a dialog_agent DialogConfig for a registered KG, reusing whatever
+    connection info the orchestrator already holds for its source. Generic
+    across every db_type the platform supports — no backend-specific code
+    lives here; that dispatch happens inside execute_node._run_sql.
+    """
+    from dialog_agent.config import DialogConfig
+
+    src = _sources.get(entry.source_id) or {}
+    conn = src.get("connection") or {}
+    db_type = (src.get("db_type") or entry.source_db_type or "").lower()
+    if not db_type:
+        return None
+    if db_type in _FILE_BASED_TYPES:
+        file_path = conn.get("file_path") or src.get("db_file_path") or ""
+        if not file_path:
+            return None
+        return DialogConfig(db_type=db_type, db_file_path=file_path)
+    return DialogConfig(
+        db_type=db_type,
+        db_host=conn.get("host", entry.source_db_host or ""),
+        db_port=conn.get("port", 5432),
+        db_name=conn.get("database", entry.source_db_name or ""),
+        db_schema=conn.get("schema_", entry.source_schema or ""),
+        db_user=conn.get("username", ""),
+        db_password=conn.get("password", ""),
+        db_connection_string=conn.get("connection_string", ""),
+        db_extra=conn.get("extra", {}),
+    )
+
+
+def _make_bridge_sample_fn():
+    """
+    Build the Tier-V value-overlap sampler for kg_inference_engine.
+
+    Routed through execute_node._run_sql — the SAME dispatcher that runs
+    every real planner-generated query — so it automatically works for every
+    db_type the platform already supports (Postgres, Snowflake, BigQuery,
+    file-based sources, ...) without any new backend-specific code here.
+    kg_inference_engine itself never imports this or talks to a database
+    directly; it only calls the injected closure.
+    """
+    from dialog_agent.kg_registry import get as _reg_get
+    from dialog_agent.nodes.execute_node import _run_sql
+
+    def sample_fn(kg_id: str, entity: str, col: str):
+        entry = _reg_get(kg_id)
+        if not entry:
+            return None
+        cfg = _build_dialog_config_for_kg(entry)
+        if cfg is None:
+            return None
+        table = f"{cfg.db_schema}.{entity}" if cfg.db_schema else entity
+        sql = f"SELECT DISTINCT {col} FROM {table}"
+        try:
+            result = _run_sql(cfg, sql)
+        except Exception as exc:
+            logger.debug("bridge sampler: query failed for %s.%s — %s", entity, col, exc)
+            return None
+        if not result or result.get("error"):
+            return None
+        rows = result.get("rows") or []
+        values = {str(r[0]) for r in rows[:2000] if r and r[0] is not None}
+        return values or None
+
+    return sample_fn
+
+
 class InferRequest(BaseModel):
     kg_ids:               Optional[List[str]] = None  # subset; None = all KGs
     run_tier2_embeddings: bool  = True
@@ -4021,8 +4092,13 @@ async def trigger_bridge_inference(req: InferRequest, background_tasks: Backgrou
     Tiers run:
       1 — structural (exact + normalised name, type compatibility, cardinality)
       2 — semantic embedding similarity          (if run_tier2_embeddings=true)
+      V — data value-overlap (name-agnostic — samples real column values)
       3 — async LLM validation of medium-conf    (if run_tier3_llm=true)
     followed by a transitivity pass (A→B + B→C → A→C).
+
+    Also runs each KG against itself (intra-KG), discovering relationships
+    between tables *within* one source — not just across different sources —
+    so a single-source deployment still benefits from this endpoint.
     """
     try:
         from dialog_agent.kg_registry import list_all as _reg_list
@@ -4037,13 +4113,13 @@ async def trigger_bridge_inference(req: InferRequest, background_tasks: Backgrou
         wanted = set(req.kg_ids)
         all_entries = [e for e in all_entries if e.kg_id in wanted]
 
-    if len(all_entries) < 2:
+    if not all_entries:
         return {
             "status": "skipped",
-            "reason": "fewer than 2 KGs registered" + (
+            "reason": "no KGs registered" + (
                 f" matching ids {req.kg_ids}" if req.kg_ids else ""
             ),
-            "kg_count": len(all_entries),
+            "kg_count": 0,
         }
 
     # Build KGContext for each entry
@@ -4065,9 +4141,10 @@ async def trigger_bridge_inference(req: InferRequest, background_tasks: Backgrou
         run_tier2_embeddings  = req.run_tier2_embeddings,
         run_tier3_llm         = req.run_tier3_llm,
     )
+    sample_fn = _make_bridge_sample_fn()
 
     def _run():
-        result = run_all_pairs(contexts, opts)
+        result = run_all_pairs(contexts, opts, sample_fn=sample_fn)
         logger.info(
             "Manual inference job complete: %d pairs, %d bridges saved",
             result["pairs_processed"], result["bridges_saved"],
@@ -4079,7 +4156,7 @@ async def trigger_bridge_inference(req: InferRequest, background_tasks: Backgrou
         "status":    "accepted",
         "kg_count":  len(contexts),
         "kg_ids":    [c.kg_id for c in contexts],
-        "pairs":     len(contexts) * (len(contexts) - 1) // 2,
+        "pairs":     len(contexts) * (len(contexts) - 1) // 2 + len(contexts),  # + intra-KG self-pairs
         "options":   {
             "tier2_embeddings":    req.run_tier2_embeddings,
             "tier3_llm":           req.run_tier3_llm,

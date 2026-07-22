@@ -102,6 +102,19 @@ def get(kg_id: str) -> Optional[KGEntry]:
     return _row(r) if r else None
 
 
+def get_by_source_id(source_id: str) -> Optional[KGEntry]:
+    """Look up the KG registered for a given orchestrator source_id (1:1 today)."""
+    if not source_id:
+        return None
+    with pg_store.cursor_ctx() as cur:
+        _ensure(cur)
+        r = cur.execute(
+            "SELECT * FROM kg_registry WHERE source_id=? ORDER BY updated_at DESC LIMIT 1",
+            (source_id,),
+        ).fetchone()
+    return _row(r) if r else None
+
+
 def delete(kg_id: str) -> None:
     with pg_store.cursor_ctx() as cur:
         _ensure(cur)

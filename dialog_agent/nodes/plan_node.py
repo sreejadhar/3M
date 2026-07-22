@@ -2805,8 +2805,15 @@ def _extract_valid_join_pairs(schema_context: str) -> set:
             continue
 
         # FK / join-on lines: both "  - JOIN ON ..." and "  FK (...): JOIN ON ..."
+        # Each side may be bare ("tbl.col"), schema-qualified ("schema.tbl.col"),
+        # or deeper — (?:\w+\.)* greedily eats every leading identifier segment
+        # so the capture group always lands on the FINAL segment (the column),
+        # regardless of how many dots precede it. A lazy \S+? here would grab
+        # the wrong segment (e.g. the table name) on whichever side has no
+        # trailing token forcing it to keep backtracking — verified this was
+        # silently mis-parsing every schema-qualified cross-name FK line.
         m = re.search(
-            r'\bJOIN\s+ON\s+\S+?\.(\w+)\s*=\s*\S+?\.(\w+)',
+            r'\bJOIN\s+ON\s+(?:\w+\.)*(\w+)\s*=\s*(?:\w+\.)*(\w+)',
             stripped, re.IGNORECASE,
         )
         if m:

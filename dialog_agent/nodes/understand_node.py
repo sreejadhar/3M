@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from ..config import DialogConfig
@@ -1077,7 +1078,12 @@ def understand_node(state: DialogState) -> DialogState:
     # If the KG pipeline didn't run or failed, fall back to reading the schema
     # directly from the SQLite DB so queries still work.
     if not nodes and config.db_type.lower() in _FILE_BASED_TYPES and config.db_file_path:
+        t0 = time.perf_counter()
         nodes = _build_nodes_from_file_db(config)
+        logger.info(
+            "dialog_timing sub=understand.build_nodes_from_file_db elapsed_ms=%.1f",
+            (time.perf_counter() - t0) * 1000,
+        )
         if nodes:
             logger.info(
                 "understand_node: kg_nodes was empty — using direct DB schema fallback (%d tables)",
@@ -1097,7 +1103,12 @@ def understand_node(state: DialogState) -> DialogState:
     hierarchy: Optional[Dict[str, Dict[str, Dict[str, List[str]]]]] = None
     source_id_for_samples = getattr(config, "source_id", "") or ""
     if config.db_type.lower() in _FILE_BASED_TYPES and config.db_file_path:
+        t0 = time.perf_counter()
         samples, hierarchy = _sample_file_data(config)
+        logger.info(
+            "dialog_timing sub=understand.sample_file_data elapsed_ms=%.1f n_tables=%d",
+            (time.perf_counter() - t0) * 1000, len(samples or {}),
+        )
         if samples:
             logger.info("understand_node: sampled %d tables for value hints", len(samples))
         if hierarchy:
@@ -1107,14 +1118,24 @@ def understand_node(state: DialogState) -> DialogState:
     elif source_id_for_samples:
         # Non-file source: load categorical values and hierarchy from md_attributes
         # (populated by the indexer via infer_taxonomy / enrich_taxonomy).
+        t0 = time.perf_counter()
         samples, hierarchy = _load_samples_from_catalog(source_id_for_samples)
+        logger.info(
+            "dialog_timing sub=understand.load_samples_from_catalog elapsed_ms=%.1f",
+            (time.perf_counter() - t0) * 1000,
+        )
         if hierarchy:
             logger.info(
                 "understand_node: catalog taxonomy hierarchy loaded for %d table(s)",
                 len(hierarchy),
             )
 
+    t0 = time.perf_counter()
     schema_context = _summarise_graph(nodes, edges, db_schema, samples, hierarchy, db_type=config.db_type)
+    logger.info(
+        "dialog_timing sub=understand.summarise_graph elapsed_ms=%.1f",
+        (time.perf_counter() - t0) * 1000,
+    )
 
     logger.info(
         "Schema context built: %d chars, %d tables, %d relationships, schema=%r",
@@ -1134,6 +1155,7 @@ def understand_node(state: DialogState) -> DialogState:
     active_kpis: List[Dict] = []
     source_id = source_id_for_samples  # already extracted above
     if source_id:
+        t0 = time.perf_counter()
         try:
             import kpi_store as _kpi_store
             active_kpis = _kpi_store.list_kpis(source_id=source_id, status="active")
@@ -1168,9 +1190,69 @@ def understand_node(state: DialogState) -> DialogState:
                 schema_context = schema_context + "\n" + "\n".join(kpi_lines)
         except Exception as exc:
             logger.warning("understand_node: failed to load KPIs for source %s — %s", source_id[:8], exc)
+        finally:
+            logger.info(
+                "dialog_timing sub=understand.load_kpis elapsed_ms=%.1f",
+                (time.perf_counter() - t0) * 1000,
+            )
+
+    # Discovered join keys for this source (intra-KG bridges — see
+    # kg_inference_engine's Tier V value-overlap pass). These are relationships
+    # between tables *within* this single source whose join columns don't
+    # share a name (e.g. "personal_no" ↔ "employee_id"), so the planner would
+    # otherwise have to guess the join on every question, inconsistently.
+    if source_id:
+        t0 = time.perf_counter()
+        try:
+            from dialog_agent.kg_registry import get_by_source_id as _reg_get_by_source
+            from dialog_agent.kg_bridges import list_for_kgs as _list_bridges
+            entry = _reg_get_by_source(source_id)
+            self_bridges = _list_bridges([entry.kg_id]) if entry else []
+            if self_bridges:
+                logger.info(
+                    "understand_node: loaded %d discovered join key(s) for source %s",
+                    len(self_bridges), source_id[:8],
+                )
+                # Emit in the SAME "- JOIN ON schema.tbl.col = schema.tbl.col" format
+                # _summarise_graph already uses for declared FKs, rather than a new
+                # ad-hoc format — that's the format plan_node._extract_valid_join_pairs
+                # actually parses into its JOIN-validation whitelist. A discovered
+                # bridge in a format that parser doesn't recognise is invisible to
+                # join validation and gets silently stripped as "invalid" even when
+                # the planner used it correctly (found the hard way: a value-overlap
+                # join was generated correctly, then salvage-stripped downstream).
+                jk_lines = [
+                    "",
+                    "=" * 60,
+                    "DISCOVERED JOIN KEYS — USE THESE EXACT JOIN CONDITIONS",
+                    "=" * 60,
+                    "These joins were confirmed by sampling actual column values, not just "
+                    "column names — the columns below may look unrelated by name alone.",
+                    "",
+                ]
+                for b in self_bridges:
+                    from_q = _qualified(db_schema, b.from_entity)
+                    to_q   = _qualified(db_schema, b.to_entity)
+                    jk_lines.append(
+                        f"  - JOIN ON {from_q}.{b.from_column} = {to_q}.{b.to_column}"
+                        f"  (confidence={b.confidence:.2f}, discovered via data sampling)"
+                    )
+                jk_lines.append("=" * 60)
+                schema_context = schema_context + "\n" + "\n".join(jk_lines)
+        except Exception as exc:
+            logger.warning(
+                "understand_node: failed to load discovered join keys for source %s — %s",
+                source_id[:8], exc,
+            )
+        finally:
+            logger.info(
+                "dialog_timing sub=understand.load_join_keys elapsed_ms=%.1f",
+                (time.perf_counter() - t0) * 1000,
+            )
 
     # Load business glossary terms (all approved terms — not source-scoped)
     glossary_terms: List[Dict] = []
+    t0 = time.perf_counter()
     try:
         import glossary_store as _gl_store
         glossary_terms = _gl_store.list_terms(approved_only=True)
@@ -1178,6 +1260,11 @@ def understand_node(state: DialogState) -> DialogState:
             logger.info("understand_node: loaded %d glossary term(s)", len(glossary_terms))
     except Exception as exc:
         logger.debug("understand_node: glossary not available — %s", exc)
+    finally:
+        logger.info(
+            "dialog_timing sub=understand.load_glossary elapsed_ms=%.1f",
+            (time.perf_counter() - t0) * 1000,
+        )
 
     state["schema_context"]      = schema_context
     state["categorical_columns"] = categorical_columns

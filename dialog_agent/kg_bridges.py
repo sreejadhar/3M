@@ -232,6 +232,7 @@ def run_inference_and_save(
     kg_b_domain: str = "",
     background_tasks: Any = None,
     sample_fn: Optional[Any] = None,
+    main_loop: Any = None,
 ) -> List[Bridge]:
     """
     Infer bridges between two KGs using the enterprise multi-tier engine.
@@ -242,6 +243,10 @@ def run_inference_and_save(
     elsewhere (e.g. orchestrator_api._make_bridge_sample_fn()) so a join key
     whose names don't match (like "personal_no" vs "employee_id") can still
     be found from real data, not just column names. Omit to skip that tier.
+
+    ``main_loop``, when provided, lets LLM validation get scheduled correctly
+    even if this call itself is running off the main thread (e.g. via
+    asyncio.to_thread) — pass the loop captured on the caller's async thread.
     """
     from .kg_inference_engine import KGContext, run_enterprise_inference_and_save
 
@@ -255,4 +260,5 @@ def run_inference_and_save(
     )
     return run_enterprise_inference_and_save(ctx_a, ctx_b,
                                              background_tasks=background_tasks,
-                                             sample_fn=sample_fn)
+                                             sample_fn=sample_fn,
+                                             main_loop=main_loop)

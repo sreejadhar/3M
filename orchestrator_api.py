@@ -2140,6 +2140,7 @@ async def _index_source(source_id: str) -> None:
             logger.info("KG registry: registered %s (%s)", entry.kg_id[:8], entry.display_name)
 
             sample_fn = _make_bridge_sample_fn()
+            _this_loop = asyncio.get_running_loop()
 
             # Intra-KG pass: relationships between tables *within* this source
             # itself (e.g. education.personal_no <-> job_current.employee_id) —
@@ -2156,7 +2157,8 @@ async def _index_source(source_id: str) -> None:
                     nodes=src.get("kg_nodes", []), report=src.get("report"),
                 )
                 self_saved = await asyncio.to_thread(
-                    _run_self_infer, self_ctx, self_ctx, sample_fn=sample_fn,
+                    _run_self_infer, self_ctx, self_ctx,
+                    sample_fn=sample_fn, main_loop=_this_loop,
                 )
                 if self_saved:
                     high = sum(1 for b in self_saved if b.enabled)
@@ -2209,6 +2211,7 @@ async def _index_source(source_id: str) -> None:
                         kg_a_domain   = src.get("domain", ""),
                         kg_b_domain   = other_src.get("domain", ""),
                         sample_fn     = sample_fn,
+                        main_loop     = _this_loop,
                     )
                     if saved:
                         high = sum(1 for b in saved if b.enabled)

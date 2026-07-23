@@ -911,6 +911,9 @@ def run_enterprise_inference_and_save(
     options: Optional[InferenceOptions] = None,
     background_tasks: Any = None,   # fastapi.BackgroundTasks or None
     sample_fn: Optional[Callable[[str, str, str], Optional[Set[str]]]] = None,
+    main_loop: Any = None,          # event loop captured on the caller's thread, for
+                                     # scheduling LLM validation when this function itself
+                                     # runs off the main thread (e.g. via asyncio.to_thread)
 ) -> List["Bridge"]:
     """
     Run inference, persist all results, schedule LLM validation as a
@@ -949,14 +952,27 @@ def run_enterprise_inference_and_save(
 
             background_tasks.add_task(_run_validate)
         else:
-            # Fire-and-forget using asyncio if a loop is running
+            # Fire-and-forget. If we're on the thread that owns a running loop
+            # (the normal async call path), schedule directly. If we're on a
+            # worker thread instead (e.g. this function was invoked via
+            # asyncio.to_thread to keep it off the main event loop), there is
+            # no running loop here — hand the coroutine to the caller-supplied
+            # main_loop via run_coroutine_threadsafe instead.
+            import asyncio
             try:
-                import asyncio
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(_llm_validate_candidates(saved_medium, opts))
+                loop = asyncio.get_running_loop()
+                loop.create_task(_llm_validate_candidates(saved_medium, opts))
+            except RuntimeError:
+                if main_loop is not None:
+                    asyncio.run_coroutine_threadsafe(
+                        _llm_validate_candidates(saved_medium, opts), main_loop,
+                    )
                 else:
-                    loop.run_until_complete(_llm_validate_candidates(saved_medium, opts))
+                    logger.debug(
+                        "No running loop on this thread and no main_loop provided; "
+                        "skipping LLM validation for %d medium-confidence bridge(s)",
+                        len(saved_medium),
+                    )
             except Exception as exc:
                 logger.debug("Could not schedule LLM validation: %s", exc)
 

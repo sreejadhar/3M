@@ -2172,7 +2172,15 @@ async def _index_source(source_id: str) -> None:
                     entry.kg_id[:8], _self_exc,
                 )
 
-            # Run enterprise bridge inference against all other registered KGs
+            # Run enterprise bridge inference against all other registered KGs.
+            # Pairs run concurrently (bounded — each pair opens real DB
+            # connections via sample_fn, so unlimited concurrency would risk
+            # hammering source databases) instead of one at a time: with many
+            # registered sources, sequential pairing is what actually makes a
+            # reindex take an hour+ (observed directly against this stack),
+            # not table row count (that risk is handled separately by the
+            # native-sampling + per-query timeout above).
+            other_srcs: Dict[str, Dict] = {}
             for other in _reg_list():
                 if other.kg_id == entry.kg_id:
                     continue
@@ -2202,24 +2210,42 @@ async def _index_source(source_id: str) -> None:
                             other.source_id[:8], _load_exc,
                         )
                 if other_src:
-                    saved = await asyncio.to_thread(
-                        _infer_bridges,
-                        entry.kg_id,  src.get("kg_nodes", []),
-                        other.kg_id,  other_src.get("kg_nodes", []),
-                        kg_a_report   = src.get("report"),
-                        kg_b_report   = other_src.get("report"),
-                        kg_a_domain   = src.get("domain", ""),
-                        kg_b_domain   = other_src.get("domain", ""),
-                        sample_fn     = sample_fn,
-                        main_loop     = _this_loop,
-                    )
-                    if saved:
-                        high = sum(1 for b in saved if b.enabled)
-                        med  = len(saved) - high
-                        logger.info(
-                            "KG bridges %s↔%s: %d auto-enabled, %d queued for LLM validation",
-                            entry.kg_id[:8], other.kg_id[:8], high, med,
+                    other_srcs[other.kg_id] = other_src
+
+            _pair_semaphore = asyncio.Semaphore(_CROSS_SOURCE_PAIR_CONCURRENCY)
+
+            async def _run_one_pair(other_kg_id: str, other_src: Dict):
+                async with _pair_semaphore:
+                    try:
+                        saved = await asyncio.to_thread(
+                            _infer_bridges,
+                            entry.kg_id,  src.get("kg_nodes", []),
+                            other_kg_id,  other_src.get("kg_nodes", []),
+                            kg_a_report   = src.get("report"),
+                            kg_b_report   = other_src.get("report"),
+                            kg_a_domain   = src.get("domain", ""),
+                            kg_b_domain   = other_src.get("domain", ""),
+                            sample_fn     = sample_fn,
+                            main_loop     = _this_loop,
                         )
+                    except Exception as _pair_exc:
+                        logger.warning(
+                            "KG bridge inference failed for %s↔%s (non-fatal): %s",
+                            entry.kg_id[:8], other_kg_id[:8], _pair_exc,
+                        )
+                        return
+                if saved:
+                    high = sum(1 for b in saved if b.enabled)
+                    med  = len(saved) - high
+                    logger.info(
+                        "KG bridges %s↔%s: %d auto-enabled, %d queued for LLM validation",
+                        entry.kg_id[:8], other_kg_id[:8], high, med,
+                    )
+
+            await asyncio.gather(*[
+                _run_one_pair(kg_id, other_src)
+                for kg_id, other_src in other_srcs.items()
+            ])
 
             # Transitivity pass after all pairs are processed
             from dialog_agent.kg_inference_engine import infer_transitive_bridges
@@ -4092,6 +4118,110 @@ _RANDOM_FN_BY_DB_TYPE = {
     "teradata":   "RANDOM()",
 }
 
+# Native block/row sampling clauses, tried BEFORE the ORDER BY RANDOM() form
+# above. `ORDER BY RANDOM() LIMIT N` requires the engine to compute a random
+# key for and sort EVERY row before taking the top N — a full table scan on a
+# multi-million-row table. These native forms sample directly (page-level or
+# a fixed row count) without scanning the whole table, so sampling cost stays
+# roughly flat regardless of table size. Only wired up for dialects with a
+# verified, unambiguous fixed-row-count or page-sample clause; other dialects
+# (MySQL, BigQuery, Oracle, file-based sources — typically small anyway) keep
+# using the RANDOM()-based form. `{table}`/`{col}` are substituted with the
+# already-quoted identifiers built in sample_fn.
+_NATIVE_SAMPLE_SQL_BY_DB_TYPE = {
+    "postgres": lambda table, col: (
+        f"SELECT DISTINCT {col} FROM "
+        f"(SELECT {col} FROM {table} TABLESAMPLE SYSTEM (1) LIMIT 2000) sub_sample"
+    ),
+    "redshift": lambda table, col: (
+        f"SELECT DISTINCT {col} FROM "
+        f"(SELECT {col} FROM {table} TABLESAMPLE SYSTEM (1) LIMIT 2000) sub_sample"
+    ),
+    "snowflake": lambda table, col: (
+        f"SELECT DISTINCT {col} FROM "
+        f"(SELECT {col} FROM {table} SAMPLE (2000 ROWS)) sub_sample"
+    ),
+    "sqlserver": lambda table, col: (
+        f"SELECT DISTINCT {col} FROM "
+        f"(SELECT {col} FROM {table} TABLESAMPLE (2000 ROWS)) sub_sample"
+    ),
+    "databricks": lambda table, col: (
+        f"SELECT DISTINCT {col} FROM "
+        f"(SELECT {col} FROM {table} TABLESAMPLE (2000 ROWS)) sub_sample"
+    ),
+}
+
+# Hard ceiling on a single bridge-sampling query. Bounds the worst case for a
+# huge or unresponsive table/warehouse to a bounded per-column delay instead
+# of blocking that source pairing indefinitely (there is otherwise no
+# client-side deadline on _run_sql). Runs off the main event loop already
+# (via asyncio.to_thread in orchestrator_api._index_source), so a timeout
+# here only bounds THIS reindex's wall-clock time, not the rest of the app.
+_SAMPLE_QUERY_TIMEOUT_S = 30
+_sample_query_executor: Optional["concurrent.futures.ThreadPoolExecutor"] = None
+
+# How many other-source pairings a single reindex processes concurrently
+# during cross-source bridge inference. Bounded (not unlimited) because each
+# pairing opens real connections against a source database via sample_fn —
+# too much concurrency would risk overwhelming those databases rather than
+# just parallelizing local work.
+_CROSS_SOURCE_PAIR_CONCURRENCY = 4
+
+# Circuit breaker for a source whose database is genuinely unreachable (e.g.
+# an expired trial account, suspended warehouse, revoked credentials) — a
+# reindex otherwise re-attempts a real connection for EVERY sampled column
+# against every such source, each costing several seconds even though it's
+# certain to fail. Tracks CONSECUTIVE failures per kg_id: any success resets
+# the counter to 0, so a source that's healthy but has a few mismatched
+# columns/tables (a query-level issue, not a connection issue) never trips
+# this — only a source failing every single call in a row does, which in
+# practice means the connection itself is down.
+import threading as _threading_health
+_source_health_lock = _threading_health.Lock()
+_source_consec_failures: Dict[str, int] = {}
+_source_unhealthy_until: Dict[str, float] = {}
+_UNHEALTHY_FAILURE_THRESHOLD = 3
+_UNHEALTHY_COOLDOWN_S = 300  # 5 minutes
+
+
+def _mark_sample_result(kg_id: str, ok: bool) -> None:
+    with _source_health_lock:
+        if ok:
+            _source_consec_failures[kg_id] = 0
+            _source_unhealthy_until.pop(kg_id, None)
+        else:
+            n = _source_consec_failures.get(kg_id, 0) + 1
+            _source_consec_failures[kg_id] = n
+            if n >= _UNHEALTHY_FAILURE_THRESHOLD:
+                if kg_id not in _source_unhealthy_until:
+                    logger.info(
+                        "bridge sampler: source %s failed %d sampling attempts in a "
+                        "row — treating as unreachable, skipping for %ds",
+                        kg_id[:8], n, _UNHEALTHY_COOLDOWN_S,
+                    )
+                _source_unhealthy_until[kg_id] = time.time() + _UNHEALTHY_COOLDOWN_S
+
+
+def _is_source_unhealthy(kg_id: str) -> bool:
+    with _source_health_lock:
+        until = _source_unhealthy_until.get(kg_id)
+    return bool(until and time.time() < until)
+
+
+# Sentinel distinguishing "query errored/timed out" from a legitimate empty
+# result list, used by _make_bridge_sample_fn's _query helper.
+_QUERY_FAILED = object()
+
+
+def _get_sample_query_executor():
+    global _sample_query_executor
+    if _sample_query_executor is None:
+        import concurrent.futures as _cf
+        _sample_query_executor = _cf.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="bridge-sampler",
+        )
+    return _sample_query_executor
+
 
 def _make_bridge_sample_fn():
     """
@@ -4116,6 +4246,8 @@ def _make_bridge_sample_fn():
     from dialog_agent.nodes.execute_node import _run_sql
 
     def sample_fn(kg_id: str, entity: str, col: str):
+        if _is_source_unhealthy(kg_id):
+            return None
         entry = _reg_get(kg_id)
         if not entry:
             return None
@@ -4134,30 +4266,66 @@ def _make_bridge_sample_fn():
         entity_ref = f'"{entity}"' if quote_ids else entity
         col_ref    = f'"{col}"'    if quote_ids else col
         table = f"{cfg.db_schema}.{entity_ref}" if cfg.db_schema else entity_ref
-        rand_fn = _RANDOM_FN_BY_DB_TYPE.get(cfg.db_type.lower())
+        db_type = cfg.db_type.lower()
+        rand_fn = _RANDOM_FN_BY_DB_TYPE.get(db_type)
+        native_sql_fn = _NATIVE_SAMPLE_SQL_BY_DB_TYPE.get(db_type)
 
         def _query(sql: str):
+            """Returns _QUERY_FAILED on any error/timeout, else the (possibly
+            empty) rows list — kept distinct from a legitimate empty result
+            so the circuit breaker only counts real failures, not columns
+            that just happen to have zero distinct non-null values."""
             try:
-                r = _run_sql(cfg, sql)
+                fut = _get_sample_query_executor().submit(_run_sql, cfg, sql)
+                r = fut.result(timeout=_SAMPLE_QUERY_TIMEOUT_S)
             except Exception as exc:
-                logger.debug("bridge sampler: query failed for %s.%s — %s", entity, col, exc)
-                return None
+                logger.debug(
+                    "bridge sampler: query failed/timed out for %s.%s — %s",
+                    entity, col, exc,
+                )
+                return _QUERY_FAILED
             if not r or r.get("error"):
-                return None
+                return _QUERY_FAILED
             return r.get("rows") or []
 
         rows = None
-        if rand_fn:
-            rows = _query(
+        any_success = False
+        if native_sql_fn:
+            # Page/row-level sampling — cost stays roughly flat regardless of
+            # table size, unlike ORDER BY RANDOM() below. A tiny table can
+            # legitimately come back empty (e.g. Postgres TABLESAMPLE SYSTEM
+            # picks whole pages, so a 1% sample of a small table can miss
+            # entirely) — treat empty the same as "unavailable" and fall
+            # through rather than reporting a false "no overlap".
+            native_rows = _query(native_sql_fn(table, col_ref))
+            if native_rows is not _QUERY_FAILED:
+                any_success = True
+                if native_rows:
+                    rows = native_rows
+        if rows is None and rand_fn:
+            rand_rows = _query(
                 f"SELECT DISTINCT {col_ref} FROM "
                 f"(SELECT {col_ref} FROM {table} ORDER BY {rand_fn} LIMIT 2000) sub_sample"
             )
+            if rand_rows is not _QUERY_FAILED:
+                any_success = True
+                rows = rand_rows
         if rows is None:
-            # No known random function for this dialect, or the randomised
-            # form errored (unsupported syntax on this specific backend) —
-            # fall back to a plain deterministic sample rather than failing
-            # the whole tier for this column.
-            rows = _query(f"SELECT DISTINCT {col_ref} FROM {table} LIMIT 2000") or []
+            # No known random/native sampling for this dialect, or every
+            # attempt above errored (unsupported syntax on this specific
+            # backend) — fall back to a plain deterministic sample rather
+            # than failing the whole tier for this column.
+            plain_rows = _query(f"SELECT DISTINCT {col_ref} FROM {table} LIMIT 2000")
+            if plain_rows is not _QUERY_FAILED:
+                any_success = True
+                rows = plain_rows
+            rows = rows or []
+
+        # Mark success if ANY attempt got a real response (even zero rows) —
+        # only a source where every single attempt errored/timed out looks
+        # like a dead connection, not a column that's legitimately empty or
+        # mismatched.
+        _mark_sample_result(kg_id, ok=any_success)
 
         values = {str(r[0]) for r in rows[:2000] if r and r[0] is not None}
         return values or None

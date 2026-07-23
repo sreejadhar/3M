@@ -2155,7 +2155,9 @@ async def _index_source(source_id: str) -> None:
                     domain=src.get("domain", ""),
                     nodes=src.get("kg_nodes", []), report=src.get("report"),
                 )
-                self_saved = _run_self_infer(self_ctx, self_ctx, sample_fn=sample_fn)
+                self_saved = await asyncio.to_thread(
+                    _run_self_infer, self_ctx, self_ctx, sample_fn=sample_fn,
+                )
                 if self_saved:
                     high = sum(1 for b in self_saved if b.enabled)
                     logger.info(
@@ -2198,7 +2200,8 @@ async def _index_source(source_id: str) -> None:
                             other.source_id[:8], _load_exc,
                         )
                 if other_src:
-                    saved = _infer_bridges(
+                    saved = await asyncio.to_thread(
+                        _infer_bridges,
                         entry.kg_id,  src.get("kg_nodes", []),
                         other.kg_id,  other_src.get("kg_nodes", []),
                         kg_a_report   = src.get("report"),
@@ -2217,7 +2220,7 @@ async def _index_source(source_id: str) -> None:
 
             # Transitivity pass after all pairs are processed
             from dialog_agent.kg_inference_engine import infer_transitive_bridges
-            trans = infer_transitive_bridges()
+            trans = await asyncio.to_thread(infer_transitive_bridges)
             if trans:
                 logger.info("Transitive bridges: %d new bridges from A→B+B→C chains", len(trans))
 

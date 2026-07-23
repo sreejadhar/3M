@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -654,7 +655,8 @@ async def _startup() -> None:
                             nodes=src.get("kg_nodes") or [],
                             report=src.get("report"),
                         ))
-                    result = run_all_pairs(contexts, sample_fn=_make_bridge_sample_fn())
+                    with _bridge_sweep_lock:
+                        result = run_all_pairs(contexts, sample_fn=_make_bridge_sample_fn())
                     logger.info(
                         "Startup bridge inference: %d pairs processed, %d bridges saved",
                         result["pairs_processed"], result["bridges_saved"],
@@ -1844,6 +1846,193 @@ def _register_source_kg(src: Dict) -> Optional["KGEntry"]:
         return None
 
 
+_bridge_sweep_lock = threading.Lock()
+
+
+async def _run_bridge_inference_phase(source_id: str, src: Dict, entry: "KGEntry") -> None:
+    """
+    Intra-KG self pass + cross-source pairing + transitivity for one
+    just-(re)indexed source.
+
+    Serialized against _bridge_sweep_lock: the startup pass
+    (_startup_bridge_inference), the manual /kg-bridges/infer endpoint, and
+    this per-source reindex path can all run a full bridge-inference sweep,
+    each submitting many real DB-sampling queries to the shared
+    _get_sample_query_executor() pool. Running two sweeps at once starves
+    that pool — queries queue behind each other's work, some don't get a
+    worker before their timeout expires, and get counted as "unreachable"
+    even though the actual source database is fine (observed live: nearly
+    every registered source tripped the circuit breaker simultaneously when
+    a restart's startup sweep overlapped a reindex's sweep). Only one sweep
+    may hold this lock at a time; others wait their turn instead of
+    colliding.
+    """
+    from dialog_agent.kg_registry import list_all as _reg_list
+    from dialog_agent.kg_bridges import run_inference_and_save as _infer_bridges
+
+    await asyncio.to_thread(_bridge_sweep_lock.acquire)
+    try:
+        _push_index_event(source_id, "bridges", "running",
+                           "Analyzing relationships within this source…")
+
+        sample_fn = _make_bridge_sample_fn()
+        _this_loop = asyncio.get_running_loop()
+
+        # Intra-KG pass: relationships between tables *within* this source
+        # itself (e.g. education.personal_no <-> job_current.employee_id) —
+        # the cross-source loop below never looks at this, since it always
+        # skips pairing a KG against itself.
+        try:
+            from dialog_agent.kg_inference_engine import (
+                KGContext as _SelfKGContext,
+                run_enterprise_inference_and_save as _run_self_infer,
+            )
+            self_ctx = _SelfKGContext(
+                kg_id=entry.kg_id, display_name=entry.display_name,
+                domain=src.get("domain", ""),
+                nodes=src.get("kg_nodes", []), report=src.get("report"),
+            )
+            self_saved = await asyncio.to_thread(
+                _run_self_infer, self_ctx, self_ctx,
+                sample_fn=sample_fn, main_loop=_this_loop,
+            )
+            if self_saved:
+                high = sum(1 for b in self_saved if b.enabled)
+                logger.info(
+                    "KG intra-source bridges for %s: %d found (%d auto-enabled)",
+                    entry.kg_id[:8], len(self_saved), high,
+                )
+                _push_index_event(
+                    source_id, "bridges", "running",
+                    f"Intra-source relationships found — {len(self_saved)} "
+                    f"({high} auto-enabled)",
+                )
+            else:
+                _push_index_event(source_id, "bridges", "running",
+                                   "No intra-source relationships found")
+        except Exception as _self_exc:
+            logger.warning(
+                "Intra-KG bridge inference failed for %s (non-fatal): %s",
+                entry.kg_id[:8], _self_exc,
+            )
+
+        # Run enterprise bridge inference against all other registered KGs.
+        # Pairs run concurrently (bounded — each pair opens real DB
+        # connections via sample_fn, so unlimited concurrency would risk
+        # hammering source databases) instead of one at a time: with many
+        # registered sources, sequential pairing is what actually makes a
+        # reindex take an hour+ (observed directly against this stack),
+        # not table row count (that risk is handled separately by the
+        # native-sampling + per-query timeout above).
+        other_srcs: Dict[str, Dict] = {}
+        for other in _reg_list():
+            if other.kg_id == entry.kg_id:
+                continue
+            other_src = _sources.get(other.source_id)
+            if not other_src:
+                # Fall back to loading from persistent store — the source
+                # was indexed in a previous server run and lives in the DB.
+                try:
+                    from_store = [s for s in _kg_store.load_all()
+                                  if s["id"] == other.source_id]
+                    if from_store:
+                        other_src = from_store[0]
+                        _sources[other.source_id] = other_src  # cache it
+                        logger.info(
+                            "KG bridge inference: loaded %s from store for bridge pairing",
+                            other.source_id[:8],
+                        )
+                    else:
+                        logger.warning(
+                            "KG bridge inference skipped: KG %s (source %s) not found "
+                            "in _sources or kg_store — re-index that source to enable bridges",
+                            other.kg_id[:8], other.source_id[:8],
+                        )
+                except Exception as _load_exc:
+                    logger.warning(
+                        "KG bridge inference: kg_store lookup failed for %s: %s",
+                        other.source_id[:8], _load_exc,
+                    )
+            if other_src:
+                other_srcs[other.kg_id] = other_src
+
+        _pair_semaphore = asyncio.Semaphore(_CROSS_SOURCE_PAIR_CONCURRENCY)
+        _pair_totals = {"done": 0, "high": 0, "med": 0, "skipped": 0}
+        _pair_total_count = len(other_srcs)
+
+        if _pair_total_count:
+            _push_index_event(
+                source_id, "bridges", "running",
+                f"Checking relationships against {_pair_total_count} other source(s)…",
+            )
+
+        async def _run_one_pair(other_kg_id: str, other_src: Dict):
+            # Snapshot the circuit-breaker state ONCE, before this pairing
+            # starts — this is what actually determines whether Tier V is
+            # skipped for every column checked during this call. Checking
+            # again afterwards and OR-ing the two was a bug: a source that
+            # was unhealthy from an earlier, unrelated pairing but
+            # recovered (a success clears the breaker) would still get
+            # permanently stamped "unreachable" even though this pairing
+            # found real results via a healthy connection.
+            tier_v_skipped = _is_source_unhealthy(other_kg_id)
+            async with _pair_semaphore:
+                try:
+                    saved = await asyncio.to_thread(
+                        _infer_bridges,
+                        entry.kg_id,  src.get("kg_nodes", []),
+                        other_kg_id,  other_src.get("kg_nodes", []),
+                        kg_a_report   = src.get("report"),
+                        kg_b_report   = other_src.get("report"),
+                        kg_a_domain   = src.get("domain", ""),
+                        kg_b_domain   = other_src.get("domain", ""),
+                        sample_fn     = sample_fn,
+                        main_loop     = _this_loop,
+                    )
+                except Exception as _pair_exc:
+                    logger.warning(
+                        "KG bridge inference failed for %s↔%s (non-fatal): %s",
+                        entry.kg_id[:8], other_kg_id[:8], _pair_exc,
+                    )
+                    saved = None
+            _pair_totals["done"] += 1
+            if tier_v_skipped:
+                _pair_totals["skipped"] += 1
+            if saved:
+                high = sum(1 for b in saved if b.enabled)
+                med  = len(saved) - high
+                _pair_totals["high"] += high
+                _pair_totals["med"]  += med
+                logger.info(
+                    "KG bridges %s↔%s: %d auto-enabled, %d queued for LLM validation%s",
+                    entry.kg_id[:8], other_kg_id[:8], high, med,
+                    " (source unreachable — name/embedding tiers only)" if tier_v_skipped else "",
+                )
+
+        await asyncio.gather(*[
+            _run_one_pair(kg_id, other_src)
+            for kg_id, other_src in other_srcs.items()
+        ])
+
+        # Transitivity pass after all pairs are processed
+        from dialog_agent.kg_inference_engine import infer_transitive_bridges
+        trans = await asyncio.to_thread(infer_transitive_bridges)
+        if trans:
+            logger.info("Transitive bridges: %d new bridges from A→B+B→C chains", len(trans))
+
+        _push_index_event(
+            source_id, "bridges", "done",
+            f"Relationship discovery complete — {_pair_totals['high']} auto-enabled, "
+            f"{_pair_totals['med']} queued for LLM validation across "
+            f"{_pair_total_count} source(s)"
+            + (f", {_pair_totals['skipped']} had value-overlap sampling skipped (unreachable)"
+               if _pair_totals["skipped"] else "")
+            + (f", {len(trans)} transitive" if trans else ""),
+        )
+    finally:
+        _bridge_sweep_lock.release()
+
+
 async def _index_source(source_id: str) -> None:
     """Full pipeline for a registered data source: extract → ontology → KG."""
     src = _sources.get(source_id)
@@ -2129,129 +2318,14 @@ async def _index_source(source_id: str) -> None:
                 logger.warning("Source %s: KG failed: %s", source_id[:8], exc)
                 _push_index_event(source_id, "kg", "warn", f"KG build failed: {exc}")
 
-        # ── Register KG in federation registry ────────────────────────────────
+        # ── Register KG in federation registry, then run bridge inference ──────
         try:
-            from dialog_agent.kg_registry import list_all as _reg_list
-            from dialog_agent.kg_bridges import run_inference_and_save as _infer_bridges
-
             entry = _register_source_kg(src)
             if entry is None:
                 raise RuntimeError("kg_registry upsert failed — see prior warning")
             logger.info("KG registry: registered %s (%s)", entry.kg_id[:8], entry.display_name)
 
-            sample_fn = _make_bridge_sample_fn()
-            _this_loop = asyncio.get_running_loop()
-
-            # Intra-KG pass: relationships between tables *within* this source
-            # itself (e.g. education.personal_no <-> job_current.employee_id) —
-            # the cross-source loop below never looks at this, since it always
-            # skips pairing a KG against itself.
-            try:
-                from dialog_agent.kg_inference_engine import (
-                    KGContext as _SelfKGContext,
-                    run_enterprise_inference_and_save as _run_self_infer,
-                )
-                self_ctx = _SelfKGContext(
-                    kg_id=entry.kg_id, display_name=entry.display_name,
-                    domain=src.get("domain", ""),
-                    nodes=src.get("kg_nodes", []), report=src.get("report"),
-                )
-                self_saved = await asyncio.to_thread(
-                    _run_self_infer, self_ctx, self_ctx,
-                    sample_fn=sample_fn, main_loop=_this_loop,
-                )
-                if self_saved:
-                    high = sum(1 for b in self_saved if b.enabled)
-                    logger.info(
-                        "KG intra-source bridges for %s: %d found (%d auto-enabled)",
-                        entry.kg_id[:8], len(self_saved), high,
-                    )
-            except Exception as _self_exc:
-                logger.warning(
-                    "Intra-KG bridge inference failed for %s (non-fatal): %s",
-                    entry.kg_id[:8], _self_exc,
-                )
-
-            # Run enterprise bridge inference against all other registered KGs.
-            # Pairs run concurrently (bounded — each pair opens real DB
-            # connections via sample_fn, so unlimited concurrency would risk
-            # hammering source databases) instead of one at a time: with many
-            # registered sources, sequential pairing is what actually makes a
-            # reindex take an hour+ (observed directly against this stack),
-            # not table row count (that risk is handled separately by the
-            # native-sampling + per-query timeout above).
-            other_srcs: Dict[str, Dict] = {}
-            for other in _reg_list():
-                if other.kg_id == entry.kg_id:
-                    continue
-                other_src = _sources.get(other.source_id)
-                if not other_src:
-                    # Fall back to loading from persistent store — the source
-                    # was indexed in a previous server run and lives in the DB.
-                    try:
-                        from_store = [s for s in _kg_store.load_all()
-                                      if s["id"] == other.source_id]
-                        if from_store:
-                            other_src = from_store[0]
-                            _sources[other.source_id] = other_src  # cache it
-                            logger.info(
-                                "KG bridge inference: loaded %s from store for bridge pairing",
-                                other.source_id[:8],
-                            )
-                        else:
-                            logger.warning(
-                                "KG bridge inference skipped: KG %s (source %s) not found "
-                                "in _sources or kg_store — re-index that source to enable bridges",
-                                other.kg_id[:8], other.source_id[:8],
-                            )
-                    except Exception as _load_exc:
-                        logger.warning(
-                            "KG bridge inference: kg_store lookup failed for %s: %s",
-                            other.source_id[:8], _load_exc,
-                        )
-                if other_src:
-                    other_srcs[other.kg_id] = other_src
-
-            _pair_semaphore = asyncio.Semaphore(_CROSS_SOURCE_PAIR_CONCURRENCY)
-
-            async def _run_one_pair(other_kg_id: str, other_src: Dict):
-                async with _pair_semaphore:
-                    try:
-                        saved = await asyncio.to_thread(
-                            _infer_bridges,
-                            entry.kg_id,  src.get("kg_nodes", []),
-                            other_kg_id,  other_src.get("kg_nodes", []),
-                            kg_a_report   = src.get("report"),
-                            kg_b_report   = other_src.get("report"),
-                            kg_a_domain   = src.get("domain", ""),
-                            kg_b_domain   = other_src.get("domain", ""),
-                            sample_fn     = sample_fn,
-                            main_loop     = _this_loop,
-                        )
-                    except Exception as _pair_exc:
-                        logger.warning(
-                            "KG bridge inference failed for %s↔%s (non-fatal): %s",
-                            entry.kg_id[:8], other_kg_id[:8], _pair_exc,
-                        )
-                        return
-                if saved:
-                    high = sum(1 for b in saved if b.enabled)
-                    med  = len(saved) - high
-                    logger.info(
-                        "KG bridges %s↔%s: %d auto-enabled, %d queued for LLM validation",
-                        entry.kg_id[:8], other_kg_id[:8], high, med,
-                    )
-
-            await asyncio.gather(*[
-                _run_one_pair(kg_id, other_src)
-                for kg_id, other_src in other_srcs.items()
-            ])
-
-            # Transitivity pass after all pairs are processed
-            from dialog_agent.kg_inference_engine import infer_transitive_bridges
-            trans = await asyncio.to_thread(infer_transitive_bridges)
-            if trans:
-                logger.info("Transitive bridges: %d new bridges from A→B+B→C chains", len(trans))
+            await _run_bridge_inference_phase(source_id, src, entry)
 
         except Exception as _reg_exc:
             logger.warning("KG registry registration failed (non-fatal): %s", _reg_exc)
@@ -4218,7 +4292,7 @@ def _get_sample_query_executor():
     if _sample_query_executor is None:
         import concurrent.futures as _cf
         _sample_query_executor = _cf.ThreadPoolExecutor(
-            max_workers=8, thread_name_prefix="bridge-sampler",
+            max_workers=20, thread_name_prefix="bridge-sampler",
         )
     return _sample_query_executor
 
@@ -4403,7 +4477,8 @@ async def trigger_bridge_inference(req: InferRequest, background_tasks: Backgrou
     sample_fn = _make_bridge_sample_fn()
 
     def _run():
-        result = run_all_pairs(contexts, opts, sample_fn=sample_fn)
+        with _bridge_sweep_lock:
+            result = run_all_pairs(contexts, opts, sample_fn=sample_fn)
         logger.info(
             "Manual inference job complete: %d pairs, %d bridges saved",
             result["pairs_processed"], result["bridges_saved"],

@@ -20,9 +20,22 @@ export function AppStateProvider({ children }) {
 
   const bumpRefresh = useCallback(() => setRefreshTick((t) => t + 1), []);
 
+  // Several call sites trigger refreshSources() independently and can overlap
+  // (a 10s poll, a debounced SSE refresh, a direct post-reindex refresh, button
+  // actions) — on localhost's near-zero latency they virtually always resolve
+  // in the order they were issued, but over a real network (e.g. after
+  // deployment) an older, slower GET /sources response can resolve AFTER a
+  // newer one and silently clobber it with stale data. That's what caused
+  // freshly-populated fields (e.g. business/domain right after a reindex) to
+  // flash correctly for a moment and then revert. Guard with a generation
+  // counter so only the response to the most-recently-issued call is applied.
+  const refreshGen = useRef(0);
+
   const refreshSources = useCallback(async () => {
+    const gen = ++refreshGen.current;
     try {
       const list = await listSources();
+      if (gen !== refreshGen.current) return [];   // superseded by a newer call
       const arr = Array.isArray(list) ? list : [];
       setSources(arr);
       // auto-select first ready source once (matches app.js init)
@@ -37,7 +50,7 @@ export function AppStateProvider({ children }) {
     } catch {
       return [];
     } finally {
-      setLoadingSources(false);
+      if (gen === refreshGen.current) setLoadingSources(false);
     }
   }, [activeSourceId]);
 

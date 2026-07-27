@@ -3351,17 +3351,29 @@ async def source_index_events(source_id: str):
         raise HTTPException(status_code=404, detail="Source not found")
 
     async def _gen() -> AsyncGenerator[str, None]:
+        # Attach the live queue BEFORE snapshotting the replay buffer. Doing it
+        # after (the old order) left a window — while this generator yielded
+        # each buffered event, an event pushed by a fast-running indexing task
+        # (e.g. a local SQLite source with near-zero I/O latency) would land in
+        # neither: too late for the already-taken snapshot, too early for the
+        # not-yet-attached queue — and be lost forever, leaving the monitor
+        # showing nothing with no error. Attaching first closes that window;
+        # any event pushed after attach is captured by the queue even if it's
+        # also present in the snapshot (pushed in the gap between attach and
+        # snapshot) — deduped below via object identity so it's never replayed
+        # twice.
+        q: asyncio.Queue = asyncio.Queue(maxsize=200)
+        _source_event_queues[source_id] = q
+
         # Replay buffered events so reconnecting clients catch up.
         # Mark them as replays so the frontend doesn't act on stale terminal events.
         # Only replay events from the last 10 minutes (stale pipelines are irrelevant).
         cutoff = time.time() - 600
+        replayed_ids = set()
         for ev in list(_source_event_log.get(source_id, [])):
             if ev.get("ts", 0) > cutoff:
                 yield _sse_line({**ev, "is_replay": True})
-
-        # Attach a live queue
-        q: asyncio.Queue = asyncio.Queue(maxsize=200)
-        _source_event_queues[source_id] = q
+                replayed_ids.add(id(ev))
 
         heartbeat_interval = 20
         last_hb = time.time()
@@ -3369,6 +3381,8 @@ async def source_index_events(source_id: str):
             while True:
                 try:
                     ev = q.get_nowait()
+                    if id(ev) in replayed_ids:
+                        continue
                     yield _sse_line(ev)
                     # Stop streaming once indexing is complete or errored
                     if ev.get("step") == "complete":

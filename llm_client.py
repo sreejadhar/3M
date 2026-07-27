@@ -19,11 +19,76 @@ Config:
 """
 import logging
 import os
+import socket
 import time
 
 import anthropic
 
 logger = logging.getLogger(__name__)
+
+
+def _configure_hf_offline_mode() -> None:
+    """
+    Unrelated to the Anthropic client below — this lives here because
+    llm_client.py is the one module every service's Dockerfile bundles and
+    every service imports on startup, making it the natural single place to
+    run a check that must happen once, early, before any of the several
+    dialog_agent / knowledge_graph_agent modules lazily import
+    sentence-transformers.
+
+    sentence-transformers (used for dialog schema retrieval and KG bridge
+    inference) hits huggingface.co on every model load — even when the model
+    is already cached — to check for a newer revision. On a host/pod with no
+    outbound access to huggingface.co, that check fails via DNS resolution
+    and huggingface_hub retries 5x with exponential backoff (up to ~30s)
+    *per call*; multiplied across every dialog query and KG bridge-inference
+    pass, that stalls the pipeline for minutes.
+
+    Do one cheap, bounded reachability probe per process instead of paying
+    that cost on every call. Unreachable -> force offline mode for the life
+    of the process, so every subsequent load fails (or serves from cache)
+    instantly. Reachable -> leave online mode untouched, so an environment
+    with real internet access (e.g. a cloud deployment) can still download
+    the model the first time it's needed, exactly as before this existed.
+
+    Never overrides an explicit HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE already
+    set in the environment (e.g. by a launcher script or a future Docker/K8s
+    config) — this is a fallback for when no explicit choice was made.
+    """
+    if os.environ.get("HF_HUB_OFFLINE") or os.environ.get("TRANSFORMERS_OFFLINE"):
+        return
+
+    # socket.create_connection's timeout only bounds the TCP connect step —
+    # DNS resolution (getaddrinfo) happens first and is NOT bounded by it. On
+    # a host with no route to the internet, getaddrinfo itself can block for
+    # 15+ seconds before failing (confirmed on this Windows machine), which
+    # would make the probe itself as slow as the problem it's meant to avoid.
+    # Run it in a worker thread and enforce the timeout via Future.result()
+    # instead, which IS interruptible regardless of how long the underlying
+    # blocking call takes. shutdown(wait=False) avoids blocking on that
+    # worker if it's still stuck in getaddrinfo when we give up on it — it
+    # simply finishes in the background and is dropped.
+    import concurrent.futures
+
+    def _probe() -> None:
+        socket.create_connection(("huggingface.co", 443), timeout=1.5).close()
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        executor.submit(_probe).result(timeout=1.5)
+    except Exception:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        logger.info(
+            "huggingface.co unreachable (or too slow to resolve) — forcing "
+            "HF_HUB_OFFLINE for this process so sentence-transformers model "
+            "loads fail fast instead of retrying"
+        )
+    finally:
+        executor.shutdown(wait=False)
+
+
+_configure_hf_offline_mode()
 
 # Map a Vertex-style / loose model id to a valid public Anthropic API id by tier.
 # Targets are the current canonical ids for each tier.

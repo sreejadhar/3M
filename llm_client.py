@@ -17,8 +17,13 @@ Config:
   GCP_PROJECT_ID     — GCP project ID (Vertex path)
   VERTEX_REGION      — Vertex AI region (default: us-east5)
 """
+import logging
 import os
+import time
+
 import anthropic
+
+logger = logging.getLogger(__name__)
 
 # Map a Vertex-style / loose model id to a valid public Anthropic API id by tier.
 # Targets are the current canonical ids for each tier.
@@ -38,14 +43,53 @@ def _normalize_model(model: str) -> str:
     return model
 
 
-class _RemapMessages:
-    """Proxy for client.messages that rewrites the `model` kwarg to a valid
-    public-API id before delegating (covers create / stream / count_tokens)."""
+class _TimedMessages:
+    """Proxy for client.messages that logs wall-clock time for create/stream,
+    optionally rewriting kwargs first via `_prepare` (identity by default).
+    Timing is purely observational — call args/kwargs and return values pass
+    through unchanged, so behavior is identical to calling `inner` directly."""
 
     def __init__(self, inner):
         self._inner = inner
 
-    def _remap(self, kwargs):
+    def _prepare(self, kwargs):
+        return kwargs
+
+    def create(self, *args, **kwargs):
+        kwargs = self._prepare(kwargs)
+        model = kwargs.get("model", "")
+        t0 = time.perf_counter()
+        try:
+            return self._inner.create(*args, **kwargs)
+        finally:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info("llm_timing model=%s elapsed_ms=%.1f", model, elapsed_ms)
+
+    def stream(self, *args, **kwargs):
+        # Only times how long it takes to open the stream (setup), not the
+        # full token-by-token duration, since that's consumed by the caller
+        # after this returns.
+        kwargs = self._prepare(kwargs)
+        model = kwargs.get("model", "")
+        t0 = time.perf_counter()
+        try:
+            return self._inner.stream(*args, **kwargs)
+        finally:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info("llm_timing_stream_open model=%s elapsed_ms=%.1f", model, elapsed_ms)
+
+    def count_tokens(self, *args, **kwargs):
+        return self._inner.count_tokens(*args, **self._prepare(kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _RemapMessages(_TimedMessages):
+    """Proxy for client.messages that rewrites the `model` kwarg to a valid
+    public-API id before delegating (covers create / stream / count_tokens)."""
+
+    def _prepare(self, kwargs):
         if "model" in kwargs:
             kwargs["model"] = _normalize_model(kwargs["model"])
         # The pipeline was built for 1M-token-context models (the Vertex setup),
@@ -58,18 +102,6 @@ class _RemapMessages:
         kwargs["extra_headers"] = hdrs
         return kwargs
 
-    def create(self, *args, **kwargs):
-        return self._inner.create(*args, **self._remap(kwargs))
-
-    def stream(self, *args, **kwargs):
-        return self._inner.stream(*args, **self._remap(kwargs))
-
-    def count_tokens(self, *args, **kwargs):
-        return self._inner.count_tokens(*args, **self._remap(kwargs))
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
 
 class _DirectClient:
     """Wraps anthropic.Anthropic so .messages remaps model ids; everything else
@@ -78,6 +110,18 @@ class _DirectClient:
     def __init__(self, inner):
         self._inner = inner
         self.messages = _RemapMessages(inner.messages)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _VertexClient:
+    """Wraps AnthropicVertex so .messages calls are timed; everything else
+    passes through unchanged (no model-id remapping needed on this path)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.messages = _TimedMessages(inner.messages)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -96,4 +140,4 @@ def get_client():
 
     project_id = os.environ.get("GCP_PROJECT_ID", "cog01k24f1ea555zdv7ynzthxanz5")
     vertex_region = os.environ.get("VERTEX_REGION", "us-east5")
-    return anthropic.AnthropicVertex(region=vertex_region, project_id=project_id)
+    return _VertexClient(anthropic.AnthropicVertex(region=vertex_region, project_id=project_id))

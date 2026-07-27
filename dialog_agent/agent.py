@@ -16,6 +16,7 @@ Pipeline:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from langgraph.graph import END, START, StateGraph
@@ -37,16 +38,29 @@ logger = logging.getLogger(__name__)
 _NODES = ["retrieve", "document_context", "understand", "resolve", "plan", "execute", "synthesize"]
 
 
+def _timed_node(name, fn):
+    """Wrap a LangGraph node with wall-clock timing, logged but otherwise
+    transparent — does not alter the node's inputs, outputs, or exceptions."""
+    def _wrapped(state):
+        t0 = time.perf_counter()
+        try:
+            return fn(state)
+        finally:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.info("dialog_timing node=%s elapsed_ms=%.1f", name, elapsed_ms)
+    return _wrapped
+
+
 def _build_graph() -> Any:
     g = StateGraph(DialogState)
 
-    g.add_node("retrieve",          retrieve_node)
-    g.add_node("document_context",  document_context_node)
-    g.add_node("understand",        understand_node)
-    g.add_node("resolve",           resolve_node)
-    g.add_node("plan",              plan_node)
-    g.add_node("execute",           execute_node)
-    g.add_node("synthesize",        synthesize_node)
+    g.add_node("retrieve",          _timed_node("retrieve", retrieve_node))
+    g.add_node("document_context",  _timed_node("document_context", document_context_node))
+    g.add_node("understand",        _timed_node("understand", understand_node))
+    g.add_node("resolve",           _timed_node("resolve", resolve_node))
+    g.add_node("plan",              _timed_node("plan", plan_node))
+    g.add_node("execute",           _timed_node("execute", execute_node))
+    g.add_node("synthesize",        _timed_node("synthesize", synthesize_node))
 
     g.add_edge(START,               "retrieve")
     g.add_edge("retrieve",          "document_context")
@@ -114,7 +128,9 @@ class DialogAgent:
             kg_bridges_active=kg_bridges_active,
             multi_kg_configs=multi_kg_configs,
         )
+        t0 = time.perf_counter()
         result = self._graph.invoke(state)
+        logger.info("dialog_timing total elapsed_ms=%.1f", (time.perf_counter() - t0) * 1000)
         result["phase"] = "done"
         return result
 

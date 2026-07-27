@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -78,8 +79,19 @@ class _Cache:
         """Embed a single query string into the same space as the corpus."""
         if self.backend == "sentence-transformers":
             from sentence_transformers import SentenceTransformer
+            t0 = time.perf_counter()
             model = SentenceTransformer("all-MiniLM-L6-v2")
+            t1 = time.perf_counter()
             v = model.encode([query], normalize_embeddings=True)[0]
+            t2 = time.perf_counter()
+            logger.info(
+                "dialog_timing sub=retrieve.embed_query.model_load elapsed_ms=%.1f",
+                (t1 - t0) * 1000,
+            )
+            logger.info(
+                "dialog_timing sub=retrieve.embed_query.encode elapsed_ms=%.1f",
+                (t2 - t1) * 1000,
+            )
             return v.astype(np.float32)
 
         if self.backend == "openai":
@@ -451,8 +463,19 @@ def _build_cache(
 
     if backend == "sentence-transformers":
         from sentence_transformers import SentenceTransformer
+        t0 = time.perf_counter()
         model  = SentenceTransformer("all-MiniLM-L6-v2")
+        t1 = time.perf_counter()
         matrix = model.encode(texts, normalize_embeddings=True).astype(np.float32)
+        t2 = time.perf_counter()
+        logger.info(
+            "dialog_timing sub=retrieve.build_cache.model_load elapsed_ms=%.1f",
+            (t1 - t0) * 1000,
+        )
+        logger.info(
+            "dialog_timing sub=retrieve.build_cache.encode elapsed_ms=%.1f n_texts=%d",
+            (t2 - t1) * 1000, len(texts),
+        )
         return _Cache(schema_hash, backend, node_ids, texts, matrix)
 
     if backend == "openai":
@@ -730,7 +753,12 @@ def retrieve_node(state: DialogState) -> DialogState:
 
     # ── Try Neo4j production path first ──────────────────────────────────────
     if getattr(config, "graphrag_neo4j_uri", ""):
+        t0 = time.perf_counter()
         sub_nodes, sub_edges = _neo4j_retrieve(nodes, edges, query, config)
+        logger.info(
+            "dialog_timing sub=retrieve.neo4j_retrieve elapsed_ms=%.1f",
+            (time.perf_counter() - t0) * 1000,
+        )
         if sub_nodes is not None:
             logger.info(
                 "retrieve_node: Neo4j path — %d/%d tables, %d/%d edges",
@@ -742,8 +770,13 @@ def retrieve_node(state: DialogState) -> DialogState:
         logger.info("retrieve_node: Neo4j path unavailable — using in-memory fallback")
 
     # ── Get or build in-memory embedding cache ────────────────────────────────
+    t0 = time.perf_counter()
     s_hash  = _schema_hash(nodes)
     backend = _detect_backend(pref_backend)
+    logger.info(
+        "dialog_timing sub=retrieve.detect_backend elapsed_ms=%.1f backend=%s",
+        (time.perf_counter() - t0) * 1000, backend,
+    )
     key     = f"{s_hash}:{backend}:v{_NODE_TEXT_VERSION}"
 
     if key not in _EMBED_CACHE:
@@ -751,6 +784,7 @@ def retrieve_node(state: DialogState) -> DialogState:
             "retrieve_node: building embedding cache for %d nodes (backend=%s)",
             len(nodes), backend,
         )
+        t0 = time.perf_counter()
         try:
             _EMBED_CACHE[key] = _build_cache(nodes, backend, s_hash)
             logger.info("retrieve_node: cache built (%s)", backend)
@@ -763,6 +797,10 @@ def retrieve_node(state: DialogState) -> DialogState:
             except Exception as exc2:
                 logger.error("retrieve_node: keyword fallback also failed (%s) — using full schema", exc2)
                 return state
+        logger.info(
+            "dialog_timing sub=retrieve.cache_build_total elapsed_ms=%.1f",
+            (time.perf_counter() - t0) * 1000,
+        )
     else:
         logger.info("retrieve_node: using cached embeddings (backend=%s)", backend)
 
@@ -774,6 +812,7 @@ def retrieve_node(state: DialogState) -> DialogState:
     # decompose into sub-queries and take the element-wise max so both sides
     # of the comparison get fair representation in the seed set.
     sub_queries = _decompose_cross_query(query)
+    t0 = time.perf_counter()
     try:
         scores = np.zeros(len(nodes), dtype=np.float32)
         for sq in sub_queries:
@@ -788,6 +827,11 @@ def retrieve_node(state: DialogState) -> DialogState:
     except Exception as exc:
         logger.warning("retrieve_node: query embedding failed (%s) — using full schema", exc)
         return state
+    finally:
+        logger.info(
+            "dialog_timing sub=retrieve.rank_nodes elapsed_ms=%.1f n_subqueries=%d",
+            (time.perf_counter() - t0) * 1000, len(sub_queries),
+        )
 
     # ── Widen the seed budget for decomposed (multi-concept) queries ─────────
     # A query that _decompose_cross_query split into N sub-queries is asking
@@ -814,6 +858,7 @@ def retrieve_node(state: DialogState) -> DialogState:
         )
         top_k, max_tables = widened_top_k, widened_max_tables
 
+    t0 = time.perf_counter()
     # top-K seed node IDs
     k = min(top_k, len(nodes))
     top_indices = scores.argsort()[::-1][:k]
@@ -890,4 +935,8 @@ def retrieve_node(state: DialogState) -> DialogState:
     # many selected tables they touch, the one linked to the MOST relevant
     # table (not just an arbitrary insertion-order pick) wins.
     state["table_relevance_scores"] = {n.get("id", ""): node_score.get(n.get("id", ""), 0.0) for n in sub_nodes}
+    logger.info(
+        "dialog_timing sub=retrieve.bfs_expand_and_filter elapsed_ms=%.1f",
+        (time.perf_counter() - t0) * 1000,
+    )
     return state

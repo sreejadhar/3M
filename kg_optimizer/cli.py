@@ -48,10 +48,20 @@ def run(args: argparse.Namespace) -> None:
     champion = ga_result.best
 
     logger.info("Champion composite fitness: %.4f", champion.fitness.composite)
-    logger.info("Running ablations on champion...")
+    logger.info("Running ablations on champion (%d repeat(s) per variant)...", args.ablation_repeats)
     ablation_rows = run_ablations(
         champion.genome, champion.fitness, dataset, ontology_report, cfg, source_domain=args.domain,
+        n_repeats=args.ablation_repeats,
     )
+    for row in ablation_rows:
+        sig_note = (
+            f" p={row.p_value:.3f} significant={row.significant}"
+            if row.p_value is not None else ""
+        )
+        logger.info(
+            "Ablation %-26s delta=%.4f mean=%.4f ci95=(%.4f, %.4f)%s",
+            row.name, row.delta_composite, row.mean_composite, row.ci95[0], row.ci95[1], sig_note,
+        )
 
     logger.info("Mining gene importance from %d GA trials...", len(ga_result.history.trials))
     importance = gene_importance(ga_result.history.trials)
@@ -96,6 +106,11 @@ def main(argv=None) -> None:
     p_run.add_argument("--domain", default="", help="Optional domain hint (e.g. 'healthcare')")
     p_run.add_argument("--persist-champion", action="store_true",
                        help="Save the champion's bridges to the real kg_bridges store")
+    p_run.add_argument("--ablation-repeats", type=int, default=1,
+                       help="Re-evaluate champion + each ablation variant this many times "
+                            "(>=6 enables a paired Wilcoxon significance test — n=5's exact "
+                            "p-value floor of 0.0625 can never clear 0.05) to separate a real "
+                            "fitness drop from LLM-judge noise. Cost scales linearly.")
     p_run.set_defaults(func=run)
 
     args = parser.parse_args(argv)

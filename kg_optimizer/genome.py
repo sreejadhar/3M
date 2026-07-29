@@ -126,6 +126,36 @@ def mutate(genome: Genome, rng: random.Random, rate: float,
     return clamp_genome(out, spec)
 
 
+def population_diversity(population: List[Genome], spec: Dict[str, GeneSpec] = GENOME_SPEC) -> float:
+    """
+    0-1 diversity score, averaged across genes: numeric genes contribute their
+    population stdev normalized by the gene's (hi - lo) range; cat/bool genes
+    contribute (distinct values seen - 1) / (population size - 1). 0 means
+    every individual is identical on that gene; 1 means maximally spread.
+
+    Used by the GA loop to detect premature convergence and trigger fresh
+    random-individual injection (see kg_optimizer.ga.run_ga).
+    """
+    n = len(population)
+    if n < 2:
+        return 0.0
+
+    scores: List[float] = []
+    for name, s in spec.items():
+        kind = s[0]
+        values = [g[name] for g in population]
+        if kind in ("int", "float"):
+            lo, hi = s[1], s[2]
+            span = (hi - lo) or 1.0
+            mean = sum(values) / n
+            variance = sum((v - mean) ** 2 for v in values) / n
+            scores.append(min((variance ** 0.5) / span, 1.0))
+        else:  # cat / bool
+            distinct = len(set(values))
+            scores.append((distinct - 1) / (n - 1))
+    return sum(scores) / len(scores) if scores else 0.0
+
+
 def expensive_key(genome: Genome) -> Dict[str, Any]:
     """The subset of genes that determine whether a build must be redone."""
     return {k: genome[k] for k in sorted(EXPENSIVE_GENES)}

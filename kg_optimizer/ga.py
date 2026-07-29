@@ -17,7 +17,9 @@ from kg_optimizer.config import OptimizerConfig
 from kg_optimizer.datasets import EvalDataset
 from kg_optimizer.eval_harness import run_dataset
 from kg_optimizer.fitness import FitnessBreakdown, compute_fitness
-from kg_optimizer.genome import Genome, GENOME_SPEC, crossover, mutate, random_population
+from kg_optimizer.genome import (
+    Genome, GENOME_SPEC, crossover, mutate, population_diversity, random_population,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,8 @@ def run_ga(dataset: EvalDataset, ontology_report: Dict[str, Any], cfg: Optimizer
         scored.sort(key=lambda t: t.fitness.composite, reverse=True)
         elites = [t.genome for t in scored[: cfg.elitism]]
 
+        diversity = population_diversity([t.genome for t in scored])
+
         offspring: List[Genome] = list(elites)
         while len(offspring) < cfg.population_size:
             p1 = _tournament_select(scored, cfg.tournament_size, rng)
@@ -118,10 +122,25 @@ def run_ga(dataset: EvalDataset, ontology_report: Dict[str, Any], cfg: Optimizer
             if len(offspring) < cfg.population_size:
                 offspring.append(c2)
 
+        if diversity < cfg.diversity_threshold:
+            n_inject = min(
+                max(1, int((cfg.population_size - cfg.elitism) * cfg.diversity_injection_frac)),
+                len(offspring) - cfg.elitism,
+            )
+            fresh = random_population(n_inject, rng)
+            offspring[cfg.elitism: cfg.elitism + n_inject] = fresh
+            logger.info(
+                "Generation %d: diversity=%.3f below threshold=%.3f — injected %d fresh individual(s)",
+                gen, diversity, cfg.diversity_threshold, n_inject,
+            )
+
         scored = score_all(offspring, generation=gen)
         history.trials.extend(scored)
         mutation_rate *= cfg.mutation_decay
-        logger.info("Generation %d: best composite=%.4f", gen, max(t.fitness.composite for t in scored))
+        logger.info(
+            "Generation %d: best composite=%.4f diversity=%.3f",
+            gen, max(t.fitness.composite for t in scored), diversity,
+        )
 
     best = max(history.trials, key=lambda t: t.fitness.composite)
     return GAResult(best=best, history=history)

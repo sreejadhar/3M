@@ -33,6 +33,13 @@ class OptimizerConfig:
     elitism:          int = 2
     random_seed:      int = 42
 
+    # Premature-convergence guard: when kg_optimizer.genome.population_diversity()
+    # of the current generation falls below this, replace a fraction of the
+    # next generation's non-elite offspring with fresh random individuals
+    # instead of more crossover/mutation of an already-converged population.
+    diversity_threshold:      float = 0.10
+    diversity_injection_frac: float = 0.30
+
     # ── Fitness ──────────────────────────────────────────────────────────────
     fitness_weights: FitnessWeights = field(default_factory=FitnessWeights)
     judge_model: str = "claude-haiku-4-5"

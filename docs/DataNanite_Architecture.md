@@ -34,7 +34,7 @@ importing each other.
 |------|----------------|----------------|----------|
 | 8000 | agent-api (`api.py`) | Metadata Extraction (`agent.py` + `nodes/`) | Metadata report (JSON) |
 | 8001 | ontology-api (`ontology_api.py`) | Ontology (`ontology_agent/`) | OWL/Turtle ontology |
-| 8002 | kg-api (`kg_api.py`) | Knowledge Graph (`knowledge_graph_agent/`) | Graph nodes/edges (Neo4j + UI) |
+| 8002 | kg-api (`kg_api.py`) | Knowledge Graph (`knowledge_graph_agent/`) | Graph nodes/edges (KG snapshot store + UI) |
 | 8003 | dialog-api (`dialog_api.py`) | Dialog / DataChat (`dialog_agent/`) | NL answer + SQL + charts |
 | 8004 | conformity-api (`conformity_api.py`) | Conformity / stitching (`conformity_agent/`) | Cross-KG "super graph" |
 | 8005 | orchestrator (`orchestrator_api.py`) | *(coordinator, no agent)* | End-to-end indexing + serves chat UI |
@@ -62,7 +62,7 @@ this exact order (`_index_source`, `orchestrator_api.py:1608`):
        3. POST 8001 /generate ........... Ontology Agent  → OWL/Turtle text
             ▼
        4. POST 8002 /generate ........... Knowledge Graph Agent → nodes/edges
-            │  (writes to Neo4j in prod; stamps every node with kg_id = source_id)
+            │  (persists {nodes, edges} snapshot to kg_store; stamps every node with kg_id = source_id)
             ▼
        5. kg_registry.upsert + kg_bridges.run_inference_and_save
             │  (detect cross-source bridges vs every other registered KG,
@@ -80,8 +80,7 @@ this exact order (`_index_source`, `orchestrator_api.py:1608`):
   fetches the Turtle text (`orchestrator_api.py:1734-1769`). *Non-fatal* if it
   fails — KG is just skipped.
 - **Step 4** posts the ontology text to `{KG_API}/generate` with
-  `kg_id = source_id` and Neo4j credentials in production
-  (`orchestrator_api.py:1779-1823`).
+  `kg_id = source_id` (`orchestrator_api.py:1779-1823`).
 - **Step 5** registers the KG in the federation registry and runs cross-source
   **bridge inference** against every other KG, plus a transitivity pass
   (`orchestrator_api.py:1835-1910`).
@@ -308,9 +307,11 @@ records in `data/ontology_enrichment.db`. It is purely rule/string-match based.
 
 ## 4. Knowledge Graph Creation (port 8002)
 
-**Goal:** turn the serialized ontology into a real **property graph** (Neo4j or
-Gremlin) plus a UI-friendly `{nodes, edges}` structure, optionally with vector
-embeddings for semantic retrieval.
+**Goal:** turn the serialized ontology into a **`{nodes, edges}` knowledge graph
+snapshot** — the single graph representation used everywhere (UI visualisation,
+GraphRAG retrieval, bridge inference) — optionally with vector embeddings for
+semantic retrieval. There is no live graph database in the loop; the graph is
+persisted as JSON in the shared **KG snapshot store**.
 
 **Files:** `knowledge_graph_agent/agent.py`,
 `nodes/{parse,profile,translate,execute,embed,fetch}_node.py`, `state.py`,
@@ -319,11 +320,10 @@ embeddings for semantic retrieval.
 ### 4.1 What triggers it
 
 - `POST /generate` (`kg_api.py:219`) — **input is the raw ontology text** (not the
-  metadata or ontology objects). Optional: `graph_type` (neo4j/gremlin), DB
-  connection, `kg_id` (namespace for multi-KG coexistence), `mode`
-  (generate/update). If no DB URI is given it runs **preview/translate-only**:
-  generates the queries + `graph_data` without writing to a DB.
-- `POST /fetch` (`kg_api.py:254`) — load an existing KG back from the DB
+  metadata or ontology objects). Fields: `kg_id` (namespace for multi-KG
+  coexistence in the snapshot store), `mode` (generate/update), `clear_existing`.
+  Always persists the resulting `{nodes, edges}` snapshot to `kg_store.py`.
+- `POST /fetch` (`kg_api.py:254`) — load an existing KG snapshot back by `kg_id`
   (no ontology needed), `mode="load"`.
 
 ### 4.2 The graph (two paths)
@@ -333,10 +333,10 @@ generate/update:   START → parse → profile → translate → execute → [em
 load:              START → fetch → END
 ```
 
-`embed` runs only if `embed_enabled` **and** a Neo4j URI is set
-(`agent.py:49-56`). (The module docstring omits `embed`, but the routing confirms
-it.) Note: in generate mode `kg_api._run_kg` runs the pipeline **twice** — once
-streamed for progress, once synchronously for the result (`kg_api.py:134,148`).
+`embed` runs only if `embed_enabled` is set (`agent.py:49-56`). (The module
+docstring omits `embed`, but the routing confirms it.) Note: in generate mode
+`kg_api._run_kg` runs the pipeline **twice** — once streamed for progress, once
+synchronously for the result (`kg_api.py:134,148`).
 
 ### 4.3 Node by node
 
@@ -354,42 +354,46 @@ streamed for progress, once synchronously for the result (`kg_api.py:134,148`).
    - `owl:Class` → node (label = class name); `owl:DatatypeProperty` → node
      property; `owl:ObjectProperty` → directed edge; functional/inverse-functional
      → cardinality; `rdfs:comment` → tooltip.
-   - Generates **Cypher** (Neo4j) or **Gremlin** statements — `MERGE`/`coalesce`
-     upserts scoped by `kg_id`, with a uniqueness constraint on `(uri, kg_id)`.
-   - Builds `graph_data` (UI structure) with rich `title` strings (the
+   - Also generates a **Cypher-style declarative statement list** — `MERGE`/
+     `coalesce` upserts scoped by `kg_id` — purely as a preview/documentation
+     text export (`GET /jobs/{id}/queries`); nothing executes these anymore.
+   - Builds `graph_data` (the real output) with rich `title` strings (the
      `Properties:` block + taxonomy comments) and a structured `properties` list
      consumed by the bridge engine.
-4. **execute_node** (`execute_node.py:19`) — runs the statements against **Neo4j
-   or Gremlin**. If no URI → preview mode (no writes). There is **no in-memory
-   graph DB**; `graph_data` is a UI-only dict.
+4. **execute_node** (`execute_node.py:19`) — persists `graph_data` (`{nodes,
+   edges}`) to the **KG snapshot store** (`kg_store.save_snapshot`), keyed by
+   `kg_id`. This is the only "write" step — there is no live graph database.
 5. **embed_node** (`embed_node.py:189`) — embeds each node's title (sentence-
    transformers `all-MiniLM-L6-v2` 384-dim, or OpenAI `text-embedding-3-small`
-   1536-dim; **tfidf rejected** as variable-dimension), creates an HNSW cosine
-   vector index in Neo4j, and writes `n.embedding` + `n.title`. Powers GraphRAG
-   retrieval in DataChat.
-6. **fetch_node** (`fetch_node.py:206`) — load mode: reads nodes/edges back from
-   the DB, reconstructs titles and the `properties` list.
+   1536-dim; **tfidf rejected** as variable-dimension), attaches the vector
+   directly onto the node dict (`node["embedding"]`), and re-persists the
+   snapshot. Powers GraphRAG retrieval in DataChat via in-process numpy cosine
+   similarity — no external vector index.
+6. **fetch_node** (`fetch_node.py:206`) — load mode: reads the `{nodes, edges}`
+   snapshot back from the KG snapshot store by `kg_id`.
 
 ### 4.4 Node / edge shape
 
-- **Neo4j node:** label `KGNode` + a per-class dynamic label (`:KGNode:Customer`);
-  properties `uri`, `kg_id`, `name`, `type='owl:Class'`, optional `description`,
-  one prop per column (`<col> = '<xsd_type>'`), and after embed `embedding`+`title`.
-- **Neo4j edge:** type = sanitized uppercased property name (`HAS_CUSTOMER`);
-  properties `name`, `type='owl:ObjectProperty'`, `cardinality`, `kg_id`, and after
-  embed `join_columns` (JSON) + `title`.
+- **Node:** `id` (uri), `label` (class name), `title` (rich text: description +
+  `Properties:` block + taxonomy comments), `properties` (structured column
+  list consumed by the bridge engine), and after `embed_node` runs, `embedding`
+  (float vector).
+- **Edge:** `from`/`to` (node ids), `label` (semantic verb + cardinality, e.g.
+  "has Customer (1:N)"), `title`, `join_columns` (`[[src_col, tgt_col], ...]`).
 - **Entity types are whatever classes the ontology defines** — there's no fixed
   enum; every `owl:Class` → node, every `owl:ObjectProperty` → edge.
 
-### 4.5 Persistence (two layers)
+### 4.5 Persistence
 
-1. **Live graph** — Neo4j/Gremlin, isolated per source by the `kg_id` stamp.
-2. **Snapshot store** (`kg_store.py`) — SQLite (`data/kg_store.db`) or PostgreSQL
-   in production. Tables `kg_sources` (registry: connection, report, **ontology
-   text**, table list, status) and `kg_snapshots` (denormalized nodes/edges JSON).
-   `load_all()` runs at orchestrator startup to restore indexed KGs without
-   hitting the graph DB. (`kg_store.py` is driven by the orchestrator, not by
-   `kg_api.py`.)
+**KG snapshot store** (`kg_store.py`) — SQLite (`data/kg_store.db`) by default,
+PostgreSQL in production (`APP_ENV=production` + `KG_POSTGRES_DSN`). Tables
+`kg_sources` (registry: connection, report, **ontology text**, table list,
+status — managed by the orchestrator) and `kg_snapshots` (denormalized
+nodes/edges JSON, keyed by `kg_id`/`source_id` — written by
+`knowledge_graph_agent`'s `execute_node`/`embed_node` and read by `fetch_node`,
+`kg_optimizer`, and ad-hoc scripts). `load_all()` runs at orchestrator startup
+to restore indexed KGs without rebuilding anything. This is the single source
+of truth for the graph — there is no separate live graph database layer.
 
 ---
 
@@ -429,8 +433,8 @@ Linear, no branches (`agent.py:37-55`).
 
 1. **retrieve_node** (`retrieve_node.py:604`) — **GraphRAG**: narrows the full KG
    to the subgraph most relevant to the question. Embeds the question, finds top-K
-   seed tables by cosine similarity (Neo4j HNSW in prod; in-memory sentence-
-   transformers/tfidf/keyword otherwise), **BFS-expands** along FK edges a few
+   seed tables by in-process numpy cosine similarity (sentence-transformers,
+   openai, tfidf, or keyword backend), **BFS-expands** along FK edges a few
    hops, prunes expanded tables below a relevance floor, and caps the result
    (default 8 tables). Skipped for small schemas (≤10 tables). No LLM.
 2. **understand_node** (`understand_node.py:952`) — **no LLM**: turns the KG
@@ -626,7 +630,7 @@ context to DataChat. **Raw document text is never persisted — only metadata.**
                        [Ontology 8001] ──► OWL/Turtle      metadata catalog + taxonomy
                                   │                          (glossary, KPI links)
                                   ▼
-                       [Knowledge Graph 8002] ──► Neo4j nodes/edges (+ embeddings)
+                       [Knowledge Graph 8002] ──► KG snapshot store nodes/edges (+ embeddings)
                                   │                          ▲
                                   ▼                          │ GraphRAG retrieval
                        kg_registry + kg_bridges (cross-source joins)
@@ -664,7 +668,7 @@ sequenceDiagram
     participant MD as Metadata API (8000)
     participant ONT as Ontology API (8001)
     participant KG as KG API (8002)
-    participant NEO as Neo4j
+    participant SNAP as kg_store (snapshot store)
     participant STORE as kg_store / registry
 
     User->>ORCH: Register data source
@@ -691,9 +695,9 @@ sequenceDiagram
     end
 
     rect rgb(255,245,235)
-    Note over ORCH,NEO: 4. Knowledge Graph
+    Note over ORCH,SNAP: 4. Knowledge Graph
     ORCH->>KG: POST /generate (ontology_text, kg_id)
-    KG->>NEO: MERGE nodes/edges + HNSW vector index
+    KG->>SNAP: save_snapshot(kg_id, nodes, edges)
     KG-->>ORCH: job done
     ORCH->>KG: GET /jobs/{id}/graph
     KG-->>ORCH: nodes / edges

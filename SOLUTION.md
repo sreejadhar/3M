@@ -36,7 +36,7 @@ The system is built on **seven independently deployable microservices**, each a 
 |---|---|---|
 | **Metadata Extraction Agent** | Connects to a database and extracts schema, statistics, functional dependencies, inclusion dependencies, and cardinality relationships | 8000 |
 | **Ontology Agent** | Reads a metadata report and generates a formal OWL/RDF ontology with LLM concept annotation | 8001 |
-| **Knowledge Graph Agent** | Converts OWL/RDF to Cypher (Neo4j) or Gremlin (TinkerPop) and executes on a live graph database | 8002 |
+| **Knowledge Graph Agent** | Converts OWL/RDF into a `{nodes, edges}` knowledge graph snapshot, persisted to the shared KG snapshot store | 8002 |
 | **Dialog with Data Agent** | Accepts natural language queries, retrieves schema context via GraphRAG, plans and executes SQL, and synthesizes insights | 8003 |
 | **Conformity Agent** | Validates data quality and conformity rules against indexed sources | 8004 |
 | **Orchestrator / Chat UI** | End-to-end pipeline orchestration, session management, source registry, REST proxy for all agents | 8005 |
@@ -78,9 +78,9 @@ All services are **completely decoupled**: zero cross-package imports. They comm
          │                          │                    │
          ▼                          ▼                    ▼
 ┌──────────────────┐  ┌─────────────────────┐  ┌──────────────────────────┐
-│  Source Database │  │  Source Database     │  │  Graph Database          │
-│  PostgreSQL /    │  │  (Dialog SQL target) │  │  Neo4j (bolt://) or      │
-│  SQL Server /    │  │  any supported DB    │  │  Gremlin (ws://)         │
+│  Source Database │  │  Source Database     │  │  KG Snapshot Store       │
+│  PostgreSQL /    │  │  (Dialog SQL target) │  │  SQLite (dev) or         │
+│  SQL Server /    │  │  any supported DB    │  │  PostgreSQL (prod)       │
 │  Oracle /        │  └─────────────────────┘  └──────────────────────────┘
 │  BigQuery /      │
 │  Snowflake /     │
@@ -244,11 +244,11 @@ knowledge_graph_agent/
 ├── agent.py       # LangGraph pipeline
 └── nodes/
     ├── parse_node.py     # Parse OWL/Turtle with rdflib
-    ├── translate_node.py # OWL → Cypher / Gremlin + graph_data for UI
-    ├── execute_node.py   # Execute on Neo4j or Gremlin
-    ├── fetch_node.py     # Load existing KG snapshot from database
+    ├── translate_node.py # OWL → graph_data for UI (+ Cypher-style preview text)
+    ├── execute_node.py   # Persist graph_data to the KG snapshot store
+    ├── fetch_node.py     # Load existing KG snapshot from the snapshot store
     ├── profile_node.py   # Column taxonomy profiling via LLM
-    └── embed_node.py     # GraphRAG embedding storage (Neo4j HNSW index)
+    └── embed_node.py     # GraphRAG embedding storage (embedding on each node)
 ```
 
 ### LangGraph Pipeline
@@ -658,10 +658,7 @@ Every KG node, edge, and embedding is tagged with `kg_id` = `source_id`. This en
 | `DATA_DIR` | `./reports` | Report and ontology file storage |
 | `METADATA_DB` | `/data/metadata.db` | Metadata catalog SQLite path |
 | `KG_STORE_DB` | `/data/kg_store.db` | KG snapshot SQLite path |
-| `KG_POSTGRES_DSN` | — | PostgreSQL DSN for production persistence |
-| `NEO4J_URI` | — | Neo4j bolt URI (production only) |
-| `NEO4J_USERNAME` | `neo4j` | Neo4j credentials |
-| `NEO4J_PASSWORD` | — | Neo4j credentials |
+| `KG_POSTGRES_DSN` | — | PostgreSQL DSN for production persistence (kg_store + kg_federation) |
 | `LOG_LEVEL` | `info` | Uvicorn log level |
 
 ### Port Overrides (docker-compose)

@@ -1558,8 +1558,8 @@ def _ontology_view() -> None:
 # ── Knowledge Graph view ───────────────────────────────────────────────────────
 _KG_NODES = [
     ("parse",     "📂", "Parsing OWL ontology"),
-    ("translate", "🔄", "Translating to Cypher/Gremlin"),
-    ("execute",   "⚡", "Executing on graph database"),
+    ("translate", "🔄", "Translating to graph nodes/edges"),
+    ("execute",   "⚡", "Persisting snapshot"),
 ]
 _KG_LOAD_NODES = [
     ("fetch", "📥", "Loading graph from database"),
@@ -1693,43 +1693,23 @@ def _kg_view() -> None:
             selected_onto_label = st.selectbox("Source ontology", list(onto_options.keys()))
             onto_job_id = onto_options[selected_onto_label]
 
-        graph_type = st.radio("Target graph database", ["Neo4j (Cypher)", "Gremlin (TinkerPop)"],
-                              horizontal=True)
-        use_neo4j = graph_type.startswith("Neo4j")
+        kg_id = st.text_input(
+            "KG id", value="default", key="kg_id_input",
+            help="Isolates this graph's nodes/edges in the shared KG snapshot store.",
+        )
 
         st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
 
-        if use_neo4j:
-            neo4j_uri  = st.text_input("Neo4j Bolt URI", value="bolt://localhost:7687",
-                                       placeholder="bolt://localhost:7687", key="kg_neo4j_uri")
-            c1, c2 = st.columns(2)
-            neo4j_user = c1.text_input("Username", value="neo4j", key="kg_neo4j_user")
-            neo4j_pass = c2.text_input("Password", type="password", key="kg_neo4j_pass")
-            neo4j_db   = st.text_input("Database", value="neo4j", key="kg_neo4j_db")
-            gremlin_url = gremlin_src = ""
-        else:
-            gremlin_url = st.text_input("Gremlin WebSocket URL",
-                                        value="ws://localhost:8182/gremlin",
-                                        placeholder="ws://localhost:8182/gremlin",
-                                        key="kg_gremlin_url")
-            gremlin_src = st.text_input("Traversal source", value="g", key="kg_gremlin_src")
-            neo4j_uri = neo4j_user = neo4j_pass = neo4j_db = ""
-
         # Mode-specific options
         if is_load:
-            st.info("📥 Loads all nodes and edges already stored in the connected graph database.")
+            st.info("📥 Loads all nodes and edges already persisted for this KG id.")
             clear_existing = False
-            execute_now    = True
         elif is_update:
             st.info("🔄 Merges new nodes and relationships into the existing graph without clearing it.")
             clear_existing = False
-            execute_now    = st.checkbox("Execute on graph database (uncheck for preview only)",
-                                         value=True, key="kg_execute_now")
         else:
             clear_existing = st.checkbox("Clear existing graph before loading", value=False,
                                           key="kg_clear_existing")
-            execute_now    = st.checkbox("Execute on graph database (uncheck for preview only)",
-                                         value=True, key="kg_execute_now_gen")
 
         btn_label = ("📥  Load from Database" if is_load
                      else "🔄  Incremental Update" if is_update
@@ -1803,26 +1783,9 @@ def _kg_view() -> None:
 
     # ── Trigger ───────────────────────────────────────────────────────────────
     if action_btn:
-        db_conn = {}
-        if use_neo4j:
-            db_conn = {
-                "neo4j_uri":      neo4j_uri.strip(),
-                "neo4j_username": neo4j_user.strip(),
-                "neo4j_password": neo4j_pass,
-                "neo4j_database": neo4j_db.strip() or "neo4j",
-            }
-        else:
-            db_conn = {
-                "gremlin_url":              gremlin_url.strip(),
-                "gremlin_traversal_source": gremlin_src.strip() or "g",
-            }
-
         if is_load:
-            # Load existing graph — no ontology needed
-            payload = {
-                "graph_type": "neo4j" if use_neo4j else "gremlin",
-                **db_conn,
-            }
+            # Load existing graph snapshot — no ontology needed
+            payload = {"kg_id": kg_id.strip() or "default"}
             try:
                 jid = kg_api.fetch(payload)
                 st.session_state.kg_job_id    = jid
@@ -1845,12 +1808,10 @@ def _kg_view() -> None:
             payload = {
                 "ontology_text":   ontology_text,
                 "ontology_format": ontology_format,
-                "graph_type":      "neo4j" if use_neo4j else "gremlin",
+                "kg_id":           kg_id.strip() or "default",
                 "mode":            "update" if is_update else "generate",
                 "clear_existing":  clear_existing,
             }
-            if execute_now:
-                payload.update(db_conn)
 
             try:
                 jid = kg_api.generate(payload)
@@ -1880,12 +1841,11 @@ def _kg_view() -> None:
             for j in done_jobs:
                 cols = st.columns([7, 2])
                 with cols[0]:
-                    gtype    = j.get("graph_type", "neo4j").upper()
                     job_mode = j.get("mode", "generate")
                     mode_tag = {"load": "📥 Loaded", "update": "🔄 Updated"}.get(job_mode, "🆕 Generated")
                     st.markdown(
                         f'<div class="hcard">'
-                        f'<div class="hcard-title">🕸️ {gtype} Knowledge Graph &nbsp; '
+                        f'<div class="hcard-title">🕸️ Knowledge Graph &nbsp; '
                         f'<span style="font-size:0.75rem;opacity:0.7">{mode_tag}</span></div>'
                         f'<div class="hcard-meta">'
                         f'{j.get("node_count",0)} nodes &nbsp;·&nbsp; '
@@ -1925,7 +1885,6 @@ def _kg_view() -> None:
         + _stat_card(result.get("node_count", 0), "Graph Nodes",    "#63b3ed")
         + _stat_card(result.get("edge_count",  0), "Graph Edges",   "#68d391")
         + _stat_card(result.get("executed_count", 0), "Queries Run", "#b794f4")
-        + _stat_card(result.get("graph_type","?").upper(), "DB Type", "#f6ad55")
         + "</div>",
         unsafe_allow_html=True,
     )
@@ -1952,13 +1911,12 @@ def _kg_view() -> None:
                 try:
                     q_data = kg_api.get_queries(job_id_for_queries)
                     q_list = q_data.get("queries", [])
-                    lang   = "cypher" if q_data.get("graph_type") == "neo4j" else "text"
-                    st.caption(f"{len(q_list)} {q_data.get('graph_type','').upper()} statements")
-                    st.code("\n\n".join(q_list), language=lang)
+                    st.caption(f"{len(q_list)} Cypher-style statements")
+                    st.code("\n\n".join(q_list), language="cypher")
                     st.download_button(
                         "⬇ Download queries",
                         data="\n\n".join(q_list),
-                        file_name=f"kg_queries_{q_data.get('graph_type','kg')}.{'cypher' if lang=='cypher' else 'groovy'}",
+                        file_name="kg_queries.cypher",
                         mime="text/plain",
                         use_container_width=False,
                     )
@@ -2061,8 +2019,7 @@ def _dialog_view() -> None:
         kg_jobs = [j for j in kg_api.list_jobs() if j.get("status") == "done"]
         kg_options: Dict[str, Optional[str]] = {"(no KG — schema-less mode)": None}
         for j in kg_jobs:
-            label = (f'{j.get("graph_type","?").upper()} · '
-                     f'{j.get("node_count",0)} nodes · '
+            label = (f'{j.get("node_count",0)} nodes · '
                      f'{j.get("edge_count",0)} edges · '
                      f'id={j["id"][:8]}')
             kg_options[label] = j["id"]

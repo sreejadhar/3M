@@ -2,18 +2,18 @@
 FastAPI service for the Knowledge Graph Agent.
 
 Standalone microservice — completely independent of metadata_agent and ontology_agent.
-Accepts a raw ontology string (Turtle/RDF/N3), converts it to Cypher or Gremlin,
-optionally executes on a live Neo4j / Gremlin server, and returns graph data
-for visualisation in the UI.
+Accepts a raw ontology string (Turtle/RDF/N3), converts it into a {nodes, edges}
+knowledge graph snapshot persisted to the shared KG snapshot store (kg_store.py),
+and returns graph data for visualisation in the UI.
 
 Endpoints
 ---------
 GET  /health
 POST /generate                    start async KG creation/update job → {job_id}
-POST /fetch                       load existing graph from DB → {job_id}
+POST /fetch                       load an existing snapshot by kg_id → {job_id}
 GET  /jobs/{job_id}               poll status + stats
 GET  /jobs/{job_id}/graph         get {nodes, edges} for UI visualisation
-GET  /jobs/{job_id}/queries       get the generated Cypher/Gremlin statements
+GET  /jobs/{job_id}/queries       get the generated Cypher-style statements
 GET  /list                        list all KG jobs
 """
 from __future__ import annotations
@@ -62,21 +62,10 @@ KG_LOAD_NODES  = ["fetch"]
 class GenerateRequest(BaseModel):
     ontology_text:   str
     ontology_format: str = "turtle"     # "turtle" | "xml" | "n3"
-    graph_type:      str = "neo4j"      # "neo4j" | "gremlin"
-
-    # Neo4j connection (optional — omit to run in preview/translate-only mode)
-    neo4j_uri:      str = ""
-    neo4j_username: str = "neo4j"
-    neo4j_password: str = ""
-    neo4j_database: str = "neo4j"
-
-    # Gremlin connection (optional)
-    gremlin_url:              str = ""
-    gremlin_traversal_source: str = "g"
 
     # KG identity — must match KGConfig.kg_id / DialogConfig.graphrag_kg_id.
     # When set, nodes are stamped with this id so multiple KGs can coexist
-    # in the same Neo4j database.  Defaults to "default" when empty.
+    # in the shared KG snapshot store. Defaults to "default" when empty.
     kg_id: str = ""
 
     # Behaviour: "generate" (default) | "update" (incremental, never clears)
@@ -85,24 +74,15 @@ class GenerateRequest(BaseModel):
 
 
 class FetchRequest(BaseModel):
-    """Load an existing graph from the graph database (no ontology needed)."""
-    graph_type: str = "neo4j"      # "neo4j" | "gremlin"
-
-    neo4j_uri:      str = ""
-    neo4j_username: str = "neo4j"
-    neo4j_password: str = ""
-    neo4j_database: str = "neo4j"
-
-    gremlin_url:              str = ""
-    gremlin_traversal_source: str = "g"
+    """Load an existing graph snapshot from the KG snapshot store."""
+    kg_id: str = ""
 
 
 # ── Job record helpers ─────────────────────────────────────────────────────────
 
-def _new_job(job_id: str, graph_type: str, ontology_format: str, mode: str) -> Dict:
+def _new_job(job_id: str, ontology_format: str, mode: str) -> Dict:
     return {
         "id":                job_id,
-        "graph_type":        graph_type,
         "ontology_format":   ontology_format,
         "mode":              mode,
         "status":            "queued",
@@ -220,8 +200,6 @@ def health():
 def generate_kg(req: GenerateRequest, background_tasks: BackgroundTasks):
     if not req.ontology_text.strip():
         raise HTTPException(status_code=400, detail="ontology_text must not be empty")
-    if req.graph_type not in ("neo4j", "gremlin"):
-        raise HTTPException(status_code=400, detail="graph_type must be 'neo4j' or 'gremlin'")
     if req.mode not in ("generate", "update"):
         raise HTTPException(status_code=400, detail="mode must be 'generate' or 'update'")
 
@@ -229,21 +207,14 @@ def generate_kg(req: GenerateRequest, background_tasks: BackgroundTasks):
     clear = req.clear_existing if req.mode == "generate" else False
 
     cfg = KGConfig(
-        graph_type               = req.graph_type,
-        neo4j_uri                = req.neo4j_uri,
-        neo4j_username           = req.neo4j_username,
-        neo4j_password           = req.neo4j_password,
-        neo4j_database           = req.neo4j_database,
-        gremlin_url              = req.gremlin_url,
-        gremlin_traversal_source = req.gremlin_traversal_source,
-        kg_id                    = req.kg_id,
-        mode                     = req.mode,
-        clear_existing           = clear,
+        kg_id          = req.kg_id,
+        mode           = req.mode,
+        clear_existing = clear,
     )
 
     job_id = str(uuid.uuid4())
     with _lock:
-        _jobs[job_id] = _new_job(job_id, req.graph_type, req.ontology_format, req.mode)
+        _jobs[job_id] = _new_job(job_id, req.ontology_format, req.mode)
 
     background_tasks.add_task(
         _run_kg, job_id, req.ontology_text, req.ontology_format, cfg
@@ -253,34 +224,12 @@ def generate_kg(req: GenerateRequest, background_tasks: BackgroundTasks):
 
 @app.post("/fetch", status_code=202)
 def fetch_graph(req: FetchRequest, background_tasks: BackgroundTasks):
-    """Load an existing knowledge graph from the graph database."""
-    if req.graph_type not in ("neo4j", "gremlin"):
-        raise HTTPException(status_code=400, detail="graph_type must be 'neo4j' or 'gremlin'")
-
-    connected = (
-        (req.graph_type == "neo4j"   and bool(req.neo4j_uri)) or
-        (req.graph_type == "gremlin" and bool(req.gremlin_url))
-    )
-    if not connected:
-        raise HTTPException(
-            status_code=400,
-            detail="A graph database URI is required to load an existing graph",
-        )
-
-    cfg = KGConfig(
-        graph_type               = req.graph_type,
-        neo4j_uri                = req.neo4j_uri,
-        neo4j_username           = req.neo4j_username,
-        neo4j_password           = req.neo4j_password,
-        neo4j_database           = req.neo4j_database,
-        gremlin_url              = req.gremlin_url,
-        gremlin_traversal_source = req.gremlin_traversal_source,
-        mode                     = "load",
-    )
+    """Load an existing knowledge graph snapshot from the KG snapshot store."""
+    cfg = KGConfig(kg_id=req.kg_id, mode="load")
 
     job_id = str(uuid.uuid4())
     with _lock:
-        _jobs[job_id] = _new_job(job_id, req.graph_type, "", "load")
+        _jobs[job_id] = _new_job(job_id, "", "load")
 
     background_tasks.add_task(_run_fetch, job_id, cfg)
     return {"job_id": job_id}
@@ -315,9 +264,8 @@ def get_queries(job_id: str):
     if job["status"] != "done":
         raise HTTPException(status_code=202, detail="Queries not yet ready")
     return {
-        "graph_type": job["graph_type"],
-        "queries":    job["queries"],
-        "count":      len(job["queries"]),
+        "queries": job["queries"],
+        "count":   len(job["queries"]),
     }
 
 

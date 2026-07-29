@@ -1,24 +1,25 @@
 """
-embed_node — Persist vector embeddings on Neo4j KG nodes for production GraphRAG.
+embed_node — Attach vector embeddings to KG nodes for production GraphRAG.
 
 Runs after execute_node in the KG pipeline (generate / update modes only).
 For every node in graph_data:
   1. Builds a rich text representation: label + column names/types + comments.
   2. Embeds all texts in one batch using the configured backend.
-  3. Writes the embedding vector + full title back to the existing Neo4j node
-     matched by uri  (MATCH (n:KGNode {uri: $uri}) SET n.embedding = $vec, n.title = $title).
-  4. Serialises join_columns onto edges so the production retrieval query can
-     reconstruct exact JOIN ON conditions without reading graph_data.
-  5. Creates an HNSW vector index (IF NOT EXISTS) on KGNode.embedding.
+  3. Stores the embedding vector directly on the node dict (node["embedding"]).
+  4. Serialises join_columns onto edges so retrieval can reconstruct exact
+     JOIN ON conditions without extra lookups.
+  5. Re-persists the updated snapshot (now including embeddings) to the KG
+     snapshot store (kg_store.py) so retrieve_node can read it back without
+     recomputing embeddings.
 
-At query time, retrieve_node uses:
-  CALL db.index.vector.queryNodes($index, $k, $query_vec) YIELD node, score
+At query time, retrieve_node embeds the NLQ with the same backend and ranks
+nodes by numpy cosine similarity against node["embedding"].
 
 Skip conditions (node is a no-op):
   - embed_enabled = False  (default)
-  - neo4j_uri is empty (no Neo4j connection)
   - graph_data has no nodes
-  - Backend is tfidf or keyword (variable-dimension — incompatible with HNSW)
+  - Backend is tfidf or keyword (variable-dimension — incompatible with a
+    fixed-dimension embedding column)
 
 Supported backends:
   sentence-transformers  — all-MiniLM-L6-v2, 384 dims (default)
@@ -26,7 +27,6 @@ Supported backends:
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any, Dict, List
@@ -89,107 +89,17 @@ def _embed_corpus(texts: List[str], backend: str) -> np.ndarray:
     if backend == "openai":
         return _embed_openai(texts)
     raise ValueError(
-        f"Backend '{backend}' is not supported for Neo4j production mode. "
+        f"Backend '{backend}' is not supported for embedding. "
         "Use 'sentence-transformers' or 'openai'."
     )
-
-
-# ── Neo4j helpers ─────────────────────────────────────────────────────────────
-
-def _ensure_vector_index(session: Any, index_name: str, dimensions: int) -> None:
-    """Create HNSW cosine vector index on KGNode.embedding (IF NOT EXISTS)."""
-    # Neo4j 5.11+ syntax
-    try:
-        session.run(
-            f"CREATE VECTOR INDEX `{index_name}` IF NOT EXISTS "
-            f"FOR (n:KGNode) ON (n.embedding) "
-            f"OPTIONS {{indexConfig: {{"
-            f"  `vector.dimensions`: {dimensions},"
-            f"  `vector.similarity_function`: 'cosine'"
-            f"}}}}"
-        )
-        logger.info("embed_node: vector index '%s' ready (%d dims)", index_name, dimensions)
-        return
-    except Exception as exc:
-        logger.debug("embed_node: new index syntax failed (%s) — trying legacy API", exc)
-
-    # Legacy Neo4j (< 5.11) fallback
-    try:
-        session.run(
-            "CALL db.index.vector.createNodeIndex($name, 'KGNode', 'embedding', $dims, 'cosine')",
-            name=index_name, dims=dimensions,
-        )
-        logger.info("embed_node: vector index '%s' created via legacy API", index_name)
-    except Exception as exc2:
-        # Index may already exist — not fatal
-        logger.warning("embed_node: could not create vector index: %s", exc2)
-
-
-def _write_embeddings(
-    session: Any,
-    nodes: List[Dict],
-    embeddings: np.ndarray,
-    kg_id: str,
-) -> int:
-    """Batch-write embedding vectors + titles onto Neo4j KGNode nodes.
-    Matches on (uri, kg_id) so nodes from different KGs are never confused."""
-    written = 0
-    for node, emb in zip(nodes, embeddings):
-        uri   = node.get("id", "")
-        title = node.get("title", "")
-        if not uri:
-            continue
-        result = session.run(
-            "MATCH (n:KGNode {uri: $uri, kg_id: $kg_id}) "
-            "SET n.embedding = $embedding, n.title = $title "
-            "RETURN count(n) AS updated",
-            uri=uri, kg_id=kg_id, embedding=emb.tolist(), title=title,
-        )
-        record = result.single()
-        if record and record["updated"]:
-            written += 1
-        else:
-            logger.warning(
-                "embed_node: no KGNode found for uri=%s kg_id=%s — was execute_node run?",
-                uri, kg_id,
-            )
-    return written
-
-
-def _write_edge_metadata(session: Any, edges: List[Dict], kg_id: str) -> int:
-    """
-    Write join_columns + title onto Neo4j relationships.
-    Matches on (uri, kg_id) for both endpoints so cross-KG edges are never touched.
-    join_columns is serialised as a JSON string so it survives the graph store.
-    """
-    written = 0
-    for edge in edges:
-        src   = edge.get("from", "")
-        tgt   = edge.get("to", "")
-        jc    = edge.get("join_columns", [])
-        title = edge.get("title", "")
-        if not src or not tgt:
-            continue
-        result = session.run(
-            "MATCH (a:KGNode {uri: $src, kg_id: $kg_id})-[r]->(b:KGNode {uri: $tgt, kg_id: $kg_id}) "
-            "SET r.join_columns = $jc, r.title = $title "
-            "RETURN count(r) AS updated",
-            src=src, tgt=tgt, kg_id=kg_id,
-            jc=json.dumps(jc) if jc else "[]",
-            title=title,
-        )
-        record = result.single()
-        if record and record["updated"]:
-            written += 1
-    return written
 
 
 # ── Node ──────────────────────────────────────────────────────────────────────
 
 def embed_node(state: KGState) -> KGState:
     """
-    Embed KG node titles and persist to Neo4j for production GraphRAG retrieval.
-    No-op when embed_enabled=False or neo4j_uri is empty.
+    Attach embedding vectors to KG nodes and re-persist the snapshot for
+    production GraphRAG retrieval. No-op when embed_enabled=False.
     """
     logger.info("=== embed_node ===")
 
@@ -198,11 +108,6 @@ def embed_node(state: KGState) -> KGState:
     # ── Guard clauses ─────────────────────────────────────────────────────────
     if not getattr(config, "embed_enabled", False):
         logger.info("embed_node: embed_enabled=False — skipping")
-        return state
-
-    neo4j_uri = getattr(config, "neo4j_uri", "")
-    if not neo4j_uri:
-        logger.info("embed_node: no neo4j_uri configured — skipping")
         return state
 
     graph_data = state.get("graph_data") or {"nodes": [], "edges": []}
@@ -229,7 +134,7 @@ def embed_node(state: KGState) -> KGState:
     if backend in ("tfidf", "keyword"):
         msg = (
             f"embed_node: backend '{backend}' produces variable-dimension vectors "
-            "and is not compatible with Neo4j HNSW vector index. "
+            "and is not compatible with the fixed-dimension embedding column. "
             "Use 'sentence-transformers' or 'openai'."
         )
         logger.error(msg)
@@ -250,34 +155,26 @@ def embed_node(state: KGState) -> KGState:
     dimensions = embeddings.shape[1]
     logger.info("embed_node: %d vectors, %d dims", len(embeddings), dimensions)
 
-    # ── Write to Neo4j ────────────────────────────────────────────────────────
-    neo4j_user = getattr(config, "neo4j_username", "neo4j")
-    neo4j_pass = getattr(config, "neo4j_password", "")
-    neo4j_db   = getattr(config, "neo4j_database", "neo4j")
-    kg_id      = getattr(config, "kg_id", "").strip() or "default"
-    # Index name: explicit config takes precedence; otherwise derived from kg_id
-    # so each KG gets its own isolated HNSW index.
-    index_name = getattr(config, "embed_index_name", "").strip() or f"kg-{kg_id}-embeddings"
+    # ── Attach embeddings to nodes, serialise edge metadata ───────────────────
+    kg_id = getattr(config, "kg_id", "").strip() or "default"
+    for node, emb in zip(nodes, embeddings):
+        node["embedding"] = emb.tolist()
+    for edge in edges:
+        edge["join_columns"] = edge.get("join_columns", [])
 
     try:
-        from neo4j import GraphDatabase
-        driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_pass))
-
-        with driver.session(database=neo4j_db) as session:
-            _ensure_vector_index(session, index_name, dimensions)
-            node_written = _write_embeddings(session, nodes, embeddings, kg_id)
-            edge_written = _write_edge_metadata(session, edges, kg_id)
-
-        driver.close()
+        import kg_store
+        kg_store.save_snapshot(kg_id, nodes, edges)
 
         logger.info(
-            "embed_node: wrote embeddings to %d/%d nodes, metadata to %d/%d edges",
-            node_written, len(nodes), edge_written, len(edges),
+            "embed_node: attached embeddings to %d nodes, persisted snapshot kg_id=%s",
+            len(nodes), kg_id,
         )
         state["embeddings_stored"] = True
+        state["graph_data"] = {"nodes": nodes, "edges": edges}
 
     except Exception as exc:
-        msg = f"embed_node: Neo4j write failed — {exc}"
+        msg = f"embed_node: snapshot persistence failed — {exc}"
         logger.exception(msg)
         state["errors"].append(msg)
 

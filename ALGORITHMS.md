@@ -18,7 +18,7 @@ This document describes every major algorithm implemented in the DataNanite syst
 3. [Knowledge Graph & Ontology Algorithms](#3-knowledge-graph--ontology-algorithms)
    - 3.1 [_extract_ontology() — OWL Graph Parsing](#31-_extract_ontology--owl-graph-parsing)
    - 3.2 [_build_graph_data() — UI Visualisation Format](#32-_build_graph_data--ui-visualisation-format)
-   - 3.3 [_generate_cypher() / _generate_gremlin() — Query Generation](#33-_generate_cypher--_generate_gremlin--query-generation)
+   - 3.3 [_generate_cypher() — Declarative Statement Preview](#33-_generate_cypher--declarative-statement-preview)
 4. [Domain Inference & Concept Annotation](#4-domain-inference--concept-annotation)
    - 4.1 [_infer_domain_from_report() — Two-Tier Signal Voting](#41-_infer_domain_from_report--two-tier-signal-voting)
    - 4.2 [_build_col_evidence() — Per-Column Evidence String](#42-_build_col_evidence--per-column-evidence-string)
@@ -218,23 +218,23 @@ Mandatory because `_sync_taxonomy_from_kg_nodes()` expects taxonomy annotation a
 
 ---
 
-### 3.3 `_generate_cypher()` / `_generate_gremlin()` — Query Generation
+### 3.3 `_generate_cypher()` — Declarative Statement Preview
 
 **File:** `knowledge_graph_agent/nodes/translate_node.py`
 
 **Multi-KG isolation:** Every node/edge stamped with `kg_id` = `source_id`. MATCH/MERGE clauses always filter by `kg_id`.
 
-**Cypher:**
+The real output of `translate_node` is `graph_data` (`{nodes, edges}`), which
+`execute_node` persists to the KG snapshot store (`kg_store.py`) — there is no
+live graph database these statements run against. `_generate_cypher()` exists
+purely to produce a human-readable, declarative preview of the same graph
+(exposed via `GET /jobs/{id}/queries` for documentation/export):
+
 ```cypher
 CREATE CONSTRAINT kg_node_uri IF NOT EXISTS FOR (n:KGNode) REQUIRE (n.uri, n.kg_id) IS UNIQUE
 MERGE (n:KGNode:Orders {uri: '...', kg_id: '...'}) ON CREATE SET n.order_id = 'integer'
 MATCH (a:KGNode {uri: '...'}), (b:KGNode {uri: '...'})
 MERGE (a)-[r:FK_CUSTOMERS {cardinality: '1:N'}]->(b)
-```
-
-**Gremlin:**
-```groovy
-g.V().has('uri', '...').has('kg_id', '...').fold().coalesce(unfold(), addV('orders').property(...)).next()
 ```
 
 ---
@@ -629,8 +629,8 @@ Index time:
   build_node → _annotate_column_concepts() ← domain-grounded LLM concept labels
        │
        ▼
-  _extract_ontology() → _build_graph_data() → _generate_cypher/gremlin()
-  KG stored in Neo4j / in-memory graph_data
+  _extract_ontology() → _build_graph_data() → _generate_cypher() (preview only)
+  KG stored as a {nodes, edges} snapshot in the KG snapshot store (kg_store.py)
 
   (optional, user-initiated)
   validate_ontology → SHACL API → structural + semantic checks → quality report

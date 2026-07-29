@@ -1,23 +1,13 @@
 """
 retrieve_node — GraphRAG retrieval for schema context.
 
-Two execution paths, selected automatically:
+Embeds all KG node titles once per schema (module-level cache keyed by
+schema hash), computes cosine similarity with numpy against the NLQ
+embedding, and expands the seed set via an in-memory adjacency dict built
+from the KG edges.
 
-  PRODUCTION (Neo4j):
-    When graphrag_neo4j_uri is set on DialogConfig, uses the HNSW vector index
-    written by embed_node during the KG build phase.  Queries Neo4j for the
-    top-K most similar nodes, then BFS-expands via FK edges inside Neo4j.
-    No per-session embedding of the corpus (embeddings live in Neo4j).
-    Safe for multi-worker / multi-tenant deployments.
-
-  IN-MEMORY (development / small schemas):
-    When graphrag_neo4j_uri is empty or the Neo4j path fails, falls back to
-    the in-memory path: embeds all KG node titles once (module-level cache
-    keyed by schema hash), computes cosine similarity with numpy, and expands
-    via an in-memory adjacency dict.
-
-Both paths produce the same output: state kg_nodes / kg_edges are replaced
-with the retrieved subgraph so understand_node sees only relevant tables.
+Replaces state kg_nodes / kg_edges with the retrieved subgraph so
+understand_node sees only relevant tables.
 
 Skip conditions (node is a no-op):
   - graphrag_enabled = False
@@ -540,155 +530,6 @@ def _bfs_expand(
     return list(visited)
 
 
-# ── Neo4j production retrieval ────────────────────────────────────────────────
-
-def _embed_query_vec(query: str, backend: str) -> "Optional[np.ndarray]":
-    """
-    Embed a single query string into a normalised float32 vector.
-    Returns None on failure (caller should fall back to in-memory path).
-    Only fixed-dimension backends are attempted here (sentence-transformers,
-    openai); tfidf and keyword are handled inside _Cache.embed_query.
-    """
-    try:
-        if backend == "sentence-transformers":
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer("all-MiniLM-L6-v2")
-            v = model.encode([query], normalize_embeddings=True)[0]
-            return v.astype(np.float32)
-        if backend == "openai":
-            import os
-            from openai import OpenAI
-            resp = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", "")).embeddings.create(
-                model="text-embedding-3-small", input=[query]
-            )
-            v = np.array(resp.data[0].embedding, dtype=np.float32)
-            return _l2_norm(v)
-    except Exception as exc:
-        logger.warning("retrieve_node: query embedding failed (%s)", exc)
-    return None
-
-
-def _neo4j_retrieve(
-    nodes: List[Dict],
-    edges: List[Dict],
-    query: str,
-    config: Any,
-) -> "Tuple[Optional[List[Dict]], Optional[List[Dict]]]":
-    """
-    Use the Neo4j HNSW vector index + graph traversal to retrieve the relevant
-    subgraph.  Returns (sub_nodes, sub_edges) filtered from the in-memory
-    nodes/edges, or (None, None) to signal the caller to fall back to in-memory.
-    """
-    neo4j_uri      = getattr(config, "graphrag_neo4j_uri",      "")
-    neo4j_user     = getattr(config, "graphrag_neo4j_username",  "neo4j")
-    neo4j_pass     = getattr(config, "graphrag_neo4j_password",  "")
-    neo4j_db       = getattr(config, "graphrag_neo4j_database",  "neo4j")
-    # Resolve KG identity — must match KGConfig.kg_id used at build time
-    kg_id          = getattr(config, "graphrag_kg_id", "").strip() or "default"
-    # Index name: explicit override → else derive from kg_id (matches embed_node logic)
-    index_name     = getattr(config, "graphrag_neo4j_index", "").strip() or f"kg-{kg_id}-embeddings"
-    top_k          = getattr(config, "graphrag_top_k",           8)
-    hop_depth      = getattr(config, "graphrag_hop_depth",       2)
-    pref_backend   = getattr(config, "graphrag_embedding_backend", "auto")
-
-    if not neo4j_uri:
-        return None, None
-
-    # For Neo4j path we need fixed-dimension embeddings
-    backend = _detect_backend(pref_backend)
-    if backend in ("tfidf", "keyword"):
-        logger.info(
-            "retrieve_node: Neo4j path requires fixed-dimension embeddings; "
-            "backend=%s — falling back to in-memory", backend
-        )
-        return None, None
-
-    # Embed the query
-    q_vec = _embed_query_vec(query, backend)
-    if q_vec is None:
-        return None, None
-
-    try:
-        from neo4j import GraphDatabase
-        driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_pass))
-
-        # ── Step 1: vector similarity search → seed URIs ──────────────────────
-        with driver.session(database=neo4j_db) as session:
-            result = session.run(
-                "CALL db.index.vector.queryNodes($idx, $k, $vec) "
-                "YIELD node RETURN node.uri AS uri",
-                idx=index_name, k=top_k, vec=q_vec.tolist(),
-            )
-            seed_uris: set = {r["uri"] for r in result if r["uri"]}
-
-        if not seed_uris:
-            logger.warning(
-                "retrieve_node: Neo4j vector search returned 0 results "
-                "(index may not be built yet) — falling back to in-memory"
-            )
-            driver.close()
-            return None, None
-
-        logger.info("retrieve_node (Neo4j): %d seed nodes from vector search", len(seed_uris))
-
-        # ── Step 2: BFS-expand via FK edges (within same KG only) ────────────
-        subgraph_uris: set = set(seed_uris)
-        frontier: set = set(seed_uris)
-        for hop in range(hop_depth):
-            if not frontier:
-                break
-            with driver.session(database=neo4j_db) as session:
-                result = session.run(
-                    "MATCH (n:KGNode {kg_id: $kg_id})-[]-(m:KGNode {kg_id: $kg_id}) "
-                    "WHERE n.uri IN $uris "
-                    "RETURN DISTINCT m.uri AS uri",
-                    uris=list(frontier), kg_id=kg_id,
-                )
-                new_uris = {r["uri"] for r in result if r["uri"]} - subgraph_uris
-            subgraph_uris.update(new_uris)
-            frontier = new_uris
-
-        driver.close()
-
-        logger.info(
-            "retrieve_node (Neo4j): subgraph has %d nodes after %d-hop expansion",
-            len(subgraph_uris), hop_depth,
-        )
-
-        # ── Step 3: filter in-memory graph_data to subgraph ───────────────────
-        sub_nodes = [n for n in nodes if n.get("id", "") in subgraph_uris]
-        sub_edges = [
-            e for e in edges
-            if e.get("from", "") in subgraph_uris and e.get("to", "") in subgraph_uris
-        ]
-
-        # Cap to graphrag_max_tables (seed URIs = highest-scored nodes)
-        max_tables_neo = getattr(config, "graphrag_max_tables", 15)
-        if len(sub_nodes) > max_tables_neo:
-            # Seed URIs are already the highest-similarity nodes; keep those first
-            seed_set = set(seed_uris)
-            seeded   = [n for n in sub_nodes if n.get("id", "") in seed_set]
-            expanded = [n for n in sub_nodes if n.get("id", "") not in seed_set]
-            sub_nodes = (seeded + expanded)[:max_tables_neo]
-            kept_ids = {n.get("id", "") for n in sub_nodes}
-            sub_edges = [
-                e for e in sub_edges
-                if e.get("from", "") in kept_ids and e.get("to", "") in kept_ids
-            ]
-            logger.info(
-                "retrieve_node (Neo4j): capped subgraph from %d → %d tables (max_tables=%d)",
-                len(subgraph_uris), max_tables_neo, max_tables_neo,
-            )
-
-        return sub_nodes, sub_edges
-
-    except Exception as exc:
-        logger.warning(
-            "retrieve_node: Neo4j retrieval failed (%s) — falling back to in-memory", exc
-        )
-        return None, None
-
-
 # ── Main node ─────────────────────────────────────────────────────────────────
 
 def retrieve_node(state: DialogState) -> DialogState:
@@ -750,24 +591,6 @@ def retrieve_node(state: DialogState) -> DialogState:
             len(nodes), min_tables,
         )
         return state
-
-    # ── Try Neo4j production path first ──────────────────────────────────────
-    if getattr(config, "graphrag_neo4j_uri", ""):
-        t0 = time.perf_counter()
-        sub_nodes, sub_edges = _neo4j_retrieve(nodes, edges, query, config)
-        logger.info(
-            "dialog_timing sub=retrieve.neo4j_retrieve elapsed_ms=%.1f",
-            (time.perf_counter() - t0) * 1000,
-        )
-        if sub_nodes is not None:
-            logger.info(
-                "retrieve_node: Neo4j path — %d/%d tables, %d/%d edges",
-                len(sub_nodes), len(nodes), len(sub_edges), len(edges),
-            )
-            state["kg_nodes"] = sub_nodes
-            state["kg_edges"] = sub_edges
-            return state
-        logger.info("retrieve_node: Neo4j path unavailable — using in-memory fallback")
 
     # ── Get or build in-memory embedding cache ────────────────────────────────
     t0 = time.perf_counter()

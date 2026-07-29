@@ -21,9 +21,9 @@ English** and get back verified SQL-backed answers with charts and tables.
    links with cardinality. An AI step adds plain-business labels to cryptic column
    names (e.g. `arpu` → "average revenue per user").
 3. **Make it navigable (Knowledge Graph)** — Convert the ontology into a
-   **knowledge graph** (Neo4j) with semantic vector embeddings, so the system can
-   find the *right* tables for any question, even when the wording doesn't match
-   the column names.
+   **knowledge graph** (persisted as a nodes/edges snapshot) with semantic vector
+   embeddings, so the system can find the *right* tables for any question, even
+   when the wording doesn't match the column names.
 4. **Answer questions (DataChat)** — A natural-language question flows through six
    steps: find relevant tables → describe them to the AI → resolve the user's words
    to real data values → generate SQL → run it (with self-healing on errors) →

@@ -25,7 +25,7 @@ SQL always uses ? placeholders; they are translated to %s for PostgreSQL.
 
 Environment variables
 ---------------------
-APP_ENV          "production" activates PostgreSQL + Neo4j backends.
+APP_ENV          "production" activates the PostgreSQL backend.
                  Any other value (or unset) uses SQLite + inline KG.
 KG_POSTGRES_DSN  Required in production. psycopg2 DSN:
                  "host=localhost dbname=datachat user=app password=secret"

@@ -94,7 +94,7 @@ GKE Ingress (datananite-ingress)
 |---------|------|-------------|-----------|---------|
 | agent-api | 8000 | `datananite-agent` | Dockerfile.agent | Metadata extraction from databases |
 | ontology-api | 8001 | `datananite-ontology` | Dockerfile.ontology | OWL/RDF ontology generation |
-| kg-api | 8002 | `datananite-kg` | Dockerfile.kg | Knowledge graph (Neo4j/Gremlin) |
+| kg-api | 8002 | `datananite-kg` | Dockerfile.kg | Knowledge graph (KG snapshot store) |
 | dialog-api | 8003 | `datananite-dialog` | Dockerfile.dialog | NL→SQL, GraphRAG |
 | conformity-api | 8004 | `datananite-conformity` | Dockerfile.conformity | Data quality validation |
 | chat-ui | 8005 | `datananite-chat` | Dockerfile.chat | Main orchestrator UI |

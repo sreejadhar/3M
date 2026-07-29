@@ -28,11 +28,6 @@ KG_API_URL         default http://localhost:8002
 DIALOG_API_URL     default http://localhost:8003
 DATA_DIR           default ./reports
 
-NEO4J_URI          bolt://… — when set, every KG build is persisted to Neo4j
-NEO4J_USERNAME     default neo4j
-NEO4J_PASSWORD     Neo4j password (required when NEO4J_URI is set)
-NEO4J_DATABASE     default neo4j
-
 KG_POSTGRES_DSN    psycopg2 DSN — when set, kg_registry, kg_bridges and metadata use PG
 KG_FEDERATION_DB   SQLite path for KG federation tables (default data/kg_federation.db)
 METADATA_DB        SQLite path for metadata catalog     (default data/metadata.db)
@@ -227,28 +222,6 @@ KG_API       = os.environ.get("KG_API_URL",       "http://localhost:8002")
 DIALOG_API   = os.environ.get("DIALOG_API_URL",   "http://localhost:8003")
 SHACL_API          = os.environ.get("SHACL_API_URL",          "http://localhost:8007")
 UNSTRUCTURED_API   = os.environ.get("UNSTRUCTURED_API_URL",   "http://localhost:8008")
-
-# ── Neo4j persistence ──────────────────────────────────────────────────────────
-# KG nodes/edges are persisted to Neo4j only in production (APP_ENV=production)
-# and only when NEO4J_URI is provided.
-# In development / test the KG stays in-process memory (no Neo4j required).
-_NEO4J_URI      = os.environ.get("NEO4J_URI",      "")
-_NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
-_NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "")
-_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
-
-
-def _use_neo4j() -> bool:
-    """True only in production when NEO4J_URI is configured."""
-    if os.environ.get("APP_ENV", "").strip().lower() != "production":
-        return False
-    if _NEO4J_URI:
-        return True
-    logger.warning(
-        "APP_ENV=production but NEO4J_URI is not set — "
-        "KG will not be persisted to Neo4j."
-    )
-    return False
 
 DATA_DIR  = Path(os.environ.get("DATA_DIR", "./reports"))
 UI_DIR    = Path(__file__).parent / "chat_ui"
@@ -1887,6 +1860,33 @@ async def _run_bridge_inference_phase(source_id: str, src: Dict, entry: "KGEntry
                 KGContext as _SelfKGContext,
                 run_enterprise_inference_and_save as _run_self_infer,
             )
+
+            # GA-tune bridge-inference thresholds against this source's own
+            # gold bridges (declared FKs / fk_candidates from its metadata
+            # report) before running the real self-pass — re-tunes every
+            # reindex so thresholds keep adapting as the schema changes,
+            # instead of drifting stale against hardcoded defaults. Cheap:
+            # no DB access, no LLM calls, no dialog-api — see
+            # kg_optimizer.quick_tune for what's tuned and what's excluded.
+            # Never fatal to the reindex — falls back to DEFAULT_OPTIONS.
+            tuned_options = None
+            try:
+                from kg_optimizer.quick_tune import tune_bridge_options
+                tuned_options = await asyncio.to_thread(
+                    tune_bridge_options,
+                    entry.kg_id, src.get("kg_nodes", []), src.get("report"), src.get("domain", ""),
+                )
+                if tuned_options is not None:
+                    _push_index_event(
+                        source_id, "bridges", "running",
+                        "Tuned bridge-inference thresholds via GA sweep",
+                    )
+            except Exception as _tune_exc:
+                logger.warning(
+                    "quick_tune bridge-threshold sweep failed for %s (non-fatal, using defaults): %s",
+                    entry.kg_id[:8], _tune_exc,
+                )
+
             self_ctx = _SelfKGContext(
                 kg_id=entry.kg_id, display_name=entry.display_name,
                 domain=src.get("domain", ""),
@@ -1894,7 +1894,7 @@ async def _run_bridge_inference_phase(source_id: str, src: Dict, entry: "KGEntry
             )
             self_saved = await asyncio.to_thread(
                 _run_self_infer, self_ctx, self_ctx,
-                sample_fn=sample_fn, main_loop=_this_loop,
+                options=tuned_options, sample_fn=sample_fn, main_loop=_this_loop,
             )
             if self_saved:
                 high = sum(1 for b in self_saved if b.enabled)
@@ -2263,25 +2263,14 @@ async def _index_source(source_id: str) -> None:
 
         # ── 3. Knowledge Graph ─────────────────────────────────────────────────
         if ontology_content:
-            _persist_neo4j = _use_neo4j()
-            _kg_msg = "Translating ontology to knowledge graph"
-            if _persist_neo4j:
-                _kg_msg += " and persisting to Neo4j"
-            _push_index_event(source_id, "kg", "running", _kg_msg + "…")
+            _push_index_event(source_id, "kg", "running", "Translating ontology to knowledge graph…")
             try:
+                # kg_id = source_id stamps every node/edge for multi-KG isolation
+                # in the shared KG snapshot store (kg_store.py).
                 kg_req: Dict[str, Any] = {
                     "ontology_text": ontology_content,
                     "kg_id":         source_id,
                 }
-                # Production only: write nodes/edges directly to Neo4j,
-                # stamped with kg_id = source_id for multi-KG isolation.
-                if _persist_neo4j:
-                    kg_req.update({
-                        "neo4j_uri":      _NEO4J_URI,
-                        "neo4j_username": _NEO4J_USERNAME,
-                        "neo4j_password": _NEO4J_PASSWORD,
-                        "neo4j_database": _NEO4J_DATABASE,
-                    })
                 async with httpx.AsyncClient(timeout=30.0) as client:
                     rk = await client.post(f"{KG_API}/generate", json=kg_req)
                     rk.raise_for_status()

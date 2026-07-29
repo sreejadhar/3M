@@ -16,7 +16,7 @@ XSD types to a lightweight LLM and gets back per-column taxonomy annotations:
 These annotations are written back as rdfs:comment triples on each DatatypeProperty.
 translate_node._build_graph_data already surfaces col_comments[0] in the node title
 (as "  -- <annotation>"), so the annotations propagate automatically into:
-  • the KG node titles stored in Neo4j
+  • the KG node titles stored in the KG snapshot store
   • the schema context text the dialog agent reads
   • the embedding corpus used for GraphRAG retrieval
 

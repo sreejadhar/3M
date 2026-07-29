@@ -70,12 +70,10 @@ class DialogConfig:
     # Hybrid graph retrieval: embed KG node titles, find top-K tables most
     # relevant to the NLQ via cosine similarity, BFS-expand via FK edges.
     #
-    # Two paths selected automatically:
-    #   Production (Neo4j): set graphrag_neo4j_uri — uses the HNSW vector
-    #     index written by embed_node at KG build time.  Safe for multi-worker
-    #     deployments; embeddings are shared across all processes.
-    #   In-memory (dev/small schemas): graphrag_neo4j_uri empty — embeds node
-    #     titles once per session, caches in process memory with numpy.
+    # Nodes carry a precomputed "embedding" once embed_node has run at KG
+    # build time (persisted in the KG snapshot store); otherwise this node
+    # embeds node titles once per session and caches them in process memory
+    # with numpy — either way, similarity ranking runs in-process.
     graphrag_enabled: bool = True
     # Number of seed tables returned by vector search before graph expansion.
     graphrag_top_k: int = 8
@@ -90,24 +88,14 @@ class DialogConfig:
     graphrag_min_tables: int = 10
     # Embedding backend: "auto" | "sentence-transformers" | "openai" | "tfidf" | "keyword"
     # "auto" tries sentence-transformers → tfidf → keyword in order.
-    # Note: "tfidf" and "keyword" are in-memory only; Neo4j path requires
-    # "sentence-transformers" or "openai" (fixed-dimension vectors).
+    # Note: "tfidf" and "keyword" produce variable-dimension vectors, so they
+    # can't reuse a precomputed node["embedding"] from embed_node — only used
+    # when this node computes its own in-process corpus embedding.
     graphrag_embedding_backend: str = "auto"
 
-    # ── Neo4j connection for production GraphRAG ──────────────────────────────
-    # Leave graphrag_neo4j_uri empty to use the in-memory fallback.
-    # These should point to the same Neo4j instance used by the KG pipeline.
-    graphrag_neo4j_uri:      str = ""        # e.g. "bolt://localhost:7687"
-    graphrag_neo4j_username: str = "neo4j"
-    graphrag_neo4j_password: str = ""
-    graphrag_neo4j_database: str = "neo4j"
     # Which KG to query.  Must match KGConfig.kg_id used when the KG was built.
     # e.g. "sales_prod", "hr_staging".  Defaults to "default" when empty.
     graphrag_kg_id:          str = ""
-    # HNSW index name.  When empty, derived automatically as "kg-{graphrag_kg_id}-embeddings"
-    # so it matches the index created by embed_node.  Only set this explicitly
-    # if you used a custom KGConfig.embed_index_name.
-    graphrag_neo4j_index:    str = ""
 
     # ── Multi-KG federation ───────────────────────────────────────────────────────
     multi_kg_enabled: bool = True          # enable NLQ router

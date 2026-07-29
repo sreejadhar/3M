@@ -215,6 +215,51 @@ def save(source: Dict) -> None:
     logger.debug("kg_store.save: %s (%s nodes, %s edges)", sid[:8], len(source.get("kg_nodes") or []), len(source.get("kg_edges") or []))
 
 
+def save_snapshot(source_id: str, nodes: List[Dict], edges: List[Dict]) -> None:
+    """Upsert just the KG snapshot (nodes/edges) for source_id, leaving any
+    kg_sources row untouched. Used by knowledge_graph_agent's execute/embed
+    nodes, which only know kg_id — not the full source record that
+    orchestrator_api's save() manages."""
+    now = time.time()
+    nodes_json = json.dumps(nodes or [])
+    edges_json = json.dumps(edges or [])
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute("SELECT source_id FROM kg_snapshots WHERE source_id=?", (source_id,))
+        if cur.fetchone():
+            cur.execute(
+                "UPDATE kg_snapshots SET nodes_json=?, edges_json=?, updated_at=? WHERE source_id=?",
+                (nodes_json, edges_json, now, source_id),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO kg_snapshots (source_id, nodes_json, edges_json, updated_at) VALUES (?,?,?,?)",
+                (source_id, nodes_json, edges_json, now),
+            )
+    logger.debug("kg_store.save_snapshot: %s (%d nodes, %d edges)", source_id[:8], len(nodes or []), len(edges or []))
+
+
+def load_snapshot(source_id: str) -> "tuple[List[Dict], List[Dict]]":
+    """Read back just the KG snapshot (nodes/edges) for source_id.
+    Returns ([], []) if no snapshot exists."""
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        row = cur.execute(
+            "SELECT nodes_json, edges_json FROM kg_snapshots WHERE source_id=?", (source_id,)
+        ).fetchone()
+    if not row:
+        return [], []
+    try:
+        nodes = json.loads(row.get("nodes_json") or "[]")
+    except Exception:
+        nodes = []
+    try:
+        edges = json.loads(row.get("edges_json") or "[]")
+    except Exception:
+        edges = []
+    return nodes, edges
+
+
 def delete(source_id: str) -> None:
     """Remove a source and its KG snapshot from the store."""
     with _cursor_ctx() as cur:

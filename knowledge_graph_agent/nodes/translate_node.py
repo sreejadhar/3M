@@ -1,6 +1,9 @@
 """
-Knowledge Graph pipeline node: translate an rdflib OWL graph into
-Cypher (Neo4j) or Gremlin (TinkerPop) statements.
+Knowledge Graph pipeline node: translate an rdflib OWL graph into a
+{nodes, edges} snapshot, plus a Cypher-style declarative statement list
+kept for preview/documentation purposes (no live graph database executes
+these — see execute_node, which persists graph_data to the KG snapshot
+store instead).
 
 Mapping strategy
 ----------------
@@ -41,7 +44,7 @@ def _get_label(g: Graph, uri: URIRef) -> str:
 
 
 def _safe_label(name: str) -> str:
-    """Convert to a valid Neo4j node label / Gremlin vertex label."""
+    """Convert to a valid graph node label."""
     s = re.sub(r"[^a-zA-Z0-9]", "_", name)
     if s and s[0].isdigit():
         s = "_" + s
@@ -49,17 +52,12 @@ def _safe_label(name: str) -> str:
 
 
 def _safe_rel(name: str) -> str:
-    """Convert to a valid Neo4j relationship type (uppercase, underscores)."""
+    """Convert to a valid graph relationship type (uppercase, underscores)."""
     return re.sub(r"[^a-zA-Z0-9_]", "_", name).upper().strip("_") or "RELATED_TO"
 
 
 def _escape_cypher(value: str) -> str:
     """Escape a string for safe embedding in a Cypher query."""
-    return value.replace("\\", "\\\\").replace("'", "\\'")
-
-
-def _escape_gremlin(value: str) -> str:
-    """Escape a string for safe embedding in a Gremlin query."""
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
 
@@ -157,7 +155,7 @@ def _generate_cypher(classes: Dict, obj_props: List, config: Any) -> List[str]:
 
     # Resolve the KG identifier — default to "default" when not set.
     # Every node and edge is stamped with this so multiple KGs can coexist
-    # in the same Neo4j database without URI collisions.
+    # in the snapshot store without URI collisions.
     kg_id = _escape_cypher(getattr(config, "kg_id", "").strip() or "default")
 
     if config.clear_existing:
@@ -212,71 +210,6 @@ def _generate_cypher(classes: Dict, obj_props: List, config: Any) -> List[str]:
             f"MERGE (a)-[r:{rel_type} {{name: '{op_name}', "
             f"type: 'owl:ObjectProperty', cardinality: '{cardinality}', "
             f"kg_id: '{kg_id}'}}]->(b)"
-        )
-        queries.append(q)
-
-    return queries
-
-
-# ── Gremlin generation ────────────────────────────────────────────────────────
-
-def _generate_gremlin(classes: Dict, obj_props: List, config: Any) -> List[str]:
-    queries: List[str] = []
-
-    kg_id = _escape_gremlin(getattr(config, "kg_id", "").strip() or "default")
-
-    if config.clear_existing:
-        # Only drop vertices belonging to this KG.
-        queries.append(f"g.V().has('kg_id', '{kg_id}').drop().iterate()")
-
-    for uri, cls in classes.items():
-        safe_uri  = _escape_gremlin(uri)
-        safe_name = _escape_gremlin(cls["name"])
-        comment   = _escape_gremlin(cls["comments"][0]) if cls["comments"] else ""
-
-        # Build property chain — kg_id added so vertices are KG-scoped.
-        props = [
-            f".property('uri', '{safe_uri}')",
-            f".property('kg_id', '{kg_id}')",
-            f".property('name', '{safe_name}')",
-            ".property('type', 'owl:Class')",
-        ]
-        if comment:
-            props.append(f".property('description', '{comment}')")
-        for p in cls["datatype_props"]:
-            pn = _escape_gremlin(p["name"])
-            pr = _escape_gremlin(p["range"])
-            props.append(f".property('{pn}_xsd_type', '{pr}')")
-
-        props_str = "".join(props)
-        # Upsert on (uri, kg_id) so the same URI in different KGs creates
-        # separate vertices rather than merging into one.
-        q = (
-            f"g.V().has('uri', '{safe_uri}').has('kg_id', '{kg_id}').fold()"
-            f".coalesce(unfold(), addV('{safe_name}'){props_str}).next()"
-        )
-        queries.append(q)
-
-    for op in obj_props:
-        edge_label  = _escape_gremlin(op["name"]).replace(" ", "_")
-        domain_uri  = _escape_gremlin(op["domain"])
-        range_uri   = _escape_gremlin(op["range"])
-        cardinality = (
-            "1:1" if op["is_functional"] and op["is_inv_functional"]
-            else "1:N" if op["is_functional"]
-            else "M:N"
-        )
-        # Look up vertices by both uri AND kg_id to avoid cross-KG edge creation.
-        q = (
-            f"g.V().has('uri', '{domain_uri}').has('kg_id', '{kg_id}').as('a')"
-            f".V().has('uri', '{range_uri}').has('kg_id', '{kg_id}')"
-            f".coalesce("
-            f"inE('{edge_label}').where(outV().as('a')), "
-            f"addE('{edge_label}').from('a')"
-            f".property('type', 'owl:ObjectProperty')"
-            f".property('cardinality', '{cardinality}')"
-            f".property('kg_id', '{kg_id}')"
-            f").next()"
         )
         queries.append(q)
 
@@ -455,17 +388,12 @@ def translate_node(state: KGState) -> KGState:
         state["phase"] = "error"
         return state
 
-    if config.graph_type == "neo4j":
-        queries = _generate_cypher(classes, obj_props, config)
-    else:
-        queries = _generate_gremlin(classes, obj_props, config)
-
+    queries    = _generate_cypher(classes, obj_props, config)
     graph_data = _build_graph_data(classes, obj_props)
 
     logger.info(
-        "Translated ontology: %d classes, %d object properties → %d %s statements",
+        "Translated ontology: %d classes, %d object properties → %d Cypher statements",
         len(classes), len(obj_props), len(queries),
-        "Cypher" if config.graph_type == "neo4j" else "Gremlin",
     )
 
     state["queries"]    = queries

@@ -12,10 +12,6 @@ rdflib>=7.0.0
 langgraph>=0.2.0
 langchain-core>=0.3.0
 
-# Graph database drivers
-neo4j>=5.0.0
-gremlinpython>=3.7.0
-
 # Anthropic LLM (profile_node)
 anthropic>=0.25.0
 

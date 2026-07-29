@@ -23,4 +23,4 @@ class KGState(TypedDict, total=False):
     executed_count:     int        # Queries successfully executed
     errors:             List[str]  # Accumulated non-fatal errors
     phase:              str        # "init"|"parsed"|"translated"|"executed"|"embedded"|"fetched"|"error"
-    embeddings_stored:  bool       # True after embed_node successfully writes to Neo4j
+    embeddings_stored:  bool       # True after embed_node successfully persists embeddings

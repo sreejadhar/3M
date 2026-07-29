@@ -51,7 +51,7 @@ def _route_after_execute(state: KGState) -> str:
     if state.get("phase") == "error":
         return "error_end"
     config = state.get("config")
-    if config and getattr(config, "embed_enabled", False) and getattr(config, "neo4j_uri", ""):
+    if config and getattr(config, "embed_enabled", False):
         return "embed"
     return END
 
@@ -118,23 +118,19 @@ def _build_graph() -> Any:
 
 class KGAgent:
     """
-    Convert an OWL/RDF ontology to a Cypher or Gremlin knowledge graph,
-    incrementally update an existing graph, or load a graph already stored
-    in the database for visualisation.
+    Convert an OWL/RDF ontology to a {nodes, edges} knowledge graph snapshot,
+    incrementally update an existing one, or load a snapshot already
+    persisted in the KG snapshot store (kg_store.py) for visualisation.
 
     Usage (generate / update)::
 
-        cfg    = KGConfig(graph_type="neo4j", neo4j_uri="bolt://localhost:7687",
-                          neo4j_username="neo4j", neo4j_password="secret",
-                          mode="generate")   # or "update" for incremental
+        cfg    = KGConfig(kg_id="sales_prod", mode="generate")   # or "update" for incremental
         agent  = KGAgent(cfg)
         result = agent.run(turtle_text)
 
     Usage (load existing graph)::
 
-        cfg    = KGConfig(graph_type="neo4j", neo4j_uri="bolt://localhost:7687",
-                          neo4j_username="neo4j", neo4j_password="secret",
-                          mode="load")
+        cfg    = KGConfig(kg_id="sales_prod", mode="load")
         agent  = KGAgent(cfg)
         result = agent.load()
     """

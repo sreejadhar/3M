@@ -1,0 +1,14 @@
+{
+  "source_id": "lifesciences_testusecase",
+  "kg_store_source_id": "ec94dc92-2c1c-43bd-9f0f-d73b64b2b159",
+  "kg_store_path": "data/kg_store.db",
+  "questions": [
+    {"question": "How many HCPs are there per country?"},
+    {"question": "What is the distribution of HCPs by specialty?"},
+    {"question": "Which HCPs are Key Opinion Leaders (KOLs)?"},
+    {"question": "What is the HCP segmentation by customer value?"},
+    {"question": "How are HCPs distributed by therapeutic area?"},
+    {"question": "What is the gender distribution of HCPs?"}
+  ],
+  "gold_bridges": []
+}

@@ -1,0 +1,7 @@
+# KG/Ontology GA + Ablation Optimizer — dependencies beyond the shared agent packages
+deap>=1.4.1
+requests>=2.31.0
+
+# Reused from the existing agent packages (already installed alongside them):
+#   ontology_agent, knowledge_graph_agent, dialog_agent, llm_client
+#   anthropic[vertex], langgraph, numpy, scikit-learn

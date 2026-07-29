@@ -1,0 +1,20 @@
+{
+  "source_id": "",
+  "population_size": 8,
+  "generations": 4,
+  "mutation_rate": 0.2,
+  "mutation_decay": 0.9,
+  "tournament_size": 3,
+  "elitism": 2,
+  "random_seed": 42,
+  "fitness_weights": {
+    "answer_quality": 1.0,
+    "bridge_f1": 0.5,
+    "cost": 0.3,
+    "latency": 0.2
+  },
+  "judge_model": "claude-haiku-4-5",
+  "kg_query_api_base": "http://127.0.0.1:8003",
+  "query_timeout_s": 240,
+  "cache_dir": ".kg_optimizer_cache"
+}

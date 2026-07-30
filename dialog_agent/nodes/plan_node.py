@@ -21,11 +21,103 @@ from typing import Any, Dict, List, Optional
 from .. import verified_queries
 from ..state import DialogState, SQLQuery
 from ..token_guard import guard_plan_prompt
+from . import sql_identifier_resolver as _ast_resolver
 
 logger = logging.getLogger(__name__)
 
 # Show this many recent turns verbatim; summarize anything older.
 _MAX_VERBATIM_TURNS = 5
+
+# Phase 2 of the AST-based hallucination-resolver rollout: run the new
+# sqlglot-backed resolver (sql_identifier_resolver.py) alongside the existing
+# regex-based _find_hallucinated_tables/_find_hallucinated_columns checks and
+# log any disagreement, without changing which queries get dropped/repaired.
+# Flip PLAN_NODE_AST_HALLUCINATION_SHADOW=0 to disable; nothing downstream of
+# the shadow-mode block reads its output, so it can never affect a response.
+_AST_RESOLVER_SHADOW_MODE = os.getenv("PLAN_NODE_AST_HALLUCINATION_SHADOW", "1") != "0"
+
+# Phase 3 cutover: when enabled, plan_node's table/column hallucination
+# checks run ENTIRELY through the AST resolver instead of the regex pair
+# (_find_hallucinated_tables / _find_hallucinated_columns / _strip_hallucinated_
+# conditions) — those functions become dead code on this path but are left in
+# place as the fallback for when this flag is off, and for the other checks
+# in _validate_plan_items (_find_cross_table_columns, join validation, etc.)
+# that stay on the regex path regardless (out of scope for this resolver).
+#
+# Default OFF. Evidence gate before flipping per-environment (see
+# tools/run_hallucination_shadow_harness.py and hallucination_shadow_report.txt):
+# 363 real DataChat-generated SQL statements checked across PNC, LIFESCIENCE
+# STESTUSECASE, and Claim Underwriting — 0 cases where the AST resolver would
+# have produced a wrong drop/allow outcome vs. the regex path. Still limited to
+# Snowflake-dialect sources; treat other dialects as unverified until checked.
+_AST_RESOLVER_ENABLED = os.getenv("PLAN_NODE_AST_HALLUCINATION_ENABLED", "0") == "1"
+
+# Map this codebase's db_type strings to sqlglot dialect identifiers.
+_SQLGLOT_DIALECT_MAP = {
+    "sqlite": "sqlite", "csv": "sqlite", "excel": "sqlite",
+    "postgres": "postgres", "postgresql": "postgres",
+    "redshift": "redshift",
+    "sqlserver": "tsql",
+    "oracle": "oracle",
+    "snowflake": "snowflake",
+    "bigquery": "bigquery",
+}
+
+
+def _ast_dialect(db_type: str) -> str:
+    return _SQLGLOT_DIALECT_MAP.get((db_type or "").lower(), "snowflake")
+
+
+def _build_ast_schema(
+    table_labels: List[str],
+    table_columns_map: Dict[str, set],
+) -> "_ast_resolver.SchemaGraph":
+    """
+    table_columns_map keys are already bare/uppercased by _extract_table_columns;
+    fold in table_labels with empty column sets so pure table-hallucination
+    checks (no columns known for a label) still resolve correctly.
+    """
+    merged_map: Dict[str, set] = {t: set() for t in table_labels}
+    merged_map.update(table_columns_map)
+    return _ast_resolver.SchemaGraph(merged_map)
+
+
+def _shadow_check_hallucination(
+    sql: str,
+    schema: "_ast_resolver.SchemaGraph",
+    dialect: str,
+    query_id: str,
+    old_bad_tables: Optional[List[str]] = None,
+    old_bad_cols: Optional[List[str]] = None,
+) -> None:
+    """
+    Phase 2 shadow-mode comparison — log-only, never affects control flow.
+    Runs the new AST resolver against the same SQL/schema the regex checks
+    just evaluated and logs any disagreement for later triage before Phase 3
+    cutover. Any exception here is swallowed: shadow mode must never be able
+    to break the real validation path it's observing. No-op when the Phase 3
+    cutover is already live for this call (redundant — the live path already
+    exercises the AST resolver directly).
+    """
+    if not _AST_RESOLVER_SHADOW_MODE or _AST_RESOLVER_ENABLED:
+        return
+    try:
+        new_bad = _ast_resolver.find_hallucinated_identifiers(sql, schema, dialect=dialect)
+        new_bad_tables = sorted({b.name.lower() for b in new_bad if b.kind == "table"})
+        new_bad_cols = sorted({b.name.lower() for b in new_bad if b.kind == "column"})
+        old_tables = sorted({t.lower() for t in (old_bad_tables or [])})
+        old_cols = sorted({c.lower() for c in (old_bad_cols or [])})
+        if new_bad_tables != old_tables or new_bad_cols != old_cols:
+            logger.warning(
+                "plan_node: AST-resolver shadow-mode disagreement on query %s — "
+                "regex found tables=%s cols=%s; AST resolver found tables=%s cols=%s; sql=%s",
+                query_id, old_tables, old_cols, new_bad_tables, new_bad_cols, sql,
+            )
+    except Exception:
+        logger.exception(
+            "plan_node: AST-resolver shadow-mode check raised on query %s (ignored)",
+            query_id,
+        )
 
 
 def _summarize_old_turns_plan(old_turns: list, model: str) -> str:
@@ -2447,16 +2539,14 @@ def _find_hallucinated_columns(sql: str, known_cols: set) -> List[str]:
 
 def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
     """
-    Remove references to hallucinated dotted columns (alias.col where col is not
-    in the schema) from wherever they appear in the SQL:
+    Remove WHERE / AND / OR conditions that reference hallucinated dotted columns
+    (e.g. ``AND md.Check_PC = 'X'``).  Returns cleaned SQL so the rest of the
+    query can still execute.  Falls back to the original SQL on any error.
 
-      1. WHERE / AND / OR filters  — remove the condition
-      2. SELECT list               — remove the column expression (with its AS alias)
-      3. ORDER BY list             — remove the term
-      4. GROUP BY list             — remove the term
-      5. HAVING clause             — remove the condition arm
-
-    Falls back to the original SQL on any unhandled exception.
+    Handles the three most common placements:
+      1. WHERE alias.col op value  (sole condition → remove entire WHERE clause)
+      2. WHERE alias.col op value AND next_cond  (→ convert next_cond to WHERE)
+      3. AND/OR alias.col op value  (→ remove the AND/OR arm)
     """
     try:
         for col in bad_cols:
@@ -2465,97 +2555,32 @@ def _strip_hallucinated_conditions(sql: str, bad_cols: List[str]) -> str:
             # pipeline targets always quote columns, so tolerate an optional
             # quote on both sides of the bare name everywhere below.
             cp = re.escape(col) + r'"?'
+            # Value token: a quoted string, a number, or a bare word (handles =, LIKE, IN, IS)
             val = r"""(?:'[^']*'|\([^)]*\)|[^\s,)]+)"""
             op  = r"(?:=|!=|<>|>=|<=|>|<|(?:NOT\s+)?LIKE|(?:NOT\s+)?IN|IS(?:\s+NOT)?)"
 
-            # ── WHERE / AND / OR filters ──────────────────────────────────
-            # Case: AND/OR arm
+            # Case 3: AND/OR condition  — simplest, remove the entire arm
             sql = re.sub(
                 r"(?i)\s+(?:AND|OR)\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val,
-                "", sql,
+                "",
+                sql,
             )
-            # Case: WHERE col ... AND next → convert to WHERE next
+
+            # Case 2: WHERE col ... AND next → replace with WHERE next
             sql = re.sub(
                 r"(?i)\bWHERE\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val + r"\s+AND\s+",
-                "WHERE ", sql,
+                "WHERE ",
+                sql,
             )
-            # Case: sole WHERE condition
+
+            # Case 1: WHERE col ... (nothing follows, or clause keywords follow)
             sql = re.sub(
                 r"(?i)\s+WHERE\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val
                 + r"(?=\s*(?:GROUP\b|ORDER\b|HAVING\b|LIMIT\b|$))",
-                "", sql,
+                "",
+                sql,
             )
 
-            # ── HAVING filters (same patterns as WHERE) ───────────────────
-            sql = re.sub(
-                r"(?i)\s+(?:AND|OR)\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val,
-                "", sql,
-            )
-            sql = re.sub(
-                r"(?i)\bHAVING\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val + r"\s+AND\s+",
-                "HAVING ", sql,
-            )
-            sql = re.sub(
-                r"(?i)\s+HAVING\s+\w+\.\"?" + cp + r"\s+" + op + r"\s*" + val
-                + r"(?=\s*(?:GROUP\b|ORDER\b|LIMIT\b|$))",
-                "", sql,
-            )
-
-            # ── SELECT list: remove   alias.col [AS label]  ───────────────
-            # Mid-list: ", alias.col AS label" or ", alias.col"
-            sql = re.sub(
-                r"(?i),\s*\w+\.\"?" + cp + r"(?:\s+AS\s+\w+)?(?=\s*[,\n]|\s*FROM\b)",
-                "", sql,
-            )
-            # Leading item after SELECT [DISTINCT]: capture keyword, strip col + comma
-            sql = re.sub(
-                r"(?i)(SELECT(?:\s+DISTINCT)?)\s+\w+\.\"?" + cp + r"(?:\s+AS\s+\w+)?\s*,\s*",
-                r"\1 ", sql,
-            )
-
-            # ── ORDER BY: remove the term (with optional ASC/DESC) ────────
-            # Strategy: remove any occurrence of "alias.col [ASC|DESC]" inside
-            # an ORDER BY clause, cleaning up surrounding commas.
-            # Step 1: remove when preceded by a comma  ", alias.col [ASC|DESC]"
-            sql = re.sub(
-                r"(?i),\s*\w+\.\"?" + cp + r"(?:\s+(?:ASC|DESC))?",
-                "", sql,
-            )
-            # Step 2: remove when it is the first (or only) term, followed by comma
-            # "ORDER BY alias.col [ASC|DESC] ,"  →  "ORDER BY "
-            sql = re.sub(
-                r"(?i)(ORDER\s+BY\s+)\w+\.\"?" + cp + r"(?:\s+(?:ASC|DESC))?\s*,\s*",
-                r"\1", sql,
-            )
-            # Step 3: remove when it is the only remaining term — drop entire ORDER BY
-            sql = re.sub(
-                r"(?i)\s+ORDER\s+BY\s+\w+\.\"?" + cp + r"(?:\s+(?:ASC|DESC))?\s*[;]?\s*\Z",
-                "", sql,
-            )
-            # Step 3b: same but not at \Z (something follows like LIMIT)
-            sql = re.sub(
-                r"(?i)\s+ORDER\s+BY\s+\w+\.\"?" + cp + r"(?:\s+(?:ASC|DESC))?\s*(?=LIMIT|FETCH|OFFSET)",
-                " ", sql,
-            )
-
-            # ── GROUP BY: remove the term ─────────────────────────────────
-            # Mid-list
-            sql = re.sub(r"(?i),\s*\w+\.\"?" + cp + r"(?=\s*[,;]|\s*$|\s*(?:ORDER|HAVING|LIMIT)\b)", "", sql)
-            # Leading item followed by comma
-            sql = re.sub(r"(?i)(GROUP\s+BY\s+)\w+\.\"?" + cp + r"\s*,\s*", r"\1", sql)
-            # Sole term — drop entire GROUP BY clause
-            sql = re.sub(
-                r"(?i)\s+GROUP\s+BY\s+\w+\.\"?" + cp
-                + r"(?=\s*(?:ORDER|HAVING|LIMIT|\s*;|\s*\Z))",
-                "", sql,
-            )
-
-        # Tidy up artefacts left by removals
-        sql = re.sub(r",\s*,", ",", sql)                                    # double comma
-        sql = re.sub(r"(?i)(SELECT(?:\s+DISTINCT)?)\s*,", r"\1 ", sql)      # SELECT ,
-        sql = re.sub(r"(?i),\s*(FROM\b)", r" \1", sql)                      # trailing comma before FROM
-        sql = re.sub(r"(?i)(ORDER\s+BY|GROUP\s+BY)\s*(?=(?:LIMIT|HAVING|ORDER|$|\s*;))",
-                     "", sql)                                                # empty ORDER/GROUP BY
         return sql.strip()
     except Exception:
         return sql
@@ -4237,6 +4262,12 @@ def plan_node(state: DialogState) -> DialogState:
     # and _find_cross_table_columns docstring).
     table_columns_map = _extract_table_columns(schema_context)
 
+    # Built once per plan-validation request — shared by shadow-mode logging
+    # and (when PLAN_NODE_AST_HALLUCINATION_ENABLED=1) the live AST-based
+    # table/column hallucination check in _validate_plan_items below.
+    _ast_schema_graph = _build_ast_schema(table_labels, table_columns_map)
+    _ast_dialect_name = _ast_dialect(config.db_type)
+
     _DB_LABELS = {
         "sqlite": "SQLite", "csv": "SQLite (CSV file)", "excel": "SQLite (Excel file)",
         "postgres": "PostgreSQL", "postgresql": "PostgreSQL",
@@ -4428,8 +4459,8 @@ def plan_node(state: DialogState) -> DialogState:
 
     # Build verified-examples section from human-corrected past queries for
     # this data source (see dialog_agent/verified_queries.py).
-    # graphrag_kg_id is never populated by dialog_api.py (only used by the
-    # Neo4j-specific retrieval path) — it would resolve to the same "default"
+    # graphrag_kg_id is never populated by dialog_api.py (only used for
+    # multi-KG snapshot lookups) — it would resolve to the same "default"
     # bucket for every single-KG production request, silently mixing verified
     # examples across unrelated data sources. source_id IS populated on every
     # /query request (dialog_api.py: DialogConfig(source_id=req.source_id...))
@@ -4605,7 +4636,19 @@ def plan_node(state: DialogState) -> DialogState:
             # real table is SEA_IDISCOVER_EVENT_EXPENSE). Nothing else below
             # can salvage this, so drop immediately.
             if table_labels:
-                bad_tables = _find_hallucinated_tables(sql, table_labels)
+                if _AST_RESOLVER_ENABLED:
+                    bad_tables = sorted({
+                        b.name for b in _ast_resolver.find_hallucinated_identifiers(
+                            sql, _ast_schema_graph, dialect=_ast_dialect_name,
+                        )
+                        if b.kind == "table"
+                    })
+                else:
+                    bad_tables = _find_hallucinated_tables(sql, table_labels)
+                    _shadow_check_hallucination(
+                        sql, _ast_schema_graph, _ast_dialect_name,
+                        item.get("query_id", "?"), old_bad_tables=bad_tables,
+                    )
                 if bad_tables:
                     logger.warning(
                         "plan_node: dropping query %s — hallucinated table name(s): %s",
@@ -4708,7 +4751,19 @@ def plan_node(state: DialogState) -> DialogState:
 
             # Column hallucination check
             if known_columns:
-                bad_cols = _find_hallucinated_columns(sql, known_columns)
+                if _AST_RESOLVER_ENABLED:
+                    bad_cols = sorted({
+                        b.name for b in _ast_resolver.find_hallucinated_identifiers(
+                            sql, _ast_schema_graph, dialect=_ast_dialect_name,
+                        )
+                        if b.kind == "column"
+                    })
+                else:
+                    bad_cols = _find_hallucinated_columns(sql, known_columns)
+                    _shadow_check_hallucination(
+                        sql, _ast_schema_graph, _ast_dialect_name,
+                        item.get("query_id", "?"), old_bad_cols=bad_cols,
+                    )
                 if bad_cols:
                     if _has_hallucinated_join(sql, bad_cols):
                         logger.warning(
@@ -4725,23 +4780,61 @@ def plan_node(state: DialogState) -> DialogState:
                         )
                         continue
 
-                    sql = _strip_hallucinated_conditions(sql, bad_cols)
-                    still_bad = _find_hallucinated_columns(sql, known_columns)
-                    if still_bad:
-                        logger.warning(
-                            "plan_node: dropping query %s — unremovable hallucinated cols %s",
-                            item.get("query_id", "?"), still_bad,
+                    if _AST_RESOLVER_ENABLED:
+                        repaired_sql, changelog = _ast_resolver.repair(
+                            sql, _ast_schema_graph, dialect=_ast_dialect_name,
                         )
-                        state["errors"].append(
-                            f"plan_node: query {item.get('query_id','?')} skipped — "
-                            f"unremovable hallucinated column(s): {still_bad}"
-                        )
-                        continue
-                    else:
+                        if repaired_sql is None:
+                            logger.warning(
+                                "plan_node: dropping query %s — unremovable hallucinated "
+                                "col(s) %s (AST resolver: %s)",
+                                item.get("query_id", "?"), bad_cols, changelog,
+                            )
+                            state["errors"].append(
+                                f"plan_node: query {item.get('query_id','?')} skipped — "
+                                f"unremovable hallucinated column(s): {bad_cols}"
+                            )
+                            reasons.append(
+                                f"Query {item.get('query_id','?')} referenced column(s) "
+                                f"{bad_cols} that do not exist in the schema. If these "
+                                "represent a computed/derived metric (a count, sum, average, "
+                                "or similar rollup), do not assume a pre-aggregated column "
+                                "exists — compute it with COUNT()/SUM()/GROUP BY over the "
+                                "raw table(s) that hold the underlying records instead."
+                            )
+                            continue
+                        sql = repaired_sql
                         state["errors"].append(
                             f"plan_node: query {item.get('query_id','?')} — "
-                            f"stripped hallucinated condition(s) for column(s): {bad_cols}"
+                            f"stripped hallucinated condition(s) for column(s): {bad_cols} "
+                            f"(AST resolver: {'; '.join(changelog)})"
                         )
+                    else:
+                        sql = _strip_hallucinated_conditions(sql, bad_cols)
+                        still_bad = _find_hallucinated_columns(sql, known_columns)
+                        if still_bad:
+                            logger.warning(
+                                "plan_node: dropping query %s — unremovable hallucinated cols %s",
+                                item.get("query_id", "?"), still_bad,
+                            )
+                            state["errors"].append(
+                                f"plan_node: query {item.get('query_id','?')} skipped — "
+                                f"unremovable hallucinated column(s): {still_bad}"
+                            )
+                            reasons.append(
+                                f"Query {item.get('query_id','?')} referenced column(s) "
+                                f"{still_bad} that do not exist in the schema. If these "
+                                "represent a computed/derived metric (a count, sum, average, "
+                                "or similar rollup), do not assume a pre-aggregated column "
+                                "exists — compute it with COUNT()/SUM()/GROUP BY over the "
+                                "raw table(s) that hold the underlying records instead."
+                            )
+                            continue
+                        else:
+                            state["errors"].append(
+                                f"plan_node: query {item.get('query_id','?')} — "
+                                f"stripped hallucinated condition(s) for column(s): {bad_cols}"
+                            )
 
             # Cross-table column check — a column that's real SOMEWHERE in the
             # schema but referenced against a table alias that doesn't actually
@@ -4883,8 +4976,14 @@ def plan_node(state: DialogState) -> DialogState:
             "(e.g. no valid path from the fact table to a geography dimension), "
             "OMIT that filter — do not attempt to route through an unrelated dimension "
             "table (e.g. do not use dim_segment to reach dim_region).\n"
-            "4. Note in the query 'description' field any dimension you could not filter.\n"
-            "5. Return the best query you can from the available schema.\n"
+            "4. Do NOT reference any column that is not listed verbatim in the schema "
+            "below. If the question asks for a count, sum, average, rate, or other "
+            "rollup/derived metric and no column with that exact meaning exists, do "
+            "NOT assume a pre-aggregated column exists — instead compute it yourself "
+            "with COUNT()/SUM()/AVG()/GROUP BY over the raw table(s) that hold the "
+            "underlying records for that concept.\n"
+            "5. Note in the query 'description' field any dimension you could not filter.\n"
+            "6. Return the best query you can from the available schema.\n"
             "=" * 60 + "\n\n"
             + user
         )

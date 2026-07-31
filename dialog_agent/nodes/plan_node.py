@@ -1569,7 +1569,7 @@ SCHEMA CONTEXT:
 
 TARGET DATABASE TYPE: {db_type}
 {schema_line}
-{history_section}{multi_kg_section}{glossary_section}{kpi_section}{resolution_section}{verified_section}NATURAL LANGUAGE QUESTION:
+{history_section}{multi_kg_section}{lexicon_section}{glossary_section}{kpi_section}{resolution_section}{verified_section}NATURAL LANGUAGE QUESTION:
 {natural_query}
 
 CRITICAL REMINDERS:
@@ -4507,12 +4507,57 @@ def plan_node(state: DialogState) -> DialogState:
     else:
         verified_section = ""
 
+    # ── RESOLVED BUSINESS CONCEPTS (dissect_node) ───────────────────────────
+    # Empty string when the feature is disabled or in shadow mode, or when
+    # no concepts were resolved this turn — byte-identical prompt to before
+    # this feature existed in that case.
+    derived_metrics = state.get("derived_metrics") or []
+    if derived_metrics:
+        dm_lines = [
+            "RESOLVED BUSINESS CONCEPTS — MANDATORY COLUMN BINDINGS",
+            "=" * 60,
+            "Each concept below has been resolved to REAL columns and validated",
+            "against this schema (every column confirmed present; every filter",
+            "literal confirmed present in that column's actual data). You MUST",
+            "express these concepts using the bindings given. Do NOT reference a",
+            "pre-aggregated column for them — none exists.",
+            "",
+        ]
+        for dm in derived_metrics:
+            cols = ", ".join(
+                f"{b['table']}.{b['column']}" for b in (dm.get("bindings") or [])
+            )
+            dm_lines.append(f"  Concept: {dm.get('term', '')}")
+            dm_lines.append(f"    Columns:     {cols}")
+            if dm.get("aggregation"):
+                dm_lines.append(f"    Aggregation: {dm['aggregation']}")
+            if dm.get("grain"):
+                dm_lines.append(f"    Grain:       {dm['grain']}")
+            for f in (dm.get("filter_predicates") or []):
+                dm_lines.append(
+                    f"    Filter:      {f['column']} {f['op']} {f['value']!r}"
+                )
+            if dm.get("time_window"):
+                tw = dm["time_window"]
+                dm_lines.append(
+                    f"    Window:      {tw.get('column')} within {tw.get('span')}"
+                )
+            dm_lines.append("")
+        dm_lines.append("=" * 60)
+        lexicon_section = "\n".join(dm_lines) + "\n\n"
+        max_chars = getattr(config, "lexicon_section_max_chars", 4000)
+        if len(lexicon_section) > max_chars:
+            lexicon_section = lexicon_section[:max_chars] + "\n…(truncated)\n\n"
+    else:
+        lexicon_section = ""
+
     user = _USER_PROMPT.format(
         schema_context=schema_context,
         db_type=config.db_type,
         schema_line=schema_line,
         history_section=history_section,
         multi_kg_section=multi_kg_section,
+        lexicon_section=lexicon_section,
         glossary_section=glossary_section,
         kpi_section=kpi_section,
         resolution_section=resolution_section,

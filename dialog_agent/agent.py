@@ -8,6 +8,8 @@ Pipeline:
                             selected tables, via the KG's "mentions" edges)
       → understand        (build schema context from retrieved subgraph)
       → resolve           (LLM maps user query terms → exact categorical DB values)
+      → dissect           (resolve business concepts → real columns via lexicon +
+                            data-driven evaluation loop; no-op when disabled)
       → plan              (LLM decomposes NQL → SQL queries using resolved values)
       → execute           (run SQL against target DB)
       → synthesize         (LLM stitches SQL results + document context → insights)
@@ -25,6 +27,7 @@ from .config import DialogConfig
 from .nodes import (
     retrieve_node,
     document_context_node,
+    dissect_node,
     execute_node,
     plan_node,
     resolve_node,
@@ -35,7 +38,7 @@ from .state import ConversationTurn, DialogState
 
 logger = logging.getLogger(__name__)
 
-_NODES = ["retrieve", "document_context", "understand", "resolve", "plan", "execute", "synthesize"]
+_NODES = ["retrieve", "document_context", "understand", "resolve", "dissect", "plan", "execute", "synthesize"]
 
 
 def _timed_node(name, fn):
@@ -58,6 +61,7 @@ def _build_graph() -> Any:
     g.add_node("document_context",  _timed_node("document_context", document_context_node))
     g.add_node("understand",        _timed_node("understand", understand_node))
     g.add_node("resolve",           _timed_node("resolve", resolve_node))
+    g.add_node("dissect",           _timed_node("dissect", dissect_node))
     g.add_node("plan",              _timed_node("plan", plan_node))
     g.add_node("execute",           _timed_node("execute", execute_node))
     g.add_node("synthesize",        _timed_node("synthesize", synthesize_node))
@@ -66,7 +70,8 @@ def _build_graph() -> Any:
     g.add_edge("retrieve",          "document_context")
     g.add_edge("document_context",  "understand")
     g.add_edge("understand",        "resolve")
-    g.add_edge("resolve",           "plan")
+    g.add_edge("resolve",           "dissect")
+    g.add_edge("dissect",           "plan")
     g.add_edge("plan",              "execute")
     g.add_edge("execute",           "synthesize")
     g.add_edge("synthesize",        END)

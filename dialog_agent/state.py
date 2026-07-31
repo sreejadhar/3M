@@ -119,3 +119,23 @@ class DialogState(TypedDict, total=False):
     active_kg_ids: List[str]           # KG ids selected by router
     kg_bridges_active: List[Dict[str, Any]]  # bridges between active KGs
     multi_kg_configs: List[Any]        # one DialogConfig per active KG (for execute_node routing)
+
+    # ── Semantic Lexicon / Evaluation Loop (dissect_node) ─────────────────
+    # Business concepts resolved to real columns, either from the lexicon
+    # (cache hit) or the evaluation loop (cache miss). Consumed by plan_node
+    # for prompt injection. Empty = behave exactly as before this feature
+    # existed.
+    # [{"term": "promotion count", "kind": "derived_metric",
+    #   "bindings": [{"table": "...", "column": "..."}],
+    #   "aggregation": "...", "grain": "...", "filter_predicates": [...],
+    #   "time_window": {...}, "provenance": "...", "approved": 0}]
+    derived_metrics: List[Dict[str, Any]]
+
+    # Concepts identified in the question that could NOT be resolved. Planning
+    # proceeds exactly as today for these — presence here is never fatal.
+    unresolved_terms: List[str]
+
+    # Shadow-mode / diagnostic observations from dissect_node, surfaced the
+    # same way state["errors"] is, so they're visible without changing
+    # planner behaviour.
+    lexicon_diagnostics: List[str]

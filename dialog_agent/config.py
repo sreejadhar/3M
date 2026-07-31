@@ -101,3 +101,24 @@ class DialogConfig:
     multi_kg_enabled: bool = True          # enable NLQ router
     kg_ids: List[str] = field(default_factory=list)  # explicit KG list (bypasses router)
     kg_router_threshold: float = 0.30      # min cosine similarity for routing
+
+    # ── Semantic Lexicon + Data-Driven Evaluation Loop ────────────────────────
+    # Master switch. With lexicon_enabled=False the dissect node returns state
+    # untouched (pipeline byte-identical to before this feature). Enabled live
+    # (lexicon_enabled=True, lexicon_shadow_mode=False) per user decision on
+    # 2026-07-31, after validating against HR and LifeScience_V2 question
+    # sets. Known open item at that time: some concept resolutions still
+    # require human review before approval (approved=0 on every entry) — see
+    # docs/Semantic_Lexicon_And_Evaluation_Loop_Design.md.
+    lexicon_enabled:        bool  = True    # master switch
+    lexicon_shadow_mode:    bool  = False   # Phase 4: bindings are injected into live prompts
+    # Higher than verified_queries' 0.35 on purpose: a wrong binding here is
+    # worse than a missed few-shot example.
+    lexicon_min_similarity: float = 0.62
+    dissect_enabled:        bool  = True    # run the loop on lexicon miss
+    dissect_llm_model:      str   = "claude-haiku-4-5"
+    dissect_probe_enabled:  bool  = True    # safety gate; disable only to debug
+    dissect_max_terms:      int   = 4       # per-request cost ceiling
+    # Cap the injected prompt block so it cannot crowd out schema_context
+    # under the token guard (guard_plan_prompt trims schema_context, not this).
+    lexicon_section_max_chars: int = 4000

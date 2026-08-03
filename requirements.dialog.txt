@@ -41,3 +41,6 @@ pymssql>=2.2.0                 # SQL Server — pure-Python wheel, no ODBC drive
 
 # Snowflake
 snowflake-connector-python>=3.6.0
+
+# SQL parsing/AST — hallucinated-identifier resolver (dialect-aware parse/rewrite)
+sqlglot>=25.0.0

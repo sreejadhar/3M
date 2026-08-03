@@ -3,8 +3,8 @@ Configuration for the Ontology Agent.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Dict, Optional
 
 
 @dataclass
@@ -29,6 +29,17 @@ class OntologyConfig:
     source_domain     : Optional domain hint passed to the concept LLM
                         (e.g. "telecom", "banking", "healthcare").  When set the
                         LLM resolves ambiguous abbreviations in domain context.
+    enable_name_resolution : Replace raw table/column names in RDFS.label with a
+                        GA-chosen canonical label (see kg_optimizer/naming_resolver.py)
+                        when a mapping exists in table_labels/column_labels.
+                        Default: False — raw names pass through unchanged, identical
+                        to pre-existing behavior.
+    table_labels      : raw table name -> canonical label. Only used when
+                        enable_name_resolution=True; missing entries fall back to
+                        the raw name.
+    column_labels     : raw column name -> canonical label. Only used when
+                        enable_name_resolution=True; missing entries fall back to
+                        the raw name.
     """
     base_uri:           str  = "http://metadata-agent.io/ontology/"
     ontology_name:      str  = "DatabaseOntology"
@@ -38,3 +49,6 @@ class OntologyConfig:
     annotate_concepts:  bool = True
     llm_model:          str  = "claude-haiku-4-5"
     source_domain:      str  = ""
+    enable_name_resolution: bool = False
+    table_labels:       Dict[str, str] = field(default_factory=dict)
+    column_labels:      Dict[str, str] = field(default_factory=dict)

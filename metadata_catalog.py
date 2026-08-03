@@ -178,6 +178,7 @@ CREATE TABLE IF NOT EXISTS md_entities (
     primary_keys         TEXT NOT NULL DEFAULT '[]',
     is_golden_record     INTEGER NOT NULL DEFAULT 0,
     deleted_from_source  INTEGER NOT NULL DEFAULT 0,
+    canonical_label      TEXT NOT NULL DEFAULT '',
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
     UNIQUE(source_id, schema_name, table_name)
@@ -197,6 +198,7 @@ CREATE TABLE IF NOT EXISTS md_entities (
     primary_keys         TEXT NOT NULL DEFAULT '[]',
     is_golden_record     BOOLEAN NOT NULL DEFAULT FALSE,
     deleted_from_source  BOOLEAN NOT NULL DEFAULT FALSE,
+    canonical_label      TEXT NOT NULL DEFAULT '',
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
     UNIQUE(source_id, schema_name, table_name)
@@ -231,6 +233,7 @@ CREATE TABLE IF NOT EXISTS md_attributes (
     pii_type             TEXT NOT NULL DEFAULT '',
     is_golden_record     INTEGER NOT NULL DEFAULT 0,
     deleted_from_source  INTEGER NOT NULL DEFAULT 0,
+    canonical_label      TEXT NOT NULL DEFAULT '',
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
     UNIQUE(metadata_id, column_name)
@@ -265,6 +268,7 @@ CREATE TABLE IF NOT EXISTS md_attributes (
     pii_type             TEXT NOT NULL DEFAULT '',
     is_golden_record     BOOLEAN NOT NULL DEFAULT FALSE,
     deleted_from_source  BOOLEAN NOT NULL DEFAULT FALSE,
+    canonical_label      TEXT NOT NULL DEFAULT '',
     created_at           TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
     UNIQUE(metadata_id, column_name)
@@ -404,6 +408,14 @@ def _ensure(cur: Any) -> None:
                 "ALTER TABLE md_attributes ADD COLUMN IF NOT EXISTS "
                 "pii_type TEXT NOT NULL DEFAULT ''"
             )
+            cur.execute(
+                "ALTER TABLE md_entities ADD COLUMN IF NOT EXISTS "
+                "canonical_label TEXT NOT NULL DEFAULT ''"
+            )
+            cur.execute(
+                "ALTER TABLE md_attributes ADD COLUMN IF NOT EXISTS "
+                "canonical_label TEXT NOT NULL DEFAULT ''"
+            )
             _schema_migrated = True
     else:
         cur.ddl(
@@ -443,6 +455,14 @@ def _ensure(cur: Any) -> None:
             if "pii_type" not in cols_a:
                 cur.execute(
                     "ALTER TABLE md_attributes ADD COLUMN pii_type TEXT NOT NULL DEFAULT ''"
+                )
+            if "canonical_label" not in cols_e:
+                cur.execute(
+                    "ALTER TABLE md_entities ADD COLUMN canonical_label TEXT NOT NULL DEFAULT ''"
+                )
+            if "canonical_label" not in cols_a:
+                cur.execute(
+                    "ALTER TABLE md_attributes ADD COLUMN canonical_label TEXT NOT NULL DEFAULT ''"
                 )
             _schema_migrated = True
 
@@ -864,7 +884,7 @@ def get_attribute(attr_id: str) -> Optional[Dict]:
 
 
 def update_entity(metadata_id: str, **fields: Any) -> bool:
-    allowed = {"description", "is_golden_record"}
+    allowed = {"description", "is_golden_record", "canonical_label"}
     updates: Dict[str, Any] = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False
@@ -882,7 +902,7 @@ def update_entity(metadata_id: str, **fields: Any) -> bool:
 
 
 def update_attribute(attr_id: str, **fields: Any) -> bool:
-    allowed = {"description", "is_golden_record", "statistical_type", "semantic_role", "taxonomy_tree"}
+    allowed = {"description", "is_golden_record", "statistical_type", "semantic_role", "taxonomy_tree", "canonical_label"}
     updates: Dict[str, Any] = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return False

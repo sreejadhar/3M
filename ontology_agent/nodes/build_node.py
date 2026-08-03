@@ -402,10 +402,15 @@ def build_node(state: OntologyState) -> OntologyState:
     # ------------------------------------------------------------------
     # 1. OWL Classes from tables + DatatypeProperties from columns
     # ------------------------------------------------------------------
+    table_labels: Dict[str, str] = getattr(config, "table_labels", None) or {}
+    column_labels: Dict[str, str] = getattr(config, "column_labels", None) or {}
+    resolve_names = getattr(config, "enable_name_resolution", False)
+
     for table_name, table_meta in tables.items():
         cls_uri = ns[_safe(table_name)]
+        cls_label = table_labels.get(table_name, table_name) if resolve_names else table_name
         g.add((cls_uri, RDF.type,    OWL.Class))
-        g.add((cls_uri, RDFS.label,  Literal(table_name)))
+        g.add((cls_uri, RDFS.label,  Literal(cls_label)))
 
         if isinstance(table_meta, dict):
             # ── Rich class description ──────────────────────────────────
@@ -457,9 +462,10 @@ def build_node(state: OntologyState) -> OntologyState:
             col_name  = col.get("name", "")
             prop_uri  = ns[f"{_safe(table_name)}_{_safe(col_name)}"]
             xsd_range = _xsd_type(col.get("data_type", ""))
+            col_label = column_labels.get(col_name, col_name) if resolve_names else col_name
 
             g.add((prop_uri, RDF.type,    OWL.DatatypeProperty))
-            g.add((prop_uri, RDFS.label,  Literal(col_name)))
+            g.add((prop_uri, RDFS.label,  Literal(col_label)))
             g.add((prop_uri, RDFS.domain, cls_uri))
             g.add((prop_uri, RDFS.range,  xsd_range))
 

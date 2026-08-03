@@ -214,6 +214,38 @@ async def proxy_sse_index_events(request: Request, source_id: str):
     )
 
 
+# ── Streaming upload proxy — must be declared BEFORE the catch-all ───────────
+# The buffered _proxy() calls `await request.body()`, which reads the entire
+# file into this pod's memory before forwarding a single byte downstream.
+# Fine for small JSON bodies, but a large SQLite/Excel upload (100s of MB)
+# would balloon this pod's memory and sit well past the buffered proxy's
+# 30s write / 120s read timeouts. Stream the body straight through instead.
+_UPLOAD_TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=None, pool=5.0)
+
+
+@app.post("/api/sources/upload-file")
+async def proxy_upload_file(request: Request):
+    """Stream a file upload straight through to the orchestrator."""
+    url = f"{ORCHESTRATOR_URL}/sources/upload-file"
+    headers = {k: v for k, v in _req_headers(request).items()
+               if k.lower() != "content-length"}
+
+    try:
+        async with httpx.AsyncClient(timeout=_UPLOAD_TIMEOUT) as client:
+            upstream = await client.post(url, headers=headers, content=request.stream())
+    except httpx.HTTPError as exc:
+        log.warning("Upload proxy to %s failed: %s", url, exc)
+        return Response(content=b'{"detail":"Upstream service unreachable"}',
+                         status_code=502, media_type="application/json")
+
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=_resp_headers(upstream.headers),
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
 # ── Catch-all API proxy — forward /api/* → orchestrator /* ───────────────────
 # The tech UI prefixes all calls with /api/ (const API = '/api').
 # The orchestrator routes live at the root (e.g. GET /sources, not GET /api/sources).

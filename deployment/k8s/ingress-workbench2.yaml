@@ -6,6 +6,7 @@ metadata:
   annotations:
     kubernetes.io/ingress.class: "gce"
     kubernetes.io/ingress.global-static-ip-name: "datananite-workbench-ip"
+    ingress.gcp.kubernetes.io/pre-shared-cert: "datananite-workbench-cert"
 spec:
   rules:
   - host: datananite-workbench.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog

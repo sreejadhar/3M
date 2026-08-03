@@ -1,0 +1,8 @@
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: datananite2-cert
+  namespace: datananite2
+spec:
+  domains:
+    - datananite2.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog

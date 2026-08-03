@@ -6,6 +6,7 @@ metadata:
   annotations:
     kubernetes.io/ingress.class: "gce"
     kubernetes.io/ingress.global-static-ip-name: "datananite2-static-ip"
+    networking.gke.io/managed-certificates: "datananite2-cert"
 spec:
   rules:
   - host: datananite2.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog

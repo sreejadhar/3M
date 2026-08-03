@@ -23,6 +23,9 @@ COPY ontology_enricher.py .
 COPY snowflake_auth.py .
 COPY config.py .
 COPY llm_client.py .
+COPY excel_export.py .
+COPY business_classifier.py .
+COPY domain_classifier.py .
 COPY connectors/ ./connectors/
 
 # Chat UI static assets served by the orchestrator

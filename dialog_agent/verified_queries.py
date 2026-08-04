@@ -210,8 +210,8 @@ def _rank_by_keyword_similarity(question: str, texts: List[str]) -> np.ndarray:
 
 def _rank_by_embedding_similarity(question: str, texts: List[str]) -> Optional[np.ndarray]:
     try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2")
+        from .embedding_cache import get_sentence_transformer
+        model = get_sentence_transformer("all-MiniLM-L6-v2")
         corpus_vecs = model.encode(texts, normalize_embeddings=True).astype(np.float32)
         q_vec = model.encode([question], normalize_embeddings=True)[0].astype(np.float32)
         return corpus_vecs @ q_vec

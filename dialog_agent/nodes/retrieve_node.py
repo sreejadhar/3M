@@ -33,43 +33,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ..embedding_cache import get_sentence_transformer as _get_sentence_transformer
 from ..state import DialogState
 
 logger = logging.getLogger(__name__)
 
-# sentence-transformers lazily hits huggingface.co on first load to check for
-# newer model revisions, even when the model is already cached on disk. In
-# environments where huggingface.co is network-blocked (e.g. corporate
-# firewalls returning HTTP 403), this turns into a multi-minute retry storm
-# on every request (~4 min observed in production logs) before falling back
-# to the already-cached local weights. Defaulting to offline mode skips that
-# network round-trip entirely: if the model is cached, load is instant; if
-# not, it fails immediately instead of retrying, and the existing except
-# blocks below fall back to the tfidf/keyword backend. `setdefault` so an
-# operator who explicitly sets these (e.g. to force a fresh download) is
-# never overridden.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-
 # ── Module-level embedding cache ──────────────────────────────────────────────
 # Keyed by (schema_hash, backend, _NODE_TEXT_VERSION) so cache is invalidated
 # when the schema changes OR when _node_text() logic is updated.
+# (The SentenceTransformer model object itself is cached separately, and
+# shared across this module and dialog_agent.verified_queries — see
+# dialog_agent/embedding_cache.py — since it's loaded at most once per
+# process regardless of which call site needs it first.)
 _EMBED_CACHE: Dict[str, "_Cache"] = {}
 _NODE_TEXT_VERSION = "6"   # bump when _node_text() or _expand_table_name() changes, or the tokenizer changes
-
-# The SentenceTransformer model object itself was previously reconstructed
-# from disk on EVERY embed_query() call and every _build_cache() call — even
-# when the corpus embedding cache above already had a hit, a repeated
-# question still paid a fresh model load. Cache the loaded model instance
-# per model name so it's loaded at most once per process.
-_MODEL_CACHE: Dict[str, Any] = {}
-
-
-def _get_sentence_transformer(model_name: str) -> Any:
-    if model_name not in _MODEL_CACHE:
-        from sentence_transformers import SentenceTransformer
-        _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
-    return _MODEL_CACHE[model_name]
 
 
 class _Cache:

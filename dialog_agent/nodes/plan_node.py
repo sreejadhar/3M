@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .. import verified_queries
 from ..state import DialogState, SQLQuery
@@ -2152,6 +2152,70 @@ def _call_llm(
     )
     _log_cost("plan_node", model, msg.usage)
     return msg.content[0].text if msg.content else ""
+
+
+_JSON_RETRY_MAX_ATTEMPTS = 1  # one extra attempt after the initial call
+
+
+def _call_plan_llm_and_parse(
+    system: str,
+    user: str,
+    model: str,
+    temperature: float,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Call the plan LLM and parse its JSON array response, retrying once with
+    an augmented prompt if the response is not valid JSON.
+
+    The plan JSON's "sql" field often has to carry a long, verbatim SQL
+    expression (e.g. a KPI's pre-defined sql_expression, which the LLM is
+    explicitly told to copy without rewriting — see the DEFINED KPIs section
+    below). A long/complex expression with several quoted literals is a
+    plausible spot for the model to slip on JSON escaping, producing a
+    JSONDecodeError. Previously that was fatal with zero retry — an
+    otherwise-recoverable one-off formatting mistake took down the whole
+    response ("No query results were produced"). One retry, with the
+    specific parse error fed back to the model, recovers most of these
+    without materially changing latency (LLM formatting mistakes are rare;
+    this path is a no-op in the overwhelming majority of requests).
+    """
+    raw = _call_llm(system, user, model, temperature)
+    try:
+        return raw, _extract_json(raw)
+    except json.JSONDecodeError as exc:
+        # `except ... as exc` implicitly deletes `exc` when the block exits, so
+        # it must be captured under a different name to survive past here.
+        last_exc = exc
+        logger.warning(
+            "plan_node: LLM returned unparseable JSON (%s) — retrying once with the "
+            "parse error fed back",
+            exc,
+        )
+
+    for attempt in range(_JSON_RETRY_MAX_ATTEMPTS):
+        retry_user = (
+            f"{user}\n\n---\n"
+            "Your previous response was not valid JSON and could not be parsed "
+            "(this exact error occurred while parsing it):\n"
+            f"{last_exc}\n\n"
+            "Return ONLY a valid JSON array in the exact same shape as before. "
+            "Pay special attention to correctly escaping any quotes, newlines, or "
+            "special characters inside \"sql\" string values — the entire SQL text "
+            "must be a single valid JSON string."
+        )
+        raw = _call_llm(system, retry_user, model, temperature)
+        try:
+            return raw, _extract_json(raw)
+        except json.JSONDecodeError as exc2:
+            last_exc = exc2
+            logger.warning(
+                "plan_node: retry attempt %d/%d also returned unparseable JSON — %s",
+                attempt + 1, _JSON_RETRY_MAX_ATTEMPTS, exc2,
+            )
+
+    # All attempts exhausted — re-raise the last parse error so the caller's
+    # existing except-block handles it exactly as before this fix.
+    raise last_exc
 
 
 _FIX_THRESHOLD_SYSTEM = """\
@@ -4569,9 +4633,8 @@ def plan_node(state: DialogState) -> DialogState:
     system, user = guard_plan_prompt(system, user, schema_context, model=config.plan_llm_model)
 
     try:
-        raw = _call_llm(system, user, config.plan_llm_model, config.llm_temperature)
+        raw, plan = _call_plan_llm_and_parse(system, user, config.plan_llm_model, config.llm_temperature)
         logger.info("LLM plan response (first 500 chars): %s", raw[:500])
-        plan: List[Dict] = _extract_json(raw)
     except Exception as exc:
         logger.exception("plan_node LLM call failed")
         state["errors"].append(f"plan_node: LLM error — {exc}")

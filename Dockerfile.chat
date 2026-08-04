@@ -32,9 +32,6 @@ COPY chat_ui/ ./chat_ui/
 COPY chat_frontend/dist/ ./chat_frontend/dist/
 COPY dialog_agent/ ./dialog_agent/
 
-# SENTENCE_TRANSFORMER_MODEL_PATH is set via the datananite-config ConfigMap
-# to a path on the shared PVC (mounted at /data) — see
-# scripts/bootstrap_embedding_model_pvc.md for the one-time upload step.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

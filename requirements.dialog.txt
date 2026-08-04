@@ -13,9 +13,7 @@ openpyxl>=3.1.0
 # GraphRAG in-memory retrieval
 numpy>=1.26.0                          # vector math for cosine similarity (required)
 scikit-learn>=1.4.0                    # TF-IDF embedding backend (recommended)
---extra-index-url https://download.pytorch.org/whl/cpu  # CPU-only wheels for torch (below)
-torch>=2.0.0                           # required by sentence-transformers
-sentence-transformers>=3.0.0           # best-quality local embedding backend
+# sentence-transformers>=3.0.0         # best-quality local embedding backend (optional)
 # openai>=1.0.0                        # OpenAI embedding backend (optional, needs OPENAI_API_KEY)
 
 # Database drivers (install only the driver for your target DB)

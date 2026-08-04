@@ -16,7 +16,3 @@ node_modules/
 # Local dev logs & scratch
 logs/
 *.log
-
-# One-time embedding-model download artifact (uploaded to the shared PVC,
-# not committed — see scripts/bootstrap_embedding_model_pvc.md)
-/models/

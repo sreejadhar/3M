@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 # sentence-transformers lazily hits huggingface.co on first load to check for
 # newer model revisions, even when the model is already cached on disk. In
@@ -47,13 +47,6 @@ def get_sentence_transformer(model_name: str = "all-MiniLM-L6-v2") -> Any:
     at most once per process. Thread-safe: concurrent callers racing on a
     cold cache block on the lock instead of each constructing their own
     redundant model instance.
-
-    If SENTENCE_TRANSFORMER_MODEL_PATH is set, load from that local directory
-    instead of resolving *model_name* through the HF hub cache. This is for
-    network-restricted build/runtime environments: the model is baked into
-    the image as a plain folder (see scripts/download_embedding_model.py),
-    so loading it is a filesystem read with no huggingface.co lookup at all
-    — HF_HUB_OFFLINE above is irrelevant to this path.
     """
     cached = _MODEL_CACHE.get(model_name)
     if cached is not None:
@@ -64,32 +57,6 @@ def get_sentence_transformer(model_name: str = "all-MiniLM-L6-v2") -> Any:
         cached = _MODEL_CACHE.get(model_name)
         if cached is None:
             from sentence_transformers import SentenceTransformer
-            local_path = os.environ.get("SENTENCE_TRANSFORMER_MODEL_PATH")
-            cached = SentenceTransformer(local_path or model_name)
+            cached = SentenceTransformer(model_name)
             _MODEL_CACHE[model_name] = cached
         return cached
-
-
-# Tag stored alongside every persisted embedding (semantic_lexicon,
-# verified_queries) so a row's cached vector can be identified as belonging
-# to THIS backend/model. If the encoding backend ever changes (a different
-# model name, or falling back to keyword similarity because
-# sentence-transformers becomes unavailable in some environment), stored
-# vectors under a different tag are treated as stale and recomputed rather
-# than being silently compared against incompatible vector spaces.
-CURRENT_EMBEDDING_TAG = "st:all-MiniLM-L6-v2"
-
-
-def encode_text(text: str, model_name: str = "all-MiniLM-L6-v2") -> Optional[List[float]]:
-    """
-    Encode a single text into a normalized embedding vector (as a plain list,
-    ready for JSON persistence). Returns None if the embedding backend is
-    unavailable — best-effort, callers fall back to keyword similarity.
-    """
-    try:
-        import numpy as np
-        model = get_sentence_transformer(model_name)
-        vec = model.encode([text], normalize_embeddings=True)[0]
-        return np.asarray(vec, dtype=np.float32).tolist()
-    except Exception:
-        return None

@@ -7,9 +7,7 @@ httpx>=0.27.0          # async HTTP calls to the other microservices
 python-multipart>=0.0.9  # file upload support
 numpy>=1.26.0          # GraphRAG cosine similarity
 scikit-learn>=1.4.0    # TF-IDF embedding backend (optional but recommended)
---extra-index-url https://download.pytorch.org/whl/cpu  # CPU-only wheels for torch (below)
-torch>=2.0.0           # required by sentence-transformers
-sentence-transformers>=2.7.0  # best-quality embeddings
+# sentence-transformers>=2.7.0  # best-quality embeddings (optional, requires torch)
 openpyxl>=3.1.0               # Excel export (multi-tab workbook + charts)
 matplotlib>=3.7.0             # chart rendering to PNG for Excel embedding
 Pillow>=10.0.0                # image handling for openpyxl XlImage embedding

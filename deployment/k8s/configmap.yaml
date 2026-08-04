@@ -21,8 +21,3 @@ data:
   UNSTRUCTURED_API_URL: "http://unstructured-api-service:8008"
   UNSTRUCTURED_DB: "/data/unstructured.db"
   UNSTRUCTURED_WORKERS: "4"
-  # GraphRAG/semantic-lexicon embedding model — loaded from the shared PVC
-  # (mounted at /data on dialog-api, orchestrator-api, chat-ui) instead of
-  # huggingface.co, which is unreachable from these pods. One-time upload:
-  # see scripts/bootstrap_embedding_model_pvc.md.
-  SENTENCE_TRANSFORMER_MODEL_PATH: "/data/models/all-MiniLM-L6-v2"

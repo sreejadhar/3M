@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 
 from . import pg_store
-from .verified_queries import _rank_by_embedding_similarity, _rank_by_keyword_similarity, _stem
+from .verified_queries import _rank_by_keyword_similarity, _stem
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,18 @@ CREATE TABLE IF NOT EXISTS semantic_lexicon (
 
 def _ensure(cur) -> None:
     cur.ddl(_DDL_PG if pg_store.is_postgres() else _DDL_SQLITE)
+    # Migration: persisted embedding columns (added after initial release —
+    # see save()/lookup()). Previously Tier 3 of lookup() re-encoded EVERY
+    # candidate's term on EVERY call; these columns let a term's embedding be
+    # computed once at save() time and reused on every future lookup.
+    for stmt in (
+        "ALTER TABLE semantic_lexicon ADD COLUMN embedding_json TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE semantic_lexicon ADD COLUMN embedding_model TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            cur.execute(stmt)
+        except Exception:
+            pass
 
 
 # ── Data model ─────────────────────────────────────────────────────────────
@@ -132,6 +144,8 @@ class LexiconEntry:
     entry_id: Optional[str] = None
     created_at: float = 0.0
     verified_at: float = 0.0
+    embedding: List[float] = field(default_factory=list)   # persisted, see save()
+    embedding_model: str = ""                               # tag — see embedding_cache.CURRENT_EMBEDDING_TAG
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -167,6 +181,8 @@ def _row(r: dict) -> LexiconEntry:
         schema_fingerprint=r.get("schema_fingerprint") or "",
         created_at=float(r.get("created_at") or 0.0),
         verified_at=float(r.get("verified_at") or 0.0),
+        embedding=_j("embedding_json", []),
+        embedding_model=r.get("embedding_model") or "",
     )
 
 
@@ -207,10 +223,28 @@ def schema_fingerprint(table_columns_map: Dict[str, Set[str]], tables: List[str]
 # ── CRUD ───────────────────────────────────────────────────────────────────
 
 def save(entry: LexiconEntry) -> str:
-    """Upsert on (source_id, term). Returns the entry_id."""
+    """Upsert on (source_id, term). Returns the entry_id.
+
+    Computes and persists the term's embedding here, once, so lookup()'s
+    Tier 3 never needs to re-encode this row again — see
+    dialog_agent/embedding_cache.py. Best-effort: if the embedding backend
+    is unavailable, embedding/embedding_model are left empty and lookup()
+    falls back to keyword similarity for this row, exactly as before this
+    feature existed.
+    """
     now = time.time()
     entry.entry_id = entry.entry_id or str(uuid.uuid4())
     entry.term = normalize_term(entry.display_term or entry.term) or entry.term
+
+    from .embedding_cache import encode_text, CURRENT_EMBEDDING_TAG
+    vec = encode_text(entry.term)
+    if vec is not None:
+        entry.embedding = vec
+        entry.embedding_model = CURRENT_EMBEDDING_TAG
+    else:
+        entry.embedding = []
+        entry.embedding_model = ""
+
     params = (
         entry.entry_id, entry.source_id, entry.term, entry.display_term,
         json.dumps(entry.aliases), entry.kind, json.dumps(entry.bindings),
@@ -219,12 +253,14 @@ def save(entry: LexiconEntry) -> str:
         entry.sql_template, entry.rationale, entry.confidence, entry.provenance,
         int(entry.probe_ok), int(entry.approved), entry.hit_count, entry.fail_count,
         entry.schema_fingerprint, now, now,
+        json.dumps(entry.embedding), entry.embedding_model,
     )
     cols = ("entry_id, source_id, term, display_term, aliases_json, kind, "
             "bindings_json, aggregation, grain, filter_json, time_window_json, "
             "sql_template, rationale, confidence, provenance, probe_ok, approved, "
-            "hit_count, fail_count, schema_fingerprint, created_at, verified_at")
-    placeholders = ",".join(["?"] * 22)
+            "hit_count, fail_count, schema_fingerprint, created_at, verified_at, "
+            "embedding_json, embedding_model")
+    placeholders = ",".join(["?"] * 24)
 
     with pg_store.cursor_ctx() as cur:
         _ensure(cur)
@@ -234,18 +270,26 @@ def save(entry: LexiconEntry) -> str:
         ).fetchone()
         if existing:
             entry.entry_id = existing["entry_id"]
+            # fail_count resets to 0 on every re-save: a re-save means dissect_node
+            # re-ran the evaluation loop for this term (either the old binding was
+            # auto-suppressed by lookup()'s fail_count gate — see _MAX_ALLOWED_FAILS
+            # below — or the schema changed) and produced a fresh proposal that
+            # passed validation + probe again. Carrying the OLD binding's fail
+            # count forward would leave the new, different binding permanently
+            # suppressed before it ever gets a chance to prove itself.
             cur.execute(
                 "UPDATE semantic_lexicon SET display_term=?, aliases_json=?, kind=?, "
                 "bindings_json=?, aggregation=?, grain=?, filter_json=?, time_window_json=?, "
                 "sql_template=?, rationale=?, confidence=?, provenance=?, probe_ok=?, "
-                "approved=?, schema_fingerprint=?, verified_at=? WHERE entry_id=?",
+                "approved=?, fail_count=0, schema_fingerprint=?, verified_at=?, "
+                "embedding_json=?, embedding_model=? WHERE entry_id=?",
                 (entry.display_term, json.dumps(entry.aliases), entry.kind,
                  json.dumps(entry.bindings), entry.aggregation, entry.grain,
                  json.dumps(entry.filter_predicates),
                  json.dumps(entry.time_window) if entry.time_window else "",
                  entry.sql_template, entry.rationale, entry.confidence, entry.provenance,
                  int(entry.probe_ok), int(entry.approved), entry.schema_fingerprint,
-                 now, entry.entry_id),
+                 now, json.dumps(entry.embedding), entry.embedding_model, entry.entry_id),
             )
         else:
             cur.execute(f"INSERT INTO semantic_lexicon ({cols}) VALUES ({placeholders})", params)
@@ -321,7 +365,46 @@ def approve(entry_id: str) -> None:
         cur.execute("UPDATE semantic_lexicon SET approved=1 WHERE entry_id=?", (entry_id,))
 
 
+def _backfill_embedding(entry_id: str, embedding: List[float], model_tag: str) -> None:
+    """Best-effort: persist an embedding computed for a row at lookup time
+    (see lookup()'s Tier 3) so future lookups reuse it instead of
+    recomputing. Never raises — a failed backfill just means this one row
+    keeps paying the recompute cost until it succeeds another time."""
+    with pg_store.cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute(
+            "UPDATE semantic_lexicon SET embedding_json=?, embedding_model=? WHERE entry_id=?",
+            (json.dumps(embedding), model_tag, entry_id),
+        )
+
+
 # ── Lookup ladder (§4.3) ────────────────────────────────────────────────────
+
+# Lightweight correctness guard (cheaper than a full async reflection job):
+# an entry that has caused this many downstream execution failures (see
+# bump_fail, called from execute_node when a query built from this entry's
+# binding fails) is suppressed from every lookup tier — exact/alias/embedding
+# alike — until it is re-resolved. This is a synchronous circuit breaker, not
+# a proactive audit: it only catches an entry AFTER it has caused real
+# failures, and dissect_node's next MISS on that term re-runs the evaluation
+# loop, which (if it succeeds) re-saves the entry and resets fail_count to 0
+# — see the comment on the UPDATE in save(). A term whose evaluation loop
+# keeps failing simply keeps getting re-attempted per-question rather than
+# permanently blocking on one bad cached binding.
+_MAX_ALLOWED_FAILS = 2
+
+# Second lightweight correctness guard: Tiers 1 (exact) and 2 (alias) are
+# strong signals — the question genuinely used this term's normalized form
+# or a previously-confirmed alias, so they're served regardless of
+# confidence. Tier 3 (embedding similarity) is the fuzziest match and the
+# one most likely to confidently apply a WRONG binding to a differently
+# phrased question. An unapproved, LLM-derived entry hasn't been confirmed
+# by anything except its own self-reported confidence — require that to
+# clear a bar before it's trusted on a fuzzy match. Human-authored and
+# execution_verified entries are already trusted by a stronger signal than
+# self-reported confidence, so they bypass this gate.
+_MIN_CONFIDENCE_FOR_FUZZY_MATCH = 0.6
+
 
 def lookup(
     source_id: str,
@@ -350,6 +433,8 @@ def lookup(
         return None
 
     def _valid(e: LexiconEntry) -> bool:
+        if e.fail_count >= _MAX_ALLOWED_FAILS:
+            return False
         if not current_fingerprint or not e.schema_fingerprint:
             return True
         return e.schema_fingerprint == current_fingerprint
@@ -366,17 +451,54 @@ def lookup(
 
     # Tier 3 — embedding (accept above threshold; higher than verified_queries'
     # 0.35 default because a wrong binding here is worse than a missed few-shot)
-    valid_candidates = [e for e in candidates if _valid(e)]
+    def _fuzzy_eligible(e: LexiconEntry) -> bool:
+        if not _valid(e):
+            return False
+        if e.provenance == "llm_dissector" and not e.approved:
+            return e.confidence >= _MIN_CONFIDENCE_FOR_FUZZY_MATCH
+        return True
+
+    valid_candidates = [e for e in candidates if _fuzzy_eligible(e)]
     if not valid_candidates:
         return None
-    texts = [e.term for e in valid_candidates]
-    try:
-        scores = _rank_by_embedding_similarity(norm, texts)
-        if scores is None:
+
+    from .embedding_cache import encode_text, CURRENT_EMBEDDING_TAG
+    query_vec = encode_text(norm)
+
+    scores: Optional[np.ndarray] = None
+    if query_vec is not None:
+        try:
+            q_arr = np.asarray(query_vec, dtype=np.float32)
+            corpus_rows = []
+            for e in valid_candidates:
+                if e.embedding and e.embedding_model == CURRENT_EMBEDDING_TAG:
+                    corpus_rows.append(e.embedding)
+                    continue
+                # Legacy row (saved before this feature, or a model-tag
+                # mismatch) — compute once here and persist so every future
+                # lookup reuses it instead of recomputing again.
+                row_vec = encode_text(e.term)
+                if row_vec is None:
+                    row_vec = [0.0] * len(query_vec)
+                else:
+                    try:
+                        _backfill_embedding(e.entry_id, row_vec, CURRENT_EMBEDDING_TAG)
+                    except Exception as exc:
+                        logger.debug("semantic_lexicon: embedding backfill failed for %s — %s",
+                                     e.entry_id, exc)
+                corpus_rows.append(row_vec)
+            scores = np.asarray(corpus_rows, dtype=np.float32) @ q_arr
+        except Exception as exc:
+            logger.warning("semantic_lexicon: embedding similarity scoring failed — %s", exc)
+            scores = None
+
+    if scores is None:
+        texts = [e.term for e in valid_candidates]
+        try:
             scores = _rank_by_keyword_similarity(norm, texts)
-    except Exception as exc:
-        logger.warning("semantic_lexicon: similarity ranking failed — %s", exc)
-        return None
+        except Exception as exc:
+            logger.warning("semantic_lexicon: similarity ranking failed — %s", exc)
+            return None
 
     best_idx = int(np.argmax(scores)) if len(scores) else -1
     if best_idx >= 0 and float(scores[best_idx]) >= min_similarity:

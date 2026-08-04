@@ -1601,6 +1601,61 @@ def execute_node(state: DialogState) -> DialogState:
     if getattr(config, "identity_backfill_enabled", True):
         results = _backfill_identity_columns(results, state.get("schema_context", ""))
 
+    _report_lexicon_failures(results, state.get("derived_metrics") or [])
+
     state["query_results"] = results
     state["phase"] = "execute"
     return state
+
+
+def _report_lexicon_failures(
+    results: List[QueryResult],
+    derived_metrics: List[Dict[str, Any]],
+) -> None:
+    """
+    Lightweight correctness guard (see semantic_lexicon._MAX_ALLOWED_FAILS):
+    when a query that references a lexicon-derived metric's bound table/column
+    fails, tell the lexicon so a repeatedly-failing binding gets suppressed
+    from future lookups instead of being served forever. Best-effort and
+    purely additive — a turn with no lexicon-derived metrics, or no failures,
+    is a no-op.
+
+    Heuristic, not exact: a query is considered to implicate a derived metric
+    if the query's SQL text mentions that metric's bound table AND column —
+    cheap to compute (no LLM call, no extra query) and good enough for a
+    circuit breaker whose only job is to catch a binding that keeps causing
+    real failures, not to perfectly attribute blame for a single failure.
+    """
+    if not derived_metrics:
+        return
+    failed_sql = [r.get("sql", "") for r in results if r.get("error")]
+    if not failed_sql:
+        return
+
+    from .. import semantic_lexicon
+
+    already_reported: set = set()
+    for dm in derived_metrics:
+        entry_id = dm.get("entry_id")
+        if not entry_id or entry_id in already_reported:
+            continue
+        bindings = dm.get("bindings") or []
+        implicated = any(
+            b.get("table") and b.get("column")
+            and any(
+                b["table"].lower() in sql.lower() and b["column"].lower() in sql.lower()
+                for sql in failed_sql
+            )
+            for b in bindings
+        )
+        if implicated:
+            try:
+                semantic_lexicon.bump_fail(entry_id)
+                already_reported.add(entry_id)
+                logger.info(
+                    "execute_node: reported failure for lexicon entry %s (term %r) "
+                    "— query referencing its binding failed",
+                    entry_id, dm.get("term"),
+                )
+            except Exception as exc:
+                logger.warning("execute_node: bump_fail failed for entry %s — %s", entry_id, exc)

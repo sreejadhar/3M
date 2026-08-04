@@ -165,6 +165,7 @@ def _resolve_one_term(
             pass
         diagnostics.append(f"dissect_node: lexicon HIT for {term!r} -> entry {entry.entry_id}")
         derived_metric = {
+            "entry_id": entry.entry_id,
             "term": entry.term, "kind": entry.kind, "bindings": entry.bindings,
             "aggregation": entry.aggregation, "grain": entry.grain,
             "filter_predicates": entry.filter_predicates, "time_window": entry.time_window,
@@ -662,6 +663,7 @@ def _run_evaluation_loop(
         logger.warning("dissect_node: failed to persist resolved concept %r — %s", term, exc)
 
     return {
+        "entry_id": entry.entry_id,
         "term": entry.term, "kind": entry.kind, "bindings": entry.bindings,
         "aggregation": entry.aggregation, "grain": entry.grain,
         "filter_predicates": entry.filter_predicates, "time_window": entry.time_window,

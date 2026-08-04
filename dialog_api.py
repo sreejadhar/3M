@@ -798,6 +798,54 @@ def delete_verified_query(vq_id: int):
     return {"deleted": vq_id}
 
 
+# ── Semantic lexicon review endpoints ────────────────────────────────────────
+#
+# Human-approval workflow for dissect_node-derived concept bindings (see
+# dialog_agent/semantic_lexicon.py). Approval is additive, not a serving
+# gate: an unapproved llm_dissector entry is already served once it clears
+# semantic_lexicon._MIN_CONFIDENCE_FOR_FUZZY_MATCH on a fuzzy match (see
+# lookup()) — approving it exempts it from that confidence check on future
+# fuzzy matches, raising it to the same trust tier as a human-authored or
+# execution_verified entry. Rejecting an entry deletes it outright;
+# dissect_node treats the term as unresolved again on the next question that
+# needs it and may re-derive a (hopefully corrected) binding.
+
+@app.get("/lexicon")
+def list_lexicon_entries(source_id: Optional[str] = None, pending_only: bool = False):
+    """
+    List semantic-lexicon entries for human review.
+    pending_only=true restricts to unapproved entries — the review queue.
+    """
+    from dialog_agent.semantic_lexicon import list_all as _list_lexicon
+    entries = _list_lexicon(source_id)
+    if pending_only:
+        entries = [e for e in entries if not e.approved]
+    return [e.to_dict() for e in entries]
+
+
+@app.post("/lexicon/{entry_id}/approve", status_code=200)
+def approve_lexicon_entry(entry_id: str):
+    """Mark a lexicon entry as human-approved."""
+    from dialog_agent.semantic_lexicon import get_by_id as _get_lexicon, approve as _approve_lexicon
+    entry = _get_lexicon(entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Lexicon entry not found")
+    _approve_lexicon(entry_id)
+    return {"approved": entry_id}
+
+
+@app.delete("/lexicon/{entry_id}", status_code=200)
+def delete_lexicon_entry(entry_id: str):
+    """Reject a lexicon entry — e.g. a reviewer determined a dissect_node-derived
+    binding is wrong. Deletes it outright (see module note above)."""
+    from dialog_agent.semantic_lexicon import get_by_id as _get_lexicon, delete as _delete_lexicon
+    entry = _get_lexicon(entry_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Lexicon entry not found")
+    _delete_lexicon(entry_id)
+    return {"deleted": entry_id}
+
+
 # ── File-DB cache endpoints ────────────────────────────────────────────────────
 
 @app.delete("/file-cache/{file_path:path}", status_code=200)

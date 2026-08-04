@@ -20,6 +20,12 @@ COPY kpi_store.py .
 COPY llm_client.py .
 COPY snowflake_auth.py .
 
+# SENTENCE_TRANSFORMER_MODEL_PATH is set via the datananite-config ConfigMap
+# to a path on the shared PVC (mounted at /data) — see
+# scripts/bootstrap_embedding_model_pvc.md for the one-time upload step.
+# embedding_cache.get_sentence_transformer() loads from that local path
+# instead of resolving the model name through the HF hub cache, so neither
+# the build nor the running pod ever needs to reach huggingface.co.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 

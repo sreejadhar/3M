@@ -81,6 +81,20 @@ from collections import deque as _deque
 _GR_EMBED_CACHE: Dict[str, Any] = {}
 
 
+def _gr_sentence_transformer(model_name: str = "all-MiniLM-L6-v2"):
+    """
+    Construct a SentenceTransformer, loading from SENTENCE_TRANSFORMER_MODEL_PATH
+    (a local directory baked into the image, see scripts/download_embedding_model.py)
+    instead of resolving *model_name* through the HF hub cache when set — for
+    network-restricted build/runtime environments. Mirrors
+    dialog_agent.embedding_cache.get_sentence_transformer, duplicated here since
+    this module's GraphRAG helpers are deliberately dialog_agent-free.
+    """
+    from sentence_transformers import SentenceTransformer
+    local_path = os.environ.get("SENTENCE_TRANSFORMER_MODEL_PATH")
+    return SentenceTransformer(local_path or model_name)
+
+
 class _GRCache:
     __slots__ = ("key", "backend", "node_ids", "texts", "matrix", "_vect")
 
@@ -95,8 +109,7 @@ class _GRCache:
     def embed_query(self, query: str):
         import numpy as np
         if self.backend == "sentence-transformers":
-            from sentence_transformers import SentenceTransformer
-            m = SentenceTransformer("all-MiniLM-L6-v2")
+            m = _gr_sentence_transformer()
             v = m.encode([query], normalize_embeddings=True)[0]
             return v.astype(np.float32)
         if self.backend == "openai":
@@ -160,8 +173,7 @@ def _gr_build_cache(nodes, backend: str, s_hash: str) -> _GRCache:
     texts    = [_gr_node_text(n) for n in nodes]
 
     if backend == "sentence-transformers":
-        from sentence_transformers import SentenceTransformer
-        model  = SentenceTransformer("all-MiniLM-L6-v2")
+        model  = _gr_sentence_transformer()
         matrix = model.encode(texts, normalize_embeddings=True).astype(np.float32)
         return _GRCache(s_hash, backend, node_ids, texts, matrix)
 

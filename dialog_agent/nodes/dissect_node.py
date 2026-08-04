@@ -79,10 +79,6 @@ def _dissect_node_impl(state: DialogState) -> DialogState:
     schema = _ast_resolver.SchemaGraph(table_columns_map)
     fingerprint = semantic_lexicon.schema_fingerprint(table_columns_map, list(table_columns_map.keys()))
 
-    diagnostics: List[str] = []
-    derived_metrics: List[Dict[str, Any]] = []
-    unresolved_terms: List[str] = []
-
     # ── Step 1 — identify candidate concepts ────────────────────────────────
     try:
         concepts = _identify_concepts(natural_query, table_columns_map, config)
@@ -91,48 +87,37 @@ def _dissect_node_impl(state: DialogState) -> DialogState:
         concepts = []
 
     max_terms = getattr(config, "dissect_max_terms", 4)
-    for term in concepts[:max_terms]:
-        try:
-            entry = semantic_lexicon.lookup(
-                source_id, term,
-                min_similarity=getattr(config, "lexicon_min_similarity", 0.62),
-                current_fingerprint=fingerprint,
-            )
-        except Exception as exc:
-            logger.warning("dissect_node: lexicon lookup failed for %r — %s", term, exc)
-            entry = None
+    terms = concepts[:max_terms]
 
-        if entry is not None:
-            try:
-                semantic_lexicon.bump_hit(entry.entry_id)
-            except Exception:
-                pass
-            diagnostics.append(f"dissect_node: lexicon HIT for {term!r} -> entry {entry.entry_id}")
-            derived_metrics.append({
-                "term": entry.term, "kind": entry.kind, "bindings": entry.bindings,
-                "aggregation": entry.aggregation, "grain": entry.grain,
-                "filter_predicates": entry.filter_predicates, "time_window": entry.time_window,
-                "provenance": entry.provenance, "approved": int(entry.approved),
-            })
-            continue
+    # Each term is resolved fully independently (its own lexicon lookup +,
+    # on miss, its own LLM/DB evaluation loop) — nothing shares mutable state
+    # across terms (semantic_lexicon opens its own DB connection per call,
+    # see pg_store.cursor_ctx; _probe opens its own SQL connection per call),
+    # so terms run concurrently instead of one at a time. Previously a
+    # question with N lexicon-miss concepts paid N sequential evaluation
+    # loops (each with its own LLM calls + a live probe query) end to end.
+    if len(terms) > 1:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(terms)) as pool:
+            term_outcomes = list(pool.map(
+                lambda term: _resolve_one_term(term, source_id, table_columns_map, schema, state, config, fingerprint),
+                terms,
+            ))
+    else:
+        term_outcomes = [
+            _resolve_one_term(term, source_id, table_columns_map, schema, state, config, fingerprint)
+            for term in terms
+        ]
 
-        diagnostics.append(f"dissect_node: lexicon MISS for {term!r} — running evaluation loop")
-
-        if not getattr(config, "dissect_enabled", False):
-            unresolved_terms.append(term)
-            continue
-
-        try:
-            resolved = _run_evaluation_loop(term, table_columns_map, schema, state, config, fingerprint)
-        except Exception as exc:
-            logger.warning("dissect_node: evaluation loop failed for %r — %s", term, exc)
-            resolved = None
-
-        if resolved is None:
-            unresolved_terms.append(term)
-        else:
-            diagnostics.append(f"dissect_node: resolved {term!r} via evaluation loop")
-            derived_metrics.append(resolved)
+    diagnostics: List[str] = []
+    derived_metrics: List[Dict[str, Any]] = []
+    unresolved_terms: List[str] = []
+    for term_diagnostics, derived_metric, unresolved_term in term_outcomes:
+        diagnostics.extend(term_diagnostics)
+        if derived_metric is not None:
+            derived_metrics.append(derived_metric)
+        if unresolved_term is not None:
+            unresolved_terms.append(unresolved_term)
 
     shadow_mode = getattr(config, "lexicon_shadow_mode", True)
     if shadow_mode:
@@ -147,6 +132,62 @@ def _dissect_node_impl(state: DialogState) -> DialogState:
     state["unresolved_terms"] = (state.get("unresolved_terms") or []) + unresolved_terms
     state["lexicon_diagnostics"] = (state.get("lexicon_diagnostics") or []) + diagnostics
     return state
+
+
+def _resolve_one_term(
+    term: str,
+    source_id: str,
+    table_columns_map: Dict[str, Set[str]],
+    schema: "_ast_resolver.SchemaGraph",
+    state: DialogState,
+    config: Any,
+    fingerprint: str,
+) -> Tuple[List[str], Optional[Dict[str, Any]], Optional[str]]:
+    """Resolve a single concept: lexicon lookup, then (on miss) the
+    evaluation loop. Returns (diagnostics, derived_metric_or_None,
+    unresolved_term_or_None). Safe to call concurrently for different terms —
+    see the call site in _dissect_node_impl for why."""
+    diagnostics: List[str] = []
+    try:
+        entry = semantic_lexicon.lookup(
+            source_id, term,
+            min_similarity=getattr(config, "lexicon_min_similarity", 0.62),
+            current_fingerprint=fingerprint,
+        )
+    except Exception as exc:
+        logger.warning("dissect_node: lexicon lookup failed for %r — %s", term, exc)
+        entry = None
+
+    if entry is not None:
+        try:
+            semantic_lexicon.bump_hit(entry.entry_id)
+        except Exception:
+            pass
+        diagnostics.append(f"dissect_node: lexicon HIT for {term!r} -> entry {entry.entry_id}")
+        derived_metric = {
+            "term": entry.term, "kind": entry.kind, "bindings": entry.bindings,
+            "aggregation": entry.aggregation, "grain": entry.grain,
+            "filter_predicates": entry.filter_predicates, "time_window": entry.time_window,
+            "provenance": entry.provenance, "approved": int(entry.approved),
+        }
+        return diagnostics, derived_metric, None
+
+    diagnostics.append(f"dissect_node: lexicon MISS for {term!r} — running evaluation loop")
+
+    if not getattr(config, "dissect_enabled", False):
+        return diagnostics, None, term
+
+    try:
+        resolved = _run_evaluation_loop(term, table_columns_map, schema, state, config, fingerprint)
+    except Exception as exc:
+        logger.warning("dissect_node: evaluation loop failed for %r — %s", term, exc)
+        resolved = None
+
+    if resolved is None:
+        return diagnostics, None, term
+
+    diagnostics.append(f"dissect_node: resolved {term!r} via evaluation loop")
+    return diagnostics, resolved, None
 
 
 # ── Step 1 — identify candidate concepts ────────────────────────────────────

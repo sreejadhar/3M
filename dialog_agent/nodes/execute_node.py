@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import DialogConfig
 from ..state import DialogState, QueryResult
@@ -103,6 +103,13 @@ def list_file_dbs() -> Dict[str, str]:
 # because the LLM cannot invent rows or tables that don't exist.
 
 _MAX_RETRIES = 3
+
+# _llm_fix_sql is a best-effort repair call inside a retry loop (up to
+# _MAX_RETRIES attempts per query). Like dissect_node's LLM calls, it must
+# fail fast rather than inherit the SDK's much longer default timeout/retry
+# budget — a single stalled network call here previously could block one
+# query for many minutes, multiplied by up to _MAX_RETRIES attempts.
+_LLM_FIX_TIMEOUT_S = 25.0
 
 # Errors the LLM can plausibly fix by adjusting casts, dialect syntax, or
 # column qualification.
@@ -235,6 +242,7 @@ def _llm_fix_sql(
             temperature=temperature,
             system=system,
             messages=[{"role": "user", "content": user}],
+            timeout=_LLM_FIX_TIMEOUT_S,
         )
         fixed = (msg.content[0].text if msg.content else "").strip()
         # Strip accidental markdown fences
@@ -244,6 +252,40 @@ def _llm_fix_sql(
     except Exception as exc:
         logger.warning("self-heal: LLM fix call failed — %s", exc)
         return sql
+
+
+_SQLITE_NEAR_RE = re.compile(r'near\s+"([^"]+)":\s+syntax error', re.IGNORECASE)
+
+
+def _sqlite_quote_reserved_word(sql: str, error_msg: str) -> str:
+    """
+    Deterministic pre-fix for SQLite 'near "X": syntax error', the shape
+    produced when generated SQL uses a SQL keyword (e.g. INDEX, ORDER, GROUP)
+    unquoted as a table/column name. Quoting every bare occurrence of the
+    offending token as a double-quoted identifier is always a no-op for a
+    genuinely-invalid token (still a syntax error, harmless) and always a fix
+    when the token was meant as an identifier — cheaper and faster than
+    burning an LLM call + full retry cycle for a purely mechanical fix.
+
+    Returns sql unchanged if the error doesn't match this shape or the token
+    is already quoted everywhere.
+    """
+    m = _SQLITE_NEAR_RE.search(error_msg)
+    if not m:
+        return sql
+    token = m.group(1)
+    if not token or '"' in token:
+        return sql
+    fixed = re.sub(
+        r'(?<!["\w])' + re.escape(token) + r'(?!["\w])',
+        f'"{token}"', sql, flags=re.IGNORECASE,
+    )
+    if fixed != sql:
+        logger.info(
+            "self-heal (file-db): quoted reserved-word identifier %r (deterministic pre-fix)",
+            token,
+        )
+    return fixed
 
 
 _SF_INVALID_ID_RE = re.compile(
@@ -547,6 +589,15 @@ def _exec_on_conn_with_retry(
         if not _is_retryable(error_msg):
             logger.info("self-heal (file-db): non-retryable — %s", error_msg[:120])
             break
+
+        deterministic = _sqlite_quote_reserved_word(current_sql, error_msg)
+        if deterministic != current_sql:
+            logger.info(
+                "self-heal (file-db): attempt %d/%d — reserved-word quoting pre-fix applied",
+                attempt + 1, _MAX_RETRIES,
+            )
+            current_sql = deterministic
+            continue  # retry immediately without LLM
 
         logger.info(
             "self-heal (file-db): attempt %d/%d — asking LLM to fix SQL\n"
@@ -1412,6 +1463,74 @@ def _backfill_identity_columns(
     return results
 
 
+def _execute_one_query(
+    q: Dict[str, Any],
+    config: DialogConfig,
+    state: DialogState,
+    file_conn: Optional[sqlite3.Connection],
+) -> Tuple[QueryResult, Optional[str]]:
+    """Run one planned query and build its QueryResult. Returns (result,
+    error_message_for_state_errors_or_None). Pure w.r.t. shared state other
+    than mutating q['sql'] in place (each q is a distinct dict, one per
+    query, so this is safe even when queries run concurrently)."""
+    logger.info("  Running %s: %s", q["query_id"], q["description"])
+    q_kg_id = q.get("kg_id", "")
+    if file_conn is not None:
+        outcome = _exec_on_conn_with_retry(file_conn, q["sql"], config)
+    else:
+        outcome = _run_sql_with_retry(config, q["sql"], state=state, kg_id=q_kg_id)
+
+    rows      = outcome.get("rows") or []
+    columns   = outcome.get("columns") or []
+    error_msg: Optional[str] = outcome.get("error")
+
+    # Self-heal may have rewritten the SQL (deterministic pre-fix or LLM
+    # fix) before it actually ran. Use that final text everywhere so the
+    # displayed/audited query always matches what was executed — never
+    # silently show the original, pre-heal SQL as if it were what ran.
+    executed_sql = outcome.get("sql") or q["sql"]
+    if executed_sql != q["sql"]:
+        logger.info(
+            "  %s: recording self-healed SQL (differs from planned SQL)",
+            q["query_id"],
+        )
+        q["sql"] = executed_sql
+
+    # For aggregation queries, return all rows — truncating would silently
+    # drop groups and produce wrong totals.  For raw-row queries the SQL
+    # already has a LIMIT clause added by plan_node, so Python truncation
+    # is redundant; we keep it only as a safety cap for very large raw dumps.
+    _is_agg = bool(re.search(
+        r'\b(GROUP\s+BY|COUNT\s*\(|SUM\s*\(|AVG\s*\(|MIN\s*\(|MAX\s*\()\b',
+        executed_sql, re.IGNORECASE,
+    ))
+    # Raw (non-aggregated) queries only: drop placeholder-zero duplicate
+    # rows that conflict with a real nonzero value for the same key (see
+    # _dedupe_placeholder_rows). Aggregated results are never touched —
+    # GROUP BY already collapses to one row per key, so this can only be
+    # a no-op there anyway, and skipping it avoids any ambiguity around
+    # HAVING-filtered aggregate semantics.
+    if not _is_agg and not error_msg:
+        rows = _dedupe_placeholder_rows(columns, rows)
+    returned_rows = rows if _is_agg else rows[: config.row_limit]
+
+    result = QueryResult(
+        query_id    = q["query_id"],
+        description = q["description"],
+        sql         = executed_sql,
+        columns     = columns,
+        rows        = returned_rows,
+        row_count   = len(rows),
+        error       = error_msg,
+    )
+
+    if error_msg:
+        logger.warning("  %s FAILED: %s", q["query_id"], error_msg)
+        return result, f"execute_node [{q['query_id']}]: {error_msg}"
+    logger.info("  %s OK — %d rows returned", q["query_id"], len(rows))
+    return result, None
+
+
 def execute_node(state: DialogState) -> DialogState:
     """Execute all planned SQL queries and store results."""
     logger.info("=== execute_node ===")
@@ -1442,65 +1561,28 @@ def execute_node(state: DialogState) -> DialogState:
     results: List[QueryResult] = []
 
     try:
-        for q in sql_queries:
-            logger.info("  Running %s: %s", q["query_id"], q["description"])
-            q_kg_id = q.get("kg_id", "")
-            if file_conn is not None:
-                outcome = _exec_on_conn_with_retry(file_conn, q["sql"], config)
-            else:
-                outcome = _run_sql_with_retry(config, q["sql"], state=state, kg_id=q_kg_id)
+        if file_conn is None and len(sql_queries) > 1:
+            # Each live-DB query opens its OWN connection (see _run_postgres /
+            # _run_snowflake / etc.), so independent queries are safe to run
+            # concurrently — previously they ran strictly one at a time even
+            # though nothing serializes them. A shared file_conn (SQLite) is
+            # NOT parallelized: sqlite3 serializes access to one connection
+            # internally anyway, so concurrency there would add complexity
+            # with no speedup.
+            import concurrent.futures
+            max_workers = min(len(sql_queries), 8)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+                outcomes = list(pool.map(
+                    lambda q: _execute_one_query(q, config, state, file_conn),
+                    sql_queries,
+                ))
+        else:
+            outcomes = [_execute_one_query(q, config, state, file_conn) for q in sql_queries]
 
-            rows      = outcome.get("rows") or []
-            columns   = outcome.get("columns") or []
-            error_msg: Optional[str] = outcome.get("error")
-
-            # Self-heal may have rewritten the SQL (deterministic pre-fix or LLM
-            # fix) before it actually ran. Use that final text everywhere so the
-            # displayed/audited query always matches what was executed — never
-            # silently show the original, pre-heal SQL as if it were what ran.
-            executed_sql = outcome.get("sql") or q["sql"]
-            if executed_sql != q["sql"]:
-                logger.info(
-                    "  %s: recording self-healed SQL (differs from planned SQL)",
-                    q["query_id"],
-                )
-                q["sql"] = executed_sql
-
-            # For aggregation queries, return all rows — truncating would silently
-            # drop groups and produce wrong totals.  For raw-row queries the SQL
-            # already has a LIMIT clause added by plan_node, so Python truncation
-            # is redundant; we keep it only as a safety cap for very large raw dumps.
-            _is_agg = bool(re.search(
-                r'\b(GROUP\s+BY|COUNT\s*\(|SUM\s*\(|AVG\s*\(|MIN\s*\(|MAX\s*\()\b',
-                executed_sql, re.IGNORECASE,
-            ))
-            # Raw (non-aggregated) queries only: drop placeholder-zero duplicate
-            # rows that conflict with a real nonzero value for the same key (see
-            # _dedupe_placeholder_rows). Aggregated results are never touched —
-            # GROUP BY already collapses to one row per key, so this can only be
-            # a no-op there anyway, and skipping it avoids any ambiguity around
-            # HAVING-filtered aggregate semantics.
-            if not _is_agg and not error_msg:
-                rows = _dedupe_placeholder_rows(columns, rows)
-            returned_rows = rows if _is_agg else rows[: config.row_limit]
-
-            results.append(
-                QueryResult(
-                    query_id    = q["query_id"],
-                    description = q["description"],
-                    sql         = executed_sql,
-                    columns     = columns,
-                    rows        = returned_rows,
-                    row_count   = len(rows),
-                    error       = error_msg,
-                )
-            )
-
-            if error_msg:
-                logger.warning("  %s FAILED: %s", q["query_id"], error_msg)
-                state["errors"].append(f"execute_node [{q['query_id']}]: {error_msg}")
-            else:
-                logger.info("  %s OK — %d rows returned", q["query_id"], len(rows))
+        for result, error_for_state in outcomes:
+            results.append(result)
+            if error_for_state:
+                state["errors"].append(error_for_state)
 
     finally:
         # Close the connection to the cached DB — the DB file itself stays on disk

@@ -47,13 +47,6 @@ def get_sentence_transformer(model_name: str = "all-MiniLM-L6-v2") -> Any:
     at most once per process. Thread-safe: concurrent callers racing on a
     cold cache block on the lock instead of each constructing their own
     redundant model instance.
-
-    If SENTENCE_TRANSFORMER_MODEL_PATH is set, load from that local directory
-    instead of resolving *model_name* through the HF hub cache. This is for
-    network-restricted build/runtime environments: the model is baked into
-    the image as a plain folder (see scripts/download_embedding_model.py),
-    so loading it is a filesystem read with no huggingface.co lookup at all
-    — HF_HUB_OFFLINE above is irrelevant to this path.
     """
     cached = _MODEL_CACHE.get(model_name)
     if cached is not None:
@@ -64,8 +57,7 @@ def get_sentence_transformer(model_name: str = "all-MiniLM-L6-v2") -> Any:
         cached = _MODEL_CACHE.get(model_name)
         if cached is None:
             from sentence_transformers import SentenceTransformer
-            local_path = os.environ.get("SENTENCE_TRANSFORMER_MODEL_PATH")
-            cached = SentenceTransformer(local_path or model_name)
+            cached = SentenceTransformer(model_name)
             _MODEL_CACHE[model_name] = cached
         return cached
 

@@ -1,0 +1,23 @@
+name: Network reachability check
+
+# Manual-only diagnostic — does NOT build, push, or deploy anything.
+# Confirms whether the runner used by deploy.yml (same runs-on: ubuntu-latest)
+# can reach the external hosts needed to install torch/sentence-transformers
+# during the dialog-api/orchestrator-api/chat-ui image builds.
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Check external host reachability
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check pypi.org (baseline — should already work, other deps install from here)
+        run: curl -sSf -o /dev/null -w "pypi.org -> HTTP %{http_code}\n" https://pypi.org --max-time 10
+
+      - name: Check download.pytorch.org (needed for the CPU torch wheel)
+        run: curl -sSf -o /dev/null -w "download.pytorch.org -> HTTP %{http_code}\n" https://download.pytorch.org --max-time 10
+
+      - name: Check huggingface.co (NOT required by the fix, but useful to know)
+        run: curl -sSf -o /dev/null -w "huggingface.co -> HTTP %{http_code}\n" https://huggingface.co --max-time 10
+        continue-on-error: true

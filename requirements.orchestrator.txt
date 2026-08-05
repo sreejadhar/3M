@@ -13,3 +13,6 @@ matplotlib>=3.7.0             # chart rendering to PNG for Excel embedding
 Pillow>=10.0.0                # image handling for openpyxl XlImage embedding
 bcrypt>=4.0.0                 # password hashing for auth
 PyJWT>=2.8.0                  # JWT token signing/verification
+sqlglot>=25.0.0                # SQL parsing for dialog_agent.nodes.sql_identifier_resolver,
+                                # transitively imported via dialog_agent.nodes.execute_node
+                                # (cross-source bridge inference sample queries)

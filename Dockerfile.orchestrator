@@ -28,6 +28,14 @@ COPY business_classifier.py .
 COPY domain_classifier.py .
 COPY connectors/ ./connectors/
 
+# orchestrator_api imports dialog_agent.kg_bridges / kg_registry / kg_router /
+# kg_inference_engine / pg_store / nodes.execute_node for cross-source bridge
+# inference (see dialog_agent/__init__.py's ImportError guard around agent.py,
+# which exists specifically so these lightweight submodules stay importable
+# here without the full dialog_agent requirement set). Without this package
+# present, every bridge-inference call site silently no-ops.
+COPY dialog_agent/ ./dialog_agent/
+
 # Chat UI static assets served by the orchestrator
 COPY chat_frontend/dist/ ./chat_frontend/dist/
 

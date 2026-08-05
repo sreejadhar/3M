@@ -39,6 +39,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 import threading
 import time
@@ -2984,23 +2985,39 @@ async def upload_source_file(file: UploadFile = File(...)):
     AND forwards to agent-api's /upload-permanent (for extraction).
     Both pods need the file; the shared PVC gives each pod its own mount binding.
     """
-    file_bytes = await file.read()
     upload_dir = DATA_DIR / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     dest = upload_dir / file.filename
+
+    def _save_sync() -> None:
+        # Copy the spooled upload to disk in chunks on a worker thread.
+        # Large files (100s of MB, e.g. SQLite DBs) previously went through
+        # `await file.read()` + a synchronous `dest.write_bytes(...)` called
+        # directly in this async handler — that blocked the single-threaded
+        # event loop for the whole write, freezing every other request/SSE
+        # stream on the orchestrator until it finished.
+        file.file.seek(0)
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(file.file, out, length=8 * 1024 * 1024)
+
     try:
-        dest.write_bytes(file_bytes)
+        await asyncio.to_thread(_save_sync)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Local save failed: {exc}")
 
-    # Forward to agent-api so it has the file for extraction
+    # Forward to agent-api so it has the file for extraction. Stream from the
+    # saved copy on disk (instead of a second in-memory buffer) and scale the
+    # timeout to file size so large uploads don't spuriously time out.
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            await client.post(
-                f"{METADATA_API}/upload-permanent",
-                files={"file": (file.filename, file_bytes,
-                                file.content_type or "application/octet-stream")},
-            )
+        size_mb = dest.stat().st_size / (1024 * 1024)
+        timeout = httpx.Timeout(max(60.0, size_mb * 2.0), connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            with open(dest, "rb") as fh:
+                await client.post(
+                    f"{METADATA_API}/upload-permanent",
+                    files={"file": (file.filename, fh,
+                                    file.content_type or "application/octet-stream")},
+                )
     except Exception as exc:
         logger.warning("Could not forward upload to agent-api (non-fatal): %s", exc)
 

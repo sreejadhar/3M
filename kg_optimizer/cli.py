@@ -14,10 +14,13 @@ import logging
 import sys
 
 from kg_optimizer.ablation import run_ablations
-from kg_optimizer.build_runner import persist_champion_bridges
-from kg_optimizer.config import load_config
-from kg_optimizer.datasets import load_dataset
-from kg_optimizer.fitness import pareto_front
+from kg_optimizer.build_runner import build_ontology_and_kg, persist_champion_bridges, run_bridge_inference
+from kg_optimizer.config import OptimizerConfig, load_config
+from kg_optimizer.datasets import (
+    from_lifesciences_assets, gold_bridges_from_metadata_report, load_dataset,
+)
+from kg_optimizer.eval_harness import run_dataset
+from kg_optimizer.fitness import bridge_precision_recall, compute_fitness, pareto_front
 from kg_optimizer.ga import run_ga
 from kg_optimizer.importance import gene_importance
 
@@ -94,6 +97,70 @@ def run(args: argparse.Namespace) -> None:
     logger.info("Wrote results to %s", args.output)
 
 
+def apply_champion(args: argparse.Namespace) -> None:
+    """Build a real ontology + KG from an already-known champion genome (e.g. the
+    output of `run`, or any hand-picked genome), optionally persist its bridges to
+    the real kg_bridges store, and optionally check answer quality against a real
+    question set. Skips the GA search entirely — for re-applying a genome you
+    already trust, not for finding one."""
+    with open(args.genome, "r", encoding="utf-8") as f:
+        genome_raw = json.load(f)
+    genome = genome_raw["champion_genome"] if "champion_genome" in genome_raw else genome_raw
+
+    with open(args.report, "r", encoding="utf-8") as f:
+        report = json.load(f)
+
+    cfg = OptimizerConfig(source_id=args.source_id, judge_model=args.judge_model)
+
+    logger.info("Building real ontology + KG (kg_id=%s, source_id=%s) ...", args.kg_id, args.source_id)
+    kg_build = build_ontology_and_kg(genome, report, args.kg_id, cfg, source_domain=args.domain)
+    logger.info("Built KG: %d nodes, %d edges in %.1fs", len(kg_build.nodes), len(kg_build.edges), kg_build.build_time_s)
+
+    if args.persist_bridges:
+        logger.info("Persisting champion's bridges to the real kg_bridges store...")
+        predicted = persist_champion_bridges(genome, kg_build, report, domain=args.domain)
+    else:
+        result = run_bridge_inference(genome, kg_build, report, domain=args.domain)
+        predicted = result.high_conf + result.medium_conf
+
+    gold_types = args.gold_cardinality_types.split(",") if args.gold_cardinality_types else None
+    gold_bridges = gold_bridges_from_metadata_report(report, include_cardinality_types=gold_types)
+    precision, recall, f1 = bridge_precision_recall(predicted, gold_bridges)
+    logger.info("Bridges: precision=%.3f recall=%.3f f1=%.3f against %d gold bridges",
+               precision, recall, f1, len(gold_bridges))
+
+    fitness = None
+    run_result = None
+    if args.dataset or args.lifesciences_questions:
+        dataset = (load_dataset(args.dataset) if args.dataset
+                  else from_lifesciences_assets(limit=args.lifesciences_questions))
+        logger.info("Running %d questions against dialog-api (%s) ...", len(dataset.questions), cfg.kg_query_api_base)
+        run_result = run_dataset(dataset, kg_build, cfg)
+        fitness = compute_fitness(
+            run_result=run_result, predicted_bridges=predicted, gold_bridges=gold_bridges,
+            build_time_s=kg_build.build_time_s, infer_time_s=0.0,
+            weights=cfg.fitness_weights, judge_model=cfg.judge_model,
+        )
+        logger.info("Answer quality=%.4f composite=%.4f", fitness.answer_quality, fitness.composite)
+
+    output = {
+        "genome": genome,
+        "kg_id": args.kg_id,
+        "nodes": len(kg_build.nodes),
+        "edges": len(kg_build.edges),
+        "build_time_s": kg_build.build_time_s,
+        "persisted_bridge_count": len(predicted) if args.persist_bridges else None,
+        "bridge_precision": precision,
+        "bridge_recall": recall,
+        "bridge_f1": f1,
+        "fitness": fitness,
+        "question_results": run_result.question_results if run_result else None,
+    }
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, default=_json_default)
+    logger.info("Wrote results to %s", args.output)
+
+
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(prog="kg_optimizer")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -112,6 +179,28 @@ def main(argv=None) -> None:
                             "p-value floor of 0.0625 can never clear 0.05) to separate a real "
                             "fitness drop from LLM-judge noise. Cost scales linearly.")
     p_run.set_defaults(func=run)
+
+    p_apply = sub.add_parser("apply-champion",
+                             help="Build a real ontology + KG from an already-known genome and check answer quality")
+    p_apply.add_argument("--genome", required=True,
+                         help="Path to a JSON file with a raw genome dict, or a `run` result "
+                              "(read from its top-level champion_genome key)")
+    p_apply.add_argument("--report", required=True, help="Path to a pre-extracted metadata report JSON")
+    p_apply.add_argument("--source-id", required=True, help="Logical source id (cache/kg namespace)")
+    p_apply.add_argument("--kg-id", required=True, help="kg_id to build/persist the KG snapshot under")
+    p_apply.add_argument("--domain", default="", help="Optional domain hint (e.g. 'healthcare')")
+    p_apply.add_argument("--persist-bridges", action="store_true",
+                         help="Save the genome's bridges to the real kg_bridges store (else score-only)")
+    p_apply.add_argument("--gold-cardinality-types", default="1:1,1:N,N:1",
+                         help="Comma-separated cardinality_relationships types to trust as gold bridges "
+                              "(empty string = include all types)")
+    p_apply.add_argument("--dataset", default=None, help="Path to an EvalDataset JSON to check answer quality against")
+    p_apply.add_argument("--lifesciences-questions", type=int, default=None,
+                         help="Convenience: use N questions from the built-in LifeSciences question set "
+                              "instead of --dataset")
+    p_apply.add_argument("--judge-model", default="claude-haiku-4-5")
+    p_apply.add_argument("--output", default="kg_optimizer_apply_champion_result.json")
+    p_apply.set_defaults(func=apply_champion)
 
     args = parser.parse_args(argv)
     args.func(args)

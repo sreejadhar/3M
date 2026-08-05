@@ -21,3 +21,4 @@ data:
   UNSTRUCTURED_API_URL: "http://unstructured-api-service:8008"
   UNSTRUCTURED_DB: "/data/unstructured.db"
   UNSTRUCTURED_WORKERS: "4"
+  PLAN_NODE_AST_HALLUCINATION_ENABLED: "1"

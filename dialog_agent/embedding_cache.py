@@ -37,6 +37,15 @@ from typing import Any, Dict, List, Optional
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
+# Dockerfile.dialog bakes a `model.save()`-format copy of the model at this
+# path (a plain folder, not an HF hub cache) so loading it doesn't depend on
+# the hub's cache-key resolution lining up between build time and runtime —
+# it's just a path on disk. Local dev (no baked model) falls back to the
+# short repo name below, which needs the model already in the local HF cache
+# since HF_HUB_OFFLINE is on.
+_LOCAL_MODEL_PATH_ENV = "LOCAL_EMBEDDING_MODEL_PATH"
+_DEFAULT_LOCAL_MODEL_PATH = "/app/models/all-MiniLM-L6-v2"
+
 _MODEL_CACHE: Dict[str, Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
@@ -47,6 +56,11 @@ def get_sentence_transformer(model_name: str = "all-MiniLM-L6-v2") -> Any:
     at most once per process. Thread-safe: concurrent callers racing on a
     cold cache block on the lock instead of each constructing their own
     redundant model instance.
+
+    If a locally baked copy of the model exists (see _LOCAL_MODEL_PATH_ENV /
+    _DEFAULT_LOCAL_MODEL_PATH), it's loaded from that path instead of
+    resolving `model_name` through the HF hub cache — avoids any dependency
+    on hub cache-key/offline-mode resolution matching between build and run.
     """
     cached = _MODEL_CACHE.get(model_name)
     if cached is not None:
@@ -57,7 +71,9 @@ def get_sentence_transformer(model_name: str = "all-MiniLM-L6-v2") -> Any:
         cached = _MODEL_CACHE.get(model_name)
         if cached is None:
             from sentence_transformers import SentenceTransformer
-            cached = SentenceTransformer(model_name)
+            local_path = os.environ.get(_LOCAL_MODEL_PATH_ENV, _DEFAULT_LOCAL_MODEL_PATH)
+            load_from = local_path if os.path.isdir(local_path) else model_name
+            cached = SentenceTransformer(load_from)
             _MODEL_CACHE[model_name] = cached
         return cached
 

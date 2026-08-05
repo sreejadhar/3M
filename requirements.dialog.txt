@@ -12,8 +12,8 @@ openpyxl>=3.1.0
 
 # GraphRAG in-memory retrieval
 numpy>=1.26.0                          # vector math for cosine similarity (required)
-scikit-learn>=1.4.0                    # TF-IDF embedding backend (recommended)
-# sentence-transformers>=3.0.0         # best-quality local embedding backend (optional)
+scikit-learn>=1.4.0                    # TF-IDF embedding backend (fallback if sentence-transformers is unavailable)
+sentence-transformers>=3.0.0           # best-quality local embedding backend — torch installed separately (CPU-only) in Dockerfile.dialog to avoid pulling the CUDA build
 # openai>=1.0.0                        # OpenAI embedding backend (optional, needs OPENAI_API_KEY)
 
 # Database drivers (install only the driver for your target DB)

@@ -3,15 +3,36 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 COPY requirements.dialog.txt .
+
+# torch from the CPU-only wheel index first: sentence-transformers depends on
+# torch, and letting it resolve from the default PyPI index pulls the
+# CUDA-bundled build (~2GB) even though this container never touches a GPU —
+# it only needs torch as sentence-transformers' inference backend on CPU.
+RUN pip install --no-cache-dir --prefix=/install --index-url https://download.pytorch.org/whl/cpu torch
+ENV PYTHONPATH=/install/lib/python3.11/site-packages
 RUN pip install --no-cache-dir --prefix=/install -r requirements.dialog.txt
+
+# Pre-download the embedding model at build time (CI has normal internet
+# access, unlike the deployed pods) and save it as a plain folder —
+# sentence_transformers' own .save() format, not the HF hub cache — so
+# loading it at runtime is just a filesystem path with no dependency on hub
+# cache-key/offline-mode resolution lining up between build and run.
+# embedding_cache.py sets HF_HUB_OFFLINE=1 at runtime (to avoid a
+# multi-minute retry storm against a network-blocked huggingface.co), so the
+# model must already be on disk before the container starts — it cannot be
+# fetched lazily on first request in the deployed environment.
+RUN python -c "\
+from sentence_transformers import SentenceTransformer; \
+SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2').save('/models/all-MiniLM-L6-v2')"
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy installed packages
+# Copy installed packages and the pre-downloaded model folder
 COPY --from=builder /install /usr/local
+COPY --from=builder /models /app/models
 
 # Copy only the dialog agent package and its API entry-point
 COPY dialog_agent/ ./dialog_agent/
@@ -21,7 +42,8 @@ COPY llm_client.py .
 COPY snowflake_auth.py .
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    LOCAL_EMBEDDING_MODEL_PATH=/app/models/all-MiniLM-L6-v2
 
 EXPOSE 8003
 

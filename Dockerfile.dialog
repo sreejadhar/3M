@@ -40,6 +40,8 @@ COPY dialog_api.py .
 COPY kpi_store.py .
 COPY llm_client.py .
 COPY snowflake_auth.py .
+COPY glossary_store.py .
+COPY glossary_registry.py .
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

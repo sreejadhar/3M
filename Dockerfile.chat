@@ -23,9 +23,14 @@ COPY session_store.py .
 COPY access_control.py .
 COPY ontology_enricher.py .
 COPY glossary_store.py .
+COPY glossary_registry.py .
+COPY glossary_generate.py .
+COPY glossary_nlp.py .
+COPY glossary_matcher.py .
 COPY llm_client.py .
 COPY business_classifier.py .
 COPY domain_classifier.py .
+COPY snowflake_auth.py .
 COPY config.py .
 COPY connectors/ ./connectors/
 COPY chat_ui/ ./chat_ui/

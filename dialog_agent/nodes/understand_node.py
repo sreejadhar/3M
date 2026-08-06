@@ -1266,10 +1266,52 @@ def understand_node(state: DialogState) -> DialogState:
             (time.perf_counter() - t0) * 1000,
         )
 
+    # Load the auto-generated, governed business glossary (glossary_registry) —
+    # approved terms scoped to this source only. This is entirely separate from
+    # glossary_store above and from semantic_lexicon: it is never used to
+    # resolve/bind a term to columns, only rendered as supplementary,
+    # non-authoritative context in plan_node's prompt (see generated_glossary_section).
+    # Kept in its own state key so it can be disabled or removed without
+    # touching the existing glossary_terms/semantic_lexicon code paths.
+    #
+    # Gated dynamically per-source rather than by a static on/off switch: only
+    # active for sources that actually HAVE an approved generated glossary
+    # (glossary_registry.list_terms(source_id, status="approved") non-empty).
+    # Note: biz_glossary_jobs is not a reliable signal here — the
+    # generate-glossary endpoint (orchestrator_api.generate_source_glossary)
+    # calls generate_glossary_for_source directly and never writes a job
+    # record, so every source shows zero jobs even when terms exist. Term
+    # existence is therefore both the gate AND the content in one query.
+    # Sources that never ran "Generate Business Glossary" see zero terms and
+    # no change to their prompt. generated_glossary_enabled remains a global
+    # kill-switch for ops to force this off everywhere regardless of
+    # per-source state.
+    generated_glossary_terms: List[Dict] = []
+    if source_id and getattr(config, "generated_glossary_enabled", True):
+        t0 = time.perf_counter()
+        try:
+            import glossary_registry as _gl_registry
+            generated_glossary_terms = _gl_registry.list_terms(
+                source_id=source_id, status="approved",
+            )
+            if generated_glossary_terms:
+                logger.info(
+                    "understand_node: loaded %d generated glossary term(s) for source %s",
+                    len(generated_glossary_terms), source_id[:8],
+                )
+        except Exception as exc:
+            logger.debug("understand_node: generated glossary not available — %s", exc)
+        finally:
+            logger.info(
+                "dialog_timing sub=understand.load_generated_glossary elapsed_ms=%.1f",
+                (time.perf_counter() - t0) * 1000,
+            )
+
     state["schema_context"]      = schema_context
     state["categorical_columns"] = categorical_columns
     state["column_hierarchy"]    = hierarchy or {}
     state["active_kpis"]         = active_kpis
     state["glossary_terms"]      = glossary_terms
+    state["generated_glossary_terms"] = generated_glossary_terms
     state["phase"]               = "understand"
     return state

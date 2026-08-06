@@ -968,9 +968,13 @@ def _run_snowflake(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
     # Password or key-pair auth via the shared helper. Account/host/user/password
     # and any warehouse/role overrides arrive via cfg fields + cfg.db_extra
     # (passed through from the registered source's connection).
-    from snowflake_auth import connect_snowflake
+    # Connection is borrowed from snowflake_auth's process-wide pool rather
+    # than opened fresh every call — Snowflake's auth handshake + warehouse
+    # resume can take 15-20s, and a single chat turn often runs several
+    # queries (probes, the real query, self-heal retries) back to back.
+    from snowflake_auth import get_pooled_connection, release_pooled_connection
 
-    conn = connect_snowflake(
+    conn, pool_key = get_pooled_connection(
         database=cfg.db_name,
         schema=cfg.db_schema,
         username=cfg.db_user,
@@ -979,6 +983,7 @@ def _run_snowflake(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
         port=cfg.db_port or 0,
         extra=cfg.db_extra,
     )
+    healthy = True
     try:
         cur = conn.cursor()
         try:
@@ -986,8 +991,11 @@ def _run_snowflake(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
             return _cursor_to_result(cur)
         finally:
             cur.close()
+    except Exception:
+        healthy = False
+        raise
     finally:
-        conn.close()
+        release_pooled_connection(pool_key, conn, healthy=healthy)
 
 
 def _run_bigquery(cfg: DialogConfig, sql: str) -> Dict[str, Any]:

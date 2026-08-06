@@ -1569,7 +1569,7 @@ SCHEMA CONTEXT:
 
 TARGET DATABASE TYPE: {db_type}
 {schema_line}
-{history_section}{multi_kg_section}{lexicon_section}{glossary_section}{kpi_section}{resolution_section}{verified_section}NATURAL LANGUAGE QUESTION:
+{history_section}{multi_kg_section}{lexicon_section}{glossary_section}{generated_glossary_section}{kpi_section}{resolution_section}{verified_section}NATURAL LANGUAGE QUESTION:
 {natural_query}
 
 CRITICAL REMINDERS:
@@ -4448,6 +4448,36 @@ def plan_node(state: DialogState) -> DialogState:
     else:
         glossary_section = ""
 
+    # Build the auto-generated, governed glossary section (glossary_registry,
+    # source-scoped, loaded by understand_node into generated_glossary_terms).
+    # Strictly supplementary: never overrides RESOLVED BUSINESS CONCEPTS above
+    # or the curated BUSINESS GLOSSARY above — the LLM is told to defer to both.
+    generated_glossary_terms = state.get("generated_glossary_terms") or []
+    if generated_glossary_terms:
+        gg_lines = [
+            "AUTO-GENERATED BUSINESS GLOSSARY — SUPPLEMENTARY CONTEXT (non-authoritative)",
+            "=" * 60,
+            "These terms were auto-discovered from this data source and approved by a",
+            "steward. Use them ONLY to understand terminology in the user's question that",
+            "is NOT already covered by RESOLVED BUSINESS CONCEPTS or BUSINESS GLOSSARY",
+            "above. Do not let these override a binding or definition given above.",
+            "",
+        ]
+        for term in generated_glossary_terms:
+            gg_lines.append(f"  Term        : {term.get('preferred_name', '')}")
+            if term.get("domain"):
+                gg_lines.append(f"  Domain      : {term['domain']}")
+            if term.get("definition"):
+                gg_lines.append(f"  Definition  : {term['definition']}")
+            gg_lines.append("")
+        gg_lines.append("=" * 60)
+        generated_glossary_section = "\n".join(gg_lines) + "\n\n"
+        max_chars = getattr(config, "generated_glossary_section_max_chars", 3000)
+        if len(generated_glossary_section) > max_chars:
+            generated_glossary_section = generated_glossary_section[:max_chars] + "\n…(truncated)\n\n"
+    else:
+        generated_glossary_section = ""
+
     # Build KPI section from active KPI definitions loaded by understand_node
     active_kpis = state.get("active_kpis") or []
     compiled_kpis = [k for k in active_kpis if k.get("sql_expression")]
@@ -4623,6 +4653,7 @@ def plan_node(state: DialogState) -> DialogState:
         multi_kg_section=multi_kg_section,
         lexicon_section=lexicon_section,
         glossary_section=glossary_section,
+        generated_glossary_section=generated_glossary_section,
         kpi_section=kpi_section,
         resolution_section=resolution_section,
         verified_section=verified_section,

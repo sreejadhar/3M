@@ -122,3 +122,11 @@ class DialogConfig:
     # Cap the injected prompt block so it cannot crowd out schema_context
     # under the token guard (guard_plan_prompt trims schema_context, not this).
     lexicon_section_max_chars: int = 4000
+
+    # ── Auto-generated Business Glossary (glossary_registry) ──────────────────
+    # Purely additive, non-authoritative context appended to the plan prompt
+    # AFTER the resolved lexicon bindings and the curated glossary_store terms,
+    # so it never overrides either. Does not touch semantic_lexicon or the
+    # shared embedding model in any way — read-only text injection.
+    generated_glossary_enabled: bool = True
+    generated_glossary_section_max_chars: int = 3000

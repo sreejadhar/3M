@@ -26,6 +26,11 @@ COPY llm_client.py .
 COPY excel_export.py .
 COPY business_classifier.py .
 COPY domain_classifier.py .
+COPY glossary_store.py .
+COPY glossary_registry.py .
+COPY glossary_generate.py .
+COPY glossary_nlp.py .
+COPY glossary_matcher.py .
 COPY connectors/ ./connectors/
 
 # orchestrator_api imports dialog_agent.kg_bridges / kg_registry / kg_router /

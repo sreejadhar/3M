@@ -63,6 +63,8 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import metadata_catalog as _mc   # standalone catalog module (no dialog_agent dep)
+import glossary_registry as _gr        # governed business-glossary term registry
+import glossary_generate as _gg        # on-demand cross-source glossary discovery
 import kpi_store as _kpi              # BI Manager KPI definitions
 import kg_store as _kg_store           # KG snapshot persistence
 import session_store as _sess_store     # chat session + history persistence
@@ -3848,6 +3850,170 @@ async def enrich_source_taxonomy(source_id: str, background_tasks: BackgroundTas
     background_tasks.add_task(_run_enrichment, source_id)
     return {"status": "accepted", "source_id": source_id,
             "message": "Taxonomy enrichment started in background"}
+
+
+# ── Business Glossary (governed, cross-source, on-demand) ──────────────────────
+# NOT part of the indexing pipeline — only invoked by the "Generate Business
+# Glossary" button in Schema Catalog, scoped to a single source at a time.
+
+@app.post("/metadata/sources/{source_id}/generate-glossary", status_code=202)
+async def generate_source_glossary(source_id: str, background_tasks: BackgroundTasks):
+    """
+    Discover and govern business glossary terms for every table in a source:
+    NLP normalization -> canonical-term match -> cross-source structural/
+    semantic match against every OTHER already-glossaried source -> LLM
+    fallback for anything unmatched. Runs in the background with SSE
+    progress, same convention as enrich-taxonomy above.
+    """
+    async def _run_glossary(sid: str) -> None:
+        src_domain = (_sources.get(sid) or {}).get("domain", "")
+        src_business = ""
+        try:
+            import business_classifier as _bc
+            cached = _bc.get_cached_label(sid)
+            if cached:
+                src_business = cached.get("business", "") or ""
+        except Exception as exc:
+            logger.debug("generate-glossary: business label unavailable for %s — %s", sid[:8], exc)
+        _source_event_log[sid] = []
+
+        def _progress(stage: str, message: str) -> None:
+            _push_index_event(sid, f"glossary:{stage}", "running", message)
+
+        try:
+            stats = _gg.generate_glossary_for_source(sid, domain=src_domain, business=src_business,
+                                                       progress_cb=_progress)
+            _push_index_event(
+                sid, "glossary", "done",
+                f"{stats['terms_created']} term(s) created, {stats['terms_linked']} column(s) linked, "
+                f"{stats['needs_review']} need review, {stats['skipped_existing']} already governed (skipped)",
+            )
+        except Exception as exc:
+            logger.warning("generate_glossary_for_source failed for %s: %s", sid[:8], exc)
+            _push_index_event(sid, "glossary", "error", f"Business glossary generation failed: {exc}")
+        # Deliberately NOT step="complete" — that sentinel is watched by
+        # PipelineMonitor.jsx to close its own SSE connection and refresh
+        # source status, which would incorrectly fire just because an
+        # unrelated on-demand glossary run finished on the same source.
+        _push_index_event(sid, "glossary-complete", "done", "Business glossary generation complete")
+
+    background_tasks.add_task(_run_glossary, source_id)
+    return {"status": "accepted", "source_id": source_id,
+            "message": "Business glossary generation started in background"}
+
+
+@app.get("/metadata/glossary-terms")
+async def list_glossary_terms_endpoint(source_id: Optional[str] = None, status: Optional[str] = None,
+                                        domain: Optional[str] = None):
+    """List governed glossary terms, optionally filtered by source/status/domain."""
+    try:
+        return _gr.list_terms(source_id=source_id, status=status, domain=domain)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/metadata/glossary-terms/{term_id}")
+async def get_glossary_term_endpoint(term_id: str):
+    try:
+        term = _gr.get_term(term_id)
+        if not term:
+            raise HTTPException(status_code=404, detail="Term not found")
+        term["assets"] = _gr.list_assets_for_term(term_id)
+        term["audit"] = _gr.list_audit(term_id)
+        return term
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class UpdateGlossaryTermRequest(BaseModel):
+    preferred_name: Optional[str] = None
+    definition: Optional[str] = None
+    domain: Optional[str] = None
+    steward: Optional[str] = None
+
+
+@app.patch("/metadata/glossary-terms/{term_id}")
+async def update_glossary_term_endpoint(term_id: str, req: UpdateGlossaryTermRequest, request: Request):
+    """
+    Manual edit — the DMBOK 'declared beats inferred' trust boundary: the
+    server (not the client) forces match_method='manual', status='approved',
+    confidence=1.0, mirroring kg_bridges.promote_to_declared() and the same
+    rule already applied to entity/attribute descriptions elsewhere in this
+    file. Future generation runs on any source will skip a manually-edited
+    term's linked columns rather than overwrite them.
+    """
+    try:
+        kwargs: Dict[str, Any] = {}
+        if req.preferred_name is not None:
+            kwargs["preferred_name"] = req.preferred_name
+        if req.definition is not None:
+            kwargs["definition"] = req.definition
+        if req.domain is not None:
+            kwargs["domain"] = req.domain
+        if req.steward is not None:
+            kwargs["steward"] = req.steward
+        if not kwargs:
+            raise HTTPException(status_code=400, detail="No updatable fields provided")
+        kwargs["match_method"] = "manual"
+        kwargs["status"] = "approved"
+        kwargs["confidence"] = 1.0
+        changed_by = _current_user_email(request) or ""
+        if not _gr.update_term(term_id, changed_by=changed_by, **kwargs):
+            raise HTTPException(status_code=404, detail="Term not found")
+        return _gr.get_term(term_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/metadata/glossary-terms/{term_id}/approve")
+async def approve_glossary_term_endpoint(term_id: str, request: Request):
+    try:
+        changed_by = _current_user_email(request) or ""
+        if not _gr.approve_term(term_id, changed_by=changed_by):
+            raise HTTPException(status_code=404, detail="Term not found")
+        return _gr.get_term(term_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/metadata/glossary-terms/{term_id}/reject")
+async def reject_glossary_term_endpoint(term_id: str, request: Request):
+    try:
+        changed_by = _current_user_email(request) or ""
+        if not _gr.reject_term(term_id, changed_by=changed_by):
+            raise HTTPException(status_code=404, detail="Term not found")
+        return _gr.get_term(term_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/metadata/entities/{metadata_id}/glossary")
+async def get_entity_glossary_endpoint(metadata_id: str):
+    """Resolved glossary terms for one entity and each of its attributes —
+    the shape Schema Catalog needs to render term/definition/confidence/status
+    per row without every consumer re-joining glossary_term_assets itself."""
+    try:
+        entity = _mc.get_entity(metadata_id)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        entity_link = _gr.get_asset_link(metadata_id, "")
+        attrs_out = []
+        for a in entity.get("attributes", []):
+            link = _gr.get_asset_link(metadata_id, a["attr_id"])
+            attrs_out.append({**a, "glossary": link})
+        return {"entity_glossary": entity_link, "attributes": attrs_out}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/metadata/sources/{source_id}/classify-pii", status_code=202)

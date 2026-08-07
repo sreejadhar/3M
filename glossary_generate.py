@@ -35,13 +35,26 @@ GLOSSARY TERM and a one-sentence DEFINITION for the table itself and for each
 column — the plain-English name and meaning a business user (not an engineer)
 would recognize, not a restatement of the technical name or data type.
 
+You will usually be given a BUSINESS and/or DOMAIN context line describing what
+industry/function this data actually belongs to. Ground every interpretation in
+that context. Many column/table name fragments and abbreviations are ambiguous
+in general English (e.g. "CBI" can mean "Citizenship by Investment" on the open
+web, or something entirely different inside a pharma/life-sciences dataset).
+When a fragment or abbreviation could plausibly mean something else outside the
+given business/domain, DO NOT default to the generic/most-common web meaning —
+prefer the interpretation consistent with the stated business/domain, and lower
+your confidence score instead of guessing. If no business/domain context is
+given, treat any ambiguous abbreviation as low-confidence rather than picking
+the first meaning that comes to mind.
+
 Return ONLY a JSON object — no prose, no markdown fences.
 
 For each item also return a "confidence" float between 0.0 and 1.0 reflecting how
 confident you are that the term/definition is correct given the available
-evidence (column name + sample values). Use lower confidence when the column
-name is abbreviated, ambiguous, or the sample values don't clearly confirm your
-interpretation.
+evidence (column name + sample values + business/domain context). Use lower
+confidence when the column name is abbreviated, ambiguous, the sample values
+don't clearly confirm your interpretation, or you had to guess without
+business/domain context to anchor the meaning.
 
 OUTPUT FORMAT:
 {
@@ -53,7 +66,8 @@ OUTPUT FORMAT:
 """
 
 
-def _call_glossary_llm(table_name: str, col_specs: List[Dict], model: str, domain: str = "") -> Dict[str, Any]:
+def _call_glossary_llm(table_name: str, col_specs: List[Dict], model: str,
+                        domain: str = "", business: str = "") -> Dict[str, Any]:
     """Same call+parse pattern already proven in metadata_catalog.py's
     _call_enrich_llm: from llm_client import get_client, markdown-fence strip,
     brace-extraction JSON fallback, fail-soft on any error."""
@@ -63,9 +77,14 @@ def _call_glossary_llm(table_name: str, col_specs: List[Dict], model: str, domai
         sv_str = ", ".join(repr(v) for v in sv[:20]) if sv else "(no samples)"
         lines.append(f"  {c['name']} ({c.get('data_type', '')}): samples=[{sv_str}]")
 
-    domain_prefix = f"Domain context: {domain}\n" if domain else ""
+    context_lines = []
+    if business:
+        context_lines.append(f"Business: {business}")
+    if domain:
+        context_lines.append(f"Domain: {domain}")
+    context_prefix = ("\n".join(context_lines) + "\n") if context_lines else ""
     user_msg = (
-        f"{domain_prefix}Table: {table_name}\nColumns:\n"
+        f"{context_prefix}Table: {table_name}\nColumns:\n"
         + "\n".join(lines)
         + "\n\nPropose a business glossary term and definition for the table and each column."
     )
@@ -138,7 +157,7 @@ def _hydrate_pool(source_id: str) -> List[Dict]:
 
 
 def generate_glossary_for_source(
-    source_id: str, model: Optional[str] = None, domain: str = "",
+    source_id: str, model: Optional[str] = None, domain: str = "", business: str = "",
     progress_cb: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, int]:
     """
@@ -228,7 +247,7 @@ def generate_glossary_for_source(
                 for i in need_llm if i["attr_id"]
             ]
             entity_needs_llm = any(i["attr_id"] == "" for i in need_llm)
-            llm_result = _call_glossary_llm(table_name, col_specs_for_llm, model, domain=domain) \
+            llm_result = _call_glossary_llm(table_name, col_specs_for_llm, model, domain=domain, business=business) \
                 if (col_specs_for_llm or entity_needs_llm) else {}
 
             if entity_needs_llm:

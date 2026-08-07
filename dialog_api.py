@@ -66,6 +66,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+def _prewarm_embedding_model() -> None:
+    """
+    Load the shared sentence-transformers singleton (dialog_agent.embedding_cache)
+    now, in a background thread, instead of on the first request that needs it.
+    Without this, the first dissect_node/kg_router/kg_inference_engine call after
+    every process start pays the load cost inline — observed as long as ~4 min
+    when the model isn't in HF's local cache and HF_HUB_OFFLINE forces an
+    immediate failure rather than a slow retry (still not instant: even a cache
+    hit takes real seconds to load model weights). Best-effort: failure here
+    just means the first real query pays the cost instead, exactly like before
+    this existed — never blocks startup or fails it.
+    """
+    def _warm() -> None:
+        try:
+            from dialog_agent.embedding_cache import encode_text
+            encode_text("warmup")
+            logger.info("embedding_cache: model pre-warmed at startup")
+        except Exception as exc:
+            logger.info("embedding_cache: pre-warm skipped (%s)", exc)
+
+    threading.Thread(target=_warm, daemon=True).start()
+
+
 # ── In-memory job store ────────────────────────────────────────────────────────
 _jobs: Dict[str, Dict] = {}
 _lock = threading.Lock()

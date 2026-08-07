@@ -3866,7 +3866,22 @@ async def generate_source_glossary(source_id: str, background_tasks: BackgroundT
     progress, same convention as enrich-taxonomy above.
     """
     async def _run_glossary(sid: str) -> None:
-        src_domain = (_sources.get(sid) or {}).get("domain", "")
+        # domain_classifier persists the LLM sub-domain label independently of
+        # _sources[sid]["domain"] (a separate, admin-editable/heuristic field
+        # that is usually blank) — same cache-only read pattern as
+        # business_classifier below. Falls back to the free-text field only if
+        # the source was never classified.
+        src_domain = ""
+        try:
+            import domain_classifier as _dc
+            cached_domain = _dc.get_cached_label(sid)
+            if cached_domain:
+                src_domain = cached_domain.get("sub_domain", "") or ""
+        except Exception as exc:
+            logger.debug("generate-glossary: domain label unavailable for %s — %s", sid[:8], exc)
+        if not src_domain:
+            src_domain = (_sources.get(sid) or {}).get("domain", "") or ""
+
         src_business = ""
         try:
             import business_classifier as _bc
@@ -3881,8 +3896,16 @@ async def generate_source_glossary(source_id: str, background_tasks: BackgroundT
             _push_index_event(sid, f"glossary:{stage}", "running", message)
 
         try:
-            stats = _gg.generate_glossary_for_source(sid, domain=src_domain, business=src_business,
-                                                       progress_cb=_progress)
+            # generate_glossary_for_source is synchronous end-to-end (SQLite +
+            # network LLM calls) — running it directly here would block this
+            # entire process's event loop for the whole run, freezing every
+            # other request (including the SSE progress stream itself) until
+            # it finishes. asyncio.to_thread hands it to a worker thread so
+            # the event loop — and progress polling — stays responsive.
+            stats = await asyncio.to_thread(
+                _gg.generate_glossary_for_source, sid,
+                domain=src_domain, business=src_business, progress_cb=_progress,
+            )
             _push_index_event(
                 sid, "glossary", "done",
                 f"{stats['terms_created']} term(s) created, {stats['terms_linked']} column(s) linked, "

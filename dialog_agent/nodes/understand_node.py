@@ -37,6 +37,25 @@ _CATEGORICAL_DISTINCT_MAX = 50
 # Only sample columns whose distinct count is <= this (to skip IDs/timestamps)
 _SAMPLE_DISTINCT_MAX = 200
 
+# Discovered join-key bridges change only when the KG is re-indexed (rare —
+# manual trigger or periodic job), so a short TTL cache avoids paying the
+# kg_registry + kg_bridges DB round-trip on every single chat turn.
+_JOIN_KEY_CACHE: Dict[str, tuple] = {}  # source_id -> (fetched_at, self_bridges)
+_JOIN_KEY_CACHE_TTL_S = 120.0
+
+
+def _get_self_bridges_cached(source_id: str) -> list:
+    cached = _JOIN_KEY_CACHE.get(source_id)
+    now = time.perf_counter()
+    if cached is not None and (now - cached[0]) < _JOIN_KEY_CACHE_TTL_S:
+        return cached[1]
+    from dialog_agent.kg_registry import get_by_source_id as _reg_get_by_source
+    from dialog_agent.kg_bridges import list_for_kgs as _list_bridges
+    entry = _reg_get_by_source(source_id)
+    self_bridges = _list_bridges([entry.kg_id]) if entry else []
+    _JOIN_KEY_CACHE[source_id] = (now, self_bridges)
+    return self_bridges
+
 
 def _to_sql_col(name: str) -> str:
     """
@@ -1204,10 +1223,7 @@ def understand_node(state: DialogState) -> DialogState:
     if source_id:
         t0 = time.perf_counter()
         try:
-            from dialog_agent.kg_registry import get_by_source_id as _reg_get_by_source
-            from dialog_agent.kg_bridges import list_for_kgs as _list_bridges
-            entry = _reg_get_by_source(source_id)
-            self_bridges = _list_bridges([entry.kg_id]) if entry else []
+            self_bridges = _get_self_bridges_cached(source_id)
             if self_bridges:
                 logger.info(
                     "understand_node: loaded %d discovered join key(s) for source %s",

@@ -1,11 +1,10 @@
 """NLQ → KG Router: vector shortlist then LLM confirmation."""
 from __future__ import annotations
 import json, logging, os, re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from .kg_registry import KGEntry, list_all as list_kgs
 
 logger = logging.getLogger(__name__)
-_ST_MODEL: Any = None
 
 def route(nlq:str, threshold:float=0.30, llm_model:str="claude-haiku-4-5",
           llm_temperature:float=0.0, backend:str="auto") -> List[str]:
@@ -23,11 +22,17 @@ def route(nlq:str, threshold:float=0.30, llm_model:str="claude-haiku-4-5",
     return confirmed if confirmed else [c[0].kg_id for c in candidates]
 
 def _get_st():
-    global _ST_MODEL
-    if _ST_MODEL is None:
-        from sentence_transformers import SentenceTransformer
-        _ST_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-    return _ST_MODEL
+    # Delegate to embedding_cache's shared, process-wide singleton instead of
+    # keeping a second independent SentenceTransformer instance here. That
+    # module sets HF_HUB_OFFLINE=1/TRANSFORMERS_OFFLINE=1 before ever loading
+    # the model — without it, sentence-transformers hits huggingface.co on
+    # first load to check for revisions even when already cached, which turns
+    # into a multi-minute retry storm in network-restricted environments
+    # (observed: ~4 min). This function used to build its own SentenceTransformer
+    # directly, bypassing that protection entirely — every dissect_node call
+    # that resolves embeddings via kg_router._embed hit the unprotected path.
+    from .embedding_cache import get_sentence_transformer
+    return get_sentence_transformer("all-MiniLM-L6-v2")
 
 def _embed(text:str, backend:str="auto") -> Optional[List[float]]:
     try:

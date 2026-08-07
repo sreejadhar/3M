@@ -460,8 +460,12 @@ def _build_embed_matrix(profiles: List[ColumnProfile]) -> Any:
     try:
         import numpy as np
         try:
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer("all-MiniLM-L6-v2")
+            # Shared, offline-mode-protected singleton — see embedding_cache's
+            # module docstring. A direct SentenceTransformer(...) construction
+            # here previously bypassed that protection and could hit the same
+            # multi-minute huggingface.co retry storm on every cold start.
+            from .embedding_cache import get_sentence_transformer
+            model = get_sentence_transformer("all-MiniLM-L6-v2")
             mat = model.encode(texts, normalize_embeddings=True)
             return ids, mat.astype(np.float32)
         except ImportError:

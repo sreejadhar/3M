@@ -883,6 +883,31 @@ def get_attribute(attr_id: str) -> Optional[Dict]:
     return _coerce_attr(row) if row else None
 
 
+def get_attributes_bulk(attr_ids: List[str]) -> Dict[str, Dict]:
+    """Same lookup as get_attribute(), for many ids in one connection/query —
+    _cursor_ctx() opens a fresh connection per call, so callers that need
+    attributes for a large candidate pool (e.g. glossary_generate.py's
+    cross-source pool, which can grow into the thousands as more sources get
+    glossaried) must not call get_attribute() in a per-id loop. Chunked to
+    stay under SQLite's default bound-parameter limit."""
+    out: Dict[str, Dict] = {}
+    ids = [a for a in dict.fromkeys(attr_ids) if a]
+    if not ids:
+        return out
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = cur.execute(
+                f"SELECT * FROM md_attributes WHERE attr_id IN ({placeholders})", tuple(chunk)
+            ).fetchall()
+            for row in rows:
+                attr = _coerce_attr(row)
+                out[attr["attr_id"]] = attr
+    return out
+
+
 def update_entity(metadata_id: str, **fields: Any) -> bool:
     allowed = {"description", "is_golden_record", "canonical_label"}
     updates: Dict[str, Any] = {k: v for k, v in fields.items() if k in allowed}

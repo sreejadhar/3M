@@ -273,26 +273,34 @@ def get_term(term_id: str) -> Optional[Dict]:
     return dict(row) if row else None
 
 
-def find_term_by_canonical_key(canonical_key: str, domain: Optional[str] = None) -> Optional[Dict]:
+def find_term_by_canonical_key(canonical_key: str, domain: Optional[str] = None,
+                                status: Optional[str] = None) -> Optional[Dict]:
     """Exact/normalized-name lookup — the cheap first tier of discovery, and
     what lets a second source's matching column resolve to the SAME term_id
-    instead of creating a duplicate."""
+    instead of creating a duplicate. status=None (default) matches any
+    non-deprecated term, preserving prior behavior for other callers; pass
+    status="approved" to only trust steward-vetted/high-confidence terms as
+    reusable ground truth — glossary_generate.py does this so an unreviewed
+    (draft/candidate) LLM guess from one source is never silently adopted as
+    "the" definition for a matching column in another source."""
     if not canonical_key:
         return None
     with _cursor_ctx() as cur:
         _ensure(cur)
+        status_clause = "status = ?" if status else "status != 'deprecated'"
+        status_param = (status,) if status else ()
         if domain:
             row = cur.execute(
-                "SELECT * FROM biz_glossary_terms WHERE lower(canonical_key)=lower(?) "
-                "AND (domain=? OR domain='') AND status != 'deprecated' "
-                "ORDER BY (domain=?) DESC LIMIT 1",
-                (canonical_key, domain, domain),
+                f"SELECT * FROM biz_glossary_terms WHERE lower(canonical_key)=lower(?) "
+                f"AND (domain=? OR domain='') AND {status_clause} "
+                f"ORDER BY (domain=?) DESC LIMIT 1",
+                (canonical_key, domain, *status_param, domain),
             ).fetchone()
         else:
             row = cur.execute(
-                "SELECT * FROM biz_glossary_terms WHERE lower(canonical_key)=lower(?) "
-                "AND status != 'deprecated' LIMIT 1",
-                (canonical_key,),
+                f"SELECT * FROM biz_glossary_terms WHERE lower(canonical_key)=lower(?) "
+                f"AND {status_clause} LIMIT 1",
+                (canonical_key, *status_param),
             ).fetchone()
     return dict(row) if row else None
 
@@ -422,6 +430,64 @@ def link_asset(
         "metadata_id": metadata_id, "attr_id": attr_id, "confidence": float(confidence),
         "match_method": match_method, "linked_at": now,
     }
+
+
+def bulk_link_assets(links: List[Dict]) -> None:
+    """Same upsert as link_asset(), for many rows in ONE connection/transaction.
+    link_asset() opens a fresh sqlite3 connection per call (see _cursor_ctx) —
+    fine for a single manual edit, but glossary discovery's pass-1 matching
+    can link hundreds of columns in one run, and that per-call connection
+    overhead (not the SQL itself) was the dominant cost of a run. Each link
+    dict: {term_id, source_id, metadata_id, attr_id, confidence, match_method}."""
+    if not links:
+        return
+    now = _now()
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        for l in links:
+            term_id, metadata_id, attr_id = l["term_id"], l["metadata_id"], l.get("attr_id", "")
+            existing = cur.execute(
+                "SELECT link_id FROM biz_glossary_term_assets WHERE term_id=? AND metadata_id=? AND attr_id=?",
+                (term_id, metadata_id, attr_id),
+            ).fetchone()
+            if existing:
+                cur.execute(
+                    "UPDATE biz_glossary_term_assets SET confidence=?, match_method=?, linked_at=? WHERE link_id=?",
+                    (float(l.get("confidence", 0.0)), l.get("match_method", ""), now, existing["link_id"]),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO biz_glossary_term_assets "
+                    "(link_id, term_id, source_id, metadata_id, attr_id, confidence, match_method, linked_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), term_id, l["source_id"], metadata_id, attr_id,
+                     float(l.get("confidence", 0.0)), l.get("match_method", ""), now),
+                )
+
+
+def delete_unreviewed_links(pairs: List[Any]) -> None:
+    """Remove existing column links whose underlying term is NOT approved
+    (draft/candidate — an unreviewed guess, e.g. one generated before
+    business/domain context existed), for the given (metadata_id, attr_id)
+    pairs, in one connection. Approved and manually-edited links (manual
+    edits always set status='approved' — see update_term) are never touched.
+    Lets glossary_generate.py replace a stale unreviewed guess with a
+    freshly-grounded one on re-run instead of being permanently skipped by
+    the already-governed guard."""
+    if not pairs:
+        return
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        values_sql = ",".join(["(?,?)"] * len(pairs))
+        params: List[Any] = []
+        for metadata_id, attr_id in pairs:
+            params.extend([metadata_id, attr_id])
+        cur.execute(
+            f"DELETE FROM biz_glossary_term_assets "
+            f"WHERE (metadata_id, attr_id) IN (VALUES {values_sql}) "
+            f"AND term_id IN (SELECT term_id FROM biz_glossary_terms WHERE status != 'approved')",
+            tuple(params),
+        )
 
 
 def list_assets_for_term(term_id: str) -> List[Dict]:

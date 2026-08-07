@@ -115,6 +115,13 @@ export default function PipelineMonitor() {
         return;
       }
       if (ev.type === 'heartbeat') return;
+      // Business Glossary generation (triggered from Schema Catalog, not here)
+      // reports its own progress on this same per-source event bus — ignore
+      // it entirely so it never appears in this pipeline log or affects
+      // pipeline state (e.g. the "complete" close/refresh handling below).
+      if (ev.step === 'glossary' || ev.step === 'glossary-complete' || (ev.step || '').startsWith('glossary:')) {
+        return;
+      }
       setEvents((prev) => [...prev, { ...ev, _ts: Date.now() }]);
       if (ev.status === 'done' || ev.status === 'error') debouncedRefresh();
       // The classifier retrains in the background after persist — re-fetch the

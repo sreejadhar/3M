@@ -1,8 +1,111 @@
 import { useEffect, useState } from 'react';
 import { useAppState } from '../state.jsx';
-import { listEntities, getEntity } from '../api/clients.js';
+import {
+  listEntities,
+  getEntity,
+  getEntityGlossary,
+  updateBizGlossaryTerm,
+  approveBizGlossaryTerm,
+  rejectBizGlossaryTerm,
+} from '../api/clients.js';
 import { fmtNum } from '../lib/utils.js';
 import { IconCatalog, IconSearch } from '../components/Icons.jsx';
+
+const STATUS_BADGE = {
+  draft: 'badge-gray',
+  candidate: 'badge-amber',
+  approved: 'badge-green',
+  deprecated: 'badge-red',
+};
+
+function confBadgeClass(confidence) {
+  if (confidence == null) return 'badge-gray';
+  if (confidence >= 0.85) return 'badge-green';
+  if (confidence >= 0.6) return 'badge-amber';
+  return 'badge-gray';
+}
+
+// One term/definition cell — click to edit; Save always produces a manual,
+// fully-trusted override (server sets status=approved, confidence=1.0).
+// Approve/Reject act on the underlying governed term, not just this link.
+function GlossaryCell({ glossary, onSave, onApprove, onReject }) {
+  const [editing, setEditing] = useState(false);
+  const term = glossary?.preferred_name || '';
+  const definition = glossary?.definition || '';
+  const [draftTerm, setDraftTerm] = useState(term);
+  const [draftDef, setDraftDef] = useState(definition);
+
+  useEffect(() => {
+    setDraftTerm(term);
+    setDraftDef(definition);
+  }, [term, definition]);
+
+  if (editing) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 200 }}>
+        <input
+          className="search-input"
+          style={{ width: '100%' }}
+          placeholder="Business term…"
+          value={draftTerm}
+          onChange={(e) => setDraftTerm(e.target.value)}
+          autoFocus
+        />
+        <textarea
+          className="search-input"
+          style={{ width: '100%', minHeight: 44, resize: 'vertical', fontFamily: 'inherit' }}
+          placeholder="Definition…"
+          value={draftDef}
+          onChange={(e) => setDraftDef(e.target.value)}
+        />
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button className="btn btn-primary" style={{ padding: '2px 8px', fontSize: 11 }}
+            onClick={() => { setEditing(false); onSave(draftTerm, draftDef); }}>
+            Save
+          </button>
+          <button className="btn btn-ghost" style={{ padding: '2px 8px', fontSize: 11 }}
+            onClick={() => { setEditing(false); setDraftTerm(term); setDraftDef(definition); }}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!glossary) {
+    // No governed term linked yet — nothing to edit against until generation
+    // (or a future explicit "create term" action) creates one.
+    return <span className="dim">—</span>;
+  }
+
+  const status = glossary.term_status;
+  const confidence = glossary.term_confidence;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }} onClick={() => setEditing(true)} title="Click to edit">
+        <span style={{ fontWeight: 600 }}>{term}</span>
+        {confidence != null && (
+          <span className={`badge ${confBadgeClass(confidence)}`}>{Math.round(confidence * 100)}%</span>
+        )}
+        {status && <span className={`badge ${STATUS_BADGE[status] || 'badge-gray'}`}>{status}</span>}
+      </div>
+      {definition && <div className="dim">{definition}</div>}
+      {(status === 'draft' || status === 'candidate') && (
+        <div style={{ display: 'flex', gap: 4, marginTop: 2 }}>
+          <button className="btn btn-ghost" style={{ padding: '0 4px', fontSize: 10 }}
+            onClick={(e) => { e.stopPropagation(); onApprove(); }}>
+            Approve
+          </button>
+          <button className="btn btn-ghost" style={{ padding: '0 4px', fontSize: 10 }}
+            onClick={(e) => { e.stopPropagation(); onReject(); }}>
+            Reject
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 const STAT_BADGE = {
   continuous: 'badge-blue',
@@ -29,12 +132,14 @@ const ROLE_BADGE = {
 };
 
 export default function SchemaCatalog() {
-  const { activeSourceId, refreshTick } = useAppState();
+  const { activeSourceId, refreshTick, toast } = useAppState();
   const [tables, setTables] = useState([]);
   const [tableFilter, setTableFilter] = useState('');
   const [colFilter, setColFilter] = useState('');
   const [selected, setSelected] = useState(null); // entity detail
   const [loadingCols, setLoadingCols] = useState(false);
+  const [entityGlossary, setEntityGlossary] = useState(null); // {term_id, preferred_name, ...} | null
+  const [attrGlossary, setAttrGlossary] = useState({}); // attr_id -> glossary link dict
 
   useEffect(() => {
     setSelected(null);
@@ -47,14 +152,69 @@ export default function SchemaCatalog() {
       .catch(() => setTables([]));
   }, [activeSourceId, refreshTick]);
 
+  const loadGlossary = async (metadataId) => {
+    try {
+      const g = await getEntityGlossary(metadataId);
+      setEntityGlossary(g.entity_glossary || null);
+      const byAttr = {};
+      (g.attributes || []).forEach((a) => { byAttr[a.attr_id] = a.glossary || null; });
+      setAttrGlossary(byAttr);
+    } catch {
+      setEntityGlossary(null);
+      setAttrGlossary({});
+    }
+  };
+
   const openTable = async (metadataId) => {
     setLoadingCols(true);
     try {
       setSelected(await getEntity(metadataId));
+      await loadGlossary(metadataId);
     } catch {
       setSelected(null);
     } finally {
       setLoadingCols(false);
+    }
+  };
+
+  const handleSaveEntityTerm = async (term, definition) => {
+    if (!entityGlossary) return;
+    try {
+      await updateBizGlossaryTerm(entityGlossary.term_id, { preferred_name: term, definition });
+      if (selected) await loadGlossary(selected.metadata_id);
+      toast('Saved', 'success');
+    } catch (e) {
+      toast(`Save failed: ${e.message}`, 'error');
+    }
+  };
+
+  const handleSaveAttrTerm = async (attrId, term, definition) => {
+    const link = attrGlossary[attrId];
+    if (!link) return;
+    try {
+      await updateBizGlossaryTerm(link.term_id, { preferred_name: term, definition });
+      if (selected) await loadGlossary(selected.metadata_id);
+      toast('Saved', 'success');
+    } catch (e) {
+      toast(`Save failed: ${e.message}`, 'error');
+    }
+  };
+
+  const handleApprove = async (termId) => {
+    try {
+      await approveBizGlossaryTerm(termId);
+      if (selected) await loadGlossary(selected.metadata_id);
+    } catch (e) {
+      toast(`Approve failed: ${e.message}`, 'error');
+    }
+  };
+
+  const handleReject = async (termId) => {
+    try {
+      await rejectBizGlossaryTerm(termId);
+      if (selected) await loadGlossary(selected.metadata_id);
+    } catch (e) {
+      toast(`Reject failed: ${e.message}`, 'error');
     }
   };
 
@@ -136,6 +296,14 @@ export default function SchemaCatalog() {
                 />
               </div>
             </div>
+            <div style={{ marginTop: 8 }}>
+              <GlossaryCell
+                glossary={entityGlossary}
+                onSave={handleSaveEntityTerm}
+                onApprove={() => entityGlossary && handleApprove(entityGlossary.term_id)}
+                onReject={() => entityGlossary && handleReject(entityGlossary.term_id)}
+              />
+            </div>
           </div>
         )}
 
@@ -153,6 +321,7 @@ export default function SchemaCatalog() {
                 <tr>
                   <th>Column</th>
                   <th>Type</th>
+                  <th>Business Glossary</th>
                   <th>Statistical Type</th>
                   <th>Semantic Role</th>
                   <th>Statistics</th>
@@ -168,6 +337,14 @@ export default function SchemaCatalog() {
                       {a.description && <div className="dim">{a.description}</div>}
                     </td>
                     <td className="mono muted">{a.data_type}</td>
+                    <td>
+                      <GlossaryCell
+                        glossary={attrGlossary[a.attr_id]}
+                        onSave={(term, definition) => handleSaveAttrTerm(a.attr_id, term, definition)}
+                        onApprove={() => attrGlossary[a.attr_id] && handleApprove(attrGlossary[a.attr_id].term_id)}
+                        onReject={() => attrGlossary[a.attr_id] && handleReject(attrGlossary[a.attr_id].term_id)}
+                      />
+                    </td>
                     <td>
                       {a.statistical_type && (
                         <span className={`badge ${STAT_BADGE[a.statistical_type] || 'badge-gray'}`}>

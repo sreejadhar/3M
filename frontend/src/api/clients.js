@@ -85,6 +85,24 @@ export const classifyPII = (id) => apiPost(`/metadata/sources/${id}/classify-pii
 export const detectBusiness = (id) => apiPost(`/metadata/sources/${id}/detect-business`);
 export const detectDomain = (id) => apiPost(`/metadata/sources/${id}/detect-domain`);
 
+// ── Business Glossary — governed term registry (distinct from the KPI/finance
+// glossary above: this one is discovered from schema, cross-source, on demand) ─
+export const generateSourceGlossary = (sourceId) =>
+  apiPost(`/metadata/sources/${sourceId}/generate-glossary`);
+export const getEntityGlossary = (metadataId) => apiGet(`/metadata/entities/${metadataId}/glossary`);
+export const listBizGlossaryTerms = (opts = {}) => {
+  const qs = new URLSearchParams();
+  if (opts.sourceId) qs.set('source_id', opts.sourceId);
+  if (opts.status) qs.set('status', opts.status);
+  if (opts.domain) qs.set('domain', opts.domain);
+  const q = qs.toString();
+  return apiGet(`/metadata/glossary-terms${q ? `?${q}` : ''}`);
+};
+export const getBizGlossaryTerm = (termId) => apiGet(`/metadata/glossary-terms/${termId}`);
+export const updateBizGlossaryTerm = (termId, body) => apiPatch(`/metadata/glossary-terms/${termId}`, body);
+export const approveBizGlossaryTerm = (termId) => apiPost(`/metadata/glossary-terms/${termId}/approve`);
+export const rejectBizGlossaryTerm = (termId) => apiPost(`/metadata/glossary-terms/${termId}/reject`);
+
 // ── KG bridges ──────────────────────────────────────────────────────────────
 export const listBridges = () => apiGet('/kg-bridges');
 

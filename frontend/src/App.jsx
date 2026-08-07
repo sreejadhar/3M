@@ -11,6 +11,7 @@ import SchemaCatalog from './views/SchemaCatalog.jsx';
 import OntologyViewer from './views/OntologyViewer.jsx';
 import Redundancies from './views/Redundancies.jsx';
 import Glossary from './views/Glossary.jsx';
+import DataGlossary from './views/DataGlossary.jsx';
 import Kpi from './views/Kpi.jsx';
 import SqlConsole from './views/SqlConsole.jsx';
 import ChangeLog from './views/ChangeLog.jsx';
@@ -23,6 +24,7 @@ const VIEWS = {
   ontology: OntologyViewer,
   redundancy: Redundancies,
   glossary: Glossary,
+  dataglossary: DataGlossary,
   kpi: Kpi,
   sql: SqlConsole,
   cdc: ChangeLog,

@@ -21,6 +21,7 @@ const INSPECT = [
   ['ontology', IconOntology, 'Ontology Viewer'],
   ['redundancy', IconRedundancy, 'Redundancies'],
   ['glossary', IconGlossary, 'Business Glossary'],
+  ['dataglossary', IconGlossary, 'Business Glossary (Discovery)'],
   ['kpi', IconKpi, 'KPI Registry'],
   ['documents', IconDocuments, 'Document Intelligence'],
 ];

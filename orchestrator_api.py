@@ -65,6 +65,7 @@ if _PROJECT_ROOT not in sys.path:
 import metadata_catalog as _mc   # standalone catalog module (no dialog_agent dep)
 import glossary_registry as _gr        # governed business-glossary term registry
 import glossary_generate as _gg        # on-demand cross-source glossary discovery
+import business_ontology as _bo        # SKOS+OWL business ontology generated from the glossary
 import kpi_store as _kpi              # BI Manager KPI definitions
 import kg_store as _kg_store           # KG snapshot persistence
 import session_store as _sess_store     # chat session + history persistence
@@ -729,6 +730,19 @@ def _current_user_email(request: Request) -> Optional[str]:
         return None
     sub = payload.get("sub")
     return sub.strip().lower() if isinstance(sub, str) and sub.strip() else None
+
+
+def _require_permission(request: Request, action: str) -> str:
+    """Raise 403 if the authenticated user's role lacks `action`. No-op
+    outside APP_ENV=production, matching access_control.is_enforced(). Used
+    to admin-gate Business Ontology edit/version routes. Returns the caller's
+    email for audit purposes (empty string if unauthenticated)."""
+    email = _current_user_email(request) or ""
+    if _ac.is_enforced():
+        user = _ac.get_user_by_email(email) if email else None
+        if not user or not _ac.can_perform(user["user_id"], action):
+            raise HTTPException(status_code=403, detail=f"Requires permission: {action}")
+    return email
 
 
 def _owns_session(session: Dict, email: Optional[str]) -> bool:
@@ -3983,7 +3997,7 @@ async def update_glossary_term_endpoint(term_id: str, req: UpdateGlossaryTermReq
         kwargs["match_method"] = "manual"
         kwargs["status"] = "approved"
         kwargs["confidence"] = 1.0
-        changed_by = _current_user_email(request) or ""
+        changed_by = _require_permission(request, "edit_business_ontology")
         if not _gr.update_term(term_id, changed_by=changed_by, **kwargs):
             raise HTTPException(status_code=404, detail="Term not found")
         return _gr.get_term(term_id)
@@ -3996,7 +4010,7 @@ async def update_glossary_term_endpoint(term_id: str, req: UpdateGlossaryTermReq
 @app.post("/metadata/glossary-terms/{term_id}/approve")
 async def approve_glossary_term_endpoint(term_id: str, request: Request):
     try:
-        changed_by = _current_user_email(request) or ""
+        changed_by = _require_permission(request, "approve_business_ontology_term")
         if not _gr.approve_term(term_id, changed_by=changed_by):
             raise HTTPException(status_code=404, detail="Term not found")
         return _gr.get_term(term_id)
@@ -4009,7 +4023,7 @@ async def approve_glossary_term_endpoint(term_id: str, request: Request):
 @app.post("/metadata/glossary-terms/{term_id}/reject")
 async def reject_glossary_term_endpoint(term_id: str, request: Request):
     try:
-        changed_by = _current_user_email(request) or ""
+        changed_by = _require_permission(request, "approve_business_ontology_term")
         if not _gr.reject_term(term_id, changed_by=changed_by):
             raise HTTPException(status_code=404, detail="Term not found")
         return _gr.get_term(term_id)
@@ -4017,6 +4031,162 @@ async def reject_glossary_term_endpoint(term_id: str, request: Request):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Business Ontology (SKOS+OWL, generated per-source from that source's
+# governed glossary) ────────────────────────────────────────────────────────
+
+@app.get("/business-ontology/sources")
+async def list_business_ontology_sources_endpoint():
+    """Sources whose Business Glossary has actually been generated (at least
+    one linked term) — the Business Ontology UI only offers these."""
+    try:
+        rows = _gr.list_glossary_sources()
+        out = []
+        for row in rows:
+            sid = row["source_id"]
+            src = _sources.get(sid)
+            out.append({
+                "source_id": sid,
+                "source_name": (src or {}).get("name") or sid,
+                "term_count": row["term_count"],
+            })
+        out.sort(key=lambda r: r["source_name"].lower())
+        return out
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/business-ontology/{source_id}/generate")
+async def generate_business_ontology_endpoint(source_id: str, request: Request):
+    """Synchronous regeneration from this source's current glossary state —
+    reads a handful of small SQLite tables and serializes an in-memory
+    rdflib.Graph, so unlike the structural ontology's async job/polling
+    pattern this returns directly. Ungated: read-derived, not destructive
+    (matches the ungated generate-glossary trigger)."""
+    try:
+        source_ontology = (_sources.get(source_id) or {}).get("ontology_content") or ""
+        return _bo.generate_business_ontology(source_id, created_by=_current_user_email(request) or "",
+                                               source_ontology=source_ontology)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/business-ontology/{source_id}/draft")
+async def get_business_ontology_draft_endpoint(source_id: str):
+    try:
+        return _bo.get_draft(source_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class SaveBusinessOntologyDraftRequest(BaseModel):
+    ttl_content: str
+
+
+@app.put("/business-ontology/{source_id}/draft")
+async def put_business_ontology_draft_endpoint(source_id: str, req: SaveBusinessOntologyDraftRequest,
+                                                request: Request):
+    email = _require_permission(request, "edit_business_ontology")
+    try:
+        return _bo.save_draft_ttl(source_id, req.ttl_content, updated_by=email)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class UpdateBusinessOntologyTermRequest(BaseModel):
+    preferred_name: Optional[str] = None
+    definition: Optional[str] = None
+    domain: Optional[str] = None
+    steward: Optional[str] = None
+    status: Optional[str] = None
+
+
+@app.patch("/business-ontology/{source_id}/terms/{term_id}")
+async def update_business_ontology_term_endpoint(source_id: str, term_id: str,
+                                                   req: UpdateBusinessOntologyTermRequest, request: Request):
+    email = _require_permission(request, "edit_business_ontology")
+    try:
+        fields = {k: v for k, v in req.dict().items() if v is not None}
+        return _bo.update_concept(source_id, term_id, changed_by=email, **fields)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/business-ontology/{source_id}/terms/{term_id}")
+async def delete_business_ontology_term_endpoint(source_id: str, term_id: str, request: Request):
+    email = _require_permission(request, "edit_business_ontology")
+    try:
+        return _bo.delete_concept(source_id, term_id, changed_by=email)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class BusinessOntologyRelationRequest(BaseModel):
+    term_id: str
+    related_term_id: str
+    relationship_type: str = "related"
+
+
+@app.post("/business-ontology/{source_id}/relations")
+async def add_business_ontology_relation_endpoint(source_id: str, req: BusinessOntologyRelationRequest,
+                                                    request: Request):
+    email = _require_permission(request, "edit_business_ontology")
+    try:
+        return _bo.add_relation(source_id, req.term_id, req.related_term_id, req.relationship_type,
+                                 changed_by=email)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/business-ontology/{source_id}/relations/{relation_id}")
+async def delete_business_ontology_relation_endpoint(source_id: str, relation_id: str, request: Request):
+    email = _require_permission(request, "edit_business_ontology")
+    try:
+        return _bo.delete_relation(source_id, relation_id, changed_by=email)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class SaveBusinessOntologyVersionRequest(BaseModel):
+    label: str = ""
+
+
+@app.post("/business-ontology/{source_id}/versions")
+async def save_business_ontology_version_endpoint(source_id: str, req: SaveBusinessOntologyVersionRequest,
+                                                    request: Request):
+    email = _require_permission(request, "manage_business_ontology_versions")
+    try:
+        return _bo.save_version(source_id, req.label, created_by=email)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/business-ontology/{source_id}/versions")
+async def list_business_ontology_versions_endpoint(source_id: str):
+    try:
+        return _bo.list_versions(source_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/business-ontology/{source_id}/versions/{version_id}")
+async def get_business_ontology_version_endpoint(source_id: str, version_id: str):
+    v = _bo.get_version(source_id, version_id)
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return v
+
+
+@app.post("/business-ontology/{source_id}/versions/{version_id}/restore")
+async def restore_business_ontology_version_endpoint(source_id: str, version_id: str, request: Request):
+    email = _require_permission(request, "manage_business_ontology_versions")
+    result = _bo.restore_version(source_id, version_id, restored_by=email)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return result
 
 
 @app.get("/metadata/entities/{metadata_id}/glossary")

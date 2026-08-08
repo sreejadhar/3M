@@ -9,6 +9,7 @@ import PipelineMonitor from './views/PipelineMonitor.jsx';
 import GraphExplorer from './views/GraphExplorer.jsx';
 import SchemaCatalog from './views/SchemaCatalog.jsx';
 import OntologyViewer from './views/OntologyViewer.jsx';
+import BusinessOntology from './views/BusinessOntology.jsx';
 import Redundancies from './views/Redundancies.jsx';
 import Glossary from './views/Glossary.jsx';
 import DataGlossary from './views/DataGlossary.jsx';
@@ -22,6 +23,7 @@ const VIEWS = {
   graph: GraphExplorer,
   catalog: SchemaCatalog,
   ontology: OntologyViewer,
+  'business-ontology': BusinessOntology,
   redundancy: Redundancies,
   glossary: Glossary,
   dataglossary: DataGlossary,

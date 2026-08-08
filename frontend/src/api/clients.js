@@ -103,6 +103,30 @@ export const updateBizGlossaryTerm = (termId, body) => apiPatch(`/metadata/gloss
 export const approveBizGlossaryTerm = (termId) => apiPost(`/metadata/glossary-terms/${termId}/approve`);
 export const rejectBizGlossaryTerm = (termId) => apiPost(`/metadata/glossary-terms/${termId}/reject`);
 
+// ── Business Ontology — SKOS+OWL graph generated per-source from that
+// source's governed glossary above (distinct artifact from the per-source
+// structural ontology, and only offered for sources with a generated glossary) ─
+export const listBusinessOntologySources = () => apiGet('/business-ontology/sources');
+export const generateBusinessOntology = (sourceId) => apiPost(`/business-ontology/${sourceId}/generate`);
+export const getBusinessOntologyDraft = (sourceId) => apiGet(`/business-ontology/${sourceId}/draft`);
+export const saveBusinessOntologyDraftTtl = (sourceId, ttlContent) =>
+  apiPut(`/business-ontology/${sourceId}/draft`, { ttl_content: ttlContent });
+export const updateBusinessOntologyTerm = (sourceId, termId, body) =>
+  apiPatch(`/business-ontology/${sourceId}/terms/${termId}`, body);
+export const deleteBusinessOntologyTerm = (sourceId, termId) =>
+  apiDelete(`/business-ontology/${sourceId}/terms/${termId}`);
+export const addBusinessOntologyRelation = (sourceId, termId, relatedTermId, relationshipType) =>
+  apiPost(`/business-ontology/${sourceId}/relations`, {
+    term_id: termId, related_term_id: relatedTermId, relationship_type: relationshipType,
+  });
+export const saveBusinessOntologyVersion = (sourceId, label) =>
+  apiPost(`/business-ontology/${sourceId}/versions`, { label });
+export const listBusinessOntologyVersions = (sourceId) => apiGet(`/business-ontology/${sourceId}/versions`);
+export const getBusinessOntologyVersion = (sourceId, versionId) =>
+  apiGet(`/business-ontology/${sourceId}/versions/${versionId}`);
+export const restoreBusinessOntologyVersion = (sourceId, versionId) =>
+  apiPost(`/business-ontology/${sourceId}/versions/${versionId}/restore`);
+
 // ── KG bridges ──────────────────────────────────────────────────────────────
 export const listBridges = () => apiGet('/kg-bridges');
 

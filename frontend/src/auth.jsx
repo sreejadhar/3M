@@ -7,6 +7,7 @@ import { createContext, useContext, useEffect, useState, useCallback } from 'rea
 // Endpoints live on the orchestrator (proxied via /auth in vite.config.js).
 const TOKEN_KEY = 'auth_token';
 const EMAIL_KEY = 'auth_email';
+const ROLE_KEY = 'auth_role';
 
 // Capture the real fetch before we patch it, so auth calls themselves never
 // recurse through the token injector.
@@ -14,14 +15,17 @@ const origFetch = window.fetch.bind(window);
 
 export const getToken = () => sessionStorage.getItem(TOKEN_KEY) || '';
 export const getEmail = () => localStorage.getItem(EMAIL_KEY) || '';
+export const getRole = () => localStorage.getItem(ROLE_KEY) || 'viewer';
 
-function setAuth(token, email) {
+function setAuth(token, email, role) {
   sessionStorage.setItem(TOKEN_KEY, token);
   localStorage.setItem(EMAIL_KEY, email);
+  localStorage.setItem(ROLE_KEY, role || 'viewer');
 }
 function clearAuth() {
   sessionStorage.removeItem(TOKEN_KEY);
   localStorage.removeItem(EMAIL_KEY);
+  localStorage.removeItem(ROLE_KEY);
 }
 
 // Inject the Bearer token into every same-origin request (matches tech_ui).
@@ -49,7 +53,7 @@ export async function login(email, password) {
     throw new Error(d.detail || 'Invalid email or password');
   }
   const data = await r.json();
-  setAuth(data.access_token, data.email);
+  setAuth(data.access_token, data.email, data.role);
   return data;
 }
 
@@ -74,6 +78,7 @@ export function AuthProvider({ children }) {
   const [checking, setChecking] = useState(true);
   const [authed, setAuthed] = useState(false);
   const [email, setEmail] = useState(getEmail());
+  const [role, setRole] = useState(getRole());
 
   useEffect(() => {
     let alive = true;
@@ -91,6 +96,7 @@ export function AuthProvider({ children }) {
           clearAuth();
           setAuthed(false);
           setEmail('');
+          setRole('viewer');
         }
       });
     }, 5 * 60 * 1000);
@@ -100,6 +106,7 @@ export function AuthProvider({ children }) {
       clearAuth();
       setAuthed(false);
       setEmail('');
+      setRole('viewer');
     };
     window.addEventListener('auth:unauthorized', onUnauthorized);
     return () => {
@@ -112,6 +119,7 @@ export function AuthProvider({ children }) {
   const doLogin = useCallback(async (em, pw) => {
     const data = await login(em, pw);
     setEmail(data.email);
+    setRole(data.role || 'viewer');
     setAuthed(true);
     return data;
   }, []);
@@ -120,10 +128,11 @@ export function AuthProvider({ children }) {
     clearAuth();
     setAuthed(false);
     setEmail('');
+    setRole('viewer');
   }, []);
 
   return (
-    <AuthContext.Provider value={{ checking, authed, email, doLogin, doLogout }}>
+    <AuthContext.Provider value={{ checking, authed, email, role, isAdmin: role === 'admin', doLogin, doLogout }}>
       {children}
     </AuthContext.Provider>
   );

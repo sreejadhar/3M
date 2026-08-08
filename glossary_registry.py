@@ -27,7 +27,12 @@ link_asset(term_id, source_id, metadata_id, attr_id, confidence, match_method) -
 list_assets_for_term(term_id)                  -> List[dict]
 list_assets_for_source(source_id)              -> List[dict]  (delta-filter coverage set)
 list_all_linked_columns(exclude_source_id=None) -> List[dict]  (cross-source candidate pool)
+list_glossary_sources()                        -> List[dict]  (source_id, term_count with a generated glossary)
 list_audit(term_id)                            -> List[dict]
+add_relation(term_id, related_term_id, relationship_type="related") -> dict
+delete_relation(relation_id)                   -> bool
+list_relations(term_id)                        -> List[dict]  (both directions)
+list_all_relations()                           -> List[dict]  (bulk, for graph-building loops)
 create_job(source_id, force=False)             -> dict
 update_job(job_id, **fields)                   -> dict | None
 get_job(job_id)                                -> dict | None
@@ -516,6 +521,23 @@ def list_assets_for_source(source_id: str) -> List[Dict]:
     return [dict(r) for r in rows]
 
 
+def list_glossary_sources() -> List[Dict]:
+    """Every source_id that has at least one non-deprecated term linked via
+    biz_glossary_term_assets, i.e. sources whose Business Glossary has
+    actually been generated — used to scope the Business Ontology view to
+    only sources with real glossary coverage."""
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        rows = cur.execute(
+            "SELECT a.source_id, COUNT(DISTINCT a.term_id) AS term_count "
+            "FROM biz_glossary_term_assets a "
+            "JOIN biz_glossary_terms t ON t.term_id = a.term_id "
+            "WHERE t.status != 'deprecated' "
+            "GROUP BY a.source_id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_asset_link(metadata_id: str, attr_id: str = "") -> Optional[Dict]:
     """The term (if any) currently linked to a specific entity/attribute —
     used to check whether a column already has a governed term before
@@ -559,6 +581,60 @@ def list_audit(term_id: str) -> List[Dict]:
         _ensure(cur)
         rows = cur.execute(
             "SELECT * FROM biz_glossary_term_audit WHERE term_id=? ORDER BY changed_at", (term_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Term relations (broader/narrower/related/synonym scaffolding) ──────────────
+
+VALID_RELATIONSHIP_TYPES = {"broader", "narrower", "related", "synonym"}
+
+
+def add_relation(term_id: str, related_term_id: str, relationship_type: str = "related") -> Dict:
+    if relationship_type not in VALID_RELATIONSHIP_TYPES:
+        relationship_type = "related"
+    relation_id = str(uuid.uuid4())
+    now = _now()
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute(
+            "INSERT OR IGNORE INTO biz_glossary_term_relations "
+            "(relation_id, term_id, related_term_id, relationship_type, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (relation_id, term_id, related_term_id, relationship_type, now),
+        )
+    return {
+        "relation_id": relation_id, "term_id": term_id, "related_term_id": related_term_id,
+        "relationship_type": relationship_type, "created_at": now,
+    }
+
+
+def delete_relation(relation_id: str) -> bool:
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute("DELETE FROM biz_glossary_term_relations WHERE relation_id=?", (relation_id,))
+    return True
+
+
+def list_relations(term_id: str) -> List[Dict]:
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        rows = cur.execute(
+            "SELECT * FROM biz_glossary_term_relations WHERE term_id=? OR related_term_id=? "
+            "ORDER BY created_at",
+            (term_id, term_id),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_all_relations() -> List[Dict]:
+    """Bulk fetch of every relation row — for callers (e.g. business_ontology's
+    graph builder) that need relations for every term and would otherwise pay
+    a per-term connection/query cost via list_relations() in a loop."""
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        rows = cur.execute(
+            "SELECT * FROM biz_glossary_term_relations ORDER BY created_at"
         ).fetchall()
     return [dict(r) for r in rows]
 

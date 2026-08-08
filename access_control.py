@@ -69,7 +69,9 @@ _ALL_PERMISSIONS = (
     _ROLE_PERMISSIONS["viewer"]
     | _ROLE_PERMISSIONS["analyst"]
     | _ROLE_PERMISSIONS["manager"]
-    | {"manage_users", "manage_rbac", "delete_source"}
+    | {"manage_users", "manage_rbac", "delete_source",
+       "edit_business_ontology", "approve_business_ontology_term",
+       "manage_business_ontology_versions"}
 )
 _ROLE_PERMISSIONS["admin"] = _ALL_PERMISSIONS
 
@@ -231,6 +233,13 @@ def get_user(user_id: str) -> Optional[Dict]:
     with _cursor_ctx() as cur:
         _ensure(cur)
         row = cur.execute("SELECT * FROM ac_users WHERE user_id=?", (user_id,)).fetchone()
+    return _coerce_user(row) if row else None
+
+
+def get_user_by_email(email: str) -> Optional[Dict]:
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        row = cur.execute("SELECT * FROM ac_users WHERE lower(email)=lower(?)", (email,)).fetchone()
     return _coerce_user(row) if row else None
 
 

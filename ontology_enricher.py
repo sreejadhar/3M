@@ -106,6 +106,19 @@ CREATE TABLE IF NOT EXISTS enrichment_runs (
     status      TEXT NOT NULL DEFAULT 'running',
     stats_json  TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS glossary_kg_links (
+    link_id        TEXT PRIMARY KEY,
+    term_id        TEXT NOT NULL,
+    source_id      TEXT NOT NULL,
+    kg_node_id     TEXT NOT NULL,
+    target_node_id TEXT NOT NULL,
+    attr_id        TEXT NOT NULL DEFAULT '',
+    match_type     TEXT NOT NULL DEFAULT 'curated',
+    confidence     REAL NOT NULL DEFAULT 1.0,
+    created_at     TEXT NOT NULL,
+    UNIQUE(term_id, target_node_id)
+);
 """
 
 _schema_done = False
@@ -524,6 +537,188 @@ def _inject_kg_nodes() -> Dict[str, int]:
     )
     return {"sources_updated": sources_updated, "nodes_added": total_nodes,
             "edges_added": total_edges}
+
+
+# ── Pass 3: Governed business glossary → per-source KG ───────────────────────
+
+def enrich_source_kg_from_business_glossary(source_id: str) -> Dict[str, int]:
+    """
+    Enrich a single source's KG snapshot with nodes/edges derived from the
+    GOVERNED business glossary (biz_glossary_terms / glossary_registry.py,
+    generated per-source via glossary_generate.py, edited via
+    business_ontology.py) — distinct from _inject_kg_nodes(), which enriches
+    from the simpler glossary_store used for KPI/synonym definitions.
+
+    Curated term<->asset links (biz_glossary_term_assets, already scoped to
+    this source) are treated as authoritative; a term with no curated link
+    falls back to name-matching against this source's KG node properties.
+    Node id prefix `bizgloss:` (vs the legacy `glossary:`) keeps the two
+    pipelines from colliding. Scoped to `source_id` only — never touches
+    other sources' snapshots.
+
+    Returns {"terms_scanned": N, "nodes_added": M, "edges_added": K}.
+    """
+    _ensure_schema()
+
+    try:
+        import glossary_registry as _gr
+    except ImportError:
+        logger.warning("ontology_enricher: glossary_registry unavailable — skipping business glossary KG pass")
+        return {"terms_scanned": 0, "nodes_added": 0, "edges_added": 0}
+
+    try:
+        import metadata_catalog as _mc
+    except ImportError:
+        logger.warning("ontology_enricher: metadata_catalog unavailable — skipping business glossary KG pass")
+        return {"terms_scanned": 0, "nodes_added": 0, "edges_added": 0}
+
+    try:
+        import kg_store as _kg
+    except ImportError:
+        logger.warning("ontology_enricher: kg_store unavailable — skipping business glossary KG pass")
+        return {"terms_scanned": 0, "nodes_added": 0, "edges_added": 0}
+
+    terms = _gr.list_terms(source_id=source_id, status="approved")
+
+    nodes, edges = _kg.load_snapshot(source_id)
+    nodes = [n for n in nodes if not str(n.get("id", "")).startswith("bizgloss:")]
+    edges = [e for e in edges if e.get("label") != "BIZ_GLOSSARY_MATCHES"]
+
+    # Normalised property/label index over this source's *existing* KG nodes only.
+    prop_to_nodes: Dict[str, List[str]] = {}
+    label_to_nodes: Dict[str, List[str]] = {}
+    for node in nodes:
+        node_id = node.get("id", "")
+        if not node_id:
+            continue
+        ln = _norm(node.get("label", ""))
+        if ln:
+            label_to_nodes.setdefault(ln, []).append(node_id)
+        for prop in node.get("properties") or []:
+            pn = _norm(prop.get("name", "") or prop.get("column", ""))
+            if pn:
+                prop_to_nodes.setdefault(pn, []).append(node_id)
+
+    entity_cache: Dict[str, Optional[Dict]] = {}
+
+    def _get_entity(metadata_id: str) -> Optional[Dict]:
+        if metadata_id not in entity_cache:
+            entity_cache[metadata_id] = _mc.get_entity(metadata_id) if metadata_id else None
+        return entity_cache[metadata_id]
+
+    new_nodes: List[Dict] = []
+    new_edges: List[Dict] = []
+    link_rows: List[Tuple] = []
+    now = _now()
+
+    for term in terms:
+        term_id = term["term_id"]
+        node_id = f"bizgloss:{term_id}"
+
+        title_parts = [f"BUSINESS GLOSSARY: {term['preferred_name']}"]
+        if term.get("domain"):
+            title_parts.append(f"Domain: {term['domain']}")
+        if term.get("definition"):
+            title_parts.append(term["definition"])
+        if term.get("steward"):
+            title_parts.append(f"Steward: {term['steward']}")
+
+        new_nodes.append({
+            "id":    node_id,
+            "label": term["preferred_name"],
+            "title": "\n".join(title_parts),
+            "color": "#f472b6",   # pink — governed business glossary (distinct from KPI-glossary purple)
+            "size":  16,
+            "properties": [
+                {"name": "definition", "type": "text"},
+                {"name": "domain",     "type": "text"},
+            ],
+        })
+
+        matched_node_ids: Set[str] = set()
+
+        assets = [a for a in _gr.list_assets_for_term(term_id) if a.get("source_id") == source_id]
+        for asset in assets:
+            attr_id = asset.get("attr_id") or ""
+            entity = _get_entity(asset.get("metadata_id") or "")
+            if not entity:
+                continue
+            table_name = entity.get("table_name", "")
+            column_name = ""
+            if attr_id:
+                for attr in entity.get("attributes") or []:
+                    if attr.get("attr_id") == attr_id:
+                        column_name = attr.get("column_name", "")
+                        break
+
+            targets: Set[str] = set()
+            if column_name:
+                targets.update(prop_to_nodes.get(_norm(column_name), []))
+            if not targets and table_name:
+                targets.update(label_to_nodes.get(_norm(table_name), []))
+
+            for target_id in targets:
+                if target_id not in matched_node_ids:
+                    link_rows.append((
+                        str(uuid.uuid4()), term_id, source_id, node_id, target_id,
+                        attr_id, "curated", float(asset.get("confidence") or 1.0), now,
+                    ))
+                matched_node_ids.add(target_id)
+
+        if not matched_node_ids:
+            for target_id in prop_to_nodes.get(_norm(term["preferred_name"]), []):
+                if target_id not in matched_node_ids:
+                    link_rows.append((
+                        str(uuid.uuid4()), term_id, source_id, node_id, target_id,
+                        "", "name_match", 0.6, now,
+                    ))
+                matched_node_ids.add(target_id)
+
+        for target_id in matched_node_ids:
+            new_edges.append({
+                "from":  node_id,
+                "to":    target_id,
+                "label": "BIZ_GLOSSARY_MATCHES",
+                "title": f"{term['preferred_name']} → {target_id.split('/')[-1]}",
+                "join_columns": [],
+            })
+
+    _kg.save_snapshot(source_id, nodes + new_nodes, edges + new_edges)
+
+    with _cur() as conn:
+        conn.execute("DELETE FROM glossary_kg_links WHERE source_id=?", (source_id,))
+        if link_rows:
+            conn.executemany(
+                """INSERT OR IGNORE INTO glossary_kg_links
+                   (link_id,term_id,source_id,kg_node_id,target_node_id,attr_id,
+                    match_type,confidence,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                link_rows,
+            )
+
+    logger.info(
+        "ontology_enricher: business glossary KG pass — source=%s, %d terms, %d nodes, %d edges",
+        source_id[:8], len(terms), len(new_nodes), len(new_edges),
+    )
+    return {"terms_scanned": len(terms), "nodes_added": len(new_nodes), "edges_added": len(new_edges)}
+
+
+def get_business_glossary_kg_links(term_id: str, source_id: Optional[str] = None) -> List[Dict]:
+    """KG nodes/edges a governed glossary term currently enriches — reverse
+    lookup backing the 'Enriches KG' panel in BusinessOntology.jsx."""
+    _ensure_schema()
+    with _cur() as conn:
+        if source_id:
+            rows = conn.execute(
+                "SELECT * FROM glossary_kg_links WHERE term_id=? AND source_id=? ORDER BY created_at",
+                (term_id, source_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM glossary_kg_links WHERE term_id=? ORDER BY created_at",
+                (term_id,),
+            ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── Public entry points ───────────────────────────────────────────────────────

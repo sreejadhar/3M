@@ -109,6 +109,8 @@ export const rejectBizGlossaryTerm = (termId) => apiPost(`/metadata/glossary-ter
 export const listBusinessOntologySources = () => apiGet('/business-ontology/sources');
 export const generateBusinessOntology = (sourceId) => apiPost(`/business-ontology/${sourceId}/generate`);
 export const getBusinessOntologyDraft = (sourceId) => apiGet(`/business-ontology/${sourceId}/draft`);
+export const getBusinessOntologyTermKgLinks = (sourceId, termId) =>
+  apiGet(`/business-ontology/${sourceId}/terms/${termId}/kg-links`);
 export const saveBusinessOntologyDraftTtl = (sourceId, ttlContent) =>
   apiPut(`/business-ontology/${sourceId}/draft`, { ttl_content: ttlContent });
 export const updateBusinessOntologyTerm = (sourceId, termId, body) =>

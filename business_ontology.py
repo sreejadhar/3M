@@ -348,6 +348,12 @@ def generate_business_ontology(source_id: str, created_by: str = "",
                 "VALUES (?, ?, ?, '', ?, ?)",
                 (source_id, ttl_content, triple_count, created_by, now),
             )
+    try:
+        import ontology_enricher as _enricher
+        _enricher.enrich_source_kg_from_business_glossary(source_id)
+    except Exception:
+        logger.exception("business_ontology: KG enrichment failed for source %s", source_id)
+
     return {"source_id": source_id, "ttl_content": ttl_content, "triple_count": triple_count,
             "term_count": term_count, "updated_at": now}
 

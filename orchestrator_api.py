@@ -3926,6 +3926,23 @@ async def generate_source_glossary(source_id: str, background_tasks: BackgroundT
                 f"{stats['terms_created']} term(s) created, {stats['terms_linked']} column(s) linked, "
                 f"{stats['needs_review']} need review, {stats['skipped_existing']} already governed (skipped)",
             )
+            # Generation auto-approves high-confidence terms (see
+            # glossary_generate._status_for_confidence) — reflect those in this
+            # source's KG immediately, rather than waiting for someone to open
+            # the Business Ontology view or approve a term later.
+            try:
+                _progress("kg-enrich", "Enriching knowledge graph from generated glossary...")
+                kg_stats = await asyncio.to_thread(_enricher.enrich_source_kg_from_business_glossary, sid)
+                if sid in _sources:
+                    nodes, edges = _kg_store.load_snapshot(sid)
+                    _sources[sid]["kg_nodes"] = nodes
+                    _sources[sid]["kg_edges"] = edges
+                _push_index_event(
+                    sid, "glossary:kg-enrich", "done",
+                    f"{kg_stats['nodes_added']} glossary node(s), {kg_stats['edges_added']} edge(s) added to the KG",
+                )
+            except Exception as exc:
+                logger.warning("business glossary KG enrichment failed for %s: %s", sid[:8], exc)
         except Exception as exc:
             logger.warning("generate_glossary_for_source failed for %s: %s", sid[:8], exc)
             _push_index_event(sid, "glossary", "error", f"Business glossary generation failed: {exc}")
@@ -4007,12 +4024,34 @@ async def update_glossary_term_endpoint(term_id: str, req: UpdateGlossaryTermReq
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+def _reenrich_term_kg_sources(term_id: str, background_tasks: BackgroundTasks) -> None:
+    """Re-run business-glossary KG enrichment for every source this term is
+    linked to, so an approve/reject shows up in the KG without a manual
+    /ontology/enrich sweep."""
+    source_ids = {a["source_id"] for a in _gr.list_assets_for_term(term_id) if a.get("source_id")}
+
+    def _run():
+        for source_id in source_ids:
+            try:
+                _enricher.enrich_source_kg_from_business_glossary(source_id)
+                if source_id in _sources:
+                    nodes, edges = _kg_store.load_snapshot(source_id)
+                    _sources[source_id]["kg_nodes"] = nodes
+                    _sources[source_id]["kg_edges"] = edges
+            except Exception as exc:
+                logger.error("Business glossary KG re-enrichment failed for source %s: %s", source_id, exc)
+
+    if source_ids:
+        background_tasks.add_task(_run)
+
+
 @app.post("/metadata/glossary-terms/{term_id}/approve")
-async def approve_glossary_term_endpoint(term_id: str, request: Request):
+async def approve_glossary_term_endpoint(term_id: str, request: Request, background_tasks: BackgroundTasks):
     try:
         changed_by = _require_permission(request, "approve_business_ontology_term")
         if not _gr.approve_term(term_id, changed_by=changed_by):
             raise HTTPException(status_code=404, detail="Term not found")
+        _reenrich_term_kg_sources(term_id, background_tasks)
         return _gr.get_term(term_id)
     except HTTPException:
         raise
@@ -4021,11 +4060,12 @@ async def approve_glossary_term_endpoint(term_id: str, request: Request):
 
 
 @app.post("/metadata/glossary-terms/{term_id}/reject")
-async def reject_glossary_term_endpoint(term_id: str, request: Request):
+async def reject_glossary_term_endpoint(term_id: str, request: Request, background_tasks: BackgroundTasks):
     try:
         changed_by = _require_permission(request, "approve_business_ontology_term")
         if not _gr.reject_term(term_id, changed_by=changed_by):
             raise HTTPException(status_code=404, detail="Term not found")
+        _reenrich_term_kg_sources(term_id, background_tasks)
         return _gr.get_term(term_id)
     except HTTPException:
         raise
@@ -4076,6 +4116,16 @@ async def generate_business_ontology_endpoint(source_id: str, request: Request):
 async def get_business_ontology_draft_endpoint(source_id: str):
     try:
         return _bo.get_draft(source_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/business-ontology/{source_id}/terms/{term_id}/kg-links")
+async def get_business_ontology_term_kg_links_endpoint(source_id: str, term_id: str):
+    """Reverse lookup: which KG nodes/edges this term currently enriches in
+    the source's knowledge graph — backs the 'Enriches KG' panel in the UI."""
+    try:
+        return _enricher.get_business_glossary_kg_links(term_id, source_id=source_id)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

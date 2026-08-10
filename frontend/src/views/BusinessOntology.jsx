@@ -8,6 +8,7 @@ import {
   listBusinessOntologySources,
   generateBusinessOntology,
   getBusinessOntologyDraft,
+  getBusinessOntologyTermKgLinks,
   saveBusinessOntologyDraftTtl,
   updateBusinessOntologyTerm,
   deleteBusinessOntologyTerm,
@@ -50,6 +51,7 @@ export default function BusinessOntology() {
   const [form, setForm] = useState(EMPTY_FORM);
   const [relTarget, setRelTarget] = useState('');
   const [relType, setRelType] = useState('related');
+  const [kgLinks, setKgLinks] = useState(null); // null = loading, [] = none
 
   const [versionModalOpen, setVersionModalOpen] = useState(false);
   const [versionLabel, setVersionLabel] = useState('');
@@ -140,6 +142,10 @@ export default function BusinessOntology() {
     });
     setRelTarget('');
     setRelType('related');
+    setKgLinks(null);
+    getBusinessOntologyTermKgLinks(sourceId, term.term_id)
+      .then((links) => setKgLinks(Array.isArray(links) ? links : []))
+      .catch(() => setKgLinks([]));
   };
   const closeEdit = () => { if (!busy) setEditingTerm(null); };
   const setField = (k, v) => setForm((f) => ({ ...f, [k]: v }));
@@ -508,6 +514,22 @@ export default function BusinessOntology() {
                   <input value={form.steward} onChange={(e) => setField('steward', e.target.value)} />
                 </div>
               </div>
+            </div>
+
+            <div className="form-row">
+              <label>Enriches KG</label>
+              {kgLinks === null ? (
+                <div style={{ fontSize: 11, color: 'var(--text-2)' }}>Loading…</div>
+              ) : kgLinks.length === 0 ? (
+                <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
+                  Not linked to any graph nodes in this source's KG yet.
+                </div>
+              ) : (
+                <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
+                  Linked to {kgLinks.length} graph node{kgLinks.length === 1 ? '' : 's'} in this source's KG
+                  {' '}({kgLinks.map((l) => l.target_node_id.split('/').pop()).join(', ')})
+                </div>
+              )}
             </div>
 
             <div className="form-row">

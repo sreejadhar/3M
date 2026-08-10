@@ -9,28 +9,22 @@ import PipelineMonitor from './views/PipelineMonitor.jsx';
 import GraphExplorer from './views/GraphExplorer.jsx';
 import SchemaCatalog from './views/SchemaCatalog.jsx';
 import OntologyViewer from './views/OntologyViewer.jsx';
-import BusinessOntology from './views/BusinessOntology.jsx';
 import Redundancies from './views/Redundancies.jsx';
 import Glossary from './views/Glossary.jsx';
-import DataGlossary from './views/DataGlossary.jsx';
 import Kpi from './views/Kpi.jsx';
 import SqlConsole from './views/SqlConsole.jsx';
 import ChangeLog from './views/ChangeLog.jsx';
-import DocumentIntelligence from './views/DocumentIntelligence.jsx';
 
 const VIEWS = {
   pipeline: PipelineMonitor,
   graph: GraphExplorer,
   catalog: SchemaCatalog,
   ontology: OntologyViewer,
-  'business-ontology': BusinessOntology,
   redundancy: Redundancies,
   glossary: Glossary,
-  dataglossary: DataGlossary,
   kpi: Kpi,
   sql: SqlConsole,
   cdc: ChangeLog,
-  documents: DocumentIntelligence,
 };
 
 function Workbench() {

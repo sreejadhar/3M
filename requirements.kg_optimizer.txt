@@ -4,4 +4,4 @@ requests>=2.31.0
 
 # Reused from the existing agent packages (already installed alongside them):
 #   ontology_agent, knowledge_graph_agent, dialog_agent, llm_client
-#   anthropic[vertex], langgraph, numpy, scikit-learn
+#   anthropic[bedrock], boto3, langgraph, numpy, scikit-learn

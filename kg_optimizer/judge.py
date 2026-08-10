@@ -1,8 +1,8 @@
 """
 LLM-as-judge answer scoring. No such scoring code exists elsewhere in the repo
 (confirmed by exploration) — this is new. Uses llm_client.get_client(), the same
-Anthropic/Vertex-dispatching factory used by dialog_agent and kg_inference_engine,
-so it works unmodified against either local dev (ANTHROPIC_API_KEY) or GKE (Vertex).
+Anthropic/Bedrock-dispatching factory used by dialog_agent and kg_inference_engine,
+so it works unmodified against either local dev (ANTHROPIC_API_KEY) or prod (Bedrock).
 """
 from __future__ import annotations
 

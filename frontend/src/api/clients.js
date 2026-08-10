@@ -85,10 +85,7 @@ export const classifyPII = (id) => apiPost(`/metadata/sources/${id}/classify-pii
 export const detectBusiness = (id) => apiPost(`/metadata/sources/${id}/detect-business`);
 export const detectDomain = (id) => apiPost(`/metadata/sources/${id}/detect-domain`);
 
-// ── Business Glossary — governed term registry (distinct from the KPI/finance
-// glossary above: this one is discovered from schema, cross-source, on demand) ─
-export const generateSourceGlossary = (sourceId) =>
-  apiPost(`/metadata/sources/${sourceId}/generate-glossary`);
+// ── Business Glossary — governed term registry ─────────────────────────────
 export const getEntityGlossary = (metadataId) => apiGet(`/metadata/entities/${metadataId}/glossary`);
 export const listBizGlossaryTerms = (opts = {}) => {
   const qs = new URLSearchParams();
@@ -102,30 +99,6 @@ export const getBizGlossaryTerm = (termId) => apiGet(`/metadata/glossary-terms/$
 export const updateBizGlossaryTerm = (termId, body) => apiPatch(`/metadata/glossary-terms/${termId}`, body);
 export const approveBizGlossaryTerm = (termId) => apiPost(`/metadata/glossary-terms/${termId}/approve`);
 export const rejectBizGlossaryTerm = (termId) => apiPost(`/metadata/glossary-terms/${termId}/reject`);
-
-// ── Business Ontology — SKOS+OWL graph generated per-source from that
-// source's governed glossary above (distinct artifact from the per-source
-// structural ontology, and only offered for sources with a generated glossary) ─
-export const listBusinessOntologySources = () => apiGet('/business-ontology/sources');
-export const generateBusinessOntology = (sourceId) => apiPost(`/business-ontology/${sourceId}/generate`);
-export const getBusinessOntologyDraft = (sourceId) => apiGet(`/business-ontology/${sourceId}/draft`);
-export const saveBusinessOntologyDraftTtl = (sourceId, ttlContent) =>
-  apiPut(`/business-ontology/${sourceId}/draft`, { ttl_content: ttlContent });
-export const updateBusinessOntologyTerm = (sourceId, termId, body) =>
-  apiPatch(`/business-ontology/${sourceId}/terms/${termId}`, body);
-export const deleteBusinessOntologyTerm = (sourceId, termId) =>
-  apiDelete(`/business-ontology/${sourceId}/terms/${termId}`);
-export const addBusinessOntologyRelation = (sourceId, termId, relatedTermId, relationshipType) =>
-  apiPost(`/business-ontology/${sourceId}/relations`, {
-    term_id: termId, related_term_id: relatedTermId, relationship_type: relationshipType,
-  });
-export const saveBusinessOntologyVersion = (sourceId, label) =>
-  apiPost(`/business-ontology/${sourceId}/versions`, { label });
-export const listBusinessOntologyVersions = (sourceId) => apiGet(`/business-ontology/${sourceId}/versions`);
-export const getBusinessOntologyVersion = (sourceId, versionId) =>
-  apiGet(`/business-ontology/${sourceId}/versions/${versionId}`);
-export const restoreBusinessOntologyVersion = (sourceId, versionId) =>
-  apiPost(`/business-ontology/${sourceId}/versions/${versionId}/restore`);
 
 // ── KG bridges ──────────────────────────────────────────────────────────────
 export const listBridges = () => apiGet('/kg-bridges');
@@ -176,21 +149,3 @@ export const listKpiVersions = (id) => apiGet(`/kpis/${id}/versions`);
 export const rollbackKpiVersion = (id, versionNum) =>
   apiPost(`/kpis/${id}/versions/${versionNum}/rollback`, {});
 export const activateKpi = (id) => apiPost(`/kpis/${id}/activate`, {});
-
-// ── Document Intelligence (unstructured agent, port 8008) ─────────────────────
-// All routes proxy through the orchestrator: /unstructured/* → unstructured-api/*
-const _U = '/unstructured';
-export const listConnectorTypes = () => apiGet(`${_U}/connectors`);
-export const docListSources     = ()          => apiGet(`${_U}/sources`);
-export const docCreateSource    = (body)      => apiPost(`${_U}/sources`, body);
-export const docDeleteSource    = (id)        => apiDelete(`${_U}/sources/${id}`);
-export const docStartIndex      = (id)        => apiPost(`${_U}/sources/${id}/index`);
-export const docListJobs        = (id)        => apiGet(`${_U}/sources/${id}/jobs`);
-export const docListAssets      = (id)        => apiGet(`${_U}/sources/${id}/assets`);
-export const docGetAsset        = (assetId)   => apiGet(`${_U}/assets/${assetId}`);
-export const fsBrowse           = (path = '') => apiGet(`${_U}/fs/browse?path=${encodeURIComponent(path)}`);
-export const docUploadDocument  = (sourceId, file) => {
-  const fd = new FormData();
-  fd.append('file', file, file.name);
-  return apiUpload(`${_U}/sources/${sourceId}/upload`, fd);
-};

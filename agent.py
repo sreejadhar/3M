@@ -137,7 +137,7 @@ class MetadataExtractionAgent:
         self._graph = build_graph()
         self._report: Optional[Dict[str, Any]] = None
 
-        # Optional LLM for the interpret step — uses Vertex AI via llm_client
+        # Optional LLM for the interpret step — uses AWS Bedrock via llm_client
         from llm_client import get_client
         self._llm_client = get_client()
         self._llm_model  = config.llm_model

@@ -886,10 +886,9 @@ def get_attribute(attr_id: str) -> Optional[Dict]:
 def get_attributes_bulk(attr_ids: List[str]) -> Dict[str, Dict]:
     """Same lookup as get_attribute(), for many ids in one connection/query —
     _cursor_ctx() opens a fresh connection per call, so callers that need
-    attributes for a large candidate pool (e.g. glossary_generate.py's
-    cross-source pool, which can grow into the thousands as more sources get
-    glossaried) must not call get_attribute() in a per-id loop. Chunked to
-    stay under SQLite's default bound-parameter limit."""
+    attributes for a large candidate pool must not call get_attribute() in a
+    per-id loop. Chunked to stay under SQLite's default bound-parameter
+    limit."""
     out: Dict[str, Dict] = {}
     ids = [a for a in dict.fromkeys(attr_ids) if a]
     if not ids:

@@ -4,8 +4,7 @@ import { useAppState } from '../state.jsx';
 import { getGraph, listBridges } from '../api/clients.js';
 import { IconRefresh, IconGraph } from '../components/Icons.jsx';
 
-function nodeKind(label = '', id = '') {
-  if (String(id).startsWith('doc:')) return 'document';
+function nodeKind(label = '') {
   const s = String(label).toUpperCase();
   if (/FACT/.test(s)) return 'fact';
   if (/DIM/.test(s)) return 'dim';
@@ -19,9 +18,6 @@ const KIND_STYLE = {
   dim:      { background: '#11233e', border: '#58a6ff', glow: 'rgba(88,166,255,0.20)' },
   kpi:      { background: '#2a163a', border: '#bc8cff', glow: 'rgba(188,140,255,0.20)' },
   other:    { background: '#15202b', border: '#39c5cf', glow: 'rgba(57,197,207,0.18)' },
-  // Document Intelligence nodes — pink/magenta so they read as a distinct
-  // "kind" from any table/column node at a glance, even before reading labels.
-  document: { background: '#3d1530', border: '#ec4899', glow: 'rgba(236,72,153,0.30)' },
 };
 
 // Remote source node styles — vivid green backgrounds so they stand out immediately
@@ -30,7 +26,6 @@ const KIND_STYLE_REMOTE = {
   dim:  { background: '#0f3020', border: '#4ade80', glow: 'rgba(74,222,128,0.35)' },
   kpi:  { background: '#1a3820', border: '#4ade80', glow: 'rgba(74,222,128,0.35)' },
   other:{ background: '#132d18', border: '#4ade80', glow: 'rgba(74,222,128,0.30)' },
-  document: { background: '#132d18', border: '#4ade80', glow: 'rgba(74,222,128,0.30)' },
 };
 
 
@@ -69,8 +64,7 @@ function buildVisNodes(rawNodes, rawEdges, { idPrefix = '', remote = false, sour
   const maxDeg = Math.max(1, ...Object.values(degree));
 
   return rawNodes.map((n) => {
-    const kind      = nodeKind(n.label ?? n.id, n.id);
-    const isDoc     = kind === 'document';
+    const kind      = nodeKind(n.label ?? n.id);
     const st        = remote ? KIND_STYLE_REMOTE[kind] : KIND_STYLE[kind];
     const deg       = degree[n.id] || 0;
     const isHub     = kind === 'fact' || deg >= maxDeg * 0.6;
@@ -83,14 +77,12 @@ function buildVisNodes(rawNodes, rawEdges, { idPrefix = '', remote = false, sour
       title: remote
         ? `[${sourceName}] ${n.title || baseLabel}\n(remote source node)`
         : (n.title || ''),
-      // Documents get a pill/ellipse shape — visually distinct from every
-      // table/column node's box at a glance, on top of the pink color.
-      shape: isDoc ? 'ellipse' : 'box',
-      shapeProperties: isDoc ? {} : { borderRadius: 8 },
-      // Thick dashed border = remote; dotted = document; solid = primary table
-      borderDashes: remote ? [10, 5] : (isDoc ? [3, 3] : false),
+      shape: 'box',
+      shapeProperties: { borderRadius: 8 },
+      // Thick dashed border = remote; solid = primary table
+      borderDashes: remote ? [10, 5] : false,
       margin: { top: 8, bottom: 8, left: 12, right: 12 },
-      borderWidth: remote ? 3 : (isDoc ? 2.5 : (isHub ? 3 : 1.5)),
+      borderWidth: remote ? 3 : (isHub ? 3 : 1.5),
       color: {
         background: st.background,
         border:     st.border,
@@ -109,14 +101,11 @@ function buildVisNodes(rawNodes, rawEdges, { idPrefix = '', remote = false, sour
   });
 }
 
-const MENTIONS_STYLE = { color: 'rgba(236,72,153,0.55)', width: 1.2 };
-
 function buildVisEdges(rawEdges, idPrefix = '', muted = false) {
   return rawEdges.map((e, i) => {
-    const isMentions = e.label === 'mentions';
     const card = cardinalityOf(e);
     const cs   = muted ? { color: 'rgba(63,185,80,0.30)', width: 1 }
-                       : (isMentions ? MENTIONS_STYLE : ((card && CARD_STYLE[card]) || CARD_DEFAULT));
+                       : ((card && CARD_STYLE[card]) || CARD_DEFAULT);
     return {
       id:    idPrefix ? `${idPrefix}edge_${i}` : undefined,
       from:  idPrefix + e.from,
@@ -126,9 +115,9 @@ function buildVisEdges(rawEdges, idPrefix = '', muted = false) {
       arrows:{ to: { enabled: true, scaleFactor: muted ? 0.4 : (card === 'N:N' ? 0.8 : 0.6), type: 'arrow' } },
       color: { color: cs.color, highlight: cs.color, hover: '#ffffff', opacity: muted ? 0.5 : 1 },
       width: cs.width,
-      dashes: muted ? [3, 5] : (isMentions ? [2, 3] : (card === 'N:N' ? [6, 4] : false)),
+      dashes: muted ? [3, 5] : (card === 'N:N' ? [6, 4] : false),
       smooth: { enabled: true, type: 'dynamic', roundness: 0.5 },
-      font:  { color: muted ? 'transparent' : (isMentions ? MENTIONS_STYLE.color : (card ? cs.color : '#9fb2c8')), size: 10, face: 'Inter, sans-serif', strokeWidth: 4, strokeColor: '#0a0e1a', align: 'middle' },
+      font:  { color: muted ? 'transparent' : (card ? cs.color : '#9fb2c8'), size: 10, face: 'Inter, sans-serif', strokeWidth: 4, strokeColor: '#0a0e1a', align: 'middle' },
     };
   });
 }

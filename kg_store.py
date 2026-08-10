@@ -1,8 +1,16 @@
 """
 KG Snapshot Store — persists source registry + KG node/edge snapshots.
 
-In production (APP_ENV=production + KG_POSTGRES_DSN) stores in PostgreSQL.
-In dev/test stores in SQLite (KG_STORE_DB, default data/kg_store.db).
+Source registry (kg_sources: name, connection info, persona access, etc.) is
+always relational — SQLite in dev/test, PostgreSQL in production (APP_ENV=
+production + KG_POSTGRES_DSN).
+
+The KG snapshot itself (nodes/edges) additionally routes through Amazon
+Neptune when NEPTUNE_WRITER_ENDPOINT is configured in production — see
+neptune_store.py. Every snapshot function below keeps returning/accepting
+the exact same {nodes, edges} JSON shape regardless of which backend is
+active, so callers (GraphRAG retrieval, GraphExplorer.jsx, kg_bridges, etc.)
+never need to know or care.
 
 On server startup call ``load_all()`` to restore _sources from the last
 persisted snapshot so previously-indexed KGs are immediately available.
@@ -22,6 +30,8 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
+import neptune_store as _neptune
+
 logger = logging.getLogger(__name__)
 
 # ── Backend selection ──────────────────────────────────────────────────────────
@@ -37,6 +47,9 @@ def _use_postgres() -> bool:
         return True
     logger.warning("APP_ENV=production but KG_POSTGRES_DSN is not set — KG store uses SQLite.")
     return False
+
+def _use_neptune() -> bool:
+    return _is_production() and _neptune.enabled()
 
 def _sqlite_path() -> str:
     return os.environ.get("KG_STORE_DB", "data/kg_store.db")
@@ -145,8 +158,13 @@ def save(source: Dict) -> None:
     tables    = json.dumps(source.get("table_names") or [])
     report    = json.dumps(source.get("report")) if source.get("report") else None
     ontology  = source.get("ontology_content")
-    nodes     = json.dumps(source.get("kg_nodes") or [])
-    edges     = json.dumps(source.get("kg_edges") or [])
+    kg_nodes  = source.get("kg_nodes") or []
+    kg_edges  = source.get("kg_edges") or []
+    use_neptune = _use_neptune()
+    # When Neptune is active, the kg_snapshots blob columns are left empty —
+    # the graph itself lives in Neptune, keyed by the same source_id.
+    nodes     = "[]" if use_neptune else json.dumps(kg_nodes)
+    edges     = "[]" if use_neptune else json.dumps(kg_edges)
 
     with _cursor_ctx() as cur:
         _ensure(cur)
@@ -212,7 +230,10 @@ def save(source: Dict) -> None:
                 (sid, nodes, edges, now),
             )
 
-    logger.debug("kg_store.save: %s (%s nodes, %s edges)", sid[:8], len(source.get("kg_nodes") or []), len(source.get("kg_edges") or []))
+    if use_neptune:
+        _neptune.save_snapshot(sid, kg_nodes, kg_edges)
+
+    logger.debug("kg_store.save: %s (%s nodes, %s edges)", sid[:8], len(kg_nodes), len(kg_edges))
 
 
 def save_snapshot(source_id: str, nodes: List[Dict], edges: List[Dict]) -> None:
@@ -220,6 +241,12 @@ def save_snapshot(source_id: str, nodes: List[Dict], edges: List[Dict]) -> None:
     kg_sources row untouched. Used by knowledge_graph_agent's execute/embed
     nodes, which only know kg_id — not the full source record that
     orchestrator_api's save() manages."""
+    if _use_neptune():
+        _neptune.save_snapshot(source_id, nodes, edges)
+        logger.debug("kg_store.save_snapshot (neptune): %s (%d nodes, %d edges)",
+                      source_id[:8], len(nodes or []), len(edges or []))
+        return
+
     now = time.time()
     nodes_json = json.dumps(nodes or [])
     edges_json = json.dumps(edges or [])
@@ -242,6 +269,9 @@ def save_snapshot(source_id: str, nodes: List[Dict], edges: List[Dict]) -> None:
 def load_snapshot(source_id: str) -> "tuple[List[Dict], List[Dict]]":
     """Read back just the KG snapshot (nodes/edges) for source_id.
     Returns ([], []) if no snapshot exists."""
+    if _use_neptune():
+        return _neptune.load_snapshot(source_id)
+
     with _cursor_ctx() as cur:
         _ensure(cur)
         row = cur.execute(
@@ -266,6 +296,8 @@ def delete(source_id: str) -> None:
         _ensure(cur)
         cur.execute("DELETE FROM kg_sources    WHERE source_id=?", (source_id,))
         cur.execute("DELETE FROM kg_snapshots  WHERE source_id=?", (source_id,))
+    if _use_neptune():
+        _neptune.delete_snapshot(source_id)
     logger.info("kg_store.delete: %s", source_id[:8])
 
 
@@ -274,10 +306,11 @@ def load_all() -> List[Dict]:
     Restore all persisted sources (with KG snapshots) from the store.
     Returns a list of source dicts compatible with _sources in orchestrator_api.
     """
+    use_neptune = _use_neptune()
     with _cursor_ctx() as cur:
         _ensure(cur)
         src_rows  = cur.execute("SELECT * FROM kg_sources").fetchall()
-        snap_rows = cur.execute("SELECT * FROM kg_snapshots").fetchall()
+        snap_rows = [] if use_neptune else cur.execute("SELECT * FROM kg_snapshots").fetchall()
 
     snap_by_id = {r["source_id"]: r for r in snap_rows}
     result = []
@@ -299,14 +332,17 @@ def load_all() -> List[Dict]:
             report = json.loads(r["report_json"]) if r.get("report_json") else None
         except Exception:
             report = None
-        try:
-            nodes = json.loads(snap.get("nodes_json") or "[]")
-        except Exception:
-            nodes = []
-        try:
-            edges = json.loads(snap.get("edges_json") or "[]")
-        except Exception:
-            edges = []
+        if use_neptune:
+            nodes, edges = _neptune.load_snapshot(r["source_id"])
+        else:
+            try:
+                nodes = json.loads(snap.get("nodes_json") or "[]")
+            except Exception:
+                nodes = []
+            try:
+                edges = json.loads(snap.get("edges_json") or "[]")
+            except Exception:
+                edges = []
 
         result.append({
             "id":               r["source_id"],

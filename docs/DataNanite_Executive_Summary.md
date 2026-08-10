@@ -58,7 +58,6 @@ Database → Profile & Infer → Ontology → Knowledge Graph → Ask in English
 | **DataChat** | Natural-language Q&A → verified SQL → narrative + charts |
 | **Cross-source Bridges** | Links the same entity across different databases |
 | **SHACL Validation** | Quality-checks the ontology (PASS / WARN / FAIL) |
-| **Unstructured Documents** | Fingerprints reports/docs and links them to KPIs & tables |
 | **Business Glossary & KPI Registry** | Governed definitions and metric formulas |
 
 Each capability is an independent service coordinated by an **orchestrator** that

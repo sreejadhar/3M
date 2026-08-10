@@ -19,15 +19,13 @@ COPY excel_export.py .
 COPY metadata_catalog.py .
 COPY kpi_store.py .
 COPY kg_store.py .
+COPY neptune_store.py .
+COPY aws_auth.py .
 COPY session_store.py .
 COPY access_control.py .
 COPY ontology_enricher.py .
 COPY glossary_store.py .
 COPY glossary_registry.py .
-COPY glossary_generate.py .
-COPY business_ontology.py .
-COPY glossary_nlp.py .
-COPY glossary_matcher.py .
 COPY llm_client.py .
 COPY business_classifier.py .
 COPY domain_classifier.py .

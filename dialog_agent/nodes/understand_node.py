@@ -1293,12 +1293,8 @@ def understand_node(state: DialogState) -> DialogState:
     # Gated dynamically per-source rather than by a static on/off switch: only
     # active for sources that actually HAVE an approved generated glossary
     # (glossary_registry.list_terms(source_id, status="approved") non-empty).
-    # Note: biz_glossary_jobs is not a reliable signal here — the
-    # generate-glossary endpoint (orchestrator_api.generate_source_glossary)
-    # calls generate_glossary_for_source directly and never writes a job
-    # record, so every source shows zero jobs even when terms exist. Term
-    # existence is therefore both the gate AND the content in one query.
-    # Sources that never ran "Generate Business Glossary" see zero terms and
+    # Term existence is therefore both the gate AND the content in one query.
+    # Sources with no approved generated-glossary terms see zero terms and
     # no change to their prompt. generated_glossary_enabled remains a global
     # kill-switch for ops to force this off everywhere regardless of
     # per-source state.

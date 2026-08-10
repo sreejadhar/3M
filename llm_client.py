@@ -5,22 +5,31 @@ requires changes only in this file.
 
 Provider selection:
   • If ANTHROPIC_API_KEY is set (local dev), use the direct Anthropic API.
-    Vertex-style model ids (claude-sonnet-4-6, claude-haiku-4-5, claude-opus-4-x)
+    Loose model ids (claude-sonnet-4-6, claude-haiku-4-5, claude-opus-4-x)
     are normalised by tier to valid public-API ids so the ~20 call sites that
-    pass Vertex ids keep working unchanged.
-  • Otherwise use GCP Vertex AI (AnthropicVertex) via Application Default
-    Credentials — the production/GKE path (node service account has
-    roles/aiplatform.user; no key needed at runtime).
+    pass those ids keep working unchanged.
+  • Otherwise use AWS Bedrock (AnthropicBedrock) via a cross-account IAM role
+    assumed through STS — the production path. The host (EC2 instance role,
+    or whatever credentials boto3's default chain finds) must be allowed to
+    sts:AssumeRole on BEDROCK_ROLE_ARN; no API key is needed at runtime.
+    Model ids are mapped by tier to the application inference profile ARNs
+    below (required by Bedrock for cost tracking — invoking the bare
+    foundation-model id instead would bypass that tracking).
 
 Config:
-  ANTHROPIC_API_KEY  — direct Anthropic API key (enables local dev path)
-  GCP_PROJECT_ID     — GCP project ID (Vertex path)
-  VERTEX_REGION      — Vertex AI region (default: us-east5)
+  ANTHROPIC_API_KEY         — direct Anthropic API key (enables local dev path)
+  BEDROCK_ROLE_ARN          — cross-account role to assume for Bedrock access
+  BEDROCK_REGION            — Bedrock region (default: us-east-1)
+  BEDROCK_HAIKU_PROFILE_ARN  — application inference profile ARN for Haiku
+  BEDROCK_SONNET_PROFILE_ARN — application inference profile ARN for Sonnet
+  BEDROCK_OPUS_PROFILE_ARN   — application inference profile ARN for Opus
 """
 import logging
 import os
 import socket
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import anthropic
 
@@ -90,7 +99,7 @@ def _configure_hf_offline_mode() -> None:
 
 _configure_hf_offline_mode()
 
-# Map a Vertex-style / loose model id to a valid public Anthropic API id by tier.
+# Map a loose tier-style model id to a valid public Anthropic API id by tier.
 # Targets are the current canonical ids for each tier.
 _DIRECT_HAIKU = "claude-haiku-4-5-20251001"
 _DIRECT_SONNET = "claude-sonnet-4-6"
@@ -157,7 +166,7 @@ class _RemapMessages(_TimedMessages):
     def _prepare(self, kwargs):
         if "model" in kwargs:
             kwargs["model"] = _normalize_model(kwargs["model"])
-        # The pipeline was built for 1M-token-context models (the Vertex setup),
+        # The pipeline was built for 1M-token-context models in production,
         # so enable the 1M context beta on the public API too — otherwise large
         # plan/synthesis prompts overflow the default 200k window.
         hdrs = dict(kwargs.get("extra_headers") or {})
@@ -180,29 +189,114 @@ class _DirectClient:
         return getattr(self._inner, name)
 
 
-class _VertexClient:
-    """Wraps AnthropicVertex so .messages calls are timed; everything else
-    passes through unchanged (no model-id remapping needed on this path)."""
+_BEDROCK_ROLE_ARN = os.environ.get(
+    "BEDROCK_ROLE_ARN",
+    "arn:aws:iam::336756484937:role/datananite-dev-execution-role",
+)
+_BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-east-1")
+
+# Application inference profile ARNs — Bedrock requires invoking these rather
+# than the bare foundation-model id so usage/cost is attributed correctly.
+_BEDROCK_PROFILE_ARNS = {
+    "haiku": os.environ.get(
+        "BEDROCK_HAIKU_PROFILE_ARN",
+        "arn:aws:bedrock:us-east-1:336756484937:application-inference-profile/wfd1mwndgpsn",
+    ),
+    "sonnet": os.environ.get(
+        "BEDROCK_SONNET_PROFILE_ARN",
+        "arn:aws:bedrock:us-east-1:336756484937:application-inference-profile/qp3hg66g81b3",
+    ),
+    "opus": os.environ.get(
+        "BEDROCK_OPUS_PROFILE_ARN",
+        "arn:aws:bedrock:us-east-1:336756484937:application-inference-profile/5lrrvuwa9oy0",
+    ),
+}
+
+
+def _normalize_bedrock_model(model: str) -> str:
+    s = (model or "").lower()
+    if "haiku" in s:
+        return _BEDROCK_PROFILE_ARNS["haiku"]
+    if "opus" in s:
+        return _BEDROCK_PROFILE_ARNS["opus"]
+    if "sonnet" in s:
+        return _BEDROCK_PROFILE_ARNS["sonnet"]
+    return model
+
+
+class _RemapBedrockMessages(_TimedMessages):
+    """Proxy for client.messages that rewrites the `model` kwarg from a loose
+    tier-style id to the matching application inference profile ARN."""
+
+    def _prepare(self, kwargs):
+        if "model" in kwargs:
+            kwargs["model"] = _normalize_bedrock_model(kwargs["model"])
+        return kwargs
+
+
+class _BedrockClient:
+    """Wraps AnthropicBedrock so .messages remaps model ids to inference
+    profile ARNs; everything else passes through unchanged."""
 
     def __init__(self, inner):
         self._inner = inner
-        self.messages = _TimedMessages(inner.messages)
+        self.messages = _RemapBedrockMessages(inner.messages)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+# Assumed-role credentials expire (default STS session is 1h) — cache the
+# client and re-assume the role shortly before expiry instead of on every
+# call, and guard the refresh with a lock since multiple request threads can
+# race to refresh at once in a multi-worker/multi-thread service.
+_bedrock_lock = threading.Lock()
+_bedrock_client = None
+_bedrock_expiry = None
+
+
+def _assume_bedrock_role():
+    import boto3
+
+    sts = boto3.client("sts", region_name=_BEDROCK_REGION)
+    resp = sts.assume_role(
+        RoleArn=_BEDROCK_ROLE_ARN,
+        RoleSessionName="datananite-bedrock",
+    )
+    return resp["Credentials"]
+
+
+def _get_bedrock_client():
+    global _bedrock_client, _bedrock_expiry
+    now = datetime.now(timezone.utc)
+    with _bedrock_lock:
+        if _bedrock_client is None or _bedrock_expiry is None or now >= _bedrock_expiry - timedelta(minutes=5):
+            creds = _assume_bedrock_role()
+            inner = anthropic.AnthropicBedrock(
+                aws_access_key=creds["AccessKeyId"],
+                aws_secret_key=creds["SecretAccessKey"],
+                aws_session_token=creds["SessionToken"],
+                aws_region=_BEDROCK_REGION,
+            )
+            _bedrock_client = _BedrockClient(inner)
+            _bedrock_expiry = creds["Expiration"]
+            logger.info(
+                "llm_client: assumed Bedrock role %s, credentials valid until %s",
+                _BEDROCK_ROLE_ARN, _bedrock_expiry,
+            )
+    return _bedrock_client
 
 
 def get_client():
     """Return an Anthropic-compatible client.
 
     Local dev: set ANTHROPIC_API_KEY in .env → direct Anthropic API.
-    GKE/prod:  leave it unset → Vertex AI with ADC
-               (run `gcloud auth application-default login` to use Vertex locally).
+    Prod:      leave it unset → AWS Bedrock via an assumed cross-account role
+               (boto3's default credential chain must be able to reach
+               BEDROCK_ROLE_ARN — e.g. the EC2 instance role in production).
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if api_key:
         return _DirectClient(anthropic.Anthropic(api_key=api_key))
 
-    project_id = os.environ.get("GCP_PROJECT_ID", "cog01k24f1ea555zdv7ynzthxanz5")
-    vertex_region = os.environ.get("VERTEX_REGION", "us-east5")
-    return _VertexClient(anthropic.AnthropicVertex(region=vertex_region, project_id=project_id))
+    return _get_bedrock_client()

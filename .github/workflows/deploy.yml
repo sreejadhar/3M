@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
 
 env:
-  PROJECT_ID: cog01k24f1ea555zdv7ynzthxanz5
-  GKE_CLUSTER: lvp-fastapi-cluster
-  GKE_ZONE: asia-south1-a
-  NAMESPACE: datananite2
+  PROJECT_ID: ""
+  GKE_CLUSTER: ""
+  GKE_ZONE: ""
+  NAMESPACE: ""
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -36,40 +36,10 @@ jobs:
       run: |
         gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
 
-    - name: Guard — reject placeholder JWT_SECRET
-      run: |
-        # Fail if the GitHub Actions secret itself looks like a placeholder
-        if echo "${{ secrets.JWT_SECRET }}" | grep -qiE "^$|CHANGE_ME|openssl"; then
-          echo "FATAL: JWT_SECRET GitHub secret is empty or placeholder. Generate one with: openssl rand -hex 32"
-          exit 1
-        fi
-
     - name: Update K8s secrets from GitHub Actions secrets
       run: |
         kubectl create secret generic datananite-secrets \
           --namespace=$NAMESPACE \
-          --from-literal=ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} \
-          --from-literal=GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }} \
-          --from-literal=VERTEX_REGION=${{ secrets.VERTEX_REGION }} \
-          --from-literal=JWT_SECRET=${{ secrets.JWT_SECRET }} \
-          --from-literal=SEED_PASSWORD_RIMNA=${{ secrets.SEED_PASSWORD_RIMNA }} \
-          --from-literal=SEED_PASSWORD_IYER=${{ secrets.SEED_PASSWORD_IYER }} \
-          --from-literal=SEED_PASSWORD_SENTHEESH=${{ secrets.SEED_PASSWORD_SENTHEESH }} \
-          --from-literal=SEED_PASSWORD_HARPREET=${{ secrets.SEED_PASSWORD_HARPREET }} \
-          --from-literal=SEED_PASSWORD_SUNIL=${{ secrets.SEED_PASSWORD_SUNIL }} \
-          --from-literal=SEED_PASSWORD_SATHISH=${{ secrets.SEED_PASSWORD_SATHISH }} \
-          --from-literal=SEED_PASSWORD_PALASH=${{ secrets.SEED_PASSWORD_PALASH }} \
-          --from-literal=SEED_PASSWORD_SASWATA=${{ secrets.SEED_PASSWORD_SASWATA }} \
-          --from-literal=SEED_PASSWORD_MURUGESH=${{ secrets.SEED_PASSWORD_MURUGESH }} \
-          --from-literal=SEED_PASSWORD_JISHNU=${{ secrets.SEED_PASSWORD_JISHNU }} \
-          --from-literal=SEED_PASSWORD_HEMANT=${{ secrets.SEED_PASSWORD_HEMANT }} \
-          --from-literal=SEED_PASSWORD_SAMIR=${{ secrets.SEED_PASSWORD_SAMIR }} \
-          --from-literal=SEED_PASSWORD_SOUMEN=${{ secrets.SEED_PASSWORD_SOUMEN }} \
-          --from-literal=SEED_PASSWORD_ANNAL=${{ secrets.SEED_PASSWORD_ANNAL }} \
-          --from-literal=SEED_PASSWORD_SIVAKUMAR=${{ secrets.SEED_PASSWORD_SIVAKUMAR }} \
-          --from-literal=SEED_PASSWORD_SREEJA=${{ secrets.SEED_PASSWORD_SREEJA }} \
-          --from-literal=SEED_PASSWORD_SUSMITA=${{ secrets.SEED_PASSWORD_SUSMITA }} \
-          --from-literal=SEED_PASSWORD_ADITYA=${{ secrets.SEED_PASSWORD_ADITYA }} \
           --dry-run=client -o yaml | kubectl apply -f -
 
     - name: Apply Namespace, ConfigMap and PVCs
@@ -78,7 +48,6 @@ jobs:
         kubectl apply -f deployment/k8s/pvc2.yaml
         kubectl apply -f deployment/k8s/configmap.yaml
         kubectl apply -f deployment/k8s/orchestrator-api.yaml
-        kubectl apply -f deployment/k8s/unstructured-api.yaml
 
   # ── Job 1: Build → Push → Deploy each service fully in parallel ───────────────
   build-push-deploy:
@@ -99,7 +68,6 @@ jobs:
           - { name: shacl-api,        image: datananite-shacl,        dockerfile: Dockerfile.shacl,        deployment: shacl-api,        container: shacl-api }
           - { name: streamlit-ui,     image: datananite-ui,           dockerfile: Dockerfile.ui,           deployment: streamlit-ui,     container: streamlit-ui }
           - { name: orchestrator-api, image: datananite-orchestrator, dockerfile: Dockerfile.orchestrator, deployment: orchestrator-api, container: orchestrator-api }
-          - { name: unstructured-api, image: datananite-unstructured, dockerfile: Dockerfile.unstructured, deployment: unstructured-api, container: unstructured-api }
 
     steps:
     - name: Checkout code

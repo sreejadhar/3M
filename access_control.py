@@ -70,8 +70,7 @@ _ALL_PERMISSIONS = (
     | _ROLE_PERMISSIONS["analyst"]
     | _ROLE_PERMISSIONS["manager"]
     | {"manage_users", "manage_rbac", "delete_source",
-       "edit_business_ontology", "approve_business_ontology_term",
-       "manage_business_ontology_versions"}
+       "edit_glossary_term", "approve_glossary_term"}
 )
 _ROLE_PERMISSIONS["admin"] = _ALL_PERMISSIONS
 

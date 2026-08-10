@@ -7,7 +7,6 @@ import {
   IconRedundancy,
   IconSql,
   IconCdc,
-  IconDocuments,
   IconGlossary,
   IconKpi,
 } from './Icons.jsx';
@@ -19,12 +18,9 @@ const OBSERVE = [
 const INSPECT = [
   ['catalog', IconCatalog, 'Schema Catalog'],
   ['ontology', IconOntology, 'Ontology Viewer'],
-  ['business-ontology', IconOntology, 'Business Ontology'],
   ['redundancy', IconRedundancy, 'Redundancies'],
   ['glossary', IconGlossary, 'Business Glossary'],
-  ['dataglossary', IconGlossary, 'Business Glossary (Discovery)'],
   ['kpi', IconKpi, 'KPI Registry'],
-  ['documents', IconDocuments, 'Document Intelligence'],
 ];
 const DEVELOP_COMING = [];
 

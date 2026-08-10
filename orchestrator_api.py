@@ -64,8 +64,6 @@ if _PROJECT_ROOT not in sys.path:
 
 import metadata_catalog as _mc   # standalone catalog module (no dialog_agent dep)
 import glossary_registry as _gr        # governed business-glossary term registry
-import glossary_generate as _gg        # on-demand cross-source glossary discovery
-import business_ontology as _bo        # SKOS+OWL business ontology generated from the glossary
 import kpi_store as _kpi              # BI Manager KPI definitions
 import kg_store as _kg_store           # KG snapshot persistence
 import session_store as _sess_store     # chat session + history persistence
@@ -225,7 +223,6 @@ ONTOLOGY_API = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001")
 KG_API       = os.environ.get("KG_API_URL",       "http://localhost:8002")
 DIALOG_API   = os.environ.get("DIALOG_API_URL",   "http://localhost:8003")
 SHACL_API          = os.environ.get("SHACL_API_URL",          "http://localhost:8007")
-UNSTRUCTURED_API   = os.environ.get("UNSTRUCTURED_API_URL",   "http://localhost:8008")
 
 DATA_DIR  = Path(os.environ.get("DATA_DIR", "./reports"))
 UI_DIR    = Path(__file__).parent / "chat_ui"
@@ -244,24 +241,9 @@ _AUTH_DB_PATH = Path(os.environ.get("DATA_DIR", "./data")) / "auth.db"
 
 # Seed users: env var name → email
 _SEED_USERS = [
-    ("SEED_PASSWORD_SIVAKUMAR",      "Sivakumar.Shanmugam2@cognizant.com"),
-    ("SEED_PASSWORD_RIMNA",      "Rimna.Radhakrishnan@cognizant.com"),
-    ("SEED_PASSWORD_IYER",       "Iyer.Kasinath@cognizant.com"),
-    ("SEED_PASSWORD_SENTHEESH",  "Sentheesh.Lingam@cognizant.com"),
-    ("SEED_PASSWORD_HARPREET",   "Harpreet.Sethi@cognizant.com"),
-    ("SEED_PASSWORD_SUNIL",      "Sunil.Pinnamaneni@cognizant.com"),
-    ("SEED_PASSWORD_SATHISH",    "Sathish.Hegde@cognizant.com"),
     ("SEED_PASSWORD_PALASH",     "Palash.Ghosh@cognizant.com"),
-    ("SEED_PASSWORD_SASWATA",    "Saswata.Kundu@cognizant.com"),
-    ("SEED_PASSWORD_MURUGESH",   "Murugesh.Mayandi@cognizant.com"),
-    ("SEED_PASSWORD_JISHNU",     "Jishnu.Chatterji@cognizant.com"),
-    ("SEED_PASSWORD_HEMANT",     "Hemant.Singhal@cognizant.com"),
-    ("SEED_PASSWORD_SAMIR",      "Samir.Sawant@cognizant.com"),
-    ("SEED_PASSWORD_SOUMEN",     "Soumen.Das5@cognizant.com"),
-    ("SEED_PASSWORD_ANNAL",      "Annal.Tamizhnambi@cognizant.com"),
     ("SEED_PASSWORD_SREEJA",     "sreeja.dhar@cognizant.com"),
-    ("SEED_PASSWORD_SUSMITA",     "Sushmita.Sahu@cognizant.com"),
-    ("SEED_PASSWORD_ADITYA",      "AdityaSankar.Sarkar@cognizant.com"),
+
 ]
 
 
@@ -735,8 +717,8 @@ def _current_user_email(request: Request) -> Optional[str]:
 def _require_permission(request: Request, action: str) -> str:
     """Raise 403 if the authenticated user's role lacks `action`. No-op
     outside APP_ENV=production, matching access_control.is_enforced(). Used
-    to admin-gate Business Ontology edit/version routes. Returns the caller's
-    email for audit purposes (empty string if unauthenticated)."""
+    to admin-gate glossary edit/approve routes. Returns the caller's email
+    for audit purposes (empty string if unauthenticated)."""
     email = _current_user_email(request) or ""
     if _ac.is_enforced():
         user = _ac.get_user_by_email(email) if email else None
@@ -3095,119 +3077,6 @@ async def get_source_graph(source_id: str):
     }
 
 
-class DocumentGraphLink(BaseModel):
-    mention: str
-    mention_type: str = "ENTITY"
-    matched_table: str
-    matched_column: Optional[str] = None
-    confidence: float = 0.5
-    basis: str = "unknown"
-
-
-class LinkDocumentToGraphRequest(BaseModel):
-    asset_id: str
-    file_name: str
-    links: List[DocumentGraphLink] = []
-
-
-@app.post("/sources/{source_id}/graph/link-document")
-async def link_document_to_graph(source_id: str, req: LinkDocumentToGraphRequest):
-    """
-    Adds a Document Intelligence cross-modal link as a node + edges in this
-    source's in-memory KG, so linked documents show up in Graph Explorer
-    alongside the tables/columns they discuss.
-
-    Additive only: never removes or modifies existing table/column nodes or
-    edges. Re-linking the same document (e.g. after a reindex) replaces just
-    that document's own edges rather than accumulating duplicates.
-    """
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
-
-    nodes = s.setdefault("kg_nodes", [])
-    edges = s.setdefault("kg_edges", [])
-
-    doc_node_id = f"doc:{req.asset_id}"
-    table_node_id = {}
-    for n in nodes:
-        label = str(n.get("label") or "").strip().upper()
-        if label and label not in table_node_id:
-            table_node_id[label] = n["id"]
-
-    if not any(n.get("id") == doc_node_id for n in nodes):
-        nodes.append({
-            "id": doc_node_id,
-            "label": f"📄 {req.file_name}",
-            "title": f"Document: {req.file_name}\n(from Document Intelligence)",
-        })
-
-    # Drop this document's previous edges before adding the current set —
-    # keeps a reindex from piling up stale duplicates.
-    edges[:] = [e for e in edges if e.get("from") != doc_node_id]
-
-    linked = 0
-    unmatched = []
-    for link in req.links:
-        target = table_node_id.get(link.matched_table.strip().upper())
-        if not target:
-            unmatched.append(link.matched_table)
-            continue
-        detail = f"\"{link.mention}\" ({link.mention_type})"
-        if link.matched_column:
-            detail += f" → {link.matched_table}.{link.matched_column}"
-        else:
-            detail += f" → {link.matched_table}"
-        edges.append({
-            "from": doc_node_id,
-            "to": target,
-            "label": "mentions",
-            "title": f"{detail}\nconfidence={link.confidence} · basis={link.basis}",
-        })
-        linked += 1
-
-    try:
-        _kg_store.save(s)
-    except Exception as exc:
-        logger.warning("kg_store.save after document link failed (non-fatal): %s", exc)
-
-    return {"linked": linked, "unmatched_tables": sorted(set(unmatched)), "node_id": doc_node_id}
-
-
-@app.delete("/sources/{source_id}/graph/documents/{asset_id}")
-async def unlink_document_from_graph(source_id: str, asset_id: str):
-    """
-    Removes a Document Intelligence document's node + edges from this
-    source's KG — called when the document (or its whole document source)
-    is deleted in Document Intelligence, so a removed document doesn't keep
-    showing up as a "ghost" node in Graph Explorer or get pulled into
-    DataChat's document context after it no longer exists.
-
-    Not an error if the document was never linked to this source — deleting
-    something absent is a no-op, matching this KG's additive-only design.
-    """
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
-
-    doc_node_id = f"doc:{asset_id}"
-    nodes = s.setdefault("kg_nodes", [])
-    edges = s.setdefault("kg_edges", [])
-
-    before = len(nodes)
-    nodes[:] = [n for n in nodes if n.get("id") != doc_node_id]
-    edges[:] = [e for e in edges if e.get("from") != doc_node_id and e.get("to") != doc_node_id]
-    removed = before - len(nodes)
-
-    if removed:
-        try:
-            _kg_store.save(s)
-        except Exception as exc:
-            logger.warning("kg_store.save after document unlink failed (non-fatal): %s", exc)
-
-    return {"removed": bool(removed), "node_id": doc_node_id}
-
-
 @app.get("/sources/{source_id}/ontology")
 async def get_source_ontology(source_id: str):
     """Return the OWL/Turtle ontology text for an indexed source."""
@@ -3867,79 +3736,6 @@ async def enrich_source_taxonomy(source_id: str, background_tasks: BackgroundTas
             "message": "Taxonomy enrichment started in background"}
 
 
-# ── Business Glossary (governed, cross-source, on-demand) ──────────────────────
-# NOT part of the indexing pipeline — only invoked by the "Generate Business
-# Glossary" button in Schema Catalog, scoped to a single source at a time.
-
-@app.post("/metadata/sources/{source_id}/generate-glossary", status_code=202)
-async def generate_source_glossary(source_id: str, background_tasks: BackgroundTasks):
-    """
-    Discover and govern business glossary terms for every table in a source:
-    NLP normalization -> canonical-term match -> cross-source structural/
-    semantic match against every OTHER already-glossaried source -> LLM
-    fallback for anything unmatched. Runs in the background with SSE
-    progress, same convention as enrich-taxonomy above.
-    """
-    async def _run_glossary(sid: str) -> None:
-        # domain_classifier persists the LLM sub-domain label independently of
-        # _sources[sid]["domain"] (a separate, admin-editable/heuristic field
-        # that is usually blank) — same cache-only read pattern as
-        # business_classifier below. Falls back to the free-text field only if
-        # the source was never classified.
-        src_domain = ""
-        try:
-            import domain_classifier as _dc
-            cached_domain = _dc.get_cached_label(sid)
-            if cached_domain:
-                src_domain = cached_domain.get("sub_domain", "") or ""
-        except Exception as exc:
-            logger.debug("generate-glossary: domain label unavailable for %s — %s", sid[:8], exc)
-        if not src_domain:
-            src_domain = (_sources.get(sid) or {}).get("domain", "") or ""
-
-        src_business = ""
-        try:
-            import business_classifier as _bc
-            cached = _bc.get_cached_label(sid)
-            if cached:
-                src_business = cached.get("business", "") or ""
-        except Exception as exc:
-            logger.debug("generate-glossary: business label unavailable for %s — %s", sid[:8], exc)
-        _source_event_log[sid] = []
-
-        def _progress(stage: str, message: str) -> None:
-            _push_index_event(sid, f"glossary:{stage}", "running", message)
-
-        try:
-            # generate_glossary_for_source is synchronous end-to-end (SQLite +
-            # network LLM calls) — running it directly here would block this
-            # entire process's event loop for the whole run, freezing every
-            # other request (including the SSE progress stream itself) until
-            # it finishes. asyncio.to_thread hands it to a worker thread so
-            # the event loop — and progress polling — stays responsive.
-            stats = await asyncio.to_thread(
-                _gg.generate_glossary_for_source, sid,
-                domain=src_domain, business=src_business, progress_cb=_progress,
-            )
-            _push_index_event(
-                sid, "glossary", "done",
-                f"{stats['terms_created']} term(s) created, {stats['terms_linked']} column(s) linked, "
-                f"{stats['needs_review']} need review, {stats['skipped_existing']} already governed (skipped)",
-            )
-        except Exception as exc:
-            logger.warning("generate_glossary_for_source failed for %s: %s", sid[:8], exc)
-            _push_index_event(sid, "glossary", "error", f"Business glossary generation failed: {exc}")
-        # Deliberately NOT step="complete" — that sentinel is watched by
-        # PipelineMonitor.jsx to close its own SSE connection and refresh
-        # source status, which would incorrectly fire just because an
-        # unrelated on-demand glossary run finished on the same source.
-        _push_index_event(sid, "glossary-complete", "done", "Business glossary generation complete")
-
-    background_tasks.add_task(_run_glossary, source_id)
-    return {"status": "accepted", "source_id": source_id,
-            "message": "Business glossary generation started in background"}
-
-
 @app.get("/metadata/glossary-terms")
 async def list_glossary_terms_endpoint(source_id: Optional[str] = None, status: Optional[str] = None,
                                         domain: Optional[str] = None):
@@ -3997,7 +3793,7 @@ async def update_glossary_term_endpoint(term_id: str, req: UpdateGlossaryTermReq
         kwargs["match_method"] = "manual"
         kwargs["status"] = "approved"
         kwargs["confidence"] = 1.0
-        changed_by = _require_permission(request, "edit_business_ontology")
+        changed_by = _require_permission(request, "edit_glossary_term")
         if not _gr.update_term(term_id, changed_by=changed_by, **kwargs):
             raise HTTPException(status_code=404, detail="Term not found")
         return _gr.get_term(term_id)
@@ -4010,7 +3806,7 @@ async def update_glossary_term_endpoint(term_id: str, req: UpdateGlossaryTermReq
 @app.post("/metadata/glossary-terms/{term_id}/approve")
 async def approve_glossary_term_endpoint(term_id: str, request: Request):
     try:
-        changed_by = _require_permission(request, "approve_business_ontology_term")
+        changed_by = _require_permission(request, "approve_glossary_term")
         if not _gr.approve_term(term_id, changed_by=changed_by):
             raise HTTPException(status_code=404, detail="Term not found")
         return _gr.get_term(term_id)
@@ -4023,7 +3819,7 @@ async def approve_glossary_term_endpoint(term_id: str, request: Request):
 @app.post("/metadata/glossary-terms/{term_id}/reject")
 async def reject_glossary_term_endpoint(term_id: str, request: Request):
     try:
-        changed_by = _require_permission(request, "approve_business_ontology_term")
+        changed_by = _require_permission(request, "approve_glossary_term")
         if not _gr.reject_term(term_id, changed_by=changed_by):
             raise HTTPException(status_code=404, detail="Term not found")
         return _gr.get_term(term_id)
@@ -4031,162 +3827,6 @@ async def reject_glossary_term_endpoint(term_id: str, request: Request):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-
-# ── Business Ontology (SKOS+OWL, generated per-source from that source's
-# governed glossary) ────────────────────────────────────────────────────────
-
-@app.get("/business-ontology/sources")
-async def list_business_ontology_sources_endpoint():
-    """Sources whose Business Glossary has actually been generated (at least
-    one linked term) — the Business Ontology UI only offers these."""
-    try:
-        rows = _gr.list_glossary_sources()
-        out = []
-        for row in rows:
-            sid = row["source_id"]
-            src = _sources.get(sid)
-            out.append({
-                "source_id": sid,
-                "source_name": (src or {}).get("name") or sid,
-                "term_count": row["term_count"],
-            })
-        out.sort(key=lambda r: r["source_name"].lower())
-        return out
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/business-ontology/{source_id}/generate")
-async def generate_business_ontology_endpoint(source_id: str, request: Request):
-    """Synchronous regeneration from this source's current glossary state —
-    reads a handful of small SQLite tables and serializes an in-memory
-    rdflib.Graph, so unlike the structural ontology's async job/polling
-    pattern this returns directly. Ungated: read-derived, not destructive
-    (matches the ungated generate-glossary trigger)."""
-    try:
-        source_ontology = (_sources.get(source_id) or {}).get("ontology_content") or ""
-        return _bo.generate_business_ontology(source_id, created_by=_current_user_email(request) or "",
-                                               source_ontology=source_ontology)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/business-ontology/{source_id}/draft")
-async def get_business_ontology_draft_endpoint(source_id: str):
-    try:
-        return _bo.get_draft(source_id)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-class SaveBusinessOntologyDraftRequest(BaseModel):
-    ttl_content: str
-
-
-@app.put("/business-ontology/{source_id}/draft")
-async def put_business_ontology_draft_endpoint(source_id: str, req: SaveBusinessOntologyDraftRequest,
-                                                request: Request):
-    email = _require_permission(request, "edit_business_ontology")
-    try:
-        return _bo.save_draft_ttl(source_id, req.ttl_content, updated_by=email)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-class UpdateBusinessOntologyTermRequest(BaseModel):
-    preferred_name: Optional[str] = None
-    definition: Optional[str] = None
-    domain: Optional[str] = None
-    steward: Optional[str] = None
-    status: Optional[str] = None
-
-
-@app.patch("/business-ontology/{source_id}/terms/{term_id}")
-async def update_business_ontology_term_endpoint(source_id: str, term_id: str,
-                                                   req: UpdateBusinessOntologyTermRequest, request: Request):
-    email = _require_permission(request, "edit_business_ontology")
-    try:
-        fields = {k: v for k, v in req.dict().items() if v is not None}
-        return _bo.update_concept(source_id, term_id, changed_by=email, **fields)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.delete("/business-ontology/{source_id}/terms/{term_id}")
-async def delete_business_ontology_term_endpoint(source_id: str, term_id: str, request: Request):
-    email = _require_permission(request, "edit_business_ontology")
-    try:
-        return _bo.delete_concept(source_id, term_id, changed_by=email)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-class BusinessOntologyRelationRequest(BaseModel):
-    term_id: str
-    related_term_id: str
-    relationship_type: str = "related"
-
-
-@app.post("/business-ontology/{source_id}/relations")
-async def add_business_ontology_relation_endpoint(source_id: str, req: BusinessOntologyRelationRequest,
-                                                    request: Request):
-    email = _require_permission(request, "edit_business_ontology")
-    try:
-        return _bo.add_relation(source_id, req.term_id, req.related_term_id, req.relationship_type,
-                                 changed_by=email)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.delete("/business-ontology/{source_id}/relations/{relation_id}")
-async def delete_business_ontology_relation_endpoint(source_id: str, relation_id: str, request: Request):
-    email = _require_permission(request, "edit_business_ontology")
-    try:
-        return _bo.delete_relation(source_id, relation_id, changed_by=email)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-class SaveBusinessOntologyVersionRequest(BaseModel):
-    label: str = ""
-
-
-@app.post("/business-ontology/{source_id}/versions")
-async def save_business_ontology_version_endpoint(source_id: str, req: SaveBusinessOntologyVersionRequest,
-                                                    request: Request):
-    email = _require_permission(request, "manage_business_ontology_versions")
-    try:
-        return _bo.save_version(source_id, req.label, created_by=email)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/business-ontology/{source_id}/versions")
-async def list_business_ontology_versions_endpoint(source_id: str):
-    try:
-        return _bo.list_versions(source_id)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/business-ontology/{source_id}/versions/{version_id}")
-async def get_business_ontology_version_endpoint(source_id: str, version_id: str):
-    v = _bo.get_version(source_id, version_id)
-    if not v:
-        raise HTTPException(status_code=404, detail="Version not found")
-    return v
-
-
-@app.post("/business-ontology/{source_id}/versions/{version_id}/restore")
-async def restore_business_ontology_version_endpoint(source_id: str, version_id: str, request: Request):
-    email = _require_permission(request, "manage_business_ontology_versions")
-    result = _bo.restore_version(source_id, version_id, restored_by=email)
-    if result is None:
-        raise HTTPException(status_code=404, detail="Version not found")
-    return result
 
 
 @app.get("/metadata/entities/{metadata_id}/glossary")
@@ -5110,38 +4750,6 @@ async def proxy_glossary(request: Request, path: str):
         )
     except Exception as exc:
         raise HTTPException(502, f"Glossary service unavailable: {exc}")
-
-
-# ── Document Intelligence proxy route ─────────────────────────────────────────
-# Forwards /unstructured/* to the unstructured service. Additive route; all
-# other orchestrator routes and data are untouched.
-
-@app.api_route("/unstructured/{path:path}",
-               methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_unstructured(request: Request, path: str):
-    body = await request.body()
-    qs   = f"?{request.url.query}" if request.url.query else ""
-    fwd_headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in _HOP_HEADERS and k.lower() != "host"}
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.request(
-                method=request.method,
-                url=f"{UNSTRUCTURED_API}/{path}{qs}",
-                headers=fwd_headers,
-                content=body,
-            )
-        resp_headers = {k: v for k, v in resp.headers.items()
-                        if k.lower() not in _HOP_HEADERS}
-        from fastapi.responses import Response as _Resp
-        return _Resp(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=resp_headers,
-            media_type=resp.headers.get("content-type"),
-        )
-    except Exception as exc:
-        raise HTTPException(502, f"Unstructured service unavailable: {exc}")
 
 
 # ── /api/* compatibility shim ─────────────────────────────────────────────────

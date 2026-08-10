@@ -561,7 +561,7 @@ blocks query planning").
   neither cause nor fix this defect. Once this ships, new genes *could* be added
   (`lexicon_min_similarity`, `dissect_enabled`, evidence sample size) and tuned.
 - `knowledge_graph_agent/`, `ontology_agent/`, `conformity_agent/`,
-  `shacl_agent/`, `unstructured_agent/`
+  `shacl_agent/`
 - **All existing DB tables**, including `glossary_terms` and `verified_queries`
 - All frontends
 - `sql_identifier_resolver.py` — consumed as-is

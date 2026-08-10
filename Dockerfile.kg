@@ -22,7 +22,10 @@ COPY --from=builder /install /usr/local
 # Copy the knowledge_graph_agent package and FastAPI entry-point
 COPY knowledge_graph_agent/ /app/knowledge_graph_agent/
 COPY kg_api.py              /app/kg_api.py
-COPY llm_client.py      /app/llm_client.py
+COPY llm_client.py          /app/llm_client.py
+COPY kg_store.py             /app/kg_store.py
+COPY neptune_store.py        /app/neptune_store.py
+COPY aws_auth.py              /app/aws_auth.py
 
 RUN chown -R agent:agent /app
 

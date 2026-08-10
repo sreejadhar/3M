@@ -1,6 +1,7 @@
 # DataChat Orchestrator — dependencies
 fastapi>=0.111.0
-anthropic[vertex]>=0.25.0      # KPI formula compiler (kpi_store.compile_formula)
+anthropic[bedrock]>=0.34.0    # KPI formula compiler (kpi_store.compile_formula)
+boto3>=1.34.0                  # AWS Bedrock cross-account role assumption (llm_client)
 uvicorn[standard]>=0.29.0
 pydantic>=2.0.0
 httpx>=0.27.0          # async HTTP calls to the other microservices
@@ -18,6 +19,5 @@ sqlglot>=25.0.0                # SQL parsing for dialog_agent.nodes.sql_identifi
                                 # (cross-source bridge inference sample queries)
 psycopg2-binary>=2.9.9         # PostgreSQL — metadata_catalog/kg_store/kpi_store/glossary_registry
                                 # switch to Postgres when APP_ENV=production + KG_POSTGRES_DSN are set
-rdflib>=7.0.0                  # business_ontology — SKOS+OWL graph generation/serialization
 snowflake-connector-python>=3.6.0  # dialog_agent.nodes.execute_node._run_snowflake / snowflake_auth.py —
                                     # chat-ui runs the full dialog pipeline in-process (see orchestrator_api.py)

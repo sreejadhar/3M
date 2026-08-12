@@ -4,8 +4,19 @@ import { useAppState } from '../state.jsx';
 import { getGraph, listBridges } from '../api/clients.js';
 import { IconRefresh, IconGraph } from '../components/Icons.jsx';
 
-function nodeKind(label = '', id = '') {
-  if (String(id).startsWith('doc:')) return 'document';
+// Annotation nodes (business glossary terms, KPI-glossary metrics) are
+// metadata *about* real tables, not queryable relations — see
+// ontology_enricher.py's node_kind="annotation" tag and the legacy
+// id-prefix fallback (kpi:/glossary:/bizgloss:) for KG snapshots persisted
+// before that tag existed. They must read as visually secondary so the
+// real fact/dim/kpi tables stay the prominent thing on screen.
+const _LEGACY_ANNOTATION_PREFIXES = ['kpi:', 'glossary:', 'bizgloss:'];
+
+function nodeKind(label = '', id = '', node = null) {
+  if (node?.node_kind === 'annotation') return 'annotation';
+  const idStr = String(id);
+  if (!node?.node_kind && _LEGACY_ANNOTATION_PREFIXES.some((p) => idStr.startsWith(p))) return 'annotation';
+  if (idStr.startsWith('doc:')) return 'document';
   const s = String(label).toUpperCase();
   if (/FACT/.test(s)) return 'fact';
   if (/DIM/.test(s)) return 'dim';
@@ -22,6 +33,9 @@ const KIND_STYLE = {
   // Document Intelligence nodes — pink/magenta so they read as a distinct
   // "kind" from any table/column node at a glance, even before reading labels.
   document: { background: '#3d1530', border: '#ec4899', glow: 'rgba(236,72,153,0.30)' },
+  // Business glossary / KPI-glossary annotation nodes — deliberately muted
+  // and glow-free so real table nodes stay visually dominant on screen.
+  annotation: { background: '#211c2b', border: '#6b6478', glow: 'transparent' },
 };
 
 // Remote source node styles — vivid green backgrounds so they stand out immediately
@@ -31,6 +45,7 @@ const KIND_STYLE_REMOTE = {
   kpi:  { background: '#1a3820', border: '#4ade80', glow: 'rgba(74,222,128,0.35)' },
   other:{ background: '#132d18', border: '#4ade80', glow: 'rgba(74,222,128,0.30)' },
   document: { background: '#132d18', border: '#4ade80', glow: 'rgba(74,222,128,0.30)' },
+  annotation: { background: '#1a2018', border: '#5a6b58', glow: 'transparent' },
 };
 
 
@@ -40,6 +55,7 @@ const LEGEND = [
   ['KPI / summary', '#bc8cff'],
   ['Other',         '#39c5cf'],
   ['Document',      '#ec4899'],
+  ['Business glossary', '#6b6478'],
   ['Cross-source',  '#3fb950'],
 ];
 
@@ -69,12 +85,16 @@ function buildVisNodes(rawNodes, rawEdges, { idPrefix = '', remote = false, sour
   const maxDeg = Math.max(1, ...Object.values(degree));
 
   return rawNodes.map((n) => {
-    const kind      = nodeKind(n.label ?? n.id, n.id);
-    const isDoc     = kind === 'document';
-    const st        = remote ? KIND_STYLE_REMOTE[kind] : KIND_STYLE[kind];
-    const deg       = degree[n.id] || 0;
-    const isHub     = kind === 'fact' || deg >= maxDeg * 0.6;
-    const baseLabel = n.label ?? String(n.id);
+    const kind        = nodeKind(n.label ?? n.id, n.id, n);
+    const isDoc        = kind === 'document';
+    const isAnnotation = kind === 'annotation';
+    const st           = remote ? KIND_STYLE_REMOTE[kind] : KIND_STYLE[kind];
+    const deg          = degree[n.id] || 0;
+    // Annotation nodes never count as hubs, no matter how many real tables
+    // they're linked to — they're glossary/metric metadata, not the graph's
+    // structural core, and shouldn't compete visually with real tables.
+    const isHub        = !isAnnotation && (kind === 'fact' || deg >= maxDeg * 0.6);
+    const baseLabel     = n.label ?? String(n.id);
 
     return {
       id:    idPrefix + n.id,
@@ -89,8 +109,9 @@ function buildVisNodes(rawNodes, rawEdges, { idPrefix = '', remote = false, sour
       shapeProperties: isDoc ? {} : { borderRadius: 8 },
       // Thick dashed border = remote; dotted = document; solid = primary table
       borderDashes: remote ? [10, 5] : (isDoc ? [3, 3] : false),
-      margin: { top: 8, bottom: 8, left: 12, right: 12 },
-      borderWidth: remote ? 3 : (isDoc ? 2.5 : (isHub ? 3 : 1.5)),
+      margin: isAnnotation ? { top: 5, bottom: 5, left: 8, right: 8 } : { top: 8, bottom: 8, left: 12, right: 12 },
+      borderWidth: remote ? 3 : (isDoc ? 2.5 : (isAnnotation ? 1 : (isHub ? 3 : 1.5))),
+      opacity: isAnnotation ? 0.55 : 1,
       color: {
         background: st.background,
         border:     st.border,
@@ -99,9 +120,9 @@ function buildVisNodes(rawNodes, rawEdges, { idPrefix = '', remote = false, sour
       },
       font: remote
         ? { color: '#a8f0b8', size: isHub ? 14 : 12, face: 'Inter, sans-serif' }
-        : { color: '#e6edf3', size: isHub ? 16 : 13, face: 'Inter, sans-serif',
+        : { color: isAnnotation ? '#8b8496' : '#e6edf3', size: isAnnotation ? 11 : (isHub ? 16 : 13), face: 'Inter, sans-serif',
             bold: isHub ? { color: '#fff' } : false },
-      shadow: { enabled: true, color: st.glow, size: isHub ? 24 : 14, x: 0, y: 0 },
+      shadow: { enabled: !isAnnotation, color: st.glow, size: isHub ? 24 : 14, x: 0, y: 0 },
       _kind:   kind,
       _prefix: idPrefix,
       _remote: remote,

@@ -64,6 +64,8 @@ export function sourceEvents(sourceId) {
 }
 
 // ── Sources ───────────────────────────────────────────────────────────────────
+// persona=admin keeps the persona_access ABAC filter permissive; per-user
+// ownership scoping (who indexed what) is enforced server-side from the JWT.
 export const listSources = () => apiGet('/sources?persona=admin');
 export const createSource = (payload) => apiPost('/sources', payload);
 export const patchSource = (id, payload) => apiPatch(`/sources/${id}`, payload);

@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ..config import DialogConfig
 from ..state import DialogState
@@ -724,6 +724,30 @@ def _summarise_graph(
             "Generate SQL based on the natural language question alone.)"
         )
 
+    # Annotation nodes (business glossary terms, KPI/synonym glossary entries,
+    # and any future non-physical concept type ontology_enricher.py adds) are
+    # metadata *about* real tables/columns, not queryable relations themselves
+    # — they must never be offered to the SQL planner as a FROM target.
+    # ontology_enricher.py tags every such node with node_kind="annotation" at
+    # creation time, so this check is generic and doesn't need updating when
+    # a new annotation type is introduced. The id-prefix fallback only covers
+    # KG snapshots persisted before that tag existed.
+    _LEGACY_ANNOTATION_PREFIXES = ("bizgloss:", "glossary:", "kpi:")
+
+    def _is_annotation(n: Dict[str, Any]) -> bool:
+        if n.get("node_kind") == "annotation":
+            return True
+        return "node_kind" not in n and str(n.get("id", "")).startswith(_LEGACY_ANNOTATION_PREFIXES)
+
+    annotation_nodes = [n for n in nodes if _is_annotation(n)]
+    nodes = [n for n in nodes if not _is_annotation(n)]
+
+    if not nodes:
+        return (
+            "(No schema context available from the knowledge graph. "
+            "Generate SQL based on the natural language question alone.)"
+        )
+
     # Index edges by source node id
     edges_by_src: Dict[str, List[Dict]] = {}
     for e in edges:
@@ -825,6 +849,50 @@ def _summarise_graph(
             "schema. Do NOT join these tables — query each one separately."
         )
     lines.append("")
+
+    # ── Section 1c: Business/annotation concepts — resolved to real tables ────
+    # Annotation nodes (glossary terms, KPI metrics, ...) are never valid FROM
+    # targets (see split above). Where a concept has an edge to a real table
+    # (whatever that edge is labelled — BIZ_GLOSSARY_MATCHES, GLOSSARY_MATCHES,
+    # MEASURES, or any future label), surface its definition here pointed at
+    # the *real* qualified table name, so the LLM can use the phrasing without
+    # ever emitting the concept itself as a table/column identifier.
+    real_node_ids = {n.get("id", "") for n in nodes}
+    if annotation_nodes:
+        glossary_lines: List[str] = []
+        for anode in annotation_nodes:
+            aid = anode.get("id", "")
+            term_label = anode.get("label", "")
+            if not term_label:
+                continue
+            definition = ""
+            for part in (anode.get("title") or "").split("\n", 1)[1:]:
+                for sub in part.split("\n"):
+                    if sub and not sub.startswith("Domain:") and not sub.startswith("Steward:") and not sub.startswith("Unit:"):
+                        definition = sub
+                        break
+                if definition:
+                    break
+            seen_targets: Set[str] = set()
+            for e in edges_by_src.get(aid, []):
+                target_id = e.get("to", "")
+                if target_id not in real_node_ids or target_id in seen_targets:
+                    continue
+                target_label = node_label_by_id.get(target_id, "")
+                if not target_label:
+                    continue
+                seen_targets.add(target_id)
+                target_tbl = _to_sql_table(target_label) if samples is not None else target_label
+                target_q = _qualified(db_schema, target_tbl)
+                suffix = f" — {definition}" if definition else ""
+                glossary_lines.append(f'  - "{term_label}"{suffix} → refers to table {target_q}')
+        if glossary_lines:
+            lines.append(
+                "BUSINESS GLOSSARY / METRICS (these are NOT tables/columns — use "
+                "the mapped table below when the question references one of these terms):"
+            )
+            lines.extend(glossary_lines)
+            lines.append("")
 
     # ── Section 2: Detailed schema per table ──────────────────────────────────
     lines.append("DETAILED SCHEMA:")

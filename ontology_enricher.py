@@ -456,6 +456,7 @@ def _inject_kg_nodes() -> Dict[str, int]:
                 "title": "\n".join(title_parts),
                 "color": "#a78bfa",   # purple — business concept
                 "size":  16,
+                "node_kind": "annotation",   # not a queryable table/column — see understand_node._summarise_graph
                 "properties": [
                     {"name": "definition", "type": "text"},
                     {"name": "domain",     "type": "text"},
@@ -496,6 +497,7 @@ def _inject_kg_nodes() -> Dict[str, int]:
                 "title": "\n".join(title_parts),
                 "color": "#10b981",   # green — business metric
                 "size":  16,
+                "node_kind": "annotation",   # not a queryable table/column — see understand_node._summarise_graph
                 "properties": [
                     {"name": "unit",           "type": "text"},
                     {"name": "direction",      "type": "text"},
@@ -629,6 +631,7 @@ def enrich_source_kg_from_business_glossary(source_id: str) -> Dict[str, int]:
             "title": "\n".join(title_parts),
             "color": "#f472b6",   # pink — governed business glossary (distinct from KPI-glossary purple)
             "size":  16,
+            "node_kind": "annotation",   # not a queryable table/column — see understand_node._summarise_graph
             "properties": [
                 {"name": "definition", "type": "text"},
                 {"name": "domain",     "type": "text"},

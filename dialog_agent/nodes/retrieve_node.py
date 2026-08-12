@@ -533,6 +533,17 @@ def _bfs_expand(
     return list(visited)
 
 
+# Legacy KG snapshots persisted before node_kind="annotation" existed identify
+# glossary/KPI nodes by id prefix instead — mirrors understand_node._is_annotation.
+_LEGACY_ANNOTATION_PREFIXES = ("bizgloss:", "glossary:", "kpi:")
+
+
+def _is_annotation_node(n: Dict) -> bool:
+    if n.get("node_kind") == "annotation":
+        return True
+    return "node_kind" not in n and str(n.get("id", "")).startswith(_LEGACY_ANNOTATION_PREFIXES)
+
+
 # ── Main node ─────────────────────────────────────────────────────────────────
 
 def retrieve_node(state: DialogState) -> DialogState:
@@ -684,10 +695,21 @@ def retrieve_node(state: DialogState) -> DialogState:
         )
         top_k, max_tables = widened_top_k, widened_max_tables
 
+    # ── Business glossary / KPI annotation nodes never compete with real ──────
+    # tables for the top-K / max_tables budget below — they're not queryable
+    # relations (see understand_node._summarise_graph's node_kind=="annotation"
+    # check), just metadata pointing at a real table.  If they were ranked
+    # alongside tables here, a highly-scoring glossary term could bump a real
+    # table out of the seed set entirely, and the table would never reach
+    # plan_node — producing exactly the "hallucinated table" failures this
+    # guards against.
+    annotation_id_set = {n.get("id", "") for n in nodes if _is_annotation_node(n)}
+
     t0 = time.perf_counter()
-    # top-K seed node IDs
-    k = min(top_k, len(nodes))
-    top_indices = scores.argsort()[::-1][:k]
+    # top-K seed node IDs — drawn from real table nodes only.
+    table_indices = [i for i in range(len(nodes)) if nodes[i].get("id", "") not in annotation_id_set]
+    k = min(top_k, len(table_indices))
+    top_indices = sorted(table_indices, key=lambda i: scores[i], reverse=True)[:k]
     seed_ids    = [cache.node_ids[i] for i in top_indices]
 
     logger.info(
@@ -697,9 +719,33 @@ def retrieve_node(state: DialogState) -> DialogState:
         [f"{scores[i]:.3f}" for i in top_indices],
     )
 
+    # ── Relevant annotation nodes + the real tables they point at ────────────
+    # Picked independently of the table seed budget above, using the same
+    # relevance floor as BFS-expanded tables. Their edge targets are force-
+    # included so a glossary/KPI hit always drags its real backing table
+    # along, even if that table itself scored too low to be seeded — this is
+    # what lets understand_node surface a "BUSINESS GLOSSARY / METRICS" line
+    # for the term instead of silently dropping it.
+    expand_score_floor = getattr(config, "graphrag_expand_score_floor", 0.10)
+    node_score = {cache.node_ids[i]: float(scores[i]) for i in range(len(scores))}
+    relevant_annotation_ids = {
+        aid for aid in annotation_id_set if node_score.get(aid, 0.0) >= expand_score_floor
+    }
+    forced_target_ids = {
+        e.get("to", "") for e in edges
+        if e.get("from", "") in relevant_annotation_ids
+        and e.get("to", "") not in annotation_id_set
+    }
+    if relevant_annotation_ids:
+        logger.info(
+            "retrieve_node: %d relevant annotation node(s), forcing in %d linked real table(s)",
+            len(relevant_annotation_ids), len(forced_target_ids),
+        )
+
     # ── BFS-expand via edges ──────────────────────────────────────────────────
     adjacency     = _build_adjacency(edges)
     subgraph_ids  = set(_bfs_expand(seed_ids, adjacency, hop_depth))
+    subgraph_ids |= relevant_annotation_ids | forced_target_ids
 
     # ── Filter nodes and edges to subgraph ───────────────────────────────────
     sub_nodes = [n for n in nodes if n.get("id", "") in subgraph_ids]
@@ -709,16 +755,16 @@ def retrieve_node(state: DialogState) -> DialogState:
     ]
 
     # ── Drop BFS-expanded nodes that are below the relevance floor ────────────
-    # Seed nodes (top-K by similarity) are always kept.  Nodes that were pulled
-    # in purely via FK expansion and score below the floor are dropped so the
+    # Seed nodes (top-K by similarity), relevant annotation nodes, and their
+    # forced real-table targets are always kept.  Nodes that were pulled in
+    # purely via FK expansion and score below the floor are dropped so the
     # LLM does not see unrelated tables and join them unnecessarily.
-    expand_score_floor = getattr(config, "graphrag_expand_score_floor", 0.10)
     seed_id_set  = set(seed_ids)
-    node_score   = {cache.node_ids[i]: float(scores[i]) for i in range(len(scores))}
+    protected_ids = seed_id_set | relevant_annotation_ids | forced_target_ids
     before_floor = len(sub_nodes)
     sub_nodes = [
         n for n in sub_nodes
-        if n.get("id", "") in seed_id_set
+        if n.get("id", "") in protected_ids
         or node_score.get(n.get("id", ""), 0.0) >= expand_score_floor
     ]
     if len(sub_nodes) < before_floor:
@@ -734,19 +780,23 @@ def retrieve_node(state: DialogState) -> DialogState:
         )
 
     # ── Cap to graphrag_max_tables to prevent token bloat from deep FK chains ─
+    # Protected nodes (seeds, relevant annotations, their forced targets) are
+    # never trimmed by the cap — only the remaining FK-expanded extras compete
+    # for whatever slots are left.
     if len(sub_nodes) > max_tables:
-        sub_nodes.sort(
-            key=lambda n: node_score.get(n.get("id", ""), 0.0), reverse=True
-        )
-        sub_nodes = sub_nodes[:max_tables]
+        protected = [n for n in sub_nodes if n.get("id", "") in protected_ids]
+        rest      = [n for n in sub_nodes if n.get("id", "") not in protected_ids]
+        rest.sort(key=lambda n: node_score.get(n.get("id", ""), 0.0), reverse=True)
+        slots = max(max_tables - len(protected), 0)
+        sub_nodes = protected + rest[:slots]
         kept_ids = {n.get("id", "") for n in sub_nodes}
         sub_edges = [
             e for e in sub_edges
             if e.get("from", "") in kept_ids and e.get("to", "") in kept_ids
         ]
         logger.info(
-            "retrieve_node: capped subgraph from %d → %d tables (graphrag_max_tables=%d)",
-            len(subgraph_ids), max_tables, max_tables,
+            "retrieve_node: capped subgraph from %d → %d tables (graphrag_max_tables=%d, %d protected)",
+            len(subgraph_ids), len(sub_nodes), max_tables, len(protected),
         )
 
     logger.info(

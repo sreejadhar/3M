@@ -472,17 +472,154 @@ def _snowflake_quote_dotted_columns(sql: str, schema_context: str) -> str:
     return fixed
 
 
+# ── Pre-execution EXPLAIN/dry-run gate ───────────────────────────────────────
+#
+# Cheap, side-effect-free validation of the query PLAN before paying for a
+# real execution. This catches the same class of "the DB rejects this SQL"
+# errors self-heal already handles below (see _is_retryable/_RETRYABLE_RE),
+# but without first running a potentially expensive/long-running query — the
+# value is largest for a broken query that would otherwise scan a huge table
+# for minutes before failing at all. It can NEVER catch data-dependent
+# runtime errors (a CAST that only fails on a specific row's actual value,
+# a runtime division by zero, etc.) since it never touches row data — those
+# still need the real execution attempt below, exactly as before this gate
+# existed. When this returns None, behavior is completely unchanged from
+# before this gate was added.
+#
+# Deliberately skipped (returns None immediately) for dialects where a safe,
+# side-effect-free equivalent isn't practical here:
+#   - Oracle: EXPLAIN PLAN FOR requires a PLAN_TABLE that may not exist or be
+#     writable in the target schema — using it could introduce a NEW failure
+#     mode (permission/missing-table) unrelated to the query's own validity.
+#   - Teradata / Databricks: no cheap validate-only mode wired up yet.
+#   - SQLite/CSV/Excel: handled separately by _sqlite_explain_check, called
+#     from _exec_on_conn_with_retry (the file-based path never reaches here).
+#
+# Kill switch: EXECUTE_NODE_EXPLAIN_GATE=0 disables this entirely and
+# restores the exact pre-existing behavior (real execution on every attempt).
+_EXPLAIN_GATE_ENABLED = os.getenv("EXECUTE_NODE_EXPLAIN_GATE", "1") != "0"
+
+
+def _bigquery_dry_run_error(cfg: DialogConfig, sql: str) -> Optional[str]:
+    """BigQuery's dry_run job mode validates + resolves the query and reports
+    bytes-to-be-scanned without running it or incurring the query's cost."""
+    from google.cloud import bigquery
+
+    kwargs: Dict[str, Any] = {}
+    if cfg.db_extra.get("credentials_path"):
+        from google.oauth2 import service_account
+        kwargs["credentials"] = service_account.Credentials.from_service_account_file(
+            cfg.db_extra["credentials_path"]
+        )
+    client = bigquery.Client(project=cfg.db_name or cfg.db_extra.get("project"), **kwargs)
+    job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+    client.query(sql, job_config=job_config)
+    return None
+
+
+def _sqlserver_parseonly_error(cfg: DialogConfig, sql: str) -> Optional[str]:
+    """
+    SET PARSEONLY ON validates T-SQL syntax only (no object resolution, no
+    execution) — session-scoped, zero side effects. Restored to OFF before
+    the connection (opened fresh just for this check) is closed.
+    """
+    try:
+        import pymssql as _mssql  # type: ignore[import-untyped]
+        _driver_name = "pymssql"
+    except ImportError:
+        _mssql = None  # type: ignore[assignment]
+        _driver_name = "pyodbc"
+
+    if _driver_name == "pymssql":
+        if cfg.db_connection_string:
+            _driver_name = "pyodbc"
+        else:
+            conn = _mssql.connect(
+                server=cfg.db_host,
+                port=int(cfg.db_port or 1433),
+                user=cfg.db_user,
+                password=cfg.db_password,
+                database=cfg.db_name,
+            )
+
+    if _driver_name == "pyodbc":
+        import pyodbc  # type: ignore[import-untyped]
+        if cfg.db_connection_string:
+            conn = pyodbc.connect(cfg.db_connection_string)
+        else:
+            odbc_driver = cfg.db_extra.get("driver", "ODBC Driver 18 for SQL Server")
+            conn = pyodbc.connect(
+                f"DRIVER={{{odbc_driver}}};SERVER={cfg.db_host},{cfg.db_port or 1433};"
+                f"DATABASE={cfg.db_name};UID={cfg.db_user};PWD={cfg.db_password}"
+            )
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SET PARSEONLY ON")
+            cur.execute(sql)
+            return None
+        finally:
+            try:
+                cur.execute("SET PARSEONLY OFF")
+            except Exception:
+                pass
+            cur.close()
+    finally:
+        conn.close()
+
+
+def _explain_sql(cfg: "DialogConfig", sql: str) -> Optional[str]:
+    """
+    Best-effort dry-run/EXPLAIN of *sql* against the target live-DB dialect,
+    without executing it for real.
+
+    Returns the DB's rejection message if the plan is invalid, or None if
+    the plan is valid OR this dialect/config isn't covered by a check here
+    (both cases fall through to the real execution unchanged). Never raises.
+    """
+    if not _EXPLAIN_GATE_ENABLED:
+        return None
+    db = cfg.db_type.lower()
+    try:
+        if db in ("postgres", "redshift"):
+            return _run_postgres(cfg, f"EXPLAIN {sql}").get("error")
+        if db == "snowflake":
+            return _run_snowflake(cfg, f"EXPLAIN USING TEXT {sql}").get("error")
+        if db == "bigquery":
+            _bigquery_dry_run_error(cfg, sql)
+            return None
+        if db == "sqlserver":
+            _sqlserver_parseonly_error(cfg, sql)
+            return None
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
 def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = None, kg_id: str = "") -> Dict[str, Any]:
     """
     Execute *sql* against a live DB, retrying up to _MAX_RETRIES times when
     the failure looks like a fixable type-coercion / dialect error.
+
+    Before each real execution attempt, run the cheap EXPLAIN/dry-run gate
+    (see _explain_sql) — a rejection there is fed into the exact same
+    self-heal pipeline below as if the real execution had failed, without
+    paying for the real execution first.
     """
     current_sql = sql
     last_result: Dict[str, Any] = {}
     schema_context = (state or {}).get("schema_context", "")
 
     for attempt in range(_MAX_RETRIES + 1):   # attempt 0 = original
-        result = _run_sql(cfg, current_sql, state=state, kg_id=kg_id)
+        explain_error = _explain_sql(cfg, current_sql)
+        if explain_error is not None:
+            logger.info(
+                "explain-gate: dry-run rejected SQL before execution — %s",
+                explain_error[:160],
+            )
+            result: Dict[str, Any] = {"columns": [], "rows": [], "error": explain_error}
+        else:
+            result = _run_sql(cfg, current_sql, state=state, kg_id=kg_id)
         if not result.get("error"):
             if attempt > 0:
                 logger.info("self-heal: query fixed after %d attempt(s)", attempt)
@@ -561,19 +698,47 @@ def _run_sql_with_retry(cfg: "DialogConfig", sql: str, state: Optional[Dict] = N
     return last_result
 
 
+def _sqlite_explain_check(conn: sqlite3.Connection, sql: str) -> Optional[str]:
+    """
+    Cheap pre-execution validation for the file-based (SQLite) path: run
+    EXPLAIN QUERY PLAN instead of the real query first. Catches syntax
+    errors and unknown table/column references without materializing a
+    potentially large result set. Reuses _exec_on_conn so the "no such
+    table" error-message enrichment (listing available tables) still
+    applies. SQLite is dynamically typed, so this cannot catch
+    data-dependent runtime errors (e.g. a CAST that only fails on a
+    particular row's value) — those still need a real execution attempt.
+    Returns None (behaves as if this check didn't exist) when the gate is
+    disabled via EXECUTE_NODE_EXPLAIN_GATE=0.
+    """
+    if not _EXPLAIN_GATE_ENABLED:
+        return None
+    return _exec_on_conn(conn, f"EXPLAIN QUERY PLAN {sql}").get("error")
+
+
 def _exec_on_conn_with_retry(
     conn: sqlite3.Connection,
     sql: str,
     cfg: "DialogConfig",
 ) -> Dict[str, Any]:
     """
-    Like _exec_on_conn but with LLM-based self-healing for type / dialect errors.
+    Like _exec_on_conn but with LLM-based self-healing for type / dialect
+    errors, and a pre-execution EXPLAIN QUERY PLAN gate (see
+    _sqlite_explain_check) ahead of each real execution attempt.
     """
     current_sql = sql
     last_result: Dict[str, Any] = {}
 
     for attempt in range(_MAX_RETRIES + 1):
-        result = _exec_on_conn(conn, current_sql)
+        explain_error = _sqlite_explain_check(conn, current_sql)
+        if explain_error is not None:
+            logger.info(
+                "explain-gate (file-db): dry-run rejected SQL before execution — %s",
+                explain_error[:160],
+            )
+            result: Dict[str, Any] = {"columns": [], "rows": [], "error": explain_error}
+        else:
+            result = _exec_on_conn(conn, current_sql)
         if not result.get("error"):
             if attempt > 0:
                 logger.info("self-heal (file-db): query fixed after %d attempt(s)", attempt)
@@ -855,18 +1020,47 @@ def _cursor_to_result(cursor) -> Dict[str, Any]:
     return {"columns": columns, "rows": rows, "error": None}
 
 
+# ── Postgres/Redshift connection pooling ──────────────────────────────────────
+# resolve_node's live DB probe (and any other caller issuing several
+# independent queries in the same request, now run concurrently via a
+# ThreadPoolExecutor) used to pay a fresh TCP+auth handshake per query — the
+# dominant cost when probing 10-15 columns. One pool per distinct connection
+# target, reused across requests for the life of the process.
+_PG_POOLS: Dict[str, Any] = {}
+_PG_POOLS_LOCK = threading.Lock()
+
+
+def _pg_pool_key(cfg: DialogConfig) -> str:
+    if cfg.db_connection_string:
+        return cfg.db_connection_string
+    return f"{cfg.db_host}:{cfg.db_port}:{cfg.db_name}:{cfg.db_user}"
+
+
+def _get_pg_pool(cfg: DialogConfig):
+    import psycopg2.pool
+
+    key = _pg_pool_key(cfg)
+    with _PG_POOLS_LOCK:
+        pool = _PG_POOLS.get(key)
+        if pool is None:
+            if cfg.db_connection_string:
+                pool = psycopg2.pool.ThreadedConnectionPool(1, 10, cfg.db_connection_string)
+            else:
+                pool = psycopg2.pool.ThreadedConnectionPool(
+                    1, 10,
+                    host=cfg.db_host, port=cfg.db_port or 5432,
+                    dbname=cfg.db_name, user=cfg.db_user, password=cfg.db_password,
+                    **cfg.db_extra,
+                )
+            _PG_POOLS[key] = pool
+        return pool
+
+
 def _run_postgres(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
-    import psycopg2
     import psycopg2.extras
 
-    if cfg.db_connection_string:
-        conn = psycopg2.connect(cfg.db_connection_string)
-    else:
-        conn = psycopg2.connect(
-            host=cfg.db_host, port=cfg.db_port or 5432,
-            dbname=cfg.db_name, user=cfg.db_user, password=cfg.db_password,
-            **cfg.db_extra,
-        )
+    pool = _get_pg_pool(cfg)
+    conn = pool.getconn()
     conn.autocommit = True
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -876,8 +1070,13 @@ def _run_postgres(cfg: DialogConfig, sql: str) -> Dict[str, Any]:
             columns = [desc[0] for desc in (cur.description or [])]
             rows    = [[row[c] for c in columns] for row in (cur.fetchall() or [])]
             return {"columns": columns, "rows": rows, "error": None}
-    finally:
-        conn.close()
+    except Exception:
+        # Connection may be in a broken/aborted transaction state — don't
+        # return it to the pool for reuse by the next caller.
+        pool.putconn(conn, close=True)
+        raise
+    else:
+        pool.putconn(conn)
 
 
 def _run_oracle(cfg: DialogConfig, sql: str) -> Dict[str, Any]:

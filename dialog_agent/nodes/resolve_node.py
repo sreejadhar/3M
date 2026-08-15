@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ..state import DialogState
 
@@ -55,6 +55,186 @@ _STOP_WORDS = {
 
 # Single-character tokens and pure-numeric tokens are never useful for matching
 _MIN_TOKEN_LEN = 2
+
+# A stop-word written in ALL CAPS in the ORIGINAL question is very likely a
+# domain acronym, not the common word it happens to collide with once
+# lowercased — e.g. "IT" (Information Technology) vs. the pronoun "it", "OR"
+# (an org/department code) vs. the conjunction "or". Capped at 5 chars so a
+# genuinely shouted common word ("ALL", "SO") isn't mistaken for an acronym
+# just because of a coincidental stop-word collision at longer length.
+_MAX_ACRONYM_LEN = 5
+
+
+def _tokenize_query(text: str) -> Set[str]:
+    """
+    Extract significant lowercase tokens from free text for fuzzy/keyword
+    matching, stripping English stop-words — except tokens the user wrote in
+    ALL CAPS, which survive even if they collide with a stop-word (see
+    _MAX_ACRONYM_LEN above). Shared by both the fuzzy pre-match pass and the
+    post-LLM fallback so the acronym exception only needs to live in one place.
+    """
+    raw_tokens = re.findall(r'\b[a-zA-Z]\w+\b', text)
+    tokens: Set[str] = set()
+    for raw in raw_tokens:
+        lower = raw.lower()
+        if len(lower) < _MIN_TOKEN_LEN:
+            continue
+        is_probable_acronym = raw.isupper() and len(raw) <= _MAX_ACRONYM_LEN
+        if lower in _STOP_WORDS and not is_probable_acronym:
+            continue
+        tokens.add(lower)
+    return tokens
+
+
+def _acronym_tokens(text: str, require_caps: bool = True) -> Set[str]:
+    """
+    Lowercase forms of tokens that look like acronyms (≤ _MAX_ACRONYM_LEN
+    chars) — e.g. "IT", "HR", "PO". Used to gate initials-matching (see
+    _initials_match) so it only fires for terms that actually look like an
+    acronym, not any short lowercase word that happens to spell out some
+    phrase's initials by coincidence.
+
+    require_caps=True (default) — only tokens the user actually wrote in ALL
+    CAPS qualify. Used by the fast sample-based fuzzy pass (_fuzzy_match_candidates),
+    which runs against every categorical column (products, regions, etc.); without
+    this gate, common 2-3 letter stopwords ("is", "or", "an") would generate noisy
+    initials-match hints across the whole schema.
+
+    require_caps=False — any short token qualifies regardless of casing. Chat
+    users don't reliably type acronyms like "IT" or "HR" in caps mid-sentence
+    the way formal writing would. Used only by the live DB probe
+    (_db_probe_candidates), which is already bounded to a small, targeted set
+    of high-cardinality text columns (e.g. department/designation/position_title),
+    so the false-positive surface is much smaller than the general fuzzy pass.
+    """
+    raw_tokens = re.findall(r'\b[a-zA-Z]\w+\b', text)
+    out: Set[str] = set()
+    for r in raw_tokens:
+        if not (_MIN_TOKEN_LEN <= len(r) <= _MAX_ACRONYM_LEN):
+            continue
+        if require_caps and not r.isupper():
+            continue
+        out.add(r.lower())
+    return out
+
+
+def _initials_match(token: str, value: str) -> bool:
+    """
+    Generic acronym expansion check: does `token` equal the initials of some
+    run of consecutive words in `value`? e.g. "it" == initials of
+    "Information Technology", "hr" == initials of "Human Resources". No fixed
+    dictionary — works for any domain's acronyms the same way.
+    """
+    words = re.findall(r"[A-Za-z]+", value)
+    n = len(token)
+    if len(words) < n:
+        return False
+    for i in range(len(words) - n + 1):
+        if "".join(w[0] for w in words[i : i + n]).lower() == token:
+            return True
+    return False
+    return tokens
+
+
+# ── Proper-noun disambiguation ────────────────────────────────────────────────
+# When the question names a specific entity (a person, product, place, ...)
+# and the data has two or more equally-close stored values for it (e.g.
+# "Smith" could be "John Smith" or "Jane Smith"), silently picking one is a
+# guess. Detect that ambiguity here and let plan_node ask the user to choose
+# instead of running SQL against a possibly-wrong entity.
+
+_TITLE_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]*")
+
+
+def _proper_noun_phrases(text: str) -> List[str]:
+    """
+    Heuristic proper-noun detector, for disambiguation purposes only: a run
+    of one or more consecutive Title-Case words (e.g. "Smith", "John Smith",
+    "New York"). A single Title-Case word at the very start of the text is
+    excluded — English sentence-case capitalizes the first word regardless
+    of whether it's a proper noun (e.g. "How many..."), so that position
+    alone is not evidence of a name. A 2+-word Title-Case run counts even at
+    the start, since two consecutive capitalized words is much stronger
+    evidence of a real proper noun.
+
+    Intentionally permissive — this is a heuristic, not a NER model. A false
+    positive here is harmless unless it ALSO happens to collide with 2+
+    evenly-tied stored values (see _detect_ambiguous_terms), which is rare
+    for an ordinary capitalized word.
+
+    Returns phrases in original casing, deduped, in first-seen order.
+    """
+    matches = list(_TITLE_WORD_RE.finditer(text))
+    phrases: List[str] = []
+
+    def _is_title(word: str) -> bool:
+        return len(word) > 1 and word[0].isupper() and not word.isupper()
+
+    i = 0
+    n = len(matches)
+    while i < n:
+        if not _is_title(matches[i].group(0)):
+            i += 1
+            continue
+        run_end = i
+        j = i + 1
+        while j < n and _is_title(matches[j].group(0)) \
+                and text[matches[run_end].end():matches[j].start()].strip() == "":
+            run_end = j
+            j += 1
+        run_len = run_end - i + 1
+        is_sentence_start = matches[i].start() == 0
+        if run_len >= 2 or not is_sentence_start:
+            phrase = text[matches[i].start():matches[run_end].end()]
+            if phrase not in phrases:
+                phrases.append(phrase)
+        i = run_end + 1
+    return phrases
+
+
+def _detect_ambiguous_terms(
+    natural_query: str,
+    fuzzy_candidates: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    For each proper-noun phrase in the question (see _proper_noun_phrases),
+    check whether the fuzzy pre-match found 2+ DISTINCT stored values tied
+    for the top score — i.e. the closest matches are genuinely ambiguous,
+    not just "the LLM might guess wrong."
+
+    Deliberately conservative:
+    - Only "direct" and "db_probe" match types count — never
+      "promoted_parent", which is a taxonomy-hierarchy concept (filtering at
+      a parent category level) unrelated to named-entity ambiguity.
+    - A phrase only qualifies when the TOP score is shared by 2+ distinct
+      stored values. A single clear winner — even a low-scoring one — is
+      not ambiguous and is left to the normal LLM/fuzzy-fallback resolution.
+
+    Returns [{"term": "<phrase>", "candidates": [<stored values>, ...]}, ...],
+    capped at 5 candidates per term. Empty when nothing is ambiguous — the
+    overwhelming majority of questions.
+    """
+    phrases = _proper_noun_phrases(natural_query)
+    if not phrases or not fuzzy_candidates:
+        return []
+
+    eligible = [c for c in fuzzy_candidates if c.get("match_type") in ("direct", "db_probe")]
+    if not eligible:
+        return []
+
+    ambiguous: List[Dict[str, Any]] = []
+    for phrase in phrases:
+        phrase_tokens = _tokenize_query(phrase)
+        if not phrase_tokens:
+            continue
+        matches = [c for c in eligible if phrase_tokens & set(c["overlap_tokens"])]
+        if len(matches) < 2:
+            continue
+        top_score = max(c["score"] for c in matches)
+        top_values = sorted({c["stored_value"] for c in matches if c["score"] == top_score})
+        if len(top_values) >= 2:
+            ambiguous.append({"term": phrase, "candidates": top_values[:5]})
+    return ambiguous
 
 
 _RESOLVE_SYSTEM = """\
@@ -117,14 +297,22 @@ MATCHING RULES — try in order, stop at the first rule that gives a match
    a sub-category breakdown.
 
 5. SEMANTIC MATCH (synonyms, domain knowledge — no keyword overlap at all):
-   Use this when you know from FMCG / business domain knowledge that the user's
-   term maps to a stored value even without a shared word.
+   Use this when you know from domain knowledge that the user's term maps to
+   a stored value even without a shared word. This includes ANY abbreviation
+   or acronym — not just industry shorthand — whenever its expansion is a
+   stored value: department/org codes (IT → Information Technology,
+   HR → Human Resources, R&D → Research and Development, PR → Public
+   Relations, QA → Quality Assurance), time shorthand (YoY → Year over Year,
+   MoM → Month over Month), or domain terms.
    Examples:
      user "EMEA"         → stored "Europe", "Middle East", "Africa"
      user "savoury"      → stored "Snacks & Foods"   (in FMCG: savoury = salty snack foods)
      user "soft drinks"  → stored "Beverages" or "Carbonated Drinks"
      user "HPC"          → stored "Home & Personal Care"
      user "confectionery"→ stored "Candy & Chocolate" or "Sweets"
+     user "IT"           → stored "Information Technology"   (department/org column)
+     user "HR"           → stored "Human Resources"
+     user "R&D"          → stored "Research and Development"
    Include ALL semantically equivalent stored values in an IN() list.
 
 6. LAST RESORT — NO MATCH: ONLY use this when rules 1-5 all fail AND there are
@@ -194,7 +382,13 @@ def _token_matches_text(token: str, text: str) -> bool:
     2. Stemmed match    (snack   ~ 'Snacks & Foods' after stripping -s)
     3. Edit distance ≤ 1 for tokens ≥ 5 chars  (savory ≈ savoury)
     """
-    if token in text:
+    # Whole-word boundary, not a raw substring test: "it" must not match inside
+    # "limited" or "circuit" just because the letters happen to appear
+    # consecutively. This matters most for short tokens (2-3 chars), which are
+    # exactly the ones likely to turn up as a fragment of an unrelated longer
+    # word. Genuine cases like "chips" ∈ "Potato Chips & Crisps" are already
+    # word-aligned, so this doesn't lose any real matches.
+    if re.search(r'\b' + re.escape(token) + r'\b', text):
         return True
     stem_t = _stem(token)
     text_words = re.findall(r'\b\w+\b', text)
@@ -236,13 +430,10 @@ def _fuzzy_match_candidates(
         [{"table", "column", "stored_value", "overlap_tokens", "score",
           "match_type", "promoted_from"}, ...]
     """
-    raw_tokens = re.findall(r'\b[a-zA-Z]\w+\b', natural_query.lower())
-    query_tokens = {
-        t for t in raw_tokens
-        if t not in _STOP_WORDS and len(t) >= _MIN_TOKEN_LEN
-    }
+    query_tokens = _tokenize_query(natural_query)
     if not query_tokens:
         return []
+    acronym_tokens = _acronym_tokens(natural_query) & query_tokens
 
     # Build reverse map: child_col → parent_col per table (from hierarchy + naming)
     child_to_parent: Dict[str, Dict[str, str]] = {}  # tbl → {child_col: parent_col}
@@ -273,6 +464,7 @@ def _fuzzy_match_candidates(
             for val in vals:
                 val_lower = val.lower()
                 matched_tokens = {t for t in query_tokens if _token_matches_text(t, val_lower)}
+                matched_tokens |= {t for t in acronym_tokens if _initials_match(t, val)}
                 if not matched_tokens:
                     continue
 
@@ -378,7 +570,12 @@ def _build_hint_section(candidates: List[Dict[str, Any]]) -> str:
     for c in candidates[:25]:
         tokens_str = ", ".join(f'"{t}"' for t in c["overlap_tokens"])
         match_type = c.get("match_type", "direct")
-        label = "  [PARENT LEVEL — via child match]  " if match_type == "promoted_parent" else "  "
+        if match_type == "promoted_parent":
+            label = "  [PARENT LEVEL — via child match]  "
+        elif match_type == "db_probe":
+            label = "  [LIVE DB MATCH — high-cardinality column]  "
+        else:
+            label = "  "
         promoted = f"  (child: {c['promoted_from']})" if c.get("promoted_from") else ""
         lines.append(
             f"{label}token(s) [{tokens_str}] → "
@@ -448,17 +645,24 @@ def _apply_fuzzy_fallback(
             patched.append(r)
             continue
         # Find the best fuzzy candidate whose column has the highest overlap
-        # and whose stored value shares tokens with the user_term
-        user_term_lower = r.get("user_term", "").lower()
-        term_tokens = {
-            t for t in re.findall(r'\b[a-zA-Z]\w+\b', user_term_lower)
-            if t not in _STOP_WORDS and len(t) >= _MIN_TOKEN_LEN
-        }
+        # and whose stored value shares tokens with the user_term.
+        #
+        # Reuse each candidate's own precomputed overlap_tokens (set
+        # intersection) rather than recomputing overlap via
+        # _token_matches_text alone — overlap_tokens was built in
+        # _fuzzy_match_candidates using substring/stem/edit-distance AND
+        # _initials_match, so it already captures acronym matches (e.g. "it"
+        # -> "Information Technology", where neither word literally contains
+        # "it" as a substring, only as initials). Recomputing with
+        # _token_matches_text alone silently dropped every acronym-only
+        # candidate here, so a question like "how many IT employees" could
+        # fail the LLM's own resolution and then ALSO fail this safety net,
+        # even though the correct candidate had already been found earlier.
+        term_tokens = _tokenize_query(r.get("user_term", ""))
         best: Optional[Dict] = None
         best_score = 0
         for c in candidates:
-            val_lower = c["stored_value"].lower()
-            overlap = sum(1 for t in term_tokens if _token_matches_text(t, val_lower))
+            overlap = len(term_tokens & set(c.get("overlap_tokens") or []))
             # Promoted parent candidates get a bonus so they beat child-level matches
             if c.get("match_type") == "promoted_parent":
                 overlap += 1
@@ -491,6 +695,168 @@ def _apply_fuzzy_fallback(
     return patched
 
 
+# ── Live DB probe for high-cardinality text columns ──────────────────────────
+# _fuzzy_match_candidates only ever sees columns that made the "categorical"
+# cut (understand_node caps that at ~50 distinct values, or for DB-backed
+# sources whatever a cached top-values sample happened to capture). A column
+# like `position_title` with 1,000+ distinct values never gets a full value
+# list — so a term like "IT" has nothing to match against even though rows
+# like "IT Data Engineer" or "Head of Information Technology" genuinely exist.
+# This is the generic fallback: when a query token survives tokenization but
+# still has no match after the fast, sample-based pass, run a bounded, live
+# LIKE search against the source's own high-cardinality text columns. Works
+# for any token/column/dialect — nothing here is specific to "IT" or any one
+# schema.
+
+_TEXT_TYPE_HINTS = ("string", "text", "char", "clob")
+_MAX_PROBE_COLUMNS = 15
+_PROBE_DISTINCT_LIMIT = 500
+
+
+def _text_columns_from_kg_nodes(kg_nodes: List[Dict]) -> Dict[str, List[str]]:
+    """table label → text-typed column names, read straight off the KG nodes
+    (the same node["properties"] shape used throughout dialog_agent)."""
+    out: Dict[str, List[str]] = {}
+    for node in kg_nodes or []:
+        label = node.get("label") or ""
+        if not label:
+            continue
+        cols: List[str] = []
+        for prop in node.get("properties") or []:
+            col = (prop.get("name") or "").strip()
+            dtype = (prop.get("type") or "").lower()
+            if col and any(h in dtype for h in _TEXT_TYPE_HINTS):
+                cols.append(col)
+        if cols:
+            out[label] = cols
+    return out
+
+
+def _probe_candidate_columns(
+    text_columns_by_table: Dict[str, List[str]],
+    categorical_columns: Dict[str, Dict[str, List[str]]],
+) -> Dict[str, List[str]]:
+    """Text columns minus whatever the fast sample-based pass already covers —
+    these are the columns a live probe can add value on."""
+    out: Dict[str, List[str]] = {}
+    for tbl, cols in text_columns_by_table.items():
+        already_covered = set(categorical_columns.get(tbl, {}).keys())
+        extra = [c for c in cols if c not in already_covered]
+        if extra:
+            out[tbl] = extra
+    return out
+
+
+def _db_probe_candidates(
+    config: Any,
+    state: DialogState,
+    unresolved_tokens: List[str],
+    acronym_tokens: Set[str],
+    probe_columns: Dict[str, List[str]],
+) -> List[Dict[str, Any]]:
+    """
+    For tokens the cheap sample-based pass found no evidence for, fetch each
+    high-cardinality text column's distinct values ONCE (not once per token —
+    a per-token `LIKE` loop burns its round-trip budget on whichever token
+    happens to iterate first and can starve out the column that actually
+    matters) and match every unresolved token against that one result set in
+    Python, using the same whole-word logic as the fast pass plus
+    initials-matching for acronym tokens (so "IT" can still resolve to
+    "Information Technology" even though it isn't a literal substring of it).
+
+    Reuses execute_node._run_sql so this works across every dialect the
+    pipeline already supports (Postgres, Snowflake, the in-memory SQLite file
+    backends, etc.) without any new connection logic. Bounded to
+    _MAX_PROBE_COLUMNS round trips — this only runs at all when there's at
+    least one genuinely unresolved token, so the common case (fast pass
+    already found everything) pays nothing extra.
+
+    The round trips are run concurrently (same ThreadPoolExecutor pattern
+    execute_node already uses for independent queries, see execute_node.py's
+    multi-query dispatch): each _run_sql call opens and closes its own DB
+    connection, so probing 15 unrelated columns one at a time was pure
+    serialized waiting — measured at ~60s in production traces — with no
+    correctness reason for the serialization.
+    """
+    if not unresolved_tokens or not probe_columns:
+        return []
+
+    from .execute_node import _run_sql
+    from .understand_node import _FILE_BASED_TYPES, _qualified, _to_sql_col, _to_sql_table
+
+    is_file_based = config.db_type.lower() in _FILE_BASED_TYPES
+    db_schema = "" if is_file_based else (config.db_schema or "")
+
+    # Flatten to a bounded list of (table, column) probe targets up front so
+    # the _MAX_PROBE_COLUMNS cap applies the same way it did sequentially,
+    # before fanning the round trips out across a thread pool.
+    probe_targets: List[tuple] = []
+    for tbl, cols in probe_columns.items():
+        if len(probe_targets) >= _MAX_PROBE_COLUMNS:
+            break
+        sql_tbl = _to_sql_table(tbl) if is_file_based else tbl
+        table_q = _qualified(db_schema, sql_tbl)
+        for col in cols:
+            if len(probe_targets) >= _MAX_PROBE_COLUMNS:
+                break
+            sql_col = _to_sql_col(col) if is_file_based else col
+            probe_targets.append((tbl, col, table_q, sql_col))
+
+    def _probe_one(target: tuple) -> List[Dict[str, Any]]:
+        tbl, col, table_q, sql_col = target
+        sql = (
+            f"SELECT DISTINCT {sql_col} FROM {table_q} "
+            f"WHERE {sql_col} IS NOT NULL LIMIT {_PROBE_DISTINCT_LIMIT}"
+        )
+        try:
+            result = _run_sql(config, sql, state)
+        except Exception as exc:
+            logger.debug("resolve_node: DB probe failed for %s.%s: %s", tbl, col, exc)
+            return []
+        if result.get("error"):
+            return []
+        found: List[Dict[str, Any]] = []
+        for row in result.get("rows") or []:
+            val = row[0] if row else None
+            if val is None:
+                continue
+            val_str = str(val)
+            val_lower = val_str.lower()
+            matched = {t for t in unresolved_tokens if _token_matches_text(t, val_lower)}
+            matched |= {t for t in acronym_tokens if _initials_match(t, val_str)}
+            if not matched:
+                continue
+            found.append({
+                "table":          tbl,
+                "column":         col,
+                "stored_value":   val_str,
+                "overlap_tokens": sorted(matched),
+                "score":          len(matched),
+                "match_type":     "db_probe",
+                "promoted_from":  None,
+            })
+        return found
+
+    candidates: List[Dict[str, Any]] = []
+    columns_probed = len(probe_targets)
+    if len(probe_targets) == 1:
+        candidates.extend(_probe_one(probe_targets[0]))
+    elif probe_targets:
+        import concurrent.futures
+        max_workers = min(len(probe_targets), 8)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for found in pool.map(_probe_one, probe_targets):
+                candidates.extend(found)
+
+    if candidates:
+        logger.info(
+            "resolve_node: DB probe found %d candidate value(s) for unresolved "
+            "token(s) %s across %d high-cardinality column(s) (%d columns probed)",
+            len(candidates), unresolved_tokens, len(probe_columns), columns_probed,
+        )
+    return candidates
+
+
 def resolve_node(state: DialogState) -> DialogState:
     """
     Map user query terms to exact categorical column values before SQL planning.
@@ -501,11 +867,15 @@ def resolve_node(state: DialogState) -> DialogState:
     categorical_columns: Dict[str, Dict[str, List[str]]] = state.get("categorical_columns") or {}
     column_hierarchy: Dict[str, Dict[str, Dict[str, List[str]]]] = state.get("column_hierarchy") or {}
     natural_query: str = state.get("natural_query", "")
+    kg_nodes = state.get("kg_nodes") or []
 
-    # Skip if no categorical data was found (DB-backed sources without samples,
-    # or non-file sources where sampling is not available)
-    if not categorical_columns:
-        logger.info("resolve_node: no categorical columns — skipping resolution")
+    # Skip only when there's nothing at all to resolve against — no sampled
+    # categorical values AND no schema (so a live probe has no columns to hit
+    # either). A source with only high-cardinality text columns (no column
+    # ever made the categorical cut) still reaches here now, since that's
+    # exactly the case the DB probe below exists to cover.
+    if not categorical_columns and not kg_nodes:
+        logger.info("resolve_node: no categorical columns or schema — skipping resolution")
         state["term_resolution"] = []
         return state
 
@@ -516,6 +886,23 @@ def resolve_node(state: DialogState) -> DialogState:
 
     # ── Fuzzy pre-match: stemmed/edit-distance token overlap + hierarchy promotion ──
     fuzzy_candidates = _fuzzy_match_candidates(natural_query, categorical_columns, column_hierarchy)
+
+    # ── Live DB probe: give tokens the fast pass couldn't place a second shot
+    # against high-cardinality text columns that never got a full sample. ────
+    matched_tokens = {t for c in fuzzy_candidates for t in c["overlap_tokens"]}
+    unresolved_tokens = sorted(_tokenize_query(natural_query) - matched_tokens)
+    # Case-insensitive here (unlike the sample-based pass above): a token like
+    # "it" typed in normal sentence case should still be tried as an acronym
+    # against the live-probed high-cardinality columns — see _acronym_tokens.
+    unresolved_acronyms = _acronym_tokens(natural_query, require_caps=False) - matched_tokens
+    if unresolved_tokens or unresolved_acronyms:
+        text_columns_by_table = _text_columns_from_kg_nodes(kg_nodes)
+        probe_columns = _probe_candidate_columns(text_columns_by_table, categorical_columns)
+        db_candidates = _db_probe_candidates(
+            config, state, unresolved_tokens, unresolved_acronyms, probe_columns
+        )
+        fuzzy_candidates = fuzzy_candidates + db_candidates
+
     hint_section = _build_hint_section(fuzzy_candidates)
     if fuzzy_candidates:
         logger.info(
@@ -564,5 +951,19 @@ def resolve_node(state: DialogState) -> DialogState:
         term_resolution = []
 
     state["term_resolution"] = term_resolution
+
+    # ── Ambiguous proper-noun disambiguation ────────────────────────────────
+    # See _detect_ambiguous_terms — non-empty only when the question names an
+    # entity with 2+ equally-close stored values (e.g. "Smith" -> "John
+    # Smith" or "Jane Smith"). plan_node checks this and asks the user to
+    # pick one instead of guessing and running SQL against the wrong entity.
+    clarification_needed = _detect_ambiguous_terms(natural_query, fuzzy_candidates)
+    if clarification_needed:
+        logger.info(
+            "resolve_node: ambiguous proper-noun term(s) need user disambiguation: %s",
+            [(c["term"], c["candidates"]) for c in clarification_needed],
+        )
+    state["clarification_needed"] = clarification_needed
+
     state["phase"] = "resolve"
     return state

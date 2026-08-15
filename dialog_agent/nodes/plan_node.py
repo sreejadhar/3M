@@ -3661,66 +3661,19 @@ def _fix_multicolumn_subquery(sql: str) -> str:
             i += 1
         return i - 1  # position of matching ')'
 
-    # ── Pattern 1: scalar IN / NOT IN / = subquery with multiple columns ─────
-    # Match:  [NOT ]IN\s*( SELECT …
-    # Also:   = \s*( SELECT …    >= ( SELECT …   etc.
-    _SCALAR_SUB_RE = re.compile(
-        r'\b((?:NOT\s+)?IN|=|<>|!=|>=|<=|>(?!=)|<(?!=))\s*(\(\s*SELECT\b)',
-        re.IGNORECASE,
-    )
-    pieces = []
-    pos = 0
-    for m in _SCALAR_SUB_RE.finditer(sql):
-        paren_open = m.start(2) + m.group(2).index('(')
-        paren_close = _find_matching_close(sql, paren_open)
-        sub_body = sql[paren_open + 1: paren_close]  # content inside the (…)
-
-        # Extract the SELECT list of the inner query
-        sel_m = re.match(r'\s*SELECT\s+', sub_body, re.IGNORECASE)
-        if not sel_m:
-            continue
-
-        # Find the FROM keyword at depth 0 to isolate the SELECT list
-        after_select = sub_body[sel_m.end():]
-        from_pos = None
-        depth = 0
-        for i, ch in enumerate(after_select):
-            if ch == '(':
-                depth += 1
-            elif ch == ')':
-                depth -= 1
-            elif depth == 0 and re.match(r'\bFROM\b', after_select[i:], re.IGNORECASE):
-                from_pos = i
-                break
-
-        if from_pos is None:
-            continue  # can't parse — leave alone
-
-        select_list_text = after_select[:from_pos]
-        select_items = _split_select_list(select_list_text)
-
-        # Only fix when there are multiple columns
-        if len(select_items) <= 1:
-            continue
-
-        # Rebuild: keep only the first expression
-        first_col = select_items[0].strip()
-        rest_of_sub = after_select[from_pos:]  # FROM … onwards
-        new_sub = f"(SELECT {first_col} {rest_of_sub})"
-        pieces.append(sql[pos: m.start(2)])
-        pieces.append(new_sub)
-        pos = paren_close + 1
-        logger.info(
-            "plan_node: stripped extra SELECT columns from scalar subquery "
-            "(kept '%s', dropped %d col(s))",
-            first_col, len(select_items) - 1,
-        )
-
-    if pieces:
-        pieces.append(sql[pos:])
-        sql = "".join(pieces)
-
-    # ── Pattern 2: row-value constructor  (a, b, …) IN (SELECT x, y, … FROM t …) ──
+    # ── Pattern 2 runs FIRST: row-value constructor ──────────────────────────
+    #   (a, b, …) IN (SELECT x, y, … FROM t …)
+    # Must run before Pattern 1 below. Pattern 1's regex matches "IN (SELECT"
+    # regardless of what precedes the IN, so on a tuple LHS like
+    # "(o.customer_id, o.region) IN (SELECT customer_id, region FROM …)" it
+    # used to fire first and truncate the subquery to its first column —
+    # which then made Pattern 2's `len(sub_cols) != len(outer_cols)` guard
+    # fail, so the EXISTS rewrite could never trigger for the exact
+    # multi-column case it exists to handle, leaving a tuple compared against
+    # a now-mismatched single-column subquery (invalid SQL, worse than the
+    # unfixed input). Running the more specific row-value-constructor pattern
+    # first consumes those spans as EXISTS(...) before Pattern 1 ever sees an
+    # "IN (SELECT" there.
     # Match:  \( col_list \) \s* [NOT\s+]? IN \s* \( SELECT …
     _ROW_CTOR_RE = re.compile(
         r'\(\s*([\w\.\[\]`"]+(?:\s*,\s*[\w\.\[\]`"]+)+)\s*\)\s*(NOT\s+)?IN\s*(\(\s*SELECT\b)',
@@ -3799,7 +3752,172 @@ def _fix_multicolumn_subquery(sql: str) -> str:
         pieces.append(sql[pos:])
         sql = "".join(pieces)
 
+    # ── Pattern 1 runs SECOND: scalar IN / NOT IN / = subquery with multiple
+    # columns ──────────────────────────────────────────────────────────────
+    # Match:  [NOT ]IN\s*( SELECT …
+    # Also:   = \s*( SELECT …    >= ( SELECT …   etc.
+    # By this point Pattern 2 has already consumed every row-value-constructor
+    # tuple IN (SELECT ...) as EXISTS(...), so this only ever sees genuine
+    # scalar-context subqueries (col IN (SELECT ...), col = (SELECT ...)).
+    _SCALAR_SUB_RE = re.compile(
+        r'\b((?:NOT\s+)?IN|=|<>|!=|>=|<=|>(?!=)|<(?!=))\s*(\(\s*SELECT\b)',
+        re.IGNORECASE,
+    )
+    pieces = []
+    pos = 0
+    for m in _SCALAR_SUB_RE.finditer(sql):
+        paren_open = m.start(2) + m.group(2).index('(')
+        paren_close = _find_matching_close(sql, paren_open)
+        sub_body = sql[paren_open + 1: paren_close]  # content inside the (…)
+
+        # Extract the SELECT list of the inner query
+        sel_m = re.match(r'\s*SELECT\s+', sub_body, re.IGNORECASE)
+        if not sel_m:
+            continue
+
+        # Find the FROM keyword at depth 0 to isolate the SELECT list
+        after_select = sub_body[sel_m.end():]
+        from_pos = None
+        depth = 0
+        for i, ch in enumerate(after_select):
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif depth == 0 and re.match(r'\bFROM\b', after_select[i:], re.IGNORECASE):
+                from_pos = i
+                break
+
+        if from_pos is None:
+            continue  # can't parse — leave alone
+
+        select_list_text = after_select[:from_pos]
+        select_items = _split_select_list(select_list_text)
+
+        # Only fix when there are multiple columns
+        if len(select_items) <= 1:
+            continue
+
+        # Rebuild: keep only the first expression
+        first_col = select_items[0].strip()
+        rest_of_sub = after_select[from_pos:]  # FROM … onwards
+        new_sub = f"(SELECT {first_col} {rest_of_sub})"
+        pieces.append(sql[pos: m.start(2)])
+        pieces.append(new_sub)
+        pos = paren_close + 1
+        logger.info(
+            "plan_node: stripped extra SELECT columns from scalar subquery "
+            "(kept '%s', dropped %d col(s))",
+            first_col, len(select_items) - 1,
+        )
+
+    if pieces:
+        pieces.append(sql[pos:])
+        sql = "".join(pieces)
+
     return sql
+
+
+# A single identifier token in any of the quoting styles used across the
+# dialects this planner targets:
+#   bare        col
+#   PostgreSQL / Snowflake / Oracle / BigQuery standard-SQL   "col"
+#   SQL Server                                                [col]
+#   BigQuery legacy / MySQL                                   `col`
+_IDENT_SRC = r'"[^"]+"|\[[^\]]+\]|`[^`]+`|\w+'
+# No leading \b: a quote/bracket/backtick is a non-word char, so \b would
+# fail to match right after whitespace (both sides non-word) and silently
+# skip every quoted identifier — exactly the dialects that need this most
+# (Postgres/Snowflake "col", SQL Server [col], BigQuery/MySQL `col`).
+_QUALIFIED_IDENT_RE = re.compile(rf'({_IDENT_SRC})\.({_IDENT_SRC})')
+_ALIAS_CAPTURE_RE = re.compile(rf'\bAS\s+({_IDENT_SRC})\s*$', re.IGNORECASE)
+
+
+def _strip_ident_quotes(token: str) -> str:
+    """Strip whichever quoting style wraps an identifier, for comparison only."""
+    if len(token) >= 2 and token[0] == '"' and token[-1] == '"':
+        return token[1:-1]
+    if len(token) >= 2 and token[0] == '[' and token[-1] == ']':
+        return token[1:-1]
+    if len(token) >= 2 and token[0] == '`' and token[-1] == '`':
+        return token[1:-1]
+    return token
+
+
+def _fix_order_by_alias_qualifier(sql: str) -> str:
+    """
+    Fix: LLM qualifies a computed SELECT alias with a table prefix inside
+    ORDER BY, e.g. "... AS years_in_position ... ORDER BY jc.years_in_position".
+
+    "years_in_position" is not a real column on table jc — it only exists as
+    an output alias of an EXTRACT(...)/computed expression, so referencing it
+    as "jc.years_in_position" is invalid SQL in every dialect (the table has
+    no such column). This is independent of SELECT DISTINCT and must be fixed
+    even when DISTINCT is absent.
+
+    Detects each "<table_alias>.<name>" term in the outermost ORDER BY clause
+    where <name> (case-insensitively, quoting-insensitively) matches a
+    "... AS <name>" alias in the SELECT list, and rewrites the ORDER BY
+    reference to the bare alias. Identifier quoting is dialect-agnostic:
+    unquoted, "double-quoted" (Postgres/Snowflake/Oracle/BigQuery standard
+    SQL), [bracketed] (SQL Server), and `backticked` (BigQuery legacy/MySQL)
+    are all recognized on either side of the dot.
+    """
+    sel_match = re.search(r'\bSELECT\b', sql, re.IGNORECASE)
+    if not sel_match:
+        return sql
+
+    from_match = None
+    for m in re.finditer(r'\bFROM\b', sql, re.IGNORECASE):
+        prefix = sql[:m.start()]
+        if prefix.count('(') - prefix.count(')') == 0 and m.start() > sel_match.end():
+            from_match = m
+            break
+    if not from_match:
+        return sql
+
+    select_list_text = sql[sel_match.end():from_match.start()]
+    select_list_text = re.sub(r'^\s*DISTINCT\b', '', select_list_text, flags=re.IGNORECASE)
+    select_items = _split_select_list(select_list_text)
+
+    aliases: set = set()
+    for item in select_items:
+        alias_m = _ALIAS_CAPTURE_RE.search(item)
+        if alias_m:
+            aliases.add(_strip_ident_quotes(alias_m.group(1)).lower())
+    if not aliases:
+        return sql
+
+    ob_match = None
+    for m in re.finditer(r'\bORDER\s+BY\b', sql, re.IGNORECASE):
+        prefix = sql[:m.start()]
+        if prefix.count('(') - prefix.count(')') == 0:
+            ob_match = m
+    if not ob_match:
+        return sql
+
+    limiter_match = re.search(
+        r'\b(LIMIT\s+\d+|OFFSET\s+\d+|FETCH\s+FIRST\b|ROWNUM\s*<=?\s*\d+)\b',
+        sql[ob_match.end():], re.IGNORECASE,
+    )
+    ob_end = ob_match.end() + limiter_match.start() if limiter_match else len(sql)
+    order_clause = sql[ob_match.end():ob_end]
+
+    def _strip_qualifier(m: re.Match) -> str:
+        table_tok, col_tok = m.group(1), m.group(2)
+        if _strip_ident_quotes(col_tok).lower() in aliases:
+            logger.info(
+                "plan_node: stripped invalid table qualifier '%s.' from ORDER BY alias '%s'",
+                table_tok, col_tok,
+            )
+            return col_tok
+        return m.group(0)
+
+    fixed_clause = _QUALIFIED_IDENT_RE.sub(_strip_qualifier, order_clause)
+    if fixed_clause == order_clause:
+        return sql
+
+    return sql[:ob_match.end()] + fixed_clause + sql[ob_end:]
 
 
 def _fix_distinct_order_by(sql: str) -> str:
@@ -3830,6 +3948,22 @@ def _fix_distinct_order_by(sql: str) -> str:
         return sql
 
     order_clause = sql[ob_match.end():]
+
+    # Truncate at a trailing row-limiting clause (LIMIT/OFFSET/FETCH FIRST/
+    # ROWNUM) so it doesn't get glued onto the last ORDER BY term. Without
+    # this, "ORDER BY a DESC, b DESC LIMIT 50" splits its last term as
+    # "b DESC LIMIT 50" — the DESC/ASC-stripping regex only matches at the
+    # end of the term, so it fails to strip DESC here, the whole garbled
+    # fragment is then treated as "missing" from the SELECT list and spliced
+    # in verbatim, and a later LIMIT-stripping pass (for COUNT(*) companion
+    # queries) removes the embedded "LIMIT 50" but leaves the "DESC" behind.
+    limiter_match = re.search(
+        r'\b(LIMIT\s+\d+|OFFSET\s+\d+|FETCH\s+FIRST\b|ROWNUM\s*<=?\s*\d+)\b',
+        order_clause, re.IGNORECASE,
+    )
+    if limiter_match:
+        order_clause = order_clause[:limiter_match.start()]
+
     order_terms = _split_order_by_terms(order_clause)
     if not order_terms:
         return sql
@@ -3848,15 +3982,19 @@ def _fix_distinct_order_by(sql: str) -> str:
     select_list_text = sql[sel_match.end():from_match.start()]
     select_items = _split_select_list(select_list_text)
 
-    # Build normalised set: aliases, bare column names, full expressions
+    # Build normalised set: aliases, bare column names, full expressions.
+    # Table-qualifier stripping is quoting-agnostic so it works the same for
+    # bare, "double-quoted", [bracketed], and `backticked` identifiers across
+    # PostgreSQL / Snowflake / SQL Server / Oracle / BigQuery / MySQL.
     selected_exprs: set = set()
     for item in select_items:
         # alias: "expr AS alias"
-        alias_m = re.search(r'\bAS\s+(\w+)\s*$', item, re.IGNORECASE)
+        alias_m = _ALIAS_CAPTURE_RE.search(item)
         if alias_m:
-            selected_exprs.add(alias_m.group(1).lower())
-        # bare column (strip table qualifier)
-        bare = re.sub(r'^\w+\.', '', item.strip()).lower()
+            selected_exprs.add(_strip_ident_quotes(alias_m.group(1)).lower())
+        # bare column (strip table qualifier, if any)
+        qualified_m = re.fullmatch(rf'\s*({_IDENT_SRC})\.({_IDENT_SRC})\s*', item)
+        bare = _strip_ident_quotes(qualified_m.group(2)).lower() if qualified_m else item.strip().lower()
         selected_exprs.add(bare)
         # full expression as-is
         selected_exprs.add(item.strip().lower())
@@ -3865,7 +4003,11 @@ def _fix_distinct_order_by(sql: str) -> str:
     missing = []
     for term in order_terms:
         t_lower = term.lower()
-        bare_t = re.sub(r'^\w+\.', '', t_lower)
+        qualified_t = re.fullmatch(rf'\s*({_IDENT_SRC})\.({_IDENT_SRC})\s*', term)
+        bare_t = (
+            _strip_ident_quotes(qualified_t.group(2)).lower() if qualified_t
+            else _strip_ident_quotes(term.strip()).lower()
+        )
         if t_lower not in selected_exprs and bare_t not in selected_exprs:
             missing.append(term)
 
@@ -4184,6 +4326,33 @@ def plan_node(state: DialogState) -> DialogState:
         state["phase"] = "plan"
         return state
 
+    # ── Ambiguous proper-noun disambiguation ───────────────────────────────
+    # resolve_node found 2+ equally-close candidate stored values for a
+    # proper-noun term in the question (see resolve_node._detect_ambiguous_terms)
+    # — e.g. "Smith" could be "John Smith" or "Jane Smith". Ask the user to
+    # pick one instead of guessing and running SQL against a possibly-wrong
+    # entity. Reuses the same plan_explanation/no-SQL mechanism as the
+    # meta-question path below. Empty (the default) is a complete no-op.
+    clarification_needed = state.get("clarification_needed") or []
+    if clarification_needed:
+        lines = [
+            "I found more than one close match and want to make sure I pick the right one:",
+            "",
+        ]
+        for c in clarification_needed:
+            candidates_str = ", ".join(f'"{v}"' for v in c["candidates"])
+            lines.append(f'- For "{c["term"]}", did you mean one of: {candidates_str}?')
+        lines.append("")
+        lines.append("Please reply with the one you meant and I'll run the query.")
+        logger.info(
+            "plan_node: %d ambiguous term(s) — asking user to disambiguate instead of guessing",
+            len(clarification_needed),
+        )
+        state["plan_explanation"] = "\n".join(lines)
+        state["sql_queries"] = []
+        state["phase"] = "plan"
+        return state
+
     # ── Meta-question detection: discovery / capability questions ─────────────
     # "What insights can I generate?", "What can I analyse?", "What does this
     # data tell me?", "What questions can I ask?" etc. have no SQL answer.
@@ -4461,6 +4630,9 @@ def plan_node(state: DialogState) -> DialogState:
             "steward. Use them ONLY to understand terminology in the user's question that",
             "is NOT already covered by RESOLVED BUSINESS CONCEPTS or BUSINESS GLOSSARY",
             "above. Do not let these override a binding or definition given above.",
+            "When 'Observed values' is present, those are real values sampled from the",
+            "actual column — prefer them verbatim in WHERE/filter clauses over guessing",
+            "a spelling/casing from the definition text alone.",
             "",
         ]
         for term in generated_glossary_terms:
@@ -4469,6 +4641,9 @@ def plan_node(state: DialogState) -> DialogState:
                 gg_lines.append(f"  Domain      : {term['domain']}")
             if term.get("definition"):
                 gg_lines.append(f"  Definition  : {term['definition']}")
+            observed = term.get("observed_values") or []
+            if observed:
+                gg_lines.append(f"  Observed values (sampled from actual data): {observed}")
             gg_lines.append("")
         gg_lines.append("=" * 60)
         generated_glossary_section = "\n".join(gg_lines) + "\n\n"
@@ -4768,6 +4943,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _fix_subquery_order_by(sql, config.db_type)
             sql = _fix_window_functions(sql, config.db_type)
             sql = _fix_multicolumn_subquery(sql)
+            sql = _fix_order_by_alias_qualifier(sql)
             sql = _fix_distinct_order_by(sql)
 
             # Table hallucination check — a FROM/JOIN table name that doesn't
@@ -5213,6 +5389,7 @@ def plan_node(state: DialogState) -> DialogState:
                     candidate = _fix_subquery_order_by(candidate, config.db_type)
                     candidate = _fix_window_functions(candidate, config.db_type)
                     candidate = _fix_multicolumn_subquery(candidate)
+                    candidate = _fix_order_by_alias_qualifier(candidate)
                     candidate = _fix_distinct_order_by(candidate)
 
                     if table_labels and _find_hallucinated_tables(candidate, table_labels):

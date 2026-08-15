@@ -135,6 +135,15 @@ class DialogState(TypedDict, total=False):
     # proceeds exactly as today for these — presence here is never fatal.
     unresolved_terms: List[str]
 
+    # Ambiguous proper-noun terms found by resolve_node with 2+ comparably-
+    # scored candidate stored values (e.g. "Smith" could be "John Smith" or
+    # "Jane Smith") — when non-empty, plan_node short-circuits to ask the
+    # user to disambiguate instead of guessing and running SQL against the
+    # wrong entity. Empty (the default) = behave exactly as before this
+    # feature existed.
+    # [{"term": "Smith", "candidates": ["John Smith", "Jane Smith"]}]
+    clarification_needed: List[Dict[str, Any]]
+
     # Shadow-mode / diagnostic observations from dissect_node, surfaced the
     # same way state["errors"] is, so they're visible without changing
     # planner behaviour.

@@ -218,14 +218,98 @@ def _lookup_canonical(idx: Dict[str, List[Dict]], canonical_key: str, domain: st
     return candidates[0]
 
 
+_CATEGORICAL_MAX_UNIQUE = 15
+_CATEGORICAL_MAX_LEN = 40
+
+
+def _looks_categorical(values: List[Any]) -> bool:
+    """True when *values* looks like a small fixed set of short tokens (an
+    honorific, a status code, a yes/no flag, ...) rather than free text/IDs/
+    emails/names, where exact-value overlap between two columns is a
+    meaningful signal of "same real-world meaning" (or lack thereof)."""
+    vals = [str(v).strip().lower() for v in values if v is not None and str(v).strip()]
+    if not vals:
+        return False
+    if len(set(vals)) > _CATEGORICAL_MAX_UNIQUE:
+        return False
+    return all(len(v) <= _CATEGORICAL_MAX_LEN for v in vals)
+
+
+def _term_conflicts_with_samples(term: Dict, sample_values: List[Any]) -> bool:
+    """A canonical name match (e.g. two unrelated tables both having a
+    "title_en" column) must never be trusted purely on the name when real
+    data is available to check it. If the term was originally grounded on a
+    small categorical set of values (its sample_values_hint) and this
+    column's own real samples are also categorical but share NOTHING with
+    that set, the match is almost certainly a same-name-different-meaning
+    collision, not a legitimate reuse — the caller should fall back to
+    LLM-grounded generation instead of blindly linking.
+
+    Deliberately does NOT flag a conflict for high-cardinality data (free
+    text, emails, names, IDs, dates, ...) — two legitimately-shared columns
+    of that kind will rarely share literal values even when they mean the
+    exact same thing, so absence of overlap there is not a useful signal
+    and would just defeat the point of the canonical-match fast path."""
+    if not sample_values:
+        return False
+    hint_raw = term.get("sample_values_hint") or ""
+    if not hint_raw:
+        # The term was never actually grounded in real column data (e.g. a
+        # pre-existing canonical match made before this check existed, or an
+        # entity-level term). Trusting it purely by name is exactly the
+        # unverified guess this function exists to catch — if THIS column's
+        # own real values look like a small fixed set (a meaningful signal
+        # either way), treat the ungrounded term as unproven rather than
+        # blindly reusing it, forcing one fresh LLM-grounded read. Once that
+        # happens the term gains its own hint and later runs can verify it
+        # properly. High-cardinality samples fall through to "no conflict"
+        # (unchanged) since there's nothing useful to check either way.
+        return _looks_categorical(sample_values)
+    try:
+        hint_values = json.loads(hint_raw)
+    except (json.JSONDecodeError, TypeError):
+        return _looks_categorical(sample_values)
+    if not hint_values:
+        return _looks_categorical(sample_values)
+    if not _looks_categorical(hint_values) or not _looks_categorical(sample_values):
+        return False
+    hint_set = {str(v).strip().lower() for v in hint_values if v is not None}
+    sample_set = {str(v).strip().lower() for v in sample_values if v is not None}
+    return bool(hint_set) and bool(sample_set) and not (hint_set & sample_set)
+
+
+def _sample_column_live(connector: Any, schema_name: str, table_name: str,
+                         column_name: str) -> List[Any]:
+    """On-demand profiling for a single column that was never sampled at
+    index time (empty top_values) — real values pulled live from the source,
+    never fabricated. Returns [] on any failure so the caller can fall back
+    to skipping (never guessing) rather than crashing the whole run."""
+    try:
+        stats = connector.get_column_stats(schema_name, table_name, column_name, 10_000)
+        return [v for v in (stats.get("top_values") or []) if v is not None]
+    except Exception as exc:
+        logger.warning("generate_glossary: live sampling failed for %s.%s.%s — %s",
+                        schema_name, table_name, column_name, exc)
+        return []
+
+
 def generate_glossary_for_source(
     source_id: str, model: Optional[str] = None, domain: str = "", business: str = "",
     progress_cb: Optional[Callable[[str, str], None]] = None,
+    connector_factory: Optional[Callable[[], Any]] = None,
 ) -> Dict[str, int]:
     """
     Runs the full discovery pipeline for every entity in source_id.
     progress_cb(stage, message) is called at each stage boundary for SSE
     progress reporting — optional, no-op if omitted.
+
+    connector_factory, if given, is a zero-arg callable returning a
+    connected BaseConnector for this source — used ONLY to sample a column
+    live when it was never profiled at index time (empty top_values), so
+    the LLM is never asked to invent a term/definition for a column it has
+    seen no real values for. Built and connected lazily, at most once per
+    run. If omitted (or profiling fails), a column with no samples is
+    skipped rather than sent to the LLM blind — see _sample_column_live.
 
     Returns {"columns_processed", "terms_created", "terms_linked", "needs_review"}.
     """
@@ -238,7 +322,20 @@ def generate_glossary_for_source(
 
     model = model or os.environ.get("DIALOG_LLM_MODEL", "claude-haiku-4-5")
     stats = {"columns_processed": 0, "terms_created": 0, "terms_linked": 0, "needs_review": 0,
-              "skipped_existing": 0}
+              "skipped_existing": 0, "skipped_no_samples": 0}
+
+    _connector_state: Dict[str, Any] = {"built": False, "connector": None}
+
+    def get_connector() -> Optional[Any]:
+        if not _connector_state["built"]:
+            _connector_state["built"] = True
+            if connector_factory:
+                try:
+                    _connector_state["connector"] = connector_factory()
+                except Exception as exc:
+                    logger.warning("generate_glossary: could not build live connector for %s — %s",
+                                    source_id, exc)
+        return _connector_state["connector"]
 
     entities = _mc.list_entities(source_id)
     progress("normalize", f"Normalizing columns for {len(entities)} table(s)…")
@@ -251,18 +348,45 @@ def generate_glossary_for_source(
     # actual LLM time. Both of these are read-only snapshots taken once,
     # which is safe because pass 1 never creates new canonical terms itself
     # (only pass 2 does, and it re-checks the live registry before creating).
-    # Only approved (or manually-edited — update_term always forces
-    # status='approved' for a manual edit, see glossary_registry.update_term)
-    # links are permanently skipped on re-run. A link to a draft/candidate
-    # term is an unreviewed guess — possibly generated before business/domain
-    # context existed — and is treated as still eligible for regeneration, so
-    # "regenerate" can actually replace a bad guess instead of being a no-op
-    # forever once anything, right or wrong, has been linked once.
+    # A manually-edited link (match_method='manual' — update_term always
+    # forces status='approved' for a manual edit, see
+    # glossary_registry.update_term) is permanently skipped: a human already
+    # made the call, so no automated run may overwrite it.
+    #
+    # An auto-generated link (draft/candidate, OR approved but linked under a
+    # DIFFERENT domain than this run's) is treated as stale and re-evaluated.
+    # Business/domain context can change after a source is reindexed
+    # (glossary_generate is called with the source's current domain/business
+    # every run) — without the domain check here, a column that got
+    # auto-approved (>=0.9 confidence) under a wrong/blank domain on an
+    # earlier run would keep that stale domain forever, since approved links
+    # used to be frozen unconditionally. Re-evaluating it lets the freshly
+    # correct domain/business context actually reach both the term the LLM
+    # regenerates and the knowledge graph enrichment downstream.
+    # A canonical-matched link (match_method='canonical') was accepted on
+    # name alone at some point — cheaply re-derived every run rather than
+    # ever LLM-generated for THIS column, so unlike an llm_generated
+    # approval it was never actually grounded in this column's own data.
+    # It must never be treated as permanently settled just because it's
+    # "approved": re-checking it costs nothing (no LLM call, no network —
+    # see _term_conflicts_with_samples) and is what lets a stale/incorrect
+    # name collision (e.g. two unrelated tables both having a "title_en"
+    # column) self-heal on the very next Generate click instead of staying
+    # wrong forever once auto-approved.
     source_assets = _reg.list_assets_for_source(source_id)
     already_governed = {
         (a["metadata_id"], a.get("attr_id", "")) for a in source_assets
         if a.get("term_match_method") == "manual"
-        or (a.get("term_status") == "approved" and (a.get("link_domain") or "") == (domain or ""))
+        # NOTE: match_method here is the LINK's own method (this row came
+        # from list_assets_for_source's "a.*", i.e. biz_glossary_term_assets
+        # .match_method) — NOT term_match_method (the TERM's own origin,
+        # aliased separately by the same query). A term is almost always
+        # created with match_method='llm_generated' regardless of how many
+        # OTHER columns later got linked to it by name alone, so checking
+        # term_match_method here would never actually catch a canonical
+        # link — it must be this specific link's own match_method.
+        or (a.get("term_status") == "approved" and a.get("match_method") != "canonical"
+            and (a.get("link_domain") or "") == (domain or ""))
     }
     stale_links = [
         (a["metadata_id"], a.get("attr_id", "")) for a in source_assets
@@ -295,6 +419,7 @@ def generate_glossary_for_source(
             continue
         metadata_id = full["metadata_id"]
         table_name = full["table_name"]
+        schema_name = full.get("schema_name", "")
         attrs = full.get("attributes", [])
 
         items: List[Dict] = [{
@@ -322,12 +447,33 @@ def generate_glossary_for_source(
             stats["columns_processed"] += 1
             normalized = _nlp.normalize_identifier(item["column_name"])
 
+            # Gather real sample values for a real column BEFORE trusting any
+            # name-based canonical match — a name match must be checked
+            # against actual data when data is available, not the other way
+            # around (see _term_conflicts_with_samples: this is what catches
+            # e.g. an unrelated table's "title_en" column being an honorific
+            # while this one is a job title, despite the identical name).
+            if item["attr_id"] and not item["sample_values"]:
+                connector = get_connector()
+                if connector:
+                    live_samples = _sample_column_live(
+                        connector, schema_name, table_name, item["column_name"])
+                    if live_samples:
+                        item = {**item, "sample_values": live_samples}
+
             canon = _lookup_canonical(canonical_idx, normalized, domain)
-            if canon:
+            if canon and not _term_conflicts_with_samples(canon, item["sample_values"]):
                 pending_links.append({"term_id": canon["term_id"], "source_id": source_id,
                                        "metadata_id": metadata_id, "attr_id": item["attr_id"],
                                        "confidence": 0.95, "match_method": "canonical", "domain": domain})
                 stats["terms_linked"] += 1
+                continue
+
+            # A real column (not the table-level entity item) with no
+            # profiled/live-sampled values must never be handed to the LLM
+            # on name alone — that's a guess, not a grounded reading.
+            if item["attr_id"] and not item["sample_values"]:
+                stats["skipped_no_samples"] += 1
                 continue
 
             need_llm.append({**item, "normalized_phrase": normalized})
@@ -436,6 +582,13 @@ def generate_glossary_for_source(
                     key = item["normalized_phrase"].strip().lower()
                     dup = created_this_run.get(key) or _reg.find_term_by_canonical_key(
                         item["normalized_phrase"], domain=domain, status="approved")
+                    # Same name-vs-data sanity check as pass 1: this column
+                    # already has its own LLM-grounded reading of its real
+                    # samples (ann), so a same-named term from elsewhere must
+                    # still agree with the actual data before being reused —
+                    # never merge into it on name alone.
+                    if dup and _term_conflicts_with_samples(dup, item["sample_values"]):
+                        dup = None
                     if dup:
                         _reg.link_asset(dup["term_id"], source_id, metadata_id, item["attr_id"],
                                          confidence=0.95, match_method="canonical", domain=domain)
@@ -447,6 +600,7 @@ def generate_glossary_for_source(
                         ann["term"], canonical_key=item["normalized_phrase"],
                         definition=ann.get("definition", ""), domain=domain,
                         status=status, confidence=conf, match_method="llm_generated",
+                        sample_values_hint=json.dumps(item["sample_values"][:10], default=str),
                     )
                     _reg.link_asset(term["term_id"], source_id, metadata_id, item["attr_id"],
                                      confidence=conf, match_method="llm_generated", domain=domain)
@@ -458,6 +612,7 @@ def generate_glossary_for_source(
 
     progress("done", f"{stats['terms_created']} term(s) created, {stats['terms_linked']} column(s) linked "
                       f"to existing terms, {stats['needs_review']} need review, "
-                      f"{stats['skipped_existing']} already governed (skipped)")
+                      f"{stats['skipped_existing']} already governed (skipped), "
+                      f"{stats['skipped_no_samples']} skipped (no sample data available)")
     logger.info("generate_glossary_for_source: source=%s %s", source_id, stats)
     return stats

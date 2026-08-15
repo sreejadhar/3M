@@ -156,12 +156,19 @@ class BaseConnector(abc.ABC):
         except Exception:
             pass
 
-        # top 10 frequent values
+        # top 10 frequent values. sample_clause (TABLESAMPLE/LIMIT/...) is a
+        # row-sampling clause that must sit directly after FROM <table>, not
+        # before a GROUP BY on the same query — every dialect's aggregate
+        # clauses (GROUP BY/ORDER BY/LIMIT) can only follow it once there is
+        # no further FROM-clause syntax in between, so the sampled rows are
+        # pulled into a subquery first and the aggregation runs on top of
+        # that, keeping every dialect's sample_clause syntactically valid.
         try:
             top = self.execute(
-                f"SELECT {self._quote(column)} AS val, COUNT(*) AS cnt "
-                f"FROM {fqn} {sample_clause} "
-                f"GROUP BY {self._quote(column)} "
+                f"SELECT val, COUNT(*) AS cnt FROM ("
+                f"SELECT {self._quote(column)} AS val FROM {fqn} {sample_clause}"
+                f") sampled_rows "
+                f"GROUP BY val "
                 f"ORDER BY cnt DESC "
                 f"LIMIT 10"
             )

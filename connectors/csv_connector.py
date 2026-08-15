@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import BaseConnector
-from ..config import DBConfig
+from config import DBConfig
 
 
 class CSVConnector(BaseConnector):

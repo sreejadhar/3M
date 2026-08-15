@@ -172,7 +172,8 @@ CREATE TABLE IF NOT EXISTS biz_glossary_terms (
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     approved_by    TEXT NOT NULL DEFAULT '',
-    approved_at    TEXT NOT NULL DEFAULT ''
+    approved_at    TEXT NOT NULL DEFAULT '',
+    sample_values_hint TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -243,11 +244,21 @@ def _add_link_domain_column(cur: Any) -> None:
         pass
 
 
+def _add_sample_values_hint_column(cur: Any) -> None:
+    """biz_glossary_terms predates sample_values_hint — add it to any database
+    created before this change, same pattern as _add_link_domain_column."""
+    try:
+        cur.execute("ALTER TABLE biz_glossary_terms ADD COLUMN sample_values_hint TEXT NOT NULL DEFAULT ''")
+    except Exception:
+        pass
+
+
 def _ensure(cur: Any) -> None:
     global _schema_ensured
     cur.ddl(_DDL_TERMS, _DDL_ASSETS, _DDL_RELATIONS, _DDL_AUDIT, _DDL_JOBS)
     if not _schema_ensured:
         _add_link_domain_column(cur)
+        _add_sample_values_hint_column(cur)
     _schema_ensured = True
 
 
@@ -262,8 +273,13 @@ _ALLOWED_TERM_FIELDS = {
 def create_term(
     preferred_name: str, canonical_key: str = "", definition: str = "",
     domain: str = "", status: str = "draft", confidence: float = 0.0,
-    match_method: str = "", steward: str = "",
+    match_method: str = "", steward: str = "", sample_values_hint: str = "",
 ) -> Dict:
+    """sample_values_hint: a small JSON-encoded array of the real sample
+    values (if any) the column this term was first grounded on actually
+    contained — lets a later name-based canonical match on a DIFFERENT
+    column sanity-check itself against real data instead of trusting the
+    name alone (see glossary_generate.py's _term_conflicts_with_samples)."""
     if status not in VALID_STATUSES:
         status = "draft"
     now = _now()
@@ -273,16 +289,17 @@ def create_term(
         cur.execute(
             "INSERT INTO biz_glossary_terms "
             "(term_id, preferred_name, canonical_key, definition, domain, status, "
-            "steward, confidence, match_method, version, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            "steward, confidence, match_method, version, created_at, updated_at, sample_values_hint) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
             (term_id, preferred_name, canonical_key, definition, domain, status,
-             steward, float(confidence), match_method, now, now),
+             steward, float(confidence), match_method, now, now, sample_values_hint),
         )
     return {
         "term_id": term_id, "preferred_name": preferred_name, "canonical_key": canonical_key,
         "definition": definition, "domain": domain, "status": status, "steward": steward,
         "confidence": float(confidence), "match_method": match_method, "version": 1,
         "created_at": now, "updated_at": now, "approved_by": "", "approved_at": "",
+        "sample_values_hint": sample_values_hint,
     }
 
 
@@ -323,6 +340,38 @@ def find_term_by_canonical_key(canonical_key: str, domain: Optional[str] = None,
                 (canonical_key, *status_param),
             ).fetchone()
     return dict(row) if row else None
+
+
+def list_terms_with_assets(source_id: str, status: Optional[str] = None) -> List[Dict]:
+    """Same term rows as list_terms(source_id=...), but each dict also carries
+    an "assets" list of {metadata_id, attr_id} for every (metadata_id, attr_id)
+    this term is linked to in *source_id*. Callers use this to resolve a term
+    back to the real column(s) it was grounded in — e.g. to pull that column's
+    already-profiled sample values — rather than trusting the term's free-text
+    definition on its own."""
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        sql = (
+            "SELECT t.*, a.metadata_id AS a_metadata_id, a.attr_id AS a_attr_id "
+            "FROM biz_glossary_terms t "
+            "JOIN biz_glossary_term_assets a ON a.term_id = t.term_id "
+            "WHERE a.source_id = ?"
+        )
+        params: List[Any] = [source_id]
+        if status:
+            sql += " AND t.status=?"
+            params.append(status)
+        sql += " ORDER BY t.preferred_name"
+        rows = [dict(r) for r in cur.execute(sql, tuple(params)).fetchall()]
+
+    terms: Dict[str, Dict] = {}
+    for r in rows:
+        term_id = r["term_id"]
+        metadata_id = r.pop("a_metadata_id")
+        attr_id = r.pop("a_attr_id")
+        term = terms.setdefault(term_id, {**r, "assets": []})
+        term["assets"].append({"metadata_id": metadata_id, "attr_id": attr_id})
+    return list(terms.values())
 
 
 def list_terms(source_id: Optional[str] = None, status: Optional[str] = None,

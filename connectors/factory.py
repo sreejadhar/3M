@@ -1,7 +1,7 @@
 """Factory function: returns the correct connector for a DBConfig."""
 from __future__ import annotations
 
-from ..config import DBConfig, DBType
+from config import DBConfig, DBType
 from .base import BaseConnector
 
 

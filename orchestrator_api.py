@@ -3990,7 +3990,9 @@ class UpdateGlossaryTermRequest(BaseModel):
 
 
 @app.patch("/metadata/glossary-terms/{term_id}")
-async def update_glossary_term_endpoint(term_id: str, req: UpdateGlossaryTermRequest, request: Request):
+async def update_glossary_term_endpoint(
+    term_id: str, req: UpdateGlossaryTermRequest, request: Request, background_tasks: BackgroundTasks,
+):
     """
     Manual edit — the DMBOK 'declared beats inferred' trust boundary: the
     server (not the client) forces match_method='manual', status='approved',
@@ -4017,6 +4019,9 @@ async def update_glossary_term_endpoint(term_id: str, req: UpdateGlossaryTermReq
         changed_by = _require_permission(request, "edit_business_ontology")
         if not _gr.update_term(term_id, changed_by=changed_by, **kwargs):
             raise HTTPException(status_code=404, detail="Term not found")
+        # Same as approve/reject below — a manual edit must show up in the KG
+        # without waiting for a separate approve click or a full /ontology/enrich sweep.
+        _reenrich_term_kg_sources(term_id, background_tasks)
         return _gr.get_term(term_id)
     except HTTPException:
         raise

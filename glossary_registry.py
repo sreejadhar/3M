@@ -23,9 +23,10 @@ list_terms(source_id=None, status=None, domain=None)   -> List[dict]
 update_term(term_id, changed_by="", **fields)  -> bool   (writes audit rows)
 approve_term(term_id, changed_by="")           -> bool
 reject_term(term_id, changed_by="")            -> bool
-link_asset(term_id, source_id, metadata_id, attr_id, confidence, match_method) -> dict
+link_asset(term_id, source_id, metadata_id, attr_id, confidence, match_method, domain="") -> dict
+delete_stale_links(pairs)                      -> None   (re-evaluate unreviewed/domain-stale links)
 list_assets_for_term(term_id)                  -> List[dict]
-list_assets_for_source(source_id)              -> List[dict]  (delta-filter coverage set)
+list_assets_for_source(source_id)              -> List[dict]  (delta-filter coverage set, includes link_domain)
 list_all_linked_columns(exclude_source_id=None) -> List[dict]  (cross-source candidate pool)
 list_glossary_sources()                        -> List[dict]  (source_id, term_count with a generated glossary)
 list_audit(term_id)                            -> List[dict]
@@ -184,6 +185,7 @@ CREATE TABLE IF NOT EXISTS biz_glossary_term_assets (
     attr_id      TEXT NOT NULL DEFAULT '',
     confidence   REAL NOT NULL DEFAULT 0.0,
     match_method TEXT NOT NULL DEFAULT '',
+    domain       TEXT NOT NULL DEFAULT '',
     linked_at    TEXT NOT NULL,
     UNIQUE(term_id, metadata_id, attr_id)
 )
@@ -230,9 +232,22 @@ CREATE TABLE IF NOT EXISTS biz_glossary_jobs (
 _schema_ensured = False
 
 
+def _add_link_domain_column(cur: Any) -> None:
+    """biz_glossary_term_assets predates the domain column — add it to any
+    database created before this change. CREATE TABLE IF NOT EXISTS above
+    never touches an existing table, so this runs unconditionally and
+    swallows the "duplicate column" error on every subsequent call."""
+    try:
+        cur.execute("ALTER TABLE biz_glossary_term_assets ADD COLUMN domain TEXT NOT NULL DEFAULT ''")
+    except Exception:
+        pass
+
+
 def _ensure(cur: Any) -> None:
     global _schema_ensured
     cur.ddl(_DDL_TERMS, _DDL_ASSETS, _DDL_RELATIONS, _DDL_AUDIT, _DDL_JOBS)
+    if not _schema_ensured:
+        _add_link_domain_column(cur)
     _schema_ensured = True
 
 
@@ -407,7 +422,7 @@ def reject_term(term_id: str, changed_by: str = "") -> bool:
 
 def link_asset(
     term_id: str, source_id: str, metadata_id: str, attr_id: str = "",
-    confidence: float = 0.0, match_method: str = "",
+    confidence: float = 0.0, match_method: str = "", domain: str = "",
 ) -> Dict:
     now = _now()
     link_id = str(uuid.uuid4())
@@ -420,20 +435,20 @@ def link_asset(
         if existing:
             link_id = existing["link_id"]
             cur.execute(
-                "UPDATE biz_glossary_term_assets SET confidence=?, match_method=?, linked_at=? WHERE link_id=?",
-                (float(confidence), match_method, now, link_id),
+                "UPDATE biz_glossary_term_assets SET confidence=?, match_method=?, domain=?, linked_at=? WHERE link_id=?",
+                (float(confidence), match_method, domain, now, link_id),
             )
         else:
             cur.execute(
                 "INSERT INTO biz_glossary_term_assets "
-                "(link_id, term_id, source_id, metadata_id, attr_id, confidence, match_method, linked_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (link_id, term_id, source_id, metadata_id, attr_id, float(confidence), match_method, now),
+                "(link_id, term_id, source_id, metadata_id, attr_id, confidence, match_method, domain, linked_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (link_id, term_id, source_id, metadata_id, attr_id, float(confidence), match_method, domain, now),
             )
     return {
         "link_id": link_id, "term_id": term_id, "source_id": source_id,
         "metadata_id": metadata_id, "attr_id": attr_id, "confidence": float(confidence),
-        "match_method": match_method, "linked_at": now,
+        "match_method": match_method, "domain": domain, "linked_at": now,
     }
 
 
@@ -443,7 +458,7 @@ def bulk_link_assets(links: List[Dict]) -> None:
     fine for a single manual edit, but glossary discovery's pass-1 matching
     can link hundreds of columns in one run, and that per-call connection
     overhead (not the SQL itself) was the dominant cost of a run. Each link
-    dict: {term_id, source_id, metadata_id, attr_id, confidence, match_method}."""
+    dict: {term_id, source_id, metadata_id, attr_id, confidence, match_method, domain}."""
     if not links:
         return
     now = _now()
@@ -457,28 +472,29 @@ def bulk_link_assets(links: List[Dict]) -> None:
             ).fetchone()
             if existing:
                 cur.execute(
-                    "UPDATE biz_glossary_term_assets SET confidence=?, match_method=?, linked_at=? WHERE link_id=?",
-                    (float(l.get("confidence", 0.0)), l.get("match_method", ""), now, existing["link_id"]),
+                    "UPDATE biz_glossary_term_assets SET confidence=?, match_method=?, domain=?, linked_at=? WHERE link_id=?",
+                    (float(l.get("confidence", 0.0)), l.get("match_method", ""), l.get("domain", ""), now, existing["link_id"]),
                 )
             else:
                 cur.execute(
                     "INSERT INTO biz_glossary_term_assets "
-                    "(link_id, term_id, source_id, metadata_id, attr_id, confidence, match_method, linked_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "(link_id, term_id, source_id, metadata_id, attr_id, confidence, match_method, domain, linked_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (str(uuid.uuid4()), term_id, l["source_id"], metadata_id, attr_id,
-                     float(l.get("confidence", 0.0)), l.get("match_method", ""), now),
+                     float(l.get("confidence", 0.0)), l.get("match_method", ""), l.get("domain", ""), now),
                 )
 
 
-def delete_unreviewed_links(pairs: List[Any]) -> None:
-    """Remove existing column links whose underlying term is NOT approved
-    (draft/candidate — an unreviewed guess, e.g. one generated before
-    business/domain context existed), for the given (metadata_id, attr_id)
-    pairs, in one connection. Approved and manually-edited links (manual
-    edits always set status='approved' — see update_term) are never touched.
-    Lets glossary_generate.py replace a stale unreviewed guess with a
-    freshly-grounded one on re-run instead of being permanently skipped by
-    the already-governed guard."""
+def delete_stale_links(pairs: List[Any]) -> None:
+    """Remove existing column links for the given (metadata_id, attr_id)
+    pairs, in one connection, so glossary_generate.py can re-evaluate them
+    on the next pass instead of being permanently skipped by the
+    already-governed guard. Callers decide what counts as "stale" — an
+    unreviewed guess (draft/candidate, possibly made before business/domain
+    context existed) or an approved link whose stored domain no longer
+    matches the source's current domain — and must never pass a manually
+    edited (match_method='manual') pair here, since those are the one class
+    of link this deliberately does not protect against."""
     if not pairs:
         return
     with _cursor_ctx() as cur:
@@ -490,7 +506,7 @@ def delete_unreviewed_links(pairs: List[Any]) -> None:
         cur.execute(
             f"DELETE FROM biz_glossary_term_assets "
             f"WHERE (metadata_id, attr_id) IN (VALUES {values_sql}) "
-            f"AND term_id IN (SELECT term_id FROM biz_glossary_terms WHERE status != 'approved')",
+            f"AND match_method != 'manual'",
             tuple(params),
         )
 
@@ -512,8 +528,8 @@ def list_assets_for_source(source_id: str) -> List[Dict]:
     with _cursor_ctx() as cur:
         _ensure(cur)
         rows = cur.execute(
-            "SELECT a.*, t.status AS term_status, t.confidence AS term_confidence, "
-            "t.match_method AS term_match_method "
+            "SELECT a.*, a.domain AS link_domain, t.status AS term_status, "
+            "t.confidence AS term_confidence, t.match_method AS term_match_method "
             "FROM biz_glossary_term_assets a JOIN biz_glossary_terms t ON t.term_id = a.term_id "
             "WHERE a.source_id=?",
             (source_id,),

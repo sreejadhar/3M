@@ -261,15 +261,16 @@ def generate_glossary_for_source(
     source_assets = _reg.list_assets_for_source(source_id)
     already_governed = {
         (a["metadata_id"], a.get("attr_id", "")) for a in source_assets
-        if a.get("term_status") == "approved" or a.get("term_match_method") == "manual"
+        if a.get("term_match_method") == "manual"
+        or (a.get("term_status") == "approved" and (a.get("link_domain") or "") == (domain or ""))
     }
-    stale_unreviewed = [
+    stale_links = [
         (a["metadata_id"], a.get("attr_id", "")) for a in source_assets
         if (a["metadata_id"], a.get("attr_id", "")) not in already_governed
     ]
-    if stale_unreviewed:
-        _reg.delete_unreviewed_links(stale_unreviewed)
-        progress("normalize", f"Re-evaluating {len(stale_unreviewed)} previously unreviewed guess(es)…")
+    if stale_links:
+        _reg.delete_stale_links(stale_links)
+        progress("normalize", f"Re-evaluating {len(stale_links)} stale/unreviewed link(s)…")
     canonical_idx = _build_canonical_index()
     progress("normalize", f"{len(already_governed)} column(s) already governed, "
                           f"{sum(len(v) for v in canonical_idx.values())} approved canonical term(s) loaded…")
@@ -325,7 +326,7 @@ def generate_glossary_for_source(
             if canon:
                 pending_links.append({"term_id": canon["term_id"], "source_id": source_id,
                                        "metadata_id": metadata_id, "attr_id": item["attr_id"],
-                                       "confidence": 0.95, "match_method": "canonical"})
+                                       "confidence": 0.95, "match_method": "canonical", "domain": domain})
                 stats["terms_linked"] += 1
                 continue
 
@@ -408,7 +409,7 @@ def generate_glossary_for_source(
                             entity_item["normalized_phrase"], domain=domain, status="approved")
                         if dup:
                             _reg.link_asset(dup["term_id"], source_id, metadata_id, "",
-                                             confidence=0.95, match_method="canonical")
+                                             confidence=0.95, match_method="canonical", domain=domain)
                             stats["terms_linked"] += 1
                         else:
                             conf = min(max(float(e_ann.get("confidence", 0.5) or 0.5), 0.0), 0.9)
@@ -419,7 +420,7 @@ def generate_glossary_for_source(
                                 status=status, confidence=conf, match_method="llm_generated",
                             )
                             _reg.link_asset(term["term_id"], source_id, metadata_id, "",
-                                             confidence=conf, match_method="llm_generated")
+                                             confidence=conf, match_method="llm_generated", domain=domain)
                             created_this_run[key] = term
                             stats["terms_created"] += 1
                             if status != "approved":
@@ -437,7 +438,7 @@ def generate_glossary_for_source(
                         item["normalized_phrase"], domain=domain, status="approved")
                     if dup:
                         _reg.link_asset(dup["term_id"], source_id, metadata_id, item["attr_id"],
-                                         confidence=0.95, match_method="canonical")
+                                         confidence=0.95, match_method="canonical", domain=domain)
                         stats["terms_linked"] += 1
                         continue
                     conf = min(max(float(ann.get("confidence", 0.5) or 0.5), 0.0), 0.9)
@@ -448,7 +449,7 @@ def generate_glossary_for_source(
                         status=status, confidence=conf, match_method="llm_generated",
                     )
                     _reg.link_asset(term["term_id"], source_id, metadata_id, item["attr_id"],
-                                     confidence=conf, match_method="llm_generated")
+                                     confidence=conf, match_method="llm_generated", domain=domain)
                     created_this_run[key] = term
                     stats["terms_created"] += 1
                     if status != "approved":

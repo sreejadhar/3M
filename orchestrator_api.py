@@ -2080,6 +2080,20 @@ async def _run_bridge_inference_phase(source_id: str, src: Dict, entry: "KGEntry
             if other_src and _bridge_pair_allowed(src.get("created_by"), other_src.get("created_by")):
                 other_srcs[other.kg_id] = other_src
 
+        # Escape hatch — with dozens of registered sources, this fan-out (each
+        # pairing does column sampling + LLM validation) has been observed to
+        # starve the event loop badly enough to fail liveness/readiness probes
+        # and get the pod killed mid-reindex (connection refused, not just a
+        # slow response). Skip it here; bridges can still be built later via
+        # POST /kg-bridges/infer once the fan-out cost is reduced.
+        if os.environ.get("SKIP_REINDEX_BRIDGE_INFERENCE", "").strip().lower() in ("1", "true", "yes"):
+            logger.info(
+                "Reindex cross-source bridge inference skipped for %s "
+                "(SKIP_REINDEX_BRIDGE_INFERENCE set) — %d candidate pairing(s) not run",
+                source_id[:8], len(other_srcs),
+            )
+            other_srcs = {}
+
         _pair_semaphore = asyncio.Semaphore(_CROSS_SOURCE_PAIR_CONCURRENCY)
         _pair_totals = {"done": 0, "high": 0, "med": 0, "skipped": 0}
         _pair_total_count = len(other_srcs)

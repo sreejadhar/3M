@@ -15,6 +15,22 @@ Sources carry a ``persona_access`` list (e.g. ["analyst", "admin"]).
 Users carry a ``domain`` attribute; a source is accessible only when
   source.domain == user.domain  OR  user.domain == "*"  OR  role == "admin"
 
+Generic source/item ACL (provider-agnostic — SQL and unstructured sources
+alike; M365/Entra ID is just the first identity provider and connector
+family that populates this model, not a special case inside it)
+-----------------------------------------------------------------
+  - ``ac_external_identities`` maps a DataNanite user to an external IdP
+    principal (provider="entra" today, any future SSO/IdP tomorrow). This
+    never changes how a user logs into DataNanite — local JWT/auth.db login
+    is untouched; it only records identity for item-level ACL matching.
+  - ``ac_source_acl`` holds source-level grants (by user_id, role, and/or
+    domain), keyed generically by source_id — works for any source type.
+    A source with no ac_source_acl rows falls back to its legacy
+    persona_access list so existing sources don't lose access abruptly.
+  - ``filter_items()`` is the generic result-level enforcement hook: source-
+    level gating first, then item-level filtering by an ``allowed_principals``
+    field on the item (e.g. doc_assets.allowed_principals) when present.
+
 Enforcement
 -----------
   - ``is_enforced()`` returns True ONLY in production (APP_ENV=production).
@@ -37,6 +53,16 @@ delete_user(user_id)                     → bool
 set_role(user_id, role)                  → bool
 can_access_source(user_id, source)       → bool   (always True in dev)
 can_perform(user_id, action)             → bool   (always True in dev)
+filter_sources(user_id, sources)         → List[dict]
+filter_items(user_id, source, items)     → List[dict]  (Phase 4 enforcement)
+link_external_identity(user_id, provider, external_id)   → dict
+get_external_identity(user_id, provider) → dict | None
+list_external_identities(provider=None)  → List[dict]
+unlink_external_identity(user_id, provider) → bool
+sync_external_identities(provider, pairs) → int   (bulk upsert, by email)
+grant_source_access(source_id, user_id=None, role=None, domain=None) → acl_id
+revoke_source_access(acl_id)             → bool
+list_source_acl(source_id)               → List[dict]
 """
 from __future__ import annotations
 
@@ -181,9 +207,25 @@ CREATE TABLE IF NOT EXISTS ac_source_acl (
 )
 """
 
+# Provider-agnostic mapping of a DataNanite user to an external identity
+# provider's principal (e.g. provider="entra", external_id=Entra object ID).
+# One user may have at most one identity per provider; a future IdP just
+# adds rows with a new `provider` value — no schema change needed.
+_DDL_EXTERNAL_IDENTITIES = """
+CREATE TABLE IF NOT EXISTS ac_external_identities (
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    provider      TEXT NOT NULL,
+    external_id   TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    UNIQUE(user_id, provider)
+)
+"""
+
 
 def _ensure(cur: Any) -> None:
-    cur.ddl(_DDL_USERS, _DDL_SOURCE_ACL)
+    cur.ddl(_DDL_USERS, _DDL_SOURCE_ACL, _DDL_EXTERNAL_IDENTITIES)
 
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -277,6 +319,148 @@ def set_role(user_id: str, role: str) -> bool:
     return update_user(user_id, role=role)
 
 
+# ── External identities (Phase 1: generic identity/principal model) ───────────
+# Provider-agnostic — 'entra' today, any future SSO/IdP tomorrow. This never
+# changes how a user logs into DataNanite (that stays local JWT/auth.db); it
+# only records which external principal a DataNanite user corresponds to, so
+# item-level ACLs populated from that provider (e.g. M365 doc permissions)
+# can be matched back to a DataNanite user.
+
+def link_external_identity(user_id: str, provider: str, external_id: str) -> Dict:
+    """Create or update the (user_id, provider) -> external_id mapping."""
+    now = time.time()
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        existing = cur.execute(
+            "SELECT id FROM ac_external_identities WHERE user_id=? AND provider=?",
+            (user_id, provider),
+        ).fetchone()
+        if existing:
+            cur.execute(
+                "UPDATE ac_external_identities SET external_id=?, updated_at=? "
+                "WHERE user_id=? AND provider=?",
+                (external_id, now, user_id, provider),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO ac_external_identities "
+                "(id, user_id, provider, external_id, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (str(uuid.uuid4()), user_id, provider, external_id, now, now),
+            )
+    return get_external_identity(user_id, provider) or {}
+
+
+def get_external_identity(user_id: str, provider: str) -> Optional[Dict]:
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        row = cur.execute(
+            "SELECT * FROM ac_external_identities WHERE user_id=? AND provider=?",
+            (user_id, provider),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_external_identities(provider: Optional[str] = None) -> List[Dict]:
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        if provider:
+            rows = cur.execute(
+                "SELECT * FROM ac_external_identities WHERE provider=? ORDER BY updated_at DESC",
+                (provider,),
+            ).fetchall()
+        else:
+            rows = cur.execute(
+                "SELECT * FROM ac_external_identities ORDER BY updated_at DESC"
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def unlink_external_identity(user_id: str, provider: str) -> bool:
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute(
+            "DELETE FROM ac_external_identities WHERE user_id=? AND provider=?",
+            (user_id, provider),
+        )
+    return True
+
+
+def sync_external_identities(provider: str, pairs: List[Dict]) -> int:
+    """
+    Bulk-upsert external identities for one provider.
+
+    ``pairs`` — [{"email": ..., "external_id": ...}, ...], resolved by the
+    caller (e.g. entra_sync.py maps Entra users/groups to their email first).
+    This function itself is provider-agnostic: it only matches by email
+    against ac_users and writes rows — no Graph API / M365 code here.
+    Returns the number of identities linked (unmatched emails are skipped).
+    """
+    linked = 0
+    for pair in pairs:
+        email = (pair.get("email") or "").strip()
+        external_id = (pair.get("external_id") or "").strip()
+        if not email or not external_id:
+            continue
+        user = get_user_by_email(email)
+        if not user:
+            continue
+        link_external_identity(user["user_id"], provider, external_id)
+        linked += 1
+    return linked
+
+
+# ── Source-level ACL (Phase 2/3: generic ac_source_acl grants) ────────────────
+# Works for any source_id regardless of source type (SQL or unstructured).
+
+def grant_source_access(
+    source_id: str,
+    user_id: Optional[str] = None,
+    role: Optional[str] = None,
+    domain: Optional[str] = None,
+) -> str:
+    """Add a source-level grant. At least one of user_id/role/domain should
+    be set — e.g. (user_id=X) grants that one user, (role='analyst') grants
+    everyone with that role, (domain='Finance') grants that ABAC domain."""
+    acl_id = str(uuid.uuid4())
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute(
+            "INSERT INTO ac_source_acl (acl_id, source_id, user_id, role, domain, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (acl_id, source_id, user_id, role, domain, time.time()),
+        )
+    return acl_id
+
+
+def revoke_source_access(acl_id: str) -> bool:
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute("DELETE FROM ac_source_acl WHERE acl_id=?", (acl_id,))
+    return True
+
+
+def list_source_acl(source_id: str) -> List[Dict]:
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        rows = cur.execute(
+            "SELECT * FROM ac_source_acl WHERE source_id=? ORDER BY created_at", (source_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _acl_grants_access(user: Dict, acl_rows: List[Dict]) -> bool:
+    """True if any ac_source_acl row for this source grants `user` access."""
+    for row in acl_rows:
+        if row.get("user_id") and row["user_id"] == user["user_id"]:
+            return True
+        if row.get("role") and row["role"] == user.get("role"):
+            return True
+        if row.get("domain") and row["domain"] == user.get("domain"):
+            return True
+    return False
+
+
 # ── Access checks ─────────────────────────────────────────────────────────────
 
 def can_access_source(user_id: str, source: Dict) -> bool:
@@ -286,9 +470,11 @@ def can_access_source(user_id: str, source: Dict) -> bool:
 
     Rules (production):
       - admin role → always True
-      - user.domain == "*" → True for all sources
-      - source.domain empty → visible to all authenticated users
-      - user.domain == source.domain → True
+      - explicit ac_source_acl grant for this user/role/domain → True
+      - no ac_source_acl rows exist for this source → fall back to the
+        legacy persona_access + domain check (non-breaking during migration)
+      - ac_source_acl rows exist but none match → False (explicit grants
+        replace the legacy default once a source has any)
     """
     if not is_enforced():
         return True
@@ -299,7 +485,14 @@ def can_access_source(user_id: str, source: Dict) -> bool:
     if user["role"] == "admin":
         return True
 
-    # Check persona_access list (original per-source access control)
+    source_id = source.get("id") or source.get("source_id") or ""
+    acl_rows = list_source_acl(source_id) if source_id else []
+    if acl_rows:
+        return _acl_grants_access(user, acl_rows)
+
+    # No generic ACL rows yet for this source — fall back to the legacy
+    # persona_access list (original per-source access control) so no
+    # existing source loses access abruptly during migration.
     persona_access = source.get("persona_access") or []
     if isinstance(persona_access, str):
         try:
@@ -346,6 +539,64 @@ def filter_sources(user_id: str, sources: List[Dict]) -> List[Dict]:
     if not is_enforced():
         return sources
     return [s for s in sources if can_access_source(user_id, s)]
+
+
+def _user_principal_ids(user: Dict) -> set:
+    """All principal IDs `user` matches: their own user_id, plus every
+    external identity linked to them (any provider — 'entra' or otherwise)."""
+    ids = {user["user_id"]}
+    for identity in list_external_identities():
+        if identity["user_id"] == user["user_id"]:
+            ids.add(identity["external_id"])
+    return ids
+
+
+def filter_items(
+    user_id: str,
+    source: Dict,
+    items: List[Dict],
+    principal_field: str = "allowed_principals",
+) -> List[Dict]:
+    """
+    Generic result-level enforcement (Phase 4) — usable uniformly for
+    unstructured doc-search results and structured query rows alike.
+
+    First gates at the source level via can_access_source (same as today).
+    Then, for item-level ACLs: an item whose `principal_field` is empty/
+    absent is treated as open (inherits source-level gating only — this is
+    the SQL row/column case for the first release, since connectors don't
+    yet inject WHERE-clause predicates). An item that DOES carry a non-empty
+    principal_field (e.g. an M365 doc's Graph permissions, mapped in via
+    Phase 1's external identities) is only kept if the user matches one of
+    those principals.
+
+    Always a no-op (returns items unchanged) in dev/test.
+    """
+    if not is_enforced():
+        return items
+    if not can_access_source(user_id, source):
+        return []
+
+    user = get_user(user_id)
+    if not user or not user.get("is_active"):
+        return []
+    if user["role"] == "admin":
+        return items
+
+    principal_ids = _user_principal_ids(user)
+
+    def _visible(item: Dict) -> bool:
+        allowed = item.get(principal_field)
+        if isinstance(allowed, str):
+            try:
+                allowed = json.loads(allowed)
+            except Exception:
+                allowed = None
+        if not allowed:
+            return True
+        return bool(principal_ids & set(allowed))
+
+    return [i for i in items if _visible(i)]
 
 
 # ── Coerce helpers ─────────────────────────────────────────────────────────────

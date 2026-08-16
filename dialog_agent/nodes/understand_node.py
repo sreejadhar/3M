@@ -1375,9 +1375,54 @@ def understand_node(state: DialogState) -> DialogState:
         t0 = time.perf_counter()
         try:
             import glossary_registry as _gl_registry
-            generated_glossary_terms = _gl_registry.list_terms(
+            import metadata_catalog as _mcat
+            generated_glossary_terms = _gl_registry.list_terms_with_assets(
                 source_id=source_id, status="approved",
             )
+            # Ground each term in real data rather than trusting its free-text
+            # definition alone: pull the already-profiled sample values
+            # (md_attributes.top_values, populated from live data during
+            # indexing — see nodes/extraction_node.py) for every column this
+            # term is linked to, so plan_node can show the LLM what the
+            # column's values actually look like, not just what a human or
+            # LLM once guessed they meant.
+            _entity_table_cache: Dict[str, str] = {}
+            for term in generated_glossary_terms:
+                observed: List[Any] = []
+                mapped_columns: List[str] = []
+                for asset in term.get("assets") or []:
+                    attr_id = asset.get("attr_id") or ""
+                    metadata_id = asset.get("metadata_id") or ""
+                    if not attr_id:
+                        continue  # entity-level link — no column values to sample
+                    try:
+                        attr = _mcat.get_attribute(attr_id)
+                    except Exception:
+                        attr = None
+                    if not attr:
+                        continue
+                    for v in (attr.get("top_values") or []):
+                        if v is not None and v not in observed:
+                            observed.append(v)
+                    # Resolve the real table.column this term is bound to, so
+                    # plan_node can tell the LLM the actual identifier to use
+                    # in generated SQL instead of the glossary term's own name.
+                    md_id = metadata_id or attr.get("metadata_id") or ""
+                    table_name = _entity_table_cache.get(md_id, "")
+                    if md_id and not table_name:
+                        try:
+                            entity = _mcat.get_entity(md_id)
+                        except Exception:
+                            entity = None
+                        table_name = (entity or {}).get("table_name", "")
+                        _entity_table_cache[md_id] = table_name
+                    col_name = attr.get("column_name") or ""
+                    if table_name and col_name:
+                        identifier = f"{table_name}.{col_name}"
+                        if identifier not in mapped_columns:
+                            mapped_columns.append(identifier)
+                term["observed_values"] = observed[:10]
+                term["mapped_columns"] = mapped_columns
             if generated_glossary_terms:
                 logger.info(
                     "understand_node: loaded %d generated glossary term(s) for source %s",

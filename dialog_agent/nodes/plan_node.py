@@ -4596,6 +4596,11 @@ def plan_node(state: DialogState) -> DialogState:
             "=" * 60,
             "These are approved business definitions. When the user's question uses any",
             "of these terms (or their synonyms), interpret them using the definition below.",
+            "IMPORTANT: a glossary term's Name is business wording, NOT a real table or",
+            "column identifier — NEVER emit the Term text itself as a column/table name in",
+            "generated SQL. Use the Term only to understand what the user means, then find",
+            "the matching real column via the schema/RESOLVED BUSINESS CONCEPTS sections",
+            "(the SQL hint below, if present, shows the real expression/column to use).",
             "",
         ]
         for term in glossary_terms:
@@ -4633,6 +4638,10 @@ def plan_node(state: DialogState) -> DialogState:
             "When 'Observed values' is present, those are real values sampled from the",
             "actual column — prefer them verbatim in WHERE/filter clauses over guessing",
             "a spelling/casing from the definition text alone.",
+            "IMPORTANT: the Term itself is business wording, NOT a real table or column",
+            "identifier — NEVER emit the Term text as a column/table name in generated",
+            "SQL. When 'Maps to' is present below, that is the real table.column this",
+            "term refers to and MUST be the identifier used in the SQL.",
             "",
         ]
         for term in generated_glossary_terms:
@@ -4641,6 +4650,9 @@ def plan_node(state: DialogState) -> DialogState:
                 gg_lines.append(f"  Domain      : {term['domain']}")
             if term.get("definition"):
                 gg_lines.append(f"  Definition  : {term['definition']}")
+            mapped_columns = term.get("mapped_columns") or []
+            if mapped_columns:
+                gg_lines.append(f"  Maps to     : {', '.join(mapped_columns)}")
             observed = term.get("observed_values") or []
             if observed:
                 gg_lines.append(f"  Observed values (sampled from actual data): {observed}")

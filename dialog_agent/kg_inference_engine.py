@@ -1070,6 +1070,7 @@ def run_all_pairs(
     background_tasks: Any = None,
     sample_fn: Optional[Callable[[str, str, str], Optional[Set[str]]]] = None,
     include_intra_kg: bool = True,
+    is_pair_allowed: Optional[Callable[["KGContext", "KGContext"], bool]] = None,
 ) -> Dict[str, int]:
     """
     Run enterprise inference over every ordered pair of KGs, AND (when
@@ -1079,6 +1080,10 @@ def run_all_pairs(
     source (e.g. an "education" table joined to a "job_current" table by
     columns with unrelated names) — the cross-source passes alone never look
     at this, since they only ever compare different KGs to each other.
+
+    ``is_pair_allowed``, when given, is consulted before each cross-KG pair
+    (not the intra-KG self-pass, which is always allowed) — e.g. to scope
+    bridge discovery to sources owned by the same user.
 
     Returns {"pairs_processed": N, "bridges_saved": M}.
     """
@@ -1100,6 +1105,8 @@ def run_all_pairs(
     for i in range(n):
         for j in range(i + 1, n):
             ctx_a, ctx_b = kg_contexts[i], kg_contexts[j]
+            if is_pair_allowed is not None and not is_pair_allowed(ctx_a, ctx_b):
+                continue
             try:
                 saved = run_enterprise_inference_and_save(
                     ctx_a, ctx_b, options, background_tasks, sample_fn

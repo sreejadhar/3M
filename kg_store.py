@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS kg_sources (
     db_type         TEXT NOT NULL DEFAULT '',
     connection_json TEXT NOT NULL DEFAULT '{}',
     persona_access  TEXT NOT NULL DEFAULT '[]',
+    created_by      TEXT NOT NULL DEFAULT '',
     status          TEXT NOT NULL DEFAULT 'ready',
     table_count     INTEGER NOT NULL DEFAULT 0,
     table_names     TEXT NOT NULL DEFAULT '[]',
@@ -132,6 +133,16 @@ CREATE TABLE IF NOT EXISTS kg_snapshots (
 
 def _ensure(cur: Any) -> None:
     cur.ddl(_DDL_SOURCES, _DDL_KG_SNAPSHOTS)
+    # Migration: kg_sources predates the created_by column on existing DBs.
+    # Postgres supports IF NOT EXISTS directly; SQLite (< 3.35) does not, so
+    # fall back to a probe-and-swallow that doesn't poison the transaction.
+    if isinstance(cur, _PGCur):
+        cur.execute("ALTER TABLE kg_sources ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT ''")
+    else:
+        try:
+            cur.execute("SELECT created_by FROM kg_sources LIMIT 1")
+        except Exception:
+            cur.execute("ALTER TABLE kg_sources ADD COLUMN created_by TEXT NOT NULL DEFAULT ''")
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -157,7 +168,7 @@ def save(source: Dict) -> None:
         if exists:
             cur.execute(
                 "UPDATE kg_sources SET name=?, description=?, domain=?, icon=?, "
-                "db_type=?, connection_json=?, persona_access=?, status=?, "
+                "db_type=?, connection_json=?, persona_access=?, created_by=?, status=?, "
                 "table_count=?, table_names=?, report_json=?, ontology_text=?, "
                 "indexed_at=?, updated_at=? WHERE source_id=?",
                 (
@@ -167,6 +178,7 @@ def save(source: Dict) -> None:
                     source.get("icon", ""),
                     source.get("db_type", ""),
                     conn_json, persona,
+                    source.get("created_by", ""),
                     source.get("status", "ready"),
                     source.get("table_count", 0),
                     tables, report, ontology,
@@ -178,10 +190,10 @@ def save(source: Dict) -> None:
             cur.execute(
                 "INSERT INTO kg_sources "
                 "(source_id, name, description, domain, icon, db_type, "
-                " connection_json, persona_access, status, table_count, "
+                " connection_json, persona_access, created_by, status, table_count, "
                 " table_names, report_json, ontology_text, indexed_at, "
                 " created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     sid,
                     source.get("name", ""),
@@ -190,6 +202,7 @@ def save(source: Dict) -> None:
                     source.get("icon", ""),
                     source.get("db_type", ""),
                     conn_json, persona,
+                    source.get("created_by", ""),
                     source.get("status", "ready"),
                     source.get("table_count", 0),
                     tables, report, ontology,
@@ -317,6 +330,7 @@ def load_all() -> List[Dict]:
             "db_type":          r.get("db_type", ""),
             "connection":       conn,
             "persona_access":   persona,
+            "created_by":       r.get("created_by", ""),
             "status":           r.get("status", "ready"),
             "error_message":    None,
             "table_count":      r.get("table_count", 0),

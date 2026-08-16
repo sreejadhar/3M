@@ -264,6 +264,14 @@ _SEED_USERS = [
     ("SEED_PASSWORD_ADITYA",      "AdityaSankar.Sarkar@cognizant.com"),
 ]
 
+# Users who can see every source regardless of who indexed it. Everyone else
+# only sees sources they personally indexed (kg_sources.created_by).
+ADMIN_EMAILS = {
+    "sreeja.dhar@cognizant.com",
+    "iyer.kasinath@cognizant.com",
+    "palash.ghosh@cognizant.com",
+}
+
 
 def _auth_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(_AUTH_DB_PATH), check_same_thread=False)
@@ -287,10 +295,11 @@ def _bootstrap_auth() -> None:
             if not raw_pw:
                 continue
             pw_hash = bcrypt.hashpw(raw_pw.encode(), bcrypt.gensalt()).decode()
+            role = "admin" if email.lower() in ADMIN_EMAILS else "user"
             conn.execute(
-                "INSERT INTO auth_users (email, password_hash, role) VALUES (?, ?, 'user') "
-                "ON CONFLICT(email) DO UPDATE SET password_hash=excluded.password_hash",
-                (email.lower(), pw_hash),
+                "INSERT INTO auth_users (email, password_hash, role) VALUES (?, ?, ?) "
+                "ON CONFLICT(email) DO UPDATE SET password_hash=excluded.password_hash, role=excluded.role",
+                (email.lower(), pw_hash, role),
             )
         conn.commit()
     logger.info("auth: bootstrapped auth_users table")
@@ -355,7 +364,7 @@ class TestConnectionRequest(BaseModel):
     connection: SourceConnection
 
 
-def _new_source(name, description, domain, db_type, connection, persona_access) -> Dict:
+def _new_source(name, description, domain, db_type, connection, persona_access, created_by="") -> Dict:
     return {
         "id":               str(uuid.uuid4()),
         "name":             name,
@@ -367,6 +376,7 @@ def _new_source(name, description, domain, db_type, connection, persona_access) 
         "status":           "idle",
         "error_message":    None,
         "persona_access":   persona_access,
+        "created_by":       created_by,
         "created_at":       time.time(),
         "indexed_at":       None,
         "table_count":      0,
@@ -393,6 +403,7 @@ def _source_public(s: Dict) -> Dict:
         "status":         s["status"],
         "error_message":  s.get("error_message"),
         "persona_access": s["persona_access"],
+        "created_by":     s.get("created_by", ""),
         "created_at":     s["created_at"],
         "indexed_at":     s.get("indexed_at"),
         "table_count":    s["table_count"],
@@ -617,7 +628,7 @@ async def _startup() -> None:
         # relationships between tables *within* that source (intra-KG pass);
         # with ≥2 it also finds cross-source relationships. Non-blocking: runs
         # in a thread so it does not delay server startup.
-        if len(restored) >= 1:
+        if len(restored) >= 1 and os.environ.get("SKIP_STARTUP_BRIDGE_INFERENCE", "").strip().lower() not in ("1", "true", "yes"):
             def _startup_bridge_inference():
                 try:
                     from dialog_agent.kg_registry import list_all as _reg_list
@@ -626,6 +637,7 @@ async def _startup() -> None:
                     if not entries:
                         return
                     contexts = []
+                    owner_by_kg_id = {}
                     for entry in entries:
                         src = _sources.get(entry.source_id) or {}
                         contexts.append(KGContext(
@@ -635,8 +647,14 @@ async def _startup() -> None:
                             nodes=src.get("kg_nodes") or [],
                             report=src.get("report"),
                         ))
+                        owner_by_kg_id[entry.kg_id] = src.get("created_by")
                     with _bridge_sweep_lock:
-                        result = run_all_pairs(contexts, sample_fn=_make_bridge_sample_fn())
+                        result = run_all_pairs(
+                            contexts, sample_fn=_make_bridge_sample_fn(),
+                            is_pair_allowed=lambda a, b: _bridge_pair_allowed(
+                                owner_by_kg_id.get(a.kg_id), owner_by_kg_id.get(b.kg_id)
+                            ),
+                        )
                     logger.info(
                         "Startup bridge inference: %d pairs processed, %d bridges saved",
                         result["pairs_processed"], result["bridges_saved"],
@@ -646,6 +664,11 @@ async def _startup() -> None:
 
             import threading as _threading
             _threading.Thread(target=_startup_bridge_inference, daemon=True, name="startup-bridge-infer").start()
+        elif len(restored) >= 1:
+            logger.info(
+                "Startup bridge inference skipped (SKIP_STARTUP_BRIDGE_INFERENCE set). "
+                "Trigger it manually later via POST /kg-bridges/infer."
+            )
     except Exception as exc:
         logger.warning("kg_store restore failed (non-fatal): %s", exc)
 
@@ -743,6 +766,49 @@ def _require_permission(request: Request, action: str) -> str:
         if not user or not _ac.can_perform(user["user_id"], action):
             raise HTTPException(status_code=403, detail=f"Requires permission: {action}")
     return email
+
+
+def _is_admin_email(email: Optional[str]) -> bool:
+    return bool(email) and email.strip().lower() in ADMIN_EMAILS
+
+
+def _owns_source(source: Dict, email: Optional[str]) -> bool:
+    """True if `email` may access `source`.
+
+    Access is granted when the caller is unauthenticated (dev / auth off), the
+    caller is an admin, the source has no recorded owner (legacy source
+    created before per-user scoping), or the owners match.
+    """
+    if email is None or _is_admin_email(email):
+        return True
+    owner = (source.get("created_by") or "").strip().lower()
+    return owner == "" or owner == email
+
+
+def _bridge_pair_allowed(owner_a: Optional[str], owner_b: Optional[str]) -> bool:
+    """True if cross-source bridge inference may run between two sources.
+
+    Strictly same-owner, no admin exception — a source is only ever bridged
+    against sources created by the exact same user. Either owner unrecorded
+    (legacy sources predating created_by tracking) still passes, so existing
+    bridges on those sources aren't silently dropped.
+    """
+    oa = (owner_a or "").strip().lower()
+    ob = (owner_b or "").strip().lower()
+    if not oa or not ob:
+        return True
+    return oa == ob
+
+
+def _require_source_access(request: Request, source_id: str) -> Dict:
+    """Look up a source by ID, raising 404 if missing or 403 if the
+    authenticated caller doesn't own it (and isn't an admin)."""
+    s = _sources.get(source_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if not _owns_source(s, _current_user_email(request)):
+        raise HTTPException(status_code=403, detail="You do not have access to this source")
+    return s
 
 
 def _owns_session(session: Dict, email: Optional[str]) -> bool:
@@ -1678,6 +1744,46 @@ def _build_db_config(db_type: str, conn: Dict) -> Dict:
     return cfg
 
 
+def _live_connector_factory(source_id: str):
+    """Zero-arg callable building a connected connector for source_id, for
+    glossary_generate.py's on-demand column sampling (never guess a term for
+    a column with no observed values). Returns None if the source isn't
+    registered, is file-based (no live re-connect needed — file sources are
+    already fully profiled at index time), or the driver/connection fails —
+    callers treat that as "sampling unavailable" and skip rather than crash.
+    Mirrors the ad-hoc Snowflake connector construction already used for
+    startup column-case validation above."""
+    src = _sources.get(source_id)
+    if not src:
+        return None
+    db_type = (src.get("db_type") or "").lower()
+    if db_type in _FILE_BASED_TYPES:
+        return None
+
+    def _build() -> Any:
+        import sys as _sys
+        _sys.path.insert(0, _PROJECT_ROOT)
+        from config import DBConfig, DBType
+        from connectors.factory import get_connector as _get_connector
+
+        conn = src.get("connection") or {}
+        db_cfg = DBConfig(
+            db_type=DBType(db_type),
+            host=conn.get("host", ""),
+            port=conn.get("port") or None,
+            database=conn.get("database", ""),
+            username=conn.get("username", ""),
+            password=conn.get("password", ""),
+            schema=conn.get("schema_") or conn.get("schema", ""),
+            extra=conn.get("extra") or {},
+        )
+        connector = _get_connector(db_cfg)
+        connector.connect()
+        return connector
+
+    return _build
+
+
 def _push_index_event(source_id: str, step: str, status: str, message: str, detail: str = "") -> None:
     """Append an indexing step event to the per-source log and live queue."""
     event = {
@@ -1973,7 +2079,7 @@ async def _run_bridge_inference_phase(source_id: str, src: Dict, entry: "KGEntry
                         "KG bridge inference: kg_store lookup failed for %s: %s",
                         other.source_id[:8], _load_exc,
                     )
-            if other_src:
+            if other_src and _bridge_pair_allowed(src.get("created_by"), other_src.get("created_by")):
                 other_srcs[other.kg_id] = other_src
 
         _pair_semaphore = asyncio.Semaphore(_CROSS_SOURCE_PAIR_CONCURRENCY)
@@ -2887,16 +2993,19 @@ async def purge_session_file_cache(session_id: str):
 # ── Source Registry endpoints ──────────────────────────────────────────────────
 
 @app.get("/sources")
-async def list_sources(persona: str = "business_user"):
-    """List all data sources visible to a given persona (credentials never returned)."""
+async def list_sources(request: Request, persona: str = "business_user"):
+    """List data sources visible to the caller: admins see everything, everyone
+    else sees only sources they personally indexed (credentials never returned)."""
+    email = _current_user_email(request)
     return [
         _source_public(s) for s in _sources.values()
         if persona in s.get("persona_access", ["business_user", "analyst", "admin"])
+        and _owns_source(s, email)
     ]
 
 
 @app.post("/sources", status_code=201)
-async def create_source(req: CreateSourceRequest):
+async def create_source(req: CreateSourceRequest, request: Request):
     """Register a new data source and optionally start background indexing."""
     s = _new_source(
         name=req.name,
@@ -2905,6 +3014,7 @@ async def create_source(req: CreateSourceRequest):
         db_type=req.db_type,
         connection=req.connection.dict(),
         persona_access=req.persona_access,
+        created_by=_current_user_email(request) or "",
     )
     _sources[s["id"]] = s
     try:
@@ -2918,11 +3028,9 @@ async def create_source(req: CreateSourceRequest):
 
 
 @app.get("/sources/{source_id}")
-async def get_source(source_id: str):
+async def get_source(source_id: str, request: Request):
     """Get a single source by ID (without credentials)."""
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
     return _source_public(s)
 
 
@@ -2933,11 +3041,9 @@ class UpdateSourceRequest(BaseModel):
 
 
 @app.patch("/sources/{source_id}", status_code=200)
-async def update_source(source_id: str, req: UpdateSourceRequest):
+async def update_source(source_id: str, req: UpdateSourceRequest, request: Request):
     """Update editable fields (name, description, domain) on an existing source."""
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
     if req.name is not None:
         s["name"] = req.name.strip()
     if req.description is not None:
@@ -2953,8 +3059,9 @@ async def update_source(source_id: str, req: UpdateSourceRequest):
 
 
 @app.delete("/sources/{source_id}", status_code=200)
-async def delete_source(source_id: str):
+async def delete_source(source_id: str, request: Request):
     """Remove a registered source and purge any associated uploaded file."""
+    _require_source_access(request, source_id)
     s = _sources.pop(source_id, None)
     if not s:
         raise HTTPException(status_code=404, detail="Source not found")
@@ -3045,11 +3152,9 @@ async def upload_source_file(file: UploadFile = File(...)):
 
 
 @app.post("/sources/{source_id}/reindex", status_code=202)
-async def reindex_source(source_id: str):
+async def reindex_source(source_id: str, request: Request):
     """Trigger a fresh indexing run for a registered source."""
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
     if s["status"] == "indexing":
         raise HTTPException(status_code=409, detail="Source is already being indexed")
     s["status"]        = "idle"
@@ -3084,11 +3189,9 @@ async def test_source_connection(req: TestConnectionRequest):
 # ── Source detail endpoints (KG / Ontology / SSE) ─────────────────────────────
 
 @app.get("/sources/{source_id}/graph")
-async def get_source_graph(source_id: str):
+async def get_source_graph(source_id: str, request: Request):
     """Return the KG graph data (nodes + edges) for an indexed source."""
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
     return {
         "nodes": s.get("kg_nodes") or [],
         "edges": s.get("kg_edges") or [],
@@ -3111,7 +3214,7 @@ class LinkDocumentToGraphRequest(BaseModel):
 
 
 @app.post("/sources/{source_id}/graph/link-document")
-async def link_document_to_graph(source_id: str, req: LinkDocumentToGraphRequest):
+async def link_document_to_graph(source_id: str, req: LinkDocumentToGraphRequest, request: Request):
     """
     Adds a Document Intelligence cross-modal link as a node + edges in this
     source's in-memory KG, so linked documents show up in Graph Explorer
@@ -3121,9 +3224,7 @@ async def link_document_to_graph(source_id: str, req: LinkDocumentToGraphRequest
     edges. Re-linking the same document (e.g. after a reindex) replaces just
     that document's own edges rather than accumulating duplicates.
     """
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
 
     nodes = s.setdefault("kg_nodes", [])
     edges = s.setdefault("kg_edges", [])
@@ -3175,7 +3276,7 @@ async def link_document_to_graph(source_id: str, req: LinkDocumentToGraphRequest
 
 
 @app.delete("/sources/{source_id}/graph/documents/{asset_id}")
-async def unlink_document_from_graph(source_id: str, asset_id: str):
+async def unlink_document_from_graph(source_id: str, asset_id: str, request: Request):
     """
     Removes a Document Intelligence document's node + edges from this
     source's KG — called when the document (or its whole document source)
@@ -3186,9 +3287,7 @@ async def unlink_document_from_graph(source_id: str, asset_id: str):
     Not an error if the document was never linked to this source — deleting
     something absent is a no-op, matching this KG's additive-only design.
     """
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
 
     doc_node_id = f"doc:{asset_id}"
     nodes = s.setdefault("kg_nodes", [])
@@ -3209,11 +3308,9 @@ async def unlink_document_from_graph(source_id: str, asset_id: str):
 
 
 @app.get("/sources/{source_id}/ontology")
-async def get_source_ontology(source_id: str):
+async def get_source_ontology(source_id: str, request: Request):
     """Return the OWL/Turtle ontology text for an indexed source."""
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
     content = s.get("ontology_content") or ""
     return {"content": content}
 
@@ -3224,14 +3321,12 @@ class SaveOntologyRequest(BaseModel):
 
 
 @app.post("/sources/{source_id}/ontology")
-async def save_source_ontology(source_id: str, req: SaveOntologyRequest):
+async def save_source_ontology(source_id: str, req: SaveOntologyRequest, request: Request):
     """
     Save an edited ontology for a source and optionally rebuild the KG.
     Triggers a KG rebuild in the background when rebuild_kg=True.
     """
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
     s["ontology_content"] = req.content
     if req.rebuild_kg:
         asyncio.create_task(_rebuild_kg(source_id, req.content))
@@ -3251,7 +3346,7 @@ class ValidateOntologyRequest(BaseModel):
 
 
 @app.post("/sources/{source_id}/validate-ontology")
-async def validate_source_ontology(source_id: str, req: ValidateOntologyRequest):
+async def validate_source_ontology(source_id: str, req: ValidateOntologyRequest, request: Request):
     """
     Validate the OWL/RDF ontology for a source using the SHACL Validation Service.
 
@@ -3270,9 +3365,7 @@ async def validate_source_ontology(source_id: str, req: ValidateOntologyRequest)
            ontology_stats    : {classes, datatype_props, object_props, triples}
            suggestions       : actionable remediation suggestions
     """
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
 
     ontology_text = req.ontology_text or s.get("ontology_content") or ""
     if not ontology_text:
@@ -3332,14 +3425,12 @@ class KGPreviewRequest(BaseModel):
 
 
 @app.post("/sources/{source_id}/kg-preview")
-async def preview_source_kg(source_id: str, req: KGPreviewRequest):
+async def preview_source_kg(source_id: str, req: KGPreviewRequest, request: Request):
     """
     Generate a KG preview from the provided ontology text without saving.
     Calls the KG API synchronously and returns {nodes, edges}.
     """
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             rk = await client.post(f"{KG_API}/generate",
@@ -3432,16 +3523,14 @@ class ExecuteSQLRequest(BaseModel):
 
 
 @app.post("/sources/{source_id}/execute-sql")
-async def execute_sql_for_source(source_id: str, req: ExecuteSQLRequest):
+async def execute_sql_for_source(source_id: str, req: ExecuteSQLRequest, request: Request):
     """
     Execute a raw SQL statement against a registered source's database.
     Proxies to the dialog-api /execute-sql endpoint which uses the full
     connector layer (postgres, redshift, oracle, sqlserver, sqlite, csv…).
     Used by the tech UI SQL console — no LLM involved.
     """
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
 
     conn = s.get("connection") or {}
     payload: Dict[str, Any] = {
@@ -3485,15 +3574,13 @@ class GraphRAGQueryRequest(BaseModel):
 
 
 @app.post("/sources/{source_id}/graphrag-query")
-async def graphrag_query(source_id: str, req: GraphRAGQueryRequest):
+async def graphrag_query(source_id: str, req: GraphRAGQueryRequest, request: Request):
     """
     Run in-memory GraphRAG retrieval against the source's KG nodes and return
     seed nodes (with cosine scores) and BFS-expanded node IDs so the UI can
     highlight them in the KG explorer.
     """
-    s = _sources.get(source_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Source not found")
+    s = _require_source_access(request, source_id)
 
     nodes: List[Dict] = s.get("kg_nodes") or []
     edges: List[Dict] = s.get("kg_edges") or []
@@ -3618,12 +3705,43 @@ async def orc_list_kg_registry():
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+def _source_for_kg_id(kg_id: str) -> Optional[Dict]:
+    """Look up the source dict that registered `kg_id`, or None if unknown."""
+    try:
+        from dialog_agent.kg_registry import list_all as _reg_list
+        for entry in _reg_list():
+            if entry.kg_id == kg_id:
+                return _sources.get(entry.source_id)
+    except Exception:
+        pass
+    return None
+
+
 @app.get("/kg-bridges")
-async def orc_list_kg_bridges(enabled_only: bool = False):
-    """List all cross-KG bridges."""
+async def orc_list_kg_bridges(enabled_only: bool = False, request: Request = None):
+    """List cross-KG bridges visible to the caller.
+
+    Scoped the same way source visibility is: admins (and unauthenticated /
+    dev-mode callers) see every bridge; everyone else only sees bridges where
+    BOTH ends are sources they own — a bridge into a source they can't open
+    from the sources list shouldn't be visible from the KG view either.
+    """
     try:
         from dialog_agent.kg_bridges import list_all as _list_bridges
-        return [b.to_dict() for b in _list_bridges(enabled_only=enabled_only)]
+        bridges = _list_bridges(enabled_only=enabled_only)
+
+        email = _current_user_email(request) if request is not None else None
+        if email is not None:
+            def _created_by(src: Optional[Dict]) -> str:
+                return (src.get("created_by") or "").strip().lower() if src else ""
+
+            def _visible(b) -> bool:
+                owner_a = _created_by(_source_for_kg_id(b.from_kg))
+                owner_b = _created_by(_source_for_kg_id(b.to_kg))
+                return (owner_a in ("", email)) and (owner_b in ("", email))
+            bridges = [b for b in bridges if _visible(b)]
+
+        return [b.to_dict() for b in bridges]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -3872,7 +3990,7 @@ async def enrich_source_taxonomy(source_id: str, background_tasks: BackgroundTas
 # Glossary" button in Schema Catalog, scoped to a single source at a time.
 
 @app.post("/metadata/sources/{source_id}/generate-glossary", status_code=202)
-async def generate_source_glossary(source_id: str, background_tasks: BackgroundTasks):
+async def generate_source_glossary(source_id: str, request: Request, background_tasks: BackgroundTasks):
     """
     Discover and govern business glossary terms for every table in a source:
     NLP normalization -> canonical-term match -> cross-source structural/
@@ -3880,6 +3998,7 @@ async def generate_source_glossary(source_id: str, background_tasks: BackgroundT
     fallback for anything unmatched. Runs in the background with SSE
     progress, same convention as enrich-taxonomy above.
     """
+    _require_source_access(request, source_id)
     async def _run_glossary(sid: str) -> None:
         # domain_classifier persists the LLM sub-domain label independently of
         # _sources[sid]["domain"] (a separate, admin-editable/heuristic field
@@ -3917,9 +4036,11 @@ async def generate_source_glossary(source_id: str, background_tasks: BackgroundT
             # other request (including the SSE progress stream itself) until
             # it finishes. asyncio.to_thread hands it to a worker thread so
             # the event loop — and progress polling — stays responsive.
+            _build_connector = _live_connector_factory(sid)
             stats = await asyncio.to_thread(
                 _gg.generate_glossary_for_source, sid,
                 domain=src_domain, business=src_business, progress_cb=_progress,
+                connector_factory=_build_connector,
             )
             _push_index_event(
                 sid, "glossary", "done",
@@ -4082,15 +4203,20 @@ async def reject_glossary_term_endpoint(term_id: str, request: Request, backgrou
 # governed glossary) ────────────────────────────────────────────────────────
 
 @app.get("/business-ontology/sources")
-async def list_business_ontology_sources_endpoint():
+async def list_business_ontology_sources_endpoint(request: Request):
     """Sources whose Business Glossary has actually been generated (at least
-    one linked term) — the Business Ontology UI only offers these."""
+    one linked term) — the Business Ontology UI only offers these. Scoped to
+    sources the caller owns (or all sources for admins), same as
+    ``/sources``."""
     try:
+        email = _current_user_email(request)
         rows = _gr.list_glossary_sources()
         out = []
         for row in rows:
             sid = row["source_id"]
             src = _sources.get(sid)
+            if src is not None and not _owns_source(src, email):
+                continue
             out.append({
                 "source_id": sid,
                 "source_name": (src or {}).get("name") or sid,
@@ -4110,27 +4236,36 @@ async def generate_business_ontology_endpoint(source_id: str, request: Request):
     pattern this returns directly. Ungated: read-derived, not destructive
     (matches the ungated generate-glossary trigger)."""
     try:
+        _require_source_access(request, source_id)
         source_ontology = (_sources.get(source_id) or {}).get("ontology_content") or ""
         return _bo.generate_business_ontology(source_id, created_by=_current_user_email(request) or "",
                                                source_ontology=source_ontology)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/business-ontology/{source_id}/draft")
-async def get_business_ontology_draft_endpoint(source_id: str):
+async def get_business_ontology_draft_endpoint(source_id: str, request: Request):
     try:
+        _require_source_access(request, source_id)
         return _bo.get_draft(source_id)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/business-ontology/{source_id}/terms/{term_id}/kg-links")
-async def get_business_ontology_term_kg_links_endpoint(source_id: str, term_id: str):
+async def get_business_ontology_term_kg_links_endpoint(source_id: str, term_id: str, request: Request):
     """Reverse lookup: which KG nodes/edges this term currently enriches in
     the source's knowledge graph — backs the 'Enriches KG' panel in the UI."""
     try:
+        _require_source_access(request, source_id)
         return _enricher.get_business_glossary_kg_links(term_id, source_id=source_id)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -4144,7 +4279,10 @@ async def put_business_ontology_draft_endpoint(source_id: str, req: SaveBusiness
                                                 request: Request):
     email = _require_permission(request, "edit_business_ontology")
     try:
+        _require_source_access(request, source_id)
         return _bo.save_draft_ttl(source_id, req.ttl_content, updated_by=email)
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -4164,8 +4302,11 @@ async def update_business_ontology_term_endpoint(source_id: str, term_id: str,
                                                    req: UpdateBusinessOntologyTermRequest, request: Request):
     email = _require_permission(request, "edit_business_ontology")
     try:
+        _require_source_access(request, source_id)
         fields = {k: v for k, v in req.dict().items() if v is not None}
         return _bo.update_concept(source_id, term_id, changed_by=email, **fields)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -4174,7 +4315,10 @@ async def update_business_ontology_term_endpoint(source_id: str, term_id: str,
 async def delete_business_ontology_term_endpoint(source_id: str, term_id: str, request: Request):
     email = _require_permission(request, "edit_business_ontology")
     try:
+        _require_source_access(request, source_id)
         return _bo.delete_concept(source_id, term_id, changed_by=email)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -4190,8 +4334,11 @@ async def add_business_ontology_relation_endpoint(source_id: str, req: BusinessO
                                                     request: Request):
     email = _require_permission(request, "edit_business_ontology")
     try:
+        _require_source_access(request, source_id)
         return _bo.add_relation(source_id, req.term_id, req.related_term_id, req.relationship_type,
                                  changed_by=email)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -4200,7 +4347,10 @@ async def add_business_ontology_relation_endpoint(source_id: str, req: BusinessO
 async def delete_business_ontology_relation_endpoint(source_id: str, relation_id: str, request: Request):
     email = _require_permission(request, "edit_business_ontology")
     try:
+        _require_source_access(request, source_id)
         return _bo.delete_relation(source_id, relation_id, changed_by=email)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -4214,21 +4364,28 @@ async def save_business_ontology_version_endpoint(source_id: str, req: SaveBusin
                                                     request: Request):
     email = _require_permission(request, "manage_business_ontology_versions")
     try:
+        _require_source_access(request, source_id)
         return _bo.save_version(source_id, req.label, created_by=email)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/business-ontology/{source_id}/versions")
-async def list_business_ontology_versions_endpoint(source_id: str):
+async def list_business_ontology_versions_endpoint(source_id: str, request: Request):
     try:
+        _require_source_access(request, source_id)
         return _bo.list_versions(source_id)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/business-ontology/{source_id}/versions/{version_id}")
-async def get_business_ontology_version_endpoint(source_id: str, version_id: str):
+async def get_business_ontology_version_endpoint(source_id: str, version_id: str, request: Request):
+    _require_source_access(request, source_id)
     v = _bo.get_version(source_id, version_id)
     if not v:
         raise HTTPException(status_code=404, detail="Version not found")
@@ -4238,6 +4395,7 @@ async def get_business_ontology_version_endpoint(source_id: str, version_id: str
 @app.post("/business-ontology/{source_id}/versions/{version_id}/restore")
 async def restore_business_ontology_version_endpoint(source_id: str, version_id: str, request: Request):
     email = _require_permission(request, "manage_business_ontology_versions")
+    _require_source_access(request, source_id)
     result = _bo.restore_version(source_id, version_id, restored_by=email)
     if result is None:
         raise HTTPException(status_code=404, detail="Version not found")
@@ -4894,6 +5052,7 @@ async def trigger_bridge_inference(req: InferRequest, background_tasks: Backgrou
 
     # Build KGContext for each entry
     contexts: List[KGContext] = []
+    owner_by_kg_id: Dict[str, Optional[str]] = {}
     for entry in all_entries:
         src = _sources.get(entry.source_id) or {}
         contexts.append(KGContext(
@@ -4903,6 +5062,7 @@ async def trigger_bridge_inference(req: InferRequest, background_tasks: Backgrou
             nodes        = src.get("kg_nodes") or [],
             report       = src.get("report"),
         ))
+        owner_by_kg_id[entry.kg_id] = src.get("created_by")
 
     opts = InferenceOptions(
         min_confidence        = req.min_confidence,
@@ -4915,7 +5075,12 @@ async def trigger_bridge_inference(req: InferRequest, background_tasks: Backgrou
 
     def _run():
         with _bridge_sweep_lock:
-            result = run_all_pairs(contexts, opts, sample_fn=sample_fn)
+            result = run_all_pairs(
+                contexts, opts, sample_fn=sample_fn,
+                is_pair_allowed=lambda a, b: _bridge_pair_allowed(
+                    owner_by_kg_id.get(a.kg_id), owner_by_kg_id.get(b.kg_id)
+                ),
+            )
         logger.info(
             "Manual inference job complete: %d pairs, %d bridges saved",
             result["pairs_processed"], result["bridges_saved"],
@@ -5110,6 +5275,98 @@ async def access_check(user_id: str, source_id: Optional[str] = None, action: Op
         result["can_perform"] = _ac.can_perform(user_id, action)
         result["allowed"]     = result.get("allowed", True) and result["can_perform"]
     return result
+
+
+# ── External identities (Phase 1) & source-level ACL (Phase 2/3) ──────────────
+# Generic, provider-agnostic — usable for any external IdP and any source
+# type. M365/Entra ID is the first provider to populate these, via
+# entra_sync.py, but nothing here is M365-specific.
+
+class LinkIdentityRequest(BaseModel):
+    user_id:     str
+    provider:    str   # e.g. "entra"
+    external_id: str
+
+class SourceAclCreate(BaseModel):
+    user_id: Optional[str] = None
+    role:    Optional[str] = None
+    domain:  Optional[str] = None
+
+
+@app.get("/access/external-identities")
+async def list_external_identities(provider: Optional[str] = None):
+    """List DataNanite user ↔ external-IdP identity links."""
+    try:
+        return _ac.list_external_identities(provider=provider)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/access/external-identities", status_code=201)
+async def link_external_identity(req: LinkIdentityRequest, request: Request):
+    """Manually link a DataNanite user to an external-IdP principal."""
+    _require_permission(request, "manage_rbac")
+    try:
+        return _ac.link_external_identity(req.user_id, req.provider, req.external_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/access/external-identities/{user_id}/{provider}")
+async def unlink_external_identity(user_id: str, provider: str, request: Request):
+    _require_permission(request, "manage_rbac")
+    _ac.unlink_external_identity(user_id, provider)
+    return {"unlinked": user_id, "provider": provider}
+
+
+@app.post("/access/entra/sync", status_code=202)
+async def sync_entra_identities(request: Request):
+    """
+    Admin-triggered Entra sync (Phase 1): pulls M365 users from Graph API
+    and links them to DataNanite users by matching email. Requires
+    ENTRA_TENANT_ID/ENTRA_CLIENT_ID/ENTRA_CLIENT_SECRET — returns a clear
+    error (not a silent no-op) if they aren't configured, since this
+    endpoint is only ever hit by an explicit admin action.
+    """
+    _require_permission(request, "manage_rbac")
+    try:
+        import entra_sync
+        pairs = entra_sync.fetch_entra_identities()
+        linked = _ac.sync_external_identities("entra", pairs)
+        return {"fetched": len(pairs), "linked": linked}
+    except entra_sync.EntraNotConfigured as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/access/source-acl/{source_id}")
+async def list_source_acl(source_id: str):
+    """List generic access-control grants for a source (any source type)."""
+    try:
+        return _ac.list_source_acl(source_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/access/source-acl/{source_id}", status_code=201)
+async def create_source_acl(source_id: str, req: SourceAclCreate, request: Request):
+    """Grant source-level access to a user, role, or ABAC domain."""
+    _require_permission(request, "manage_rbac")
+    if not (req.user_id or req.role or req.domain):
+        raise HTTPException(status_code=400, detail="Provide at least one of user_id/role/domain")
+    try:
+        acl_id = _ac.grant_source_access(source_id, req.user_id, req.role, req.domain)
+        return {"acl_id": acl_id}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.delete("/access/source-acl/{acl_id}")
+async def delete_source_acl(acl_id: str, request: Request):
+    _require_permission(request, "manage_rbac")
+    _ac.revoke_source_access(acl_id)
+    return {"deleted": acl_id}
 
 
 # ── Excel export ──────────────────────────────────────────────────────────────

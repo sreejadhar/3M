@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS doc_sources (
     status            TEXT NOT NULL DEFAULT 'idle',
     error_message     TEXT,
     created_at        TEXT NOT NULL,
-    indexed_at        TEXT
+    indexed_at        TEXT,
+    allowed_principals TEXT
 );
 
 CREATE TABLE IF NOT EXISTS doc_assets (
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS doc_assets (
     entities_json       TEXT,
     pii_findings_json   TEXT,
     xref_links_json     TEXT,
+    allowed_principals  TEXT,
     UNIQUE(source_id, remote_id)
 );
 
@@ -96,6 +98,7 @@ _SOURCE_COLUMNS = [
     ("error_message", "TEXT"),
     ("created_at", "TEXT NOT NULL DEFAULT ''"),
     ("indexed_at", "TEXT"),
+    ("allowed_principals", "TEXT"),
 ]
 
 _ASSET_COLUMNS = [
@@ -118,6 +121,7 @@ _ASSET_COLUMNS = [
     ("entities_json", "TEXT"),
     ("pii_findings_json", "TEXT"),
     ("xref_links_json", "TEXT"),
+    ("allowed_principals", "TEXT"),
 ]
 
 class DocStore:

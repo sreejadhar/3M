@@ -34,6 +34,9 @@ spec:
             name: datananite-config
         - secretRef:
             name: datananite-secrets
+        env:
+        - name: SKIP_STARTUP_BRIDGE_INFERENCE
+          value: "1"
         volumeMounts:
         - name: shared-data
           mountPath: /data
@@ -43,19 +46,23 @@ spec:
             cpu: "250m"
           limits:
             memory: "5Gi"
-            cpu: "500m"
+            cpu: "1000m"
         livenessProbe:
           httpGet:
             path: /health
             port: 8005
           initialDelaySeconds: 60
           periodSeconds: 15
+          timeoutSeconds: 10
+          failureThreshold: 6
         readinessProbe:
           httpGet:
             path: /health
             port: 8005
           initialDelaySeconds: 60
           periodSeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 6
       volumes:
       - name: shared-data
         persistentVolumeClaim:

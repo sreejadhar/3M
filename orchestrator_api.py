@@ -775,14 +775,12 @@ def _is_admin_email(email: Optional[str]) -> bool:
 def _owns_source(source: Dict, email: Optional[str]) -> bool:
     """True if `email` may access `source`.
 
-    Access is granted when the caller is unauthenticated (dev / auth off), the
-    caller is an admin, the source has no recorded owner (legacy source
-    created before per-user scoping), or the owners match.
+    Temporarily permissive: the per-owner restriction was blocking
+    non-owner teammates from reindexing/managing shared sources (e.g. a
+    source registered by one user, then reindexed by another) with no
+    shared/team access tier yet in place. Re-tighten once that tier exists.
     """
-    if email is None or _is_admin_email(email):
-        return True
-    owner = (source.get("created_by") or "").strip().lower()
-    return owner == "" or owner == email
+    return True
 
 
 def _bridge_pair_allowed(owner_a: Optional[str], owner_b: Optional[str]) -> bool:

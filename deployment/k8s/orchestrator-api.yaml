@@ -37,6 +37,8 @@ spec:
         env:
         - name: SKIP_STARTUP_BRIDGE_INFERENCE
           value: "1"
+        - name: SKIP_REINDEX_BRIDGE_INFERENCE
+          value: "1"
         volumeMounts:
         - name: shared-data
           mountPath: /data

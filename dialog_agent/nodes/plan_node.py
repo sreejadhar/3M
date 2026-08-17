@@ -1230,9 +1230,22 @@ General Rules:
            → Or use IN with ALL semantically related sample values:
                LOWER(col) IN ('food and snacks', 'snacks', 'savoury')
            → NEVER write WHERE col = 'savoury snacks' if that exact string is not in [sample values].
-       - NO MATCH AT ALL → do NOT add a filter for that dimension; retrieve all values
-           and let the user see what categories exist. Add a comment in "description"
-           noting that the exact term was not found.
+       - ABBREVIATION/ACRONYM with an obvious domain expansion (IT, HR, R&D, PR, QA,
+           EMEA, YoY, etc.) → this is NOT "no match" just because the samples don't
+           literally contain the expansion — a department/org-name column almost
+           certainly has an entry like "Information Technology" even if it wasn't
+           among the few sampled values. Expand the abbreviation using domain
+           knowledge and filter on the FULL EXPANDED FORM, never the bare
+           abbreviation (LIKE '%it%' matches "credIT", "capacITy", "digITal"):
+               WRONG  : LOWER(org_name) LIKE '%it%'
+               CORRECT: LOWER(org_name) LIKE '%information technology%'
+           If the expanded form is itself ≤4 characters (rare), use word-boundary
+           OR'd LIKE clauses per rule 11(g) below instead of a bare substring LIKE.
+       - NO MATCH AT ALL (no plausible domain expansion or synonym relationship
+           between the user's term and the column's purpose) → do NOT add a filter
+           for that dimension; retrieve all values and let the user see what
+           categories exist. Add a comment in "description" noting that the exact
+           term was not found.
 
     c. If a column is marked [categorical] in the schema context, you MUST follow this
        rule — do not use exact equality unless the term appears verbatim in the samples.
@@ -4722,11 +4735,18 @@ def plan_node(state: DialogState) -> DialogState:
             "These mappings were computed BEFORE SQL generation by inspecting the",
             "actual stored values.  You MUST use the sql_fragment shown for each",
             "filter.  Do NOT replace these with the user's original terminology.",
+            "A user_term MAY appear more than once below, once per table — each",
+            "entry's table/column tells you which query it applies to. Whenever a",
+            "query touches one of these tables, you MUST apply that table's entry",
+            "for every filter concept the question mentions — do NOT silently drop",
+            "a filter just because the table you're querying wasn't the top match;",
+            "use whichever entry's table matches the table(s) in that query.",
             "",
         ]
         for r in term_resolution:
             user_term      = r.get("user_term", "")
             column         = r.get("column", "")
+            table          = r.get("table", "")
             matched        = r.get("matched_values") or []
             sql_frag       = r.get("sql_fragment") or ""
             reasoning      = r.get("reasoning", "")
@@ -4745,7 +4765,7 @@ def plan_node(state: DialogState) -> DialogState:
                 res_lines.append("")
             elif sql_frag:
                 res_lines.append(
-                    f'  User said "{user_term}"  →  column "{column}"'
+                    f'  User said "{user_term}"  →  table "{table}", column "{column}"'
                 )
                 if reasoning:
                     res_lines.append(f"    Reasoning: {reasoning}")

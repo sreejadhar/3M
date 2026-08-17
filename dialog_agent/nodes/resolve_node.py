@@ -251,6 +251,14 @@ Your task:
 - Identify every filter concept in the question (e.g. a product category, a country,
   a time period, a brand, a segment name)
 - For each filter concept, find the best-matching stored value(s) using the rules below
+- ⚠ MULTI-TABLE CONCEPTS: if a filter concept plausibly matches categorical columns in
+  MORE THAN ONE table (e.g. a department/org concept like "IT" could match an org-name
+  column on an employee table AND a department column on an education/qualification
+  table), return a SEPARATE resolved_filters entry per table — one per (table, column)
+  pair — each with its own sql_fragment for that table's column. Do NOT return only the
+  single "best" table and drop the rest: the SQL planner may end up querying any one of
+  these tables (or several), and each one needs its own valid filter so a query never
+  silently loses the filter just because it doesn't touch the table you happened to pick.
 - Return ONLY a JSON object — no prose, no markdown fences
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -314,14 +322,33 @@ MATCHING RULES — try in order, stop at the first rule that gives a match
      user "HR"           → stored "Human Resources"
      user "R&D"          → stored "Research and Development"
    Include ALL semantically equivalent stored values in an IN() list.
+   ⚠ APPLIES even when the sample values shown to you don't literally contain the
+     expansion — a well-known abbreviation with an obvious domain expansion (IT,
+     HR, R&D, PR, QA, EMEA, etc.) is NOT a NO-MATCH case just because the column's
+     shown samples happen not to include that exact row. Reason from the column's
+     evident purpose (e.g. an org/department-name column almost certainly has an
+     "Information Technology" or similarly-worded entry even if it wasn't in the
+     handful of sampled values) and emit the filter using the FULL EXPANDED FORM.
+   ⛔ NEVER emit the bare abbreviation itself in the sql_fragment — it is too short
+     and matches as a substring inside unrelated words (LIKE '%it%' matches "credIT",
+     "capacITy", "digITal"). Always expand first, then match on the full word/phrase:
+       WRONG  : LOWER(org_name) LIKE '%it%'
+       CORRECT: LOWER(org_name) LIKE '%information technology%'
+     If the full-form phrase is itself short (≤4 chars, rare), use the word-boundary
+     pattern instead: LOWER(col) LIKE 'it %' OR LOWER(col) LIKE '% it' OR
+     LOWER(col) LIKE '% it %' OR LOWER(col) = 'it'.
 
 6. LAST RESORT — NO MATCH: ONLY use this when rules 1-5 all fail AND there are
    no KEYWORD MATCH HINTS for this term.
    Set matched_values to [], sql_fragment to null, and no_match to true.
    ⚠ If KEYWORD MATCH HINTS shows overlap for a user term, you MUST NOT use
      NO MATCH for that term — the hint is Python-computed proof of overlap.
+   ⚠ Do NOT reach for NO MATCH just because rule 5's expansion isn't literally
+     present among the sampled values — see the note under rule 5. NO MATCH is
+     reserved for terms with NO plausible domain mapping to the column at all.
    ⚠ NO MATCH is the CORRECT answer when the user's term genuinely does not
-     appear in any stored column value. For example: if the user says "Coca Cola"
+     appear in any stored column value AND has no reasonable expansion/synonym
+     relationship to the column's purpose. For example: if the user says "Coca Cola"
      but the [categorical] column only stores manufacturer codes like "CCEP",
      "Suntory", "Asahi" — then NO MATCH is correct. The SQL planner will then
      know NOT to add a filter for this term instead of fabricating a wrong one.
@@ -346,6 +373,10 @@ OUTPUT FORMAT (return exactly this JSON, no other text):
 For NO MATCH cases set: matched_values=[], sql_fragment=null, no_match=true.
 If no categorical filters are needed (e.g. purely numeric aggregation), return:
 {"resolved_filters": []}
+
+Multiple entries CAN share the same "user_term" when that concept matches columns in
+different tables (see MULTI-TABLE CONCEPTS above) — each entry's "table"/"column" then
+tells the SQL planner which query that entry's sql_fragment applies to.
 """
 
 

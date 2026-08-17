@@ -328,15 +328,21 @@ MATCHING RULES — try in order, stop at the first rule that gives a match
      shown samples happen not to include that exact row. Reason from the column's
      evident purpose (e.g. an org/department-name column almost certainly has an
      "Information Technology" or similarly-worded entry even if it wasn't in the
-     handful of sampled values) and emit the filter using the FULL EXPANDED FORM.
-   ⛔ NEVER emit the bare abbreviation itself in the sql_fragment — it is too short
-     and matches as a substring inside unrelated words (LIKE '%it%' matches "credIT",
-     "capacITy", "digITal"). Always expand first, then match on the full word/phrase:
-       WRONG  : LOWER(org_name) LIKE '%it%'
-       CORRECT: LOWER(org_name) LIKE '%information technology%'
-     If the full-form phrase is itself short (≤4 chars, rare), use the word-boundary
-     pattern instead: LOWER(col) LIKE 'it %' OR LOWER(col) LIKE '% it' OR
-     LOWER(col) LIKE '% it %' OR LOWER(col) = 'it'.
+     handful of sampled values).
+   ⚠ THIS IS A GUESS, NOT A CONFIRMED MATCH (unlike rule 1/4 above, which matched
+     something actually shown to you) — you do NOT know whether the real column
+     stores the bare abbreviation ("IT"), the expanded phrase ("Information
+     Technology"), or both across different rows. Do NOT commit the sql_fragment
+     to only one spelling. OR together BOTH forms so either stored spelling is
+     caught: an EXACT equality on the bare abbreviation OR'd with a LIKE on the
+     expanded full form:
+       LOWER(col) = 'it' OR LOWER(col) LIKE '%information technology%'
+     (equality, not LIKE, on the bare abbreviation — LIKE '%it%' would also match
+     "credIT", "capacITy", "digITal").
+     Example combined sql_fragment:
+       (LOWER(org_name) = 'it' OR LOWER(org_name) LIKE '%information technology%')
+     This applies to every abbreviation resolved under this rule, regardless of
+     which table/column it is being resolved against.
 
 6. LAST RESORT — NO MATCH: ONLY use this when rules 1-5 all fail AND there are
    no KEYWORD MATCH HINTS for this term.

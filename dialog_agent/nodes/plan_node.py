@@ -1597,6 +1597,43 @@ General Rules:
        which sub-dimension row is real — do not substitute one fix for the
        other. When unsure which pattern you're looking at, prefer rule 22's
        explicit status/validity filtering signal over guessing based on dates.
+
+25. "HOW MANY X ARE THERE / WORKING IN / IN Y" — DEFAULT TO THE CURRENT /
+    ACTIVE POPULATION. UNIVERSAL, ALL DOMAINS, ALL DATABASES. This is an
+    exception to rule 20's "never filter a dimension the question didn't
+    mention" — a lifecycle status is treated as IMPLIED by present-tense
+    headcount/membership questions, the same way "current" is implied even
+    when the word never appears.
+    a. Many entity tables (employees, customers, vendors, subscriptions,
+       accounts, licenses, memberships, etc.) carry a lifecycle/status
+       column distinguishing records that are presently in force from ones
+       that are not — e.g. an "employment status"/"active flag" column with
+       values like "Active"/"Terminated"/"Inactive"/"On Leave", a
+       termination/end/close/cancel date column, or a boolean is_active /
+       is_current flag. Detect this generically from the schema context
+       (column name plus its sample/distinct values or null pattern) —
+       do not hardcode to any one column name or domain.
+    b. When the question is phrased in the PRESENT tense about how many
+       members of that population exist NOW — "how many employees work in
+       IT", "how many customers do we have in California", "how many
+       active-sounding-or-not vendors are registered" — and the question
+       does NOT itself ask about a historical, cumulative, or lifecycle-wide
+       count ("ever employed", "all-time", "including terminated/former/
+       churned/cancelled", "total hired", "over the last N years"), you MUST
+       filter to the current/active state on that lifecycle column (e.g.
+       status = 'Active', or end_date IS NULL / end_date > current date),
+       even though the word "active" never appears in the question. Counting
+       every row regardless of status silently includes terminated/former/
+       cancelled records and overstates the answer.
+    c. If the schema context does not show any lifecycle/status column for
+       that entity table, do not invent one — simply count all rows, per
+       rule 20.
+    d. Only skip the active-state filter when the question explicitly asks
+       to include or scope by a different lifecycle state ("how many
+       employees have ever worked in IT", "including former employees",
+       "terminated in the last year", "churned customers") — in that case
+       filter (or omit filtering) according to what the question actually
+       asked for instead of defaulting to active.
 """
 
 _USER_PROMPT = """\
@@ -4741,6 +4778,20 @@ def plan_node(state: DialogState) -> DialogState:
             "for every filter concept the question mentions — do NOT silently drop",
             "a filter just because the table you're querying wasn't the top match;",
             "use whichever entry's table matches the table(s) in that query.",
+            "",
+            "⚠ PREFER THE SIMPLEST TABLE, NOT THE MOST EXACT STRING MATCH: when the",
+            "same user_term has entries in more than one table below, check FIRST",
+            "whether a single table already has a resolved entry for EVERY filter",
+            "concept in the question — if so, answer from that ONE table and do NOT",
+            "join in another table just because it also has a (possibly more exact)",
+            "matching entry. Reserve the extra table for when the question is",
+            "actually about THAT table's subject matter (e.g. only join an",
+            "education/certification/training table if the question asks about",
+            "education/certification/training, not merely because a department",
+            "name happens to also appear there). Joining on weak surrogate keys",
+            "(name, date-of-birth, location, etc. instead of a real employee/entity",
+            "ID) to reach a \"more exact\" match elsewhere silently drops real rows",
+            "and produces a WRONG, lower count — prefer the single-table filter.",
             "",
         ]
         for r in term_resolution:

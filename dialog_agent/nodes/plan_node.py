@@ -1234,13 +1234,25 @@ General Rules:
            EMEA, YoY, etc.) → this is NOT "no match" just because the samples don't
            literally contain the expansion — a department/org-name column almost
            certainly has an entry like "Information Technology" even if it wasn't
-           among the few sampled values. Expand the abbreviation using domain
-           knowledge and filter on the FULL EXPANDED FORM, never the bare
-           abbreviation (LIKE '%it%' matches "credIT", "capacITy", "digITal"):
-               WRONG  : LOWER(org_name) LIKE '%it%'
-               CORRECT: LOWER(org_name) LIKE '%information technology%'
-           If the expanded form is itself ≤4 characters (rare), use word-boundary
-           OR'd LIKE clauses per rule 11(g) below instead of a bare substring LIKE.
+           among the few sampled values.
+             • If the samples DO show the bare abbreviation verbatim as a stored
+               value (e.g. samples list "IT"), that IS an exact match — use
+               equality/word-boundary matching on the abbreviation per rule 11(g),
+               do NOT rewrite it to the expanded form the data doesn't contain.
+             • If the samples do NOT show either spelling (column is unsampled, or
+               the abbreviation isn't among the few sampled values), you do not
+               actually know which spelling the real data uses — do NOT commit to
+               only the expanded form and do NOT commit to only the bare
+               abbreviation. Cover BOTH with an OR: an EXACT equality on the bare
+               abbreviation OR'd with a LIKE on the expanded full form:
+                   WRONG  : LOWER(org_name) LIKE '%it%'
+                   WRONG  : LOWER(org_name) LIKE '%information technology%'   ← only
+                            (guesses the data was never sampled to confirm)
+                   CORRECT: (LOWER(org_name) = 'it' OR LOWER(org_name) LIKE '%information technology%')
+               (equality, not LIKE, on the bare abbreviation — LIKE '%it%' would
+               also match "credIT", "capacITy", "digITal"). This applies to any
+               table/column carrying that filter, not just the one the
+               abbreviation was first resolved against.
        - NO MATCH AT ALL (no plausible domain expansion or synonym relationship
            between the user's term and the column's purpose) → do NOT add a filter
            for that dimension; retrieve all values and let the user see what
@@ -1257,6 +1269,18 @@ General Rules:
        not shown in the schema. The stored values may be abbreviated, trademarked, or
        formatted differently from what the user typed (e.g. "Coca-Cola HBC", "CCEP",
        "The Coca-Cola Company").
+       ⛔ EXCEPTION — DO NOT apply the plain-LIKE instruction above when the
+       user's term is itself a short abbreviation/acronym (≤4 chars, e.g. "IT",
+       "HR", "PR", "QA", "R&D"). A bare LIKE '%it%' silently matches "credIT",
+       "capacITy", "digITal", "wrITe" — NOT just an IT department, so it is
+       WRONG here even though the column is unsampled. Because the column is
+       unsampled you also don't know whether the real data stores the bare
+       abbreviation or its expanded form, so emit BOTH, OR'd together — exact
+       equality on the abbreviation, OR'd with a LIKE on the expanded full form:
+         WRONG   : LOWER(department) LIKE '%it%'
+         CORRECT : (LOWER(department) = 'it' OR LOWER(department) LIKE '%information technology%')
+       Apply the same pattern for any other short abbreviation (HR → 'hr' /
+       '%human resources%', QA → 'qa' / '%quality assurance%', etc.).
     e. Always use case-insensitive matching (LOWER/ILIKE) — never raw equality on text.
     f. When using LIKE, anchor to the most distinctive part of the term to avoid
        false positives (e.g. LIKE '%coca%' not LIKE '%cola%' which would match Pepsi Cola).
@@ -3136,6 +3160,69 @@ _HEADCOUNT_COL_NAMES = re.compile(
     r'resource_count|count_of|no_of|num_of)\b',
     re.IGNORECASE,
 )
+
+
+_ABBREVIATION_EXPANSIONS = {
+    "it":   "information technology",
+    "hr":   "human resources",
+    "pr":   "public relations",
+    "qa":   "quality assurance",
+    "r&d":  "research and development",
+    "rnd":  "research and development",
+    "cs":   "customer service",
+    "cx":   "customer experience",
+    "bd":   "business development",
+    "ops":  "operations",
+    "fin":  "finance",
+    "eng":  "engineering",
+    "mktg": "marketing",
+    "sc":   "supply chain",
+    "hpc":  "home and personal care",
+    "emea": "europe",
+}
+
+# A bare LIKE '%it%' matches the term as a substring anywhere ("credIT",
+# "capacITy", "digITal"), not just the standalone word — see plan_node.py
+# rule 11(g)/11(d). Haiku does not reliably follow that prompt instruction
+# for short (<=4 char) categorical terms, so enforce it deterministically:
+# rewrite LOWER(col) LIKE '%<short_term>%' into an OR of (a) an exact-equality
+# check on the bare term/abbreviation and (b) — when the term has a known
+# domain expansion — a LIKE on the expanded phrase, so either real stored
+# spelling matches.
+_SHORT_LIKE_FILTER = re.compile(
+    r"LOWER\(\s*([\w.\"]+)\s*\)\s*LIKE\s*'%([a-zA-Z&]{1,4})%'",
+    re.IGNORECASE,
+)
+
+
+def _fix_short_acronym_like_filters(sql: str) -> str:
+    """
+    Rewrite unsafe bare-substring LIKE filters on short (<=4 char) terms into
+    a safe OR'd equality/LIKE pair, so acronyms like "IT"/"HR"/"QA" don't
+    match as substrings inside unrelated words, and don't silently miss rows
+    if the real data stores the expanded phrase instead of the abbreviation
+    (or vice versa).
+    """
+    def _replace(m: re.Match) -> str:
+        col = m.group(1)
+        term = m.group(2).lower()
+        expansion = _ABBREVIATION_EXPANSIONS.get(term)
+        if expansion:
+            return f"(LOWER({col}) = '{term}' OR LOWER({col}) LIKE '%{expansion}%')"
+        # No known expansion — fall back to word-boundary-safe matching so the
+        # term is only matched as a standalone word, not a substring.
+        return (
+            f"(LOWER({col}) = '{term}' OR LOWER({col}) LIKE '{term} %' "
+            f"OR LOWER({col}) LIKE '% {term}' OR LOWER({col}) LIKE '% {term} %')"
+        )
+
+    fixed = _SHORT_LIKE_FILTER.sub(_replace, sql)
+    if fixed != sql:
+        logger.info(
+            "plan_node: rewrote unsafe short-acronym LIKE filter(s) into "
+            "word-boundary-safe OR'd equality/LIKE"
+        )
+    return fixed
 
 
 def _fix_count_vs_sum(sql: str, natural_query: str) -> str:
@@ -5042,6 +5129,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = item["sql"].strip().rstrip(";").strip()
             sql = _qualify_sql(sql, db_schema, table_labels)
             sql = _fix_count_vs_sum(sql, natural_query)
+            sql = _fix_short_acronym_like_filters(sql)
             sql = _fix_percentage(sql, natural_query, config.db_type)
             sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
             sql = _fix_dialect_syntax(sql, config.db_type)

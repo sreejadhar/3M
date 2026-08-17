@@ -1247,6 +1247,18 @@ General Rules:
     e. Always use case-insensitive matching (LOWER/ILIKE) — never raw equality on text.
     f. When using LIKE, anchor to the most distinctive part of the term to avoid
        false positives (e.g. LIKE '%coca%' not LIKE '%cola%' which would match Pepsi Cola).
+    g. SHORT TERMS AND ACRONYMS (roughly ≤4 characters, e.g. "IT", "HR", "PR", "AI", "QA"):
+       a bare LIKE '%it%' matches the substring anywhere, so it silently matches "credIT",
+       "capacITy", "digITal", "wrITe", etc. — NOT just the "IT" department. For any short
+       term, replace the single '%term%' LIKE with word-boundary-safe OR'd LIKE clauses
+       instead of one substring LIKE:
+         WRONG  : LOWER(org_name) LIKE '%it%'
+         CORRECT: LOWER(org_name) LIKE 'it %' OR LOWER(org_name) LIKE '% it'
+                    OR LOWER(org_name) LIKE '% it %' OR LOWER(org_name) = 'it'
+       This checks the term as a standalone word (start, end, middle, or the whole value)
+       without matching it as part of a longer word. Apply this whenever the distinctive
+       keyword chosen in (f) is short enough to plausibly appear inside unrelated words —
+       longer, more distinctive keywords (e.g. "coca", "snack") don't need this treatment.
 12. Date/period filters — always check the [sample values] for the period column before
     writing a year filter.  Period columns often store values with a prefix or suffix:
       WRONG : WHERE fiscal_year = '2024'       ← if samples show 'FY2024'

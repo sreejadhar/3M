@@ -168,6 +168,7 @@ class BaseConnector(abc.ABC):
                 f"SELECT val, COUNT(*) AS cnt FROM ("
                 f"SELECT {self._quote(column)} AS val FROM {fqn} {sample_clause}"
                 f") sampled_rows "
+                f"WHERE val IS NOT NULL "
                 f"GROUP BY val "
                 f"ORDER BY cnt DESC "
                 f"LIMIT 10"

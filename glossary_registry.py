@@ -560,6 +560,16 @@ def delete_stale_links(pairs: List[Any]) -> None:
         )
 
 
+def delete_assets_and_jobs_for_source(source_id: str) -> None:
+    """Remove every glossary term↔column link and job row scoped to this
+    source — called when the source itself is deleted, since neither table
+    is otherwise touched by any per-source cleanup path."""
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute("DELETE FROM biz_glossary_term_assets WHERE source_id=?", (source_id,))
+        cur.execute("DELETE FROM biz_glossary_jobs WHERE source_id=?", (source_id,))
+
+
 def list_assets_for_term(term_id: str) -> List[Dict]:
     with _cursor_ctx() as cur:
         _ensure(cur)

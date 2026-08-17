@@ -173,6 +173,15 @@ def delete(bridge_id: int) -> None:
         cur.execute("DELETE FROM kg_bridges WHERE id=?", (bridge_id,))
 
 
+def delete_for_kg(kg_id: str) -> None:
+    """Remove every bridge with this kg/source on either end — called when
+    the source itself is deleted, so a stale endpoint doesn't keep matching
+    _reg_list() lookups for a source_id that no longer exists."""
+    with pg_store.cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute("DELETE FROM kg_bridges WHERE from_kg=? OR to_kg=?", (kg_id, kg_id))
+
+
 def set_enabled(bridge_id: int, enabled: bool) -> None:
     with pg_store.cursor_ctx() as cur:
         _ensure(cur)

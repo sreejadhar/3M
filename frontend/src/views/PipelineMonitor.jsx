@@ -7,9 +7,10 @@ import {
   classifyPII,
   detectBusiness,
   detectDomain,
+  deleteSource,
 } from '../api/clients.js';
 import { dbIcon, statusDotClass, fmtRelTime, fmtNum } from '../lib/utils.js';
-import { IconRefresh, IconPlus, IconDatabase, IconOntology, IconLock, IconExcel } from '../components/Icons.jsx';
+import { IconRefresh, IconPlus, IconDatabase, IconOntology, IconLock, IconExcel, IconTrash } from '../components/Icons.jsx';
 
 // step → { cls, label, sub } — drives the .ev-stage colour classes in style.css
 function stageMeta(step) {
@@ -167,6 +168,21 @@ export default function PipelineMonitor() {
     }
   };
 
+  const removeSource = async (source, e) => {
+    e.stopPropagation();
+    if (!window.confirm(
+      `Delete source "${source.name}"? This also removes its bridges, ACL grants, business ontology, glossary links, structural metadata, and KPIs. This cannot be undone.`
+    )) return;
+    try {
+      await deleteSource(source.id);
+      toast(`Deleted "${source.name}"`, 'info');
+      if (activeSourceId === source.id) setActiveSourceId('');
+      refreshSources();
+    } catch (err) {
+      toast(`Delete failed: ${err.message}`, 'error');
+    }
+  };
+
   const dotColor = {
     idle: 'var(--text-2)',
     connecting: 'var(--accent)',
@@ -221,6 +237,14 @@ export default function PipelineMonitor() {
                     {s.status} · {fmtRelTime(s.indexed_at)}
                   </div>
                 </div>
+                <button
+                  className="btn btn-ghost"
+                  title="Delete source"
+                  style={{ padding: '2px 6px', color: '#ff4d4d', flexShrink: 0 }}
+                  onClick={(e) => removeSource(s, e)}
+                >
+                  <IconTrash style={{ width: 13, height: 13 }} />
+                </button>
               </div>
             ))
           )}

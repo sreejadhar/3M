@@ -462,6 +462,8 @@ def _fuzzy_match_candidates(
             parent_vals = col_map.get(parent_col, []) if parent_col else []
 
             for val in vals:
+                if val is None:
+                    continue
                 val_lower = val.lower()
                 matched_tokens = {t for t in query_tokens if _token_matches_text(t, val_lower)}
                 matched_tokens |= {t for t in acronym_tokens if _initials_match(t, val)}
@@ -485,6 +487,8 @@ def _fuzzy_match_candidates(
                 # so the LLM filters at the correct (parent) level.
                 if parent_col and parent_vals:
                     for pval in parent_vals:
+                        if pval is None:
+                            continue
                         pkey = (tbl, parent_col, pval)
                         if pkey in promoted_parents:
                             continue

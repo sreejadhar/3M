@@ -3100,6 +3100,38 @@ async def delete_source(source_id: str, request: Request):
         _reg_delete(source_id)
     except Exception as exc:
         logger.warning("kg_registry.delete failed (non-fatal): %s", exc)
+    # Cascade-clean everything else keyed by source_id — bridges, ACL grants,
+    # business ontology, business glossary links/jobs, structural metadata,
+    # and KPIs — so nothing in the UI still references a source that no
+    # longer exists. Each step is independently best-effort (non-fatal): a
+    # failure here must not block the source itself from being removed.
+    try:
+        from dialog_agent import kg_bridges as _bridges
+        _bridges.delete_for_kg(source_id)
+    except Exception as exc:
+        logger.warning("kg_bridges.delete_for_kg failed (non-fatal): %s", exc)
+    try:
+        _ac.revoke_all_source_access(source_id)
+    except Exception as exc:
+        logger.warning("access_control.revoke_all_source_access failed (non-fatal): %s", exc)
+    try:
+        _bo.delete_source_ontology(source_id)
+    except Exception as exc:
+        logger.warning("business_ontology.delete_source_ontology failed (non-fatal): %s", exc)
+    try:
+        _gr.delete_assets_and_jobs_for_source(source_id)
+    except Exception as exc:
+        logger.warning("glossary_registry.delete_assets_and_jobs_for_source failed (non-fatal): %s", exc)
+    try:
+        from dialog_agent import metadata_store as _md
+        _md.delete_entities_for_source(source_id)
+    except Exception as exc:
+        logger.warning("metadata_store.delete_entities_for_source failed (non-fatal): %s", exc)
+    try:
+        for kpi in _kpi.list_kpis(source_id=source_id):
+            _kpi.delete_kpi(kpi["kpi_id"])
+    except Exception as exc:
+        logger.warning("kpi_store cleanup failed (non-fatal): %s", exc)
     logger.info("Source deleted: %s (%s)", source_id[:8], s["name"])
     return {"deleted": source_id}
 

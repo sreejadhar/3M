@@ -69,6 +69,7 @@ export function sourceEvents(sourceId) {
 export const listSources = () => apiGet('/sources?persona=admin');
 export const createSource = (payload) => apiPost('/sources', payload);
 export const patchSource = (id, payload) => apiPatch(`/sources/${id}`, payload);
+export const deleteSource = (id) => apiDelete(`/sources/${id}`);
 export const reindexSource = (id) => apiPost(`/sources/${id}/reindex`);
 export const testConnection = (payload) => apiPost('/sources/test-connection', payload);
 export const getGraph = (id) => apiGet(`/sources/${id}/graph`);

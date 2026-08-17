@@ -374,6 +374,19 @@ def list_entities(source_id: Optional[str] = None) -> List[Dict]:
     return [_coerce_entity(r) for r in rows]
 
 
+def delete_entities_for_source(source_id: str) -> None:
+    """Remove every md_entities row (and its md_attributes children) scoped
+    to this source — called when the source itself is deleted."""
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        ids = [r["metadata_id"] for r in cur.execute(
+            "SELECT metadata_id FROM md_entities WHERE source_id=?", (source_id,)
+        ).fetchall()]
+        for metadata_id in ids:
+            cur.execute("DELETE FROM md_attributes WHERE metadata_id=?", (metadata_id,))
+        cur.execute("DELETE FROM md_entities WHERE source_id=?", (source_id,))
+
+
 def get_entity(metadata_id: str) -> Optional[Dict]:
     """Return entity dict with attributes list, or None if not found."""
     with _cursor_ctx() as cur:

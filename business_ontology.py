@@ -422,6 +422,16 @@ def delete_relation(source_id: str, relation_id: str, changed_by: str = "") -> D
     return generate_business_ontology(source_id, created_by=changed_by)
 
 
+def delete_source_ontology(source_id: str) -> None:
+    """Drop the per-source business ontology draft and all saved versions —
+    called when the source itself is deleted, so no orphaned scope=source_id
+    rows are left behind for a source_id that will never come back."""
+    with _cursor_ctx() as cur:
+        _ensure(cur)
+        cur.execute("DELETE FROM biz_ontology_versions WHERE scope=?", (source_id,))
+        cur.execute("DELETE FROM biz_ontology_draft WHERE scope=?", (source_id,))
+
+
 # ── Versioning ───────────────────────────────────────────────────────────────
 
 def save_version(source_id: str, label: str, created_by: str = "") -> Dict:

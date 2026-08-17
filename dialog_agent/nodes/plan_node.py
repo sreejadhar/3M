@@ -657,6 +657,17 @@ General Rules:
         SELECT COUNT(DISTINCT c.claim_id) FROM claims c
         LEFT JOIN fraud_indicator f ON f.claim_id = c.claim_id
         WHERE f.status = 'CONFIRMED'
+   e. Even WITHOUT any JOIN, a single table can still store more than one row
+      per counted entity (e.g. one employee with two concurrent job/assignment
+      records, one customer with multiple addresses). Watch for these signals
+      that a table is NOT one-row-per-entity:
+        - An "is_primary" / "is_current" / status-type flag alongside the
+          entity id (it exists precisely because an entity can have >1 row).
+        - An entity id column (employee_id, customer_id, account_id, etc.)
+          that is separate from the table's own surrogate row-id/PK.
+      When either signal is present, use COUNT(DISTINCT <entity_id_column>)
+      instead of COUNT(*) for a "how many <entities>" question — do NOT
+      assume COUNT(*) is safe just because the query has no JOIN.
 7. Sibling table disambiguation — when several tables share the same columns
    (e.g. the same schema has a "by_channel" table, a "by_category" table, and
    a "combined" table with maker+category+channel):

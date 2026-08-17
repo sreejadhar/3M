@@ -5,7 +5,7 @@
 
 ## What This Project Is
 
-**DataNanite** (repo: `krishnarayapudi2571/Datananite`, originally cloned from `dabu810/metadataextractor`) is an AI-native metadata intelligence platform with 10 Python microservices. It uses FastAPI + LangGraph + Anthropic Claude API.
+**DataNanite** (repo: `sreejadhar/Datananite`, originally cloned from `dabu810/metadataextractor`) is an AI-native metadata intelligence platform with 10 Python microservices. It uses FastAPI + LangGraph + Anthropic Claude API.
 
 ---
 
@@ -20,7 +20,7 @@
 | Node Pool | `datananite-pool` (e2-standard-2 × 2 nodes) |
 | Static IP | `34.128.164.174` (reserved as `datananite-static-ip`) |
 | Public URL | `http://datananite.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog` |
-| GitHub Repo | `https://github.com/krishnarayapudi2571/Datananite.git` |
+| GitHub Repo | `https://github.com/sreejadhar/Datananite.git` |
 | Active Branch | `feat/gke-deployment` (NOT yet merged to main) |
 
 ---
@@ -55,7 +55,7 @@
 | **Real ANTHROPIC_API_KEY** | Currently placeholder in K8s secret — needs real key |
 
 ### Add GitHub Secrets Here:
-`https://github.com/krishnarayapudi2571/Datananite/settings/secrets/actions`
+`https://github.com/sreejadhar/Datananite/settings/secrets/actions`
 
 | Secret Name | Value |
 |-------------|-------|
@@ -298,7 +298,7 @@ kubectl get events -n datananite --sort-by=.lastTimestamp
 
 1. **Verify GitHub Secrets are added** — check `GCP_SA_KEY` and `ANTHROPIC_API_KEY` exist
 2. **Merge PR** `feat/gke-deployment` → `main`
-3. **Monitor CI/CD** at `https://github.com/krishnarayapudi2571/Datananite/actions`
+3. **Monitor CI/CD** at `https://github.com/sreejadhar/Datananite/actions`
 4. **Verify all pods running** after CI/CD: `kubectl get pods -n datananite`
 5. **Test the app** at `http://datananite.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog`
 6. **Optional future work:**

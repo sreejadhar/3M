@@ -37,40 +37,66 @@ jobs:
         gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
 
     - name: Guard — reject placeholder JWT_SECRET
+      env:
+        S_JWT_SECRET: ${{ secrets.JWT_SECRET }}
       run: |
         # Fail if the GitHub Actions secret itself looks like a placeholder
-        if echo "${{ secrets.JWT_SECRET }}" | grep -qiE "^$|CHANGE_ME|openssl"; then
+        if echo "$S_JWT_SECRET" | grep -qiE "^$|CHANGE_ME|openssl"; then
           echo "FATAL: JWT_SECRET GitHub secret is empty or placeholder. Generate one with: openssl rand -hex 32"
           exit 1
         fi
 
     - name: Update K8s secrets from GitHub Actions secrets
+      env:
+        S_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        S_GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        S_VERTEX_REGION: ${{ secrets.VERTEX_REGION }}
+        S_JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        S_SEED_PASSWORD_RIMNA: ${{ secrets.SEED_PASSWORD_RIMNA }}
+        S_SEED_PASSWORD_IYER: ${{ secrets.SEED_PASSWORD_IYER }}
+        S_SEED_PASSWORD_SENTHEESH: ${{ secrets.SEED_PASSWORD_SENTHEESH }}
+        S_SEED_PASSWORD_HARPREET: ${{ secrets.SEED_PASSWORD_HARPREET }}
+        S_SEED_PASSWORD_SUNIL: ${{ secrets.SEED_PASSWORD_SUNIL }}
+        S_SEED_PASSWORD_SATHISH: ${{ secrets.SEED_PASSWORD_SATHISH }}
+        S_SEED_PASSWORD_PALASH: ${{ secrets.SEED_PASSWORD_PALASH }}
+        S_SEED_PASSWORD_SASWATA: ${{ secrets.SEED_PASSWORD_SASWATA }}
+        S_SEED_PASSWORD_MURUGESH: ${{ secrets.SEED_PASSWORD_MURUGESH }}
+        S_SEED_PASSWORD_JISHNU: ${{ secrets.SEED_PASSWORD_JISHNU }}
+        S_SEED_PASSWORD_HEMANT: ${{ secrets.SEED_PASSWORD_HEMANT }}
+        S_SEED_PASSWORD_SAMIR: ${{ secrets.SEED_PASSWORD_SAMIR }}
+        S_SEED_PASSWORD_SOUMEN: ${{ secrets.SEED_PASSWORD_SOUMEN }}
+        S_SEED_PASSWORD_ANNAL: ${{ secrets.SEED_PASSWORD_ANNAL }}
+        S_SEED_PASSWORD_SIVAKUMAR: ${{ secrets.SEED_PASSWORD_SIVAKUMAR }}
+        S_SEED_PASSWORD_SREEJA: ${{ secrets.SEED_PASSWORD_SREEJA }}
+        S_SEED_PASSWORD_SUSMITA: ${{ secrets.SEED_PASSWORD_SUSMITA }}
+        S_SEED_PASSWORD_ADITYA: ${{ secrets.SEED_PASSWORD_ADITYA }}
+        S_SEED_PASSWORD_ARUNKUMAR: ${{ secrets.SEED_PASSWORD_ARUNKUMAR }}
       run: |
         kubectl create secret generic datananite-secrets \
-          --namespace=$NAMESPACE \
-          --from-literal=ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }} \
-          --from-literal=GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }} \
-          --from-literal=VERTEX_REGION=${{ secrets.VERTEX_REGION }} \
-          --from-literal=JWT_SECRET=${{ secrets.JWT_SECRET }} \
-          --from-literal=SEED_PASSWORD_RIMNA=${{ secrets.SEED_PASSWORD_RIMNA }} \
-          --from-literal=SEED_PASSWORD_IYER=${{ secrets.SEED_PASSWORD_IYER }} \
-          --from-literal=SEED_PASSWORD_SENTHEESH=${{ secrets.SEED_PASSWORD_SENTHEESH }} \
-          --from-literal=SEED_PASSWORD_HARPREET=${{ secrets.SEED_PASSWORD_HARPREET }} \
-          --from-literal=SEED_PASSWORD_SUNIL=${{ secrets.SEED_PASSWORD_SUNIL }} \
-          --from-literal=SEED_PASSWORD_SATHISH=${{ secrets.SEED_PASSWORD_SATHISH }} \
-          --from-literal=SEED_PASSWORD_PALASH=${{ secrets.SEED_PASSWORD_PALASH }} \
-          --from-literal=SEED_PASSWORD_SASWATA=${{ secrets.SEED_PASSWORD_SASWATA }} \
-          --from-literal=SEED_PASSWORD_MURUGESH=${{ secrets.SEED_PASSWORD_MURUGESH }} \
-          --from-literal=SEED_PASSWORD_JISHNU=${{ secrets.SEED_PASSWORD_JISHNU }} \
-          --from-literal=SEED_PASSWORD_HEMANT=${{ secrets.SEED_PASSWORD_HEMANT }} \
-          --from-literal=SEED_PASSWORD_SAMIR=${{ secrets.SEED_PASSWORD_SAMIR }} \
-          --from-literal=SEED_PASSWORD_SOUMEN=${{ secrets.SEED_PASSWORD_SOUMEN }} \
-          --from-literal=SEED_PASSWORD_ANNAL=${{ secrets.SEED_PASSWORD_ANNAL }} \
-          --from-literal=SEED_PASSWORD_SIVAKUMAR=${{ secrets.SEED_PASSWORD_SIVAKUMAR }} \
-          --from-literal=SEED_PASSWORD_SREEJA=${{ secrets.SEED_PASSWORD_SREEJA }} \
-          --from-literal=SEED_PASSWORD_SUSMITA=${{ secrets.SEED_PASSWORD_SUSMITA }} \
-          --from-literal=SEED_PASSWORD_ADITYA=${{ secrets.SEED_PASSWORD_ADITYA }} \
-          --from-literal=SEED_PASSWORD_ARUNKUMAR=${{ secrets.SEED_PASSWORD_ARUNKUMAR }} \
+          --namespace="$NAMESPACE" \
+          --from-literal=ANTHROPIC_API_KEY="$S_ANTHROPIC_API_KEY" \
+          --from-literal=GCP_PROJECT_ID="$S_GCP_PROJECT_ID" \
+          --from-literal=VERTEX_REGION="$S_VERTEX_REGION" \
+          --from-literal=JWT_SECRET="$S_JWT_SECRET" \
+          --from-literal=SEED_PASSWORD_RIMNA="$S_SEED_PASSWORD_RIMNA" \
+          --from-literal=SEED_PASSWORD_IYER="$S_SEED_PASSWORD_IYER" \
+          --from-literal=SEED_PASSWORD_SENTHEESH="$S_SEED_PASSWORD_SENTHEESH" \
+          --from-literal=SEED_PASSWORD_HARPREET="$S_SEED_PASSWORD_HARPREET" \
+          --from-literal=SEED_PASSWORD_SUNIL="$S_SEED_PASSWORD_SUNIL" \
+          --from-literal=SEED_PASSWORD_SATHISH="$S_SEED_PASSWORD_SATHISH" \
+          --from-literal=SEED_PASSWORD_PALASH="$S_SEED_PASSWORD_PALASH" \
+          --from-literal=SEED_PASSWORD_SASWATA="$S_SEED_PASSWORD_SASWATA" \
+          --from-literal=SEED_PASSWORD_MURUGESH="$S_SEED_PASSWORD_MURUGESH" \
+          --from-literal=SEED_PASSWORD_JISHNU="$S_SEED_PASSWORD_JISHNU" \
+          --from-literal=SEED_PASSWORD_HEMANT="$S_SEED_PASSWORD_HEMANT" \
+          --from-literal=SEED_PASSWORD_SAMIR="$S_SEED_PASSWORD_SAMIR" \
+          --from-literal=SEED_PASSWORD_SOUMEN="$S_SEED_PASSWORD_SOUMEN" \
+          --from-literal=SEED_PASSWORD_ANNAL="$S_SEED_PASSWORD_ANNAL" \
+          --from-literal=SEED_PASSWORD_SIVAKUMAR="$S_SEED_PASSWORD_SIVAKUMAR" \
+          --from-literal=SEED_PASSWORD_SREEJA="$S_SEED_PASSWORD_SREEJA" \
+          --from-literal=SEED_PASSWORD_SUSMITA="$S_SEED_PASSWORD_SUSMITA" \
+          --from-literal=SEED_PASSWORD_ADITYA="$S_SEED_PASSWORD_ADITYA" \
+          --from-literal=SEED_PASSWORD_ARUNKUMAR="$S_SEED_PASSWORD_ARUNKUMAR" \
           --dry-run=client -o yaml | kubectl apply -f -
 
     - name: Apply Namespace, ConfigMap and PVCs

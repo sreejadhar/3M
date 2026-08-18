@@ -34,6 +34,11 @@ from ..state import DialogState
 
 logger = logging.getLogger(__name__)
 
+try:
+    import abbrev_glossary_registry as _abr  # governed abbreviation-glossary term registry
+except ImportError:  # pragma: no cover - standalone module, optional at runtime
+    _abr = None
+
 # ── Stop-words stripped before token overlap scoring ────────────────────────
 _STOP_WORDS = {
     "which", "what", "who", "where", "when", "why", "how", "the", "a", "an",
@@ -227,7 +232,18 @@ def _detect_ambiguous_terms(
         phrase_tokens = _tokenize_query(phrase)
         if not phrase_tokens:
             continue
-        matches = [c for c in eligible if phrase_tokens & set(c["overlap_tokens"])]
+        # Require ALL words of the phrase to be present in the candidate's
+        # overlap tokens, not just ANY one of them. With a plain intersection,
+        # a multi-word business/department phrase like "Information
+        # Technology" would count any stored value containing only
+        # "information" (e.g. a certification title) OR only "technology"
+        # (e.g. an unrelated company name) as a "match" — those single-word
+        # coincidences then tie at the same low top_score across many
+        # unrelated columns/tables and get reported as a bogus disambiguation
+        # prompt. Requiring the full phrase's tokens keeps this rule scoped
+        # to its intended purpose: genuine full-name collisions (e.g. two
+        # different "John Smith" records), not partial-word noise.
+        matches = [c for c in eligible if phrase_tokens <= set(c["overlap_tokens"])]
         if len(matches) < 2:
             continue
         top_score = max(c["score"] for c in matches)
@@ -264,6 +280,39 @@ Your task:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MATCHING RULES — try in order, stop at the first rule that gives a match
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+0. AMBIGUOUS SHORT CODES — CHECK THE QUESTION'S DOMAIN WORD FIRST: a bare 1-3
+   letter code (FE, EE, ME, BE, PR, QA, ...) can be an exact literal value in
+   MORE THAN ONE unrelated column across the schema (e.g. a certification-type
+   code on an education/certificates table AND a performance-rating/band code
+   on a performance table). An exact string hit is NOT proof you found the
+   right column — it only proves the string exists somewhere.
+   Before trusting rule 1's exact match for a short code, look at the words
+   surrounding it in the question (performance/rating/score/band/grade vs.
+   certificate/license/qualification/degree, etc.) and prefer the stored
+   column whose OWN name/purpose matches that domain word, even if a
+   different table's column also happens to contain the same literal code.
+   - If the question's domain word points to a column that does NOT contain
+     an exact literal hit for the short code, still resolve against that
+     column (e.g. via rule 5 semantic/abbreviation expansion) rather than
+     falling back to the unrelated table's exact match.
+   - Still return a resolved_filters entry per matching table as usual (per
+     the MULTI-TABLE CONCEPTS instruction above), but set "reasoning" to
+     flag which entry matches the question's actual domain and which is an
+     incidental same-spelling collision from an unrelated concept, so the
+     SQL planner can prefer the domain-correct one.
+
+0.5. GOVERNED ABBREVIATION GLOSSARY MATCH — CHECK THIS BEFORE GUESSING (RULE 5):
+   If an ABBREVIATION GLOSSARY HINTS block is shown below and one of its entries'
+   abbreviation or full form matches the user's wording (either spelling), that
+   entry is GROUND TRUTH — it was discovered by profiling this source's own data,
+   not guessed from general knowledge. Use the hint's exact recorded stored
+   spelling directly for that entry's table/column:
+     sql_fragment: LOWER(col) = 'stored spelling'
+   Do NOT hedge with an OR of both spellings for a hint that appears in this
+   block — the discovery step already confirmed which spelling is stored. Set a
+   high confidence and no_match=false. Only fall back to Rule 5's guess-and-hedge
+   behavior for abbreviations that do NOT appear in ABBREVIATION GLOSSARY HINTS.
 
 1. EXACT MATCH (case-insensitive): user term equals a stored value verbatim.
    sql_fragment: LOWER(col) = 'stored value'
@@ -626,6 +675,87 @@ def _build_hint_section(candidates: List[Dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_abbrev_hint_section(source_id: str) -> str:
+    """
+    Format governed abbreviation-glossary terms for this source as an
+    ABBREVIATION GLOSSARY HINTS block. Unlike KEYWORD MATCH HINTS (proven
+    token overlap) this is a GROUND-TRUTH mapping discovered by profiling
+    this source's own columns (abbrev_glossary_generate.py) — the LLM should
+    use the exact stored spelling it records rather than guessing/hedging
+    both spellings the way Rule 5 (SEMANTIC MATCH) has to for un-governed
+    abbreviations.
+    """
+    if not source_id or _abr is None:
+        return ""
+    try:
+        terms = _abr.list_terms(source_id=source_id, status="approved")
+    except Exception as exc:
+        logger.debug("resolve_node: abbrev glossary lookup failed for source %s — %s", source_id, exc)
+        return ""
+    if not terms:
+        return ""
+
+    try:
+        import metadata_catalog as _mc
+    except ImportError:
+        _mc = None
+
+    entity_cache: Dict[str, Optional[Dict]] = {}
+
+    def _get_entity(metadata_id: str) -> Optional[Dict]:
+        if not _mc or not metadata_id:
+            return None
+        if metadata_id not in entity_cache:
+            entity_cache[metadata_id] = _mc.get_entity(metadata_id)
+        return entity_cache[metadata_id]
+
+    lines = [
+        "ABBREVIATION GLOSSARY HINTS (governed, discovered from this source's own columns — ground truth, not a guess):",
+        "Each entry names the abbreviation, its full form, and the exact table/column where the abbreviation "
+        "is the value actually STORED. If the user's term matches either spelling, use the stored spelling "
+        "directly — do NOT hedge with an OR of both spellings for these entries.",
+        "",
+    ]
+    added = 0
+    for term in terms[:40]:
+        abbrev = term.get("abbreviation", "")
+        full_form = term.get("full_form", "")
+        if not abbrev or not full_form:
+            continue
+        try:
+            assets = _abr.list_assets_for_term(term["term_id"])
+        except Exception:
+            assets = []
+        located = False
+        for asset in assets:
+            if asset.get("source_id") != source_id:
+                continue
+            entity = _get_entity(asset.get("metadata_id", ""))
+            if not entity:
+                continue
+            table_name = entity.get("table_name", "")
+            column_name = ""
+            attr_id = asset.get("attr_id") or ""
+            if attr_id:
+                for attr in entity.get("attributes") or []:
+                    if attr.get("attr_id") == attr_id:
+                        column_name = attr.get("column_name", "")
+                        break
+            lines.append(
+                f'  "{abbrev}" = "{full_form}"  →  table={table_name!r}  column={column_name!r}  '
+                f'(stored spelling: {abbrev!r})'
+            )
+            located = True
+            added += 1
+        if not located:
+            lines.append(f'  "{abbrev}" = "{full_form}"')
+            added += 1
+    if not added:
+        return ""
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def _call_resolve_llm(system: str, user: str, model: str) -> str:
     from llm_client import get_client
     client = get_client()
@@ -945,6 +1075,7 @@ def resolve_node(state: DialogState) -> DialogState:
         fuzzy_candidates = fuzzy_candidates + db_candidates
 
     hint_section = _build_hint_section(fuzzy_candidates)
+    abbrev_hint_section = _build_abbrev_hint_section(getattr(config, "source_id", "") or "")
     if fuzzy_candidates:
         logger.info(
             "resolve_node: fuzzy pre-match found %d candidate(s): %s",
@@ -957,6 +1088,7 @@ def resolve_node(state: DialogState) -> DialogState:
     user_prompt = (
         f"USER QUESTION:\n{natural_query}\n\n"
         f"CATEGORICAL COLUMNS AND THEIR STORED VALUES:\n{categorical_context}\n\n"
+        + (abbrev_hint_section if abbrev_hint_section else "")
         + (hint_section if hint_section else "")
         + "Resolve each filter concept in the question to exact stored values. "
         "Return the JSON object as specified."

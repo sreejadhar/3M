@@ -22,6 +22,7 @@ from .. import verified_queries
 from ..state import DialogState, SQLQuery
 from ..token_guard import guard_plan_prompt
 from . import sql_identifier_resolver as _ast_resolver
+from .resolve_node import _build_abbrev_hint_section
 
 logger = logging.getLogger(__name__)
 
@@ -1666,7 +1667,7 @@ SCHEMA CONTEXT:
 
 TARGET DATABASE TYPE: {db_type}
 {schema_line}
-{history_section}{multi_kg_section}{lexicon_section}{glossary_section}{generated_glossary_section}{kpi_section}{resolution_section}{verified_section}NATURAL LANGUAGE QUESTION:
+{history_section}{multi_kg_section}{lexicon_section}{glossary_section}{generated_glossary_section}{kpi_section}{abbrev_glossary_section}{resolution_section}{verified_section}NATURAL LANGUAGE QUESTION:
 {natural_query}
 
 CRITICAL REMINDERS:
@@ -1694,6 +1695,12 @@ CRITICAL REMINDERS:
   instructions. Always include both the raw value and the percentage column.
 - KPI FORMULAS: if a DEFINED KPIs section is shown above and the question mentions a
   KPI by name, use the pre-defined sql_expression verbatim — do not rewrite it.
+- ABBREVIATION GLOSSARY HINTS (see section above if present): these are governed
+  abbreviation→full-form mappings discovered by profiling this source's own columns —
+  ground truth, not a guess. When the question uses an abbreviation (or its full form)
+  listed there, filter using the exact stored spelling the hint records; do NOT hedge
+  with an OR of both spellings for an abbreviation covered by this section. Only fall
+  back to guessing/hedging both spellings for abbreviations NOT listed there.
 - VERIFIED EXAMPLES (see VERIFIED PAST CORRECTIONS section above if present): these are
   SQL queries a human has already confirmed correct for a similar question on THIS EXACT
   data source. They encode source-specific facts (which column is the real signal, which
@@ -3221,6 +3228,88 @@ def _fix_short_acronym_like_filters(sql: str) -> str:
         logger.info(
             "plan_node: rewrote unsafe short-acronym LIKE filter(s) into "
             "word-boundary-safe OR'd equality/LIKE"
+        )
+    return fixed
+
+
+# When the LLM hedges an abbreviation match (e.g. rule 5's "IT" →
+# "Information Technology") it sometimes ALSO tacks on separate single-word
+# LIKE clauses for each word of the expansion — LIKE '%information%' OR
+# LIKE '%technology%' — on top of the already-correct LIKE '%information
+# technology%' phrase match. Each single generic word is a strict substring
+# superset match of the phrase (anything matching the phrase already matches
+# the word), so it adds ZERO true positives while matching every unrelated
+# row that merely contains that common word (e.g. "Information Security",
+# "Medical Technology"). This is not specific to IT/HR/any one abbreviation —
+# any single-word LIKE clause on a column that is a strict substring of
+# another LIKE clause's (multi-word) phrase on the SAME column, inside the
+# SAME OR-chain, is redundant and only widens the match, so drop it.
+_COL_LIKE_CLAUSE = re.compile(
+    r"LOWER\(\s*([\w.\"]+)\s*\)\s*LIKE\s*'%([^%']+)%'",
+    re.IGNORECASE,
+)
+
+
+def _dedupe_redundant_generic_like_clauses(sql: str) -> str:
+    """
+    Remove single-word LIKE '%word%' clauses that are a redundant, broader
+    subset of another LIKE '%multi word phrase%' clause on the same column
+    within the same OR-chain — see comment above _COL_LIKE_CLAUSE.
+    """
+    # Group clauses by the OR-chain they live in: split on top-level " OR "
+    # is unsafe without paren tracking, so instead operate per contiguous
+    # run of "LOWER(col) LIKE '%...%'" separated only by OR/whitespace/parens.
+    or_chain_pattern = re.compile(
+        r"(?:LOWER\(\s*[\w.\"]+\s*\)\s*(?:=\s*'[^']*'|LIKE\s*'%[^%']+%')"
+        r"(?:\s*\)?\s*OR\s*\(?\s*)?)+",
+        re.IGNORECASE,
+    )
+
+    def _process_chain(chain_match: re.Match) -> str:
+        chain = chain_match.group(0)
+        clauses = _COL_LIKE_CLAUSE.findall(chain)
+        if len(clauses) < 2:
+            return chain
+
+        # Collect the set of multi-word phrases (by column) so single-word
+        # clauses can be checked against them.
+        phrases_by_col: Dict[str, List[str]] = {}
+        for col, pattern in clauses:
+            if " " in pattern.strip():
+                phrases_by_col.setdefault(col, []).append(pattern.lower())
+
+        def _is_narrower_subset(col: str, pattern: str) -> bool:
+            if " " in pattern.strip():
+                return False  # only single-word clauses are candidates
+            word = pattern.strip().lower()
+            for phrase in phrases_by_col.get(col, []):
+                if re.search(rf"(?:^|\s){re.escape(word)}(?:$|\s)", phrase):
+                    return True
+            return False
+
+        seen: set = set()
+        fixed_chain = chain
+        for col, pattern in clauses:
+            key = (col, pattern.lower())
+            is_exact_dup = key in seen
+            seen.add(key)
+            if is_exact_dup or _is_narrower_subset(col, pattern):
+                # Remove this exact clause plus a trailing/leading " OR ".
+                clause_re = re.compile(
+                    r"\s*OR\s*LOWER\(\s*" + re.escape(col) + r"\s*\)\s*LIKE\s*'%"
+                    + re.escape(pattern) + r"%'"
+                    r"|LOWER\(\s*" + re.escape(col) + r"\s*\)\s*LIKE\s*'%"
+                    + re.escape(pattern) + r"%'\s*OR\s*",
+                    re.IGNORECASE,
+                )
+                fixed_chain = clause_re.sub("", fixed_chain, count=1)
+        return fixed_chain
+
+    fixed = or_chain_pattern.sub(_process_chain, sql)
+    if fixed != sql:
+        logger.info(
+            "plan_node: dropped redundant single-word LIKE clause(s) already "
+            "covered by a broader multi-word phrase LIKE on the same column"
         )
     return fixed
 
@@ -4880,6 +4969,40 @@ def plan_node(state: DialogState) -> DialogState:
             "ID) to reach a \"more exact\" match elsewhere silently drops real rows",
             "and produces a WRONG, lower count — prefer the single-table filter.",
             "",
+            "⚠ EXCEPTION — A DEDICATED CONCEPT COLUMN BEATS AN INCIDENTAL TEXT MATCH:",
+            "the single-table preference above assumes every table's resolved entry is",
+            "an equally authoritative source for that filter concept. It does NOT apply",
+            "when one table's matching column is a free-text/descriptive field on a",
+            "per-event detail table (e.g. a \"position_title\"/\"role_title\" column on an",
+            "education/training/certification table, recorded in the context of THAT",
+            "event — an employee's title at the time they earned a degree) while a",
+            "DIFFERENT table has a column whose name and purpose are the dedicated/",
+            "canonical source for that exact concept (e.g. a jobs/positions table with",
+            "a job_level, grade, band, or rank column). The incidental text match is",
+            "NOT a substitute for the dedicated column here — it may describe a",
+            "different point in time or a narrower context than the question is really",
+            "asking about. In this situation, join to the table with the dedicated",
+            "column via the entity's real key (e.g. employee_id) and filter there,",
+            "even though the narrower table's text field also technically matched.",
+            "Only skip this join when no dedicated column for the concept exists",
+            "anywhere in the schema — in that case, and only then, fall back to the",
+            "incidental text-field match.",
+            "",
+            "⚠ SAME EXCEPTION APPLIES TO SHORT-CODE COLLISIONS ACROSS DOMAINS: a bare",
+            "1-3 letter user term (e.g. \"FE\", \"EE\", \"ME\", \"BE\") can be an exact",
+            "literal value in an UNRELATED table's column (e.g. certificate/license",
+            "type codes) purely by coincidence, while the question is actually asking",
+            "about a different concept (e.g. performance rating/band/grade) that has",
+            "its OWN dedicated column elsewhere. Do NOT let an exact-string match in",
+            "the unrelated table win just because it is more \"exact\" — read the",
+            "question's domain words (performance/rating/score/band/grade vs.",
+            "certificate/license/qualification/training) and resolve against the",
+            "table/column whose name and purpose match that domain, even if its entry",
+            "below is a looser (semantic/abbreviation) match than the coincidental",
+            "exact hit elsewhere. Only use the coincidental exact-match table when no",
+            "dedicated column for the question's actual domain exists anywhere in the",
+            "schema.",
+            "",
         ]
         for r in term_resolution:
             user_term      = r.get("user_term", "")
@@ -5013,6 +5136,12 @@ def plan_node(state: DialogState) -> DialogState:
     else:
         lexicon_section = ""
 
+    try:
+        abbrev_glossary_section = _build_abbrev_hint_section(getattr(config, "source_id", "") or "")
+    except Exception as exc:
+        logger.debug("plan_node: abbrev glossary hint section failed — %s", exc)
+        abbrev_glossary_section = ""
+
     user = _USER_PROMPT.format(
         schema_context=schema_context,
         db_type=config.db_type,
@@ -5023,6 +5152,7 @@ def plan_node(state: DialogState) -> DialogState:
         glossary_section=glossary_section,
         generated_glossary_section=generated_glossary_section,
         kpi_section=kpi_section,
+        abbrev_glossary_section=abbrev_glossary_section,
         resolution_section=resolution_section,
         verified_section=verified_section,
         natural_query=natural_query,
@@ -5098,14 +5228,34 @@ def plan_node(state: DialogState) -> DialogState:
     _enforce_mandatory_filters = (
         config.db_type.lower() in ("postgres", "postgresql") or _is_file_based
     )
-    _mandatory_fragments = [
-        r.get("sql_fragment", "").strip()
-        for r in term_resolution
-        if r.get("sql_fragment") and not r.get("no_match")
-    ]
+    # Group fragments by user_term (case-insensitive): the same term can
+    # resolve against more than one table (e.g. "AVP" matching both a
+    # dedicated job_level column and an incidental position_title column on
+    # an unrelated detail table) — a correct query only needs to satisfy ONE
+    # of that term's candidate fragments (whichever table it actually used),
+    # not every table's version of it. Terms with only one candidate still
+    # behave exactly as a single mandatory fragment.
+    _mandatory_fragment_groups: Dict[str, List[str]] = {}
+    for r in term_resolution:
+        frag = (r.get("sql_fragment") or "").strip()
+        if not frag or r.get("no_match"):
+            continue
+        key = (r.get("user_term") or frag).strip().lower()
+        _mandatory_fragment_groups.setdefault(key, []).append(frag)
 
     def _normalize_sql_fragment(s: str) -> str:
-        return re.sub(r"\s+", " ", s or "").strip().lower()
+        # resolve_node emits fragments against a bare column name (e.g.
+        # "LOWER(job_level) = 'avp'"), but a multi-table JOIN plan legitimately
+        # qualifies the same column with its table alias (e.g.
+        # "LOWER(j.job_level) = 'avp'"). Strip alias qualifiers (word.word ->
+        # word) before comparing so a correctly-qualified column isn't treated
+        # as if the filter were missing. Only strips outside single-quoted
+        # string literals, so a value like 'e.g. abc' is left untouched.
+        s = re.sub(r"\s+", " ", s or "").strip().lower()
+        parts = re.split(r"('(?:[^'\\]|\\.)*')", s)
+        for i in range(0, len(parts), 2):  # even indices = outside quotes
+            parts[i] = re.sub(r"\b[a-z_]\w*\.([a-z_]\w*)\b", r"\1", parts[i])
+        return "".join(parts)
 
     def _validate_plan_items(
         plan_items: List[Dict],
@@ -5130,6 +5280,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _qualify_sql(sql, db_schema, table_labels)
             sql = _fix_count_vs_sum(sql, natural_query)
             sql = _fix_short_acronym_like_filters(sql)
+            sql = _dedupe_redundant_generic_like_clauses(sql)
             sql = _fix_percentage(sql, natural_query, config.db_type)
             sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)
             sql = _fix_dialect_syntax(sql, config.db_type)
@@ -5231,10 +5382,17 @@ def plan_node(state: DialogState) -> DialogState:
             # as if it were entity-scoped — regardless of which entity was
             # actually asked about. Drop any query that omits a mandatory
             # fragment rather than execute it.
-            if _enforce_mandatory_filters and _mandatory_fragments:
+            if _enforce_mandatory_filters and _mandatory_fragment_groups:
+                normalized_sql = _normalize_sql_fragment(sql)
                 missing_fragments = [
-                    frag for frag in _mandatory_fragments
-                    if _normalize_sql_fragment(frag) not in _normalize_sql_fragment(sql)
+                    # Report the first/representative fragment for this term
+                    # in the error message — any one of the group satisfies it.
+                    group[0]
+                    for group in _mandatory_fragment_groups.values()
+                    if not any(
+                        _normalize_sql_fragment(frag) in normalized_sql
+                        for frag in group
+                    )
                 ]
                 if missing_fragments:
                     logger.warning(

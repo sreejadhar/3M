@@ -75,6 +75,11 @@ body {
 .sidebar-brand .brand-text { font-weight: 700; font-size: 13px; color: var(--text-0); line-height: 1.2; }
 .sidebar-brand .brand-sub { font-size: 10px; color: var(--text-2); text-transform: uppercase; letter-spacing: 0.05em; }
 
+.sidebar-nav {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
 .sidebar-section { padding: 8px 0; }
 .sidebar-section-label {
   padding: 4px 16px 4px;

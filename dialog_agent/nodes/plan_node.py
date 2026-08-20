@@ -22,7 +22,7 @@ from .. import verified_queries
 from ..state import DialogState, SQLQuery
 from ..token_guard import guard_plan_prompt
 from . import sql_identifier_resolver as _ast_resolver
-from .resolve_node import _build_abbrev_hint_section
+from .resolve_node import _build_abbrev_hint_section, get_glossary_abbreviation_map
 
 logger = logging.getLogger(__name__)
 
@@ -1236,6 +1236,15 @@ General Rules:
            literally contain the expansion — a department/org-name column almost
            certainly has an entry like "Information Technology" even if it wasn't
            among the few sampled values.
+             • DIRECTION-AGNOSTIC: this applies identically whether the user typed
+               the abbreviation ("IT employees") or the fully spelled-out form
+               ("employees in Information Technology") — both phrasings name the
+               exact same concept. First recognize a spelled-out phrase as the
+               known expansion of an abbreviation, THEN apply this rule exactly
+               as if the user had typed the abbreviation itself. Never treat the
+               spelled-out phrasing as a stricter/different filter than the
+               abbreviation, and never answer "no match" for it while the
+               abbreviation form would have matched.
              • If the samples DO show the bare abbreviation verbatim as a stored
                value (e.g. samples list "IT"), that IS an exact match — use
                equality/word-boundary matching on the abbreviation per rule 11(g),
@@ -3202,18 +3211,28 @@ _SHORT_LIKE_FILTER = re.compile(
 )
 
 
-def _fix_short_acronym_like_filters(sql: str) -> str:
+def _fix_short_acronym_like_filters(sql: str, extra_expansions: Optional[Dict[str, str]] = None) -> str:
     """
     Rewrite unsafe bare-substring LIKE filters on short (<=4 char) terms into
     a safe OR'd equality/LIKE pair, so acronyms like "IT"/"HR"/"QA" don't
     match as substrings inside unrelated words, and don't silently miss rows
     if the real data stores the expanded phrase instead of the abbreviation
     (or vice versa).
+
+    extra_expansions: source-specific {abbreviation: full_form} pairs from the
+    governed abbreviation glossary (see get_glossary_abbreviation_map in
+    resolve_node.py) — merged over the fixed built-in list so this covers
+    whatever abbreviations THIS source's data actually contains, not just the
+    hardcoded defaults.
     """
+    expansions = _ABBREVIATION_EXPANSIONS
+    if extra_expansions:
+        expansions = {**_ABBREVIATION_EXPANSIONS, **extra_expansions}
+
     def _replace(m: re.Match) -> str:
         col = m.group(1)
         term = m.group(2).lower()
-        expansion = _ABBREVIATION_EXPANSIONS.get(term)
+        expansion = expansions.get(term)
         if expansion:
             return f"(LOWER({col}) = '{term}' OR LOWER({col}) LIKE '%{expansion}%')"
         # No known expansion — fall back to word-boundary-safe matching so the
@@ -3228,6 +3247,151 @@ def _fix_short_acronym_like_filters(sql: str) -> str:
         logger.info(
             "plan_node: rewrote unsafe short-acronym LIKE filter(s) into "
             "word-boundary-safe OR'd equality/LIKE"
+        )
+    return fixed
+
+
+# Mirror of _ABBREVIATION_EXPANSIONS — a user asking about "Information
+# Technology" and a user asking about "IT" mean the exact same filter, but
+# the LLM sometimes only hedges when the USER typed the abbreviation (see
+# _fix_short_acronym_like_filters above) and forgets to hedge the other
+# direction when the user typed the fully spelled-out phrase instead,
+# emitting only LOWER(col) LIKE '%information technology%' with no OR'd
+# equality on the bare 'it'. Since the real column may store either
+# spelling, enforce the same bidirectional hedge deterministically here too.
+_FULL_EXPANSION_LIKE_FILTER = re.compile(
+    r"LOWER\(\s*([\w.\"]+)\s*\)\s*LIKE\s*'%([a-z][a-z &]+[a-z])%'",
+    re.IGNORECASE,
+)
+
+
+def _fix_unhedged_expansion_like_filters(sql: str, extra_expansions: Optional[Dict[str, str]] = None) -> str:
+    """
+    Rewrite a bare LOWER(col) LIKE '%<known abbreviation expansion>%' into an
+    OR'd equality/LIKE pair — the mirror image of
+    _fix_short_acronym_like_filters, for when the user's own wording was the
+    expanded phrase rather than the abbreviation.
+
+    extra_expansions: same source-specific glossary map as
+    _fix_short_acronym_like_filters — see that docstring.
+    """
+    expansions = _ABBREVIATION_EXPANSIONS
+    if extra_expansions:
+        expansions = {**_ABBREVIATION_EXPANSIONS, **extra_expansions}
+    expansion_to_abbrev = {v: k for k, v in expansions.items()}
+
+    def _replace(m: re.Match) -> str:
+        col, phrase = m.group(1), m.group(2).lower()
+        abbrev = expansion_to_abbrev.get(phrase)
+        if not abbrev:
+            return m.group(0)  # not a known expansion — leave untouched
+        # Already hedged with an equality on the abbreviation for this same
+        # column somewhere in the query — don't double up.
+        already_hedged = re.search(
+            rf"LOWER\(\s*{re.escape(col)}\s*\)\s*=\s*'{re.escape(abbrev)}'",
+            sql, re.IGNORECASE,
+        )
+        if already_hedged:
+            return m.group(0)
+        return f"(LOWER({col}) = '{abbrev}' OR LOWER({col}) LIKE '%{phrase}%')"
+
+    fixed = _FULL_EXPANSION_LIKE_FILTER.sub(_replace, sql)
+    if fixed != sql:
+        logger.info(
+            "plan_node: rewrote unhedged full-expansion LIKE filter(s) into "
+            "word-boundary-safe OR'd equality/LIKE on the matching abbreviation"
+        )
+    return fixed
+
+
+# Corporate-suffix/connector words that never contribute a meaningful letter
+# to a real-world acronym (e.g. "Advanced Info Services Public Company
+# Limited" → "AIS", not "AISPCL") — skip these when deriving the acronym.
+_CORP_ACRONYM_STOPWORDS = {
+    "public", "company", "limited", "corporation", "corp", "inc",
+    "incorporated", "ltd", "co", "group", "plc", "llc", "the", "of",
+    "and", "holdings", "holding",
+}
+
+_EXACT_EQUALITY_FILTER = re.compile(
+    r"LOWER\(\s*([\w.\"]+)\s*\)\s*=\s*'([^']+)'",
+    re.IGNORECASE,
+)
+
+
+def _sample_values_for_column(schema_context: str, col: str) -> List[str]:
+    """
+    Case-insensitive, table-agnostic lookup of the sample/categorical values
+    recorded for a given column name anywhere in schema_context — used to
+    confirm a literal is backed by real profiled data (not a pure guess)
+    before _fix_unhedged_acronym_derived_like_filters hedges it.
+    """
+    if not schema_context:
+        return []
+    bare_col = col.split(".")[-1].strip('"').lower()
+    values: List[str] = []
+    for cols in _all_column_values_by_table(schema_context).values():
+        for name, vals in cols.items():
+            if name.strip('"').lower() == bare_col:
+                values.extend(vals)
+    return values
+
+
+def _fix_unhedged_acronym_derived_like_filters(sql: str, natural_query: str, schema_context: str = "") -> str:
+    """
+    Dictionary-free companion to _fix_short_acronym_like_filters /
+    _fix_unhedged_expansion_like_filters above: those two only recognise the
+    fixed built-in / governed-glossary abbreviation list. Real-world full
+    names — company names, organisation names, etc — are effectively
+    unbounded, so no dictionary can cover them (e.g. "AIS" →
+    "Advanced Info Services Public Company Limited").
+
+    Instead, derive the acronym straight from the stored value's own words
+    (first letter of each significant word, skipping corporate
+    suffixes/connectors) and check whether that derived acronym literally
+    appears as a standalone token in the user's own question. That is direct
+    evidence the user's wording IS the abbreviation of this exact stored
+    value, so hedge it the same way rule 5 requires: exact equality on the
+    abbreviation OR'd with an (unbroken, unsplit) LIKE on the full value —
+    never leave a bare, unhedged "=" on a guessed full form.
+
+    GUARDRAIL: only hedge when the full-form literal itself is backed by an
+    actual profiled sample value for that column (per schema_context) — i.e.
+    it was a real rule-1 EXACT MATCH, not a rule-5 world-knowledge guess.
+    Widening a confirmed real value with an OR'd bare-code alternative is
+    safe; widening an unconfirmed guess is not — a wrong guess should surface
+    as a no-match, not get quietly hedged into looking more plausible.
+    """
+    if not natural_query:
+        return sql
+
+    def _replace(m: re.Match) -> str:
+        col, value = m.group(1), m.group(2)
+        words = [w for w in re.findall(r"[A-Za-z]+", value) if w.lower() not in _CORP_ACRONYM_STOPWORDS]
+        if len(words) < 2:
+            return m.group(0)  # not enough signal to derive a meaningful acronym
+        acronym = "".join(w[0] for w in words).lower()
+        if not (2 <= len(acronym) <= 6):
+            return m.group(0)
+        if not re.search(rf"\b{re.escape(acronym)}\b", natural_query, re.IGNORECASE):
+            return m.group(0)  # no evidence the user actually typed this acronym
+        sample_values = _sample_values_for_column(schema_context, col)
+        if not any(v.strip().lower() == value.strip().lower() for v in sample_values):
+            return m.group(0)  # not backed by real profiled data — leave the guess untouched
+        already_hedged = re.search(
+            rf"LOWER\(\s*{re.escape(col)}\s*\)\s*=\s*'{re.escape(acronym)}'",
+            sql, re.IGNORECASE,
+        )
+        if already_hedged:
+            return m.group(0)
+        return f"(LOWER({col}) = '{acronym}' OR LOWER({col}) LIKE '%{value}%')"
+
+    fixed = _EXACT_EQUALITY_FILTER.sub(_replace, sql)
+    if fixed != sql:
+        logger.info(
+            "plan_node: hedged an unhedged exact-equality full-form filter with "
+            "its own schema-derived acronym after finding that acronym in the "
+            "user's question"
         )
     return fixed
 
@@ -3248,6 +3412,92 @@ _COL_LIKE_CLAUSE = re.compile(
     r"LOWER\(\s*([\w.\"]+)\s*\)\s*LIKE\s*'%([^%']+)%'",
     re.IGNORECASE,
 )
+
+# Words that carry no meaning on their own — never required for a split-word
+# expansion match, and never enough by themselves to trigger a collapse.
+_EXPANSION_STOPWORDS = {"and", "of", "the", "&", "for"}
+
+
+def _fix_split_expansion_like_filters(sql: str, extra_expansions: Optional[Dict[str, str]] = None) -> str:
+    """
+    Collapse a full-form expansion that the LLM split into separate
+    single-word LIKE clauses (LIKE '%information%' OR LIKE '%technology%')
+    back into a single unbroken-phrase clause (LIKE '%information
+    technology%') on the same column, before the abbreviation-hedge fixes
+    run.
+
+    This is the sibling of _dedupe_redundant_generic_like_clauses: that
+    function only prunes a redundant single word when the correct phrase
+    clause is ALSO present; this one repairs the case where the phrase
+    clause was never emitted at all — only its individual words were,
+    OR'd together — so nothing downstream would otherwise recognise it as
+    the known full-form expansion and hedge it with the abbreviation's
+    equality check.
+
+    extra_expansions: same source-specific glossary map as
+    _fix_short_acronym_like_filters — so this covers whatever abbreviations
+    THIS source's data actually contains, not just the hardcoded defaults.
+    """
+    expansions = _ABBREVIATION_EXPANSIONS
+    if extra_expansions:
+        expansions = {**_ABBREVIATION_EXPANSIONS, **extra_expansions}
+    full_forms = sorted(set(expansions.values()), key=len, reverse=True)
+
+    or_chain_pattern = re.compile(
+        r"(?:LOWER\(\s*[\w.\"]+\s*\)\s*(?:=\s*'[^']*'|LIKE\s*'%[^%']+%')"
+        r"(?:\s*\)?\s*OR\s*\(?\s*)?)+",
+        re.IGNORECASE,
+    )
+
+    def _process_chain(chain_match: re.Match) -> str:
+        chain = chain_match.group(0)
+        clauses = _COL_LIKE_CLAUSE.findall(chain)
+        if len(clauses) < 2:
+            return chain
+
+        single_word_by_col: Dict[str, set] = {}
+        for col, pattern in clauses:
+            p = pattern.strip().lower()
+            if " " not in p:
+                single_word_by_col.setdefault(col, set()).add(p)
+
+        fixed_chain = chain
+        for col, words_present in single_word_by_col.items():
+            for full_form in full_forms:
+                form_words = [w for w in full_form.split() if w not in _EXPANSION_STOPWORDS]
+                if len(form_words) < 2 or not all(w in words_present for w in form_words):
+                    continue
+                # Rewrite the first word's clause in place to carry the full
+                # phrase, then drop every other word's clause (with its
+                # connecting OR) — mirrors the removal pattern used by
+                # _dedupe_redundant_generic_like_clauses below.
+                first_word_re = re.compile(
+                    r"LOWER\(\s*" + re.escape(col) + r"\s*\)\s*LIKE\s*'%"
+                    + re.escape(form_words[0]) + r"%'",
+                    re.IGNORECASE,
+                )
+                fixed_chain = first_word_re.sub(
+                    f"LOWER({col}) LIKE '%{full_form}%'", fixed_chain, count=1
+                )
+                for w in form_words[1:]:
+                    clause_re = re.compile(
+                        r"\s*OR\s*LOWER\(\s*" + re.escape(col) + r"\s*\)\s*LIKE\s*'%"
+                        + re.escape(w) + r"%'"
+                        r"|LOWER\(\s*" + re.escape(col) + r"\s*\)\s*LIKE\s*'%"
+                        + re.escape(w) + r"%'\s*OR\s*",
+                        re.IGNORECASE,
+                    )
+                    fixed_chain = clause_re.sub("", fixed_chain, count=1)
+                break  # only collapse against the first fully-matched expansion
+        return fixed_chain
+
+    fixed = or_chain_pattern.sub(_process_chain, sql)
+    if fixed != sql:
+        logger.info(
+            "plan_node: collapsed a full-form expansion that was split across "
+            "separate single-word LIKE clauses into one unbroken-phrase LIKE"
+        )
+    return fixed
 
 
 def _dedupe_redundant_generic_like_clauses(sql: str) -> str:
@@ -5142,6 +5392,16 @@ def plan_node(state: DialogState) -> DialogState:
         logger.debug("plan_node: abbrev glossary hint section failed — %s", exc)
         abbrev_glossary_section = ""
 
+    # Source-specific {abbreviation: full_form} map from the governed glossary,
+    # used by _fix_short_acronym_like_filters/_fix_unhedged_expansion_like_filters
+    # below so their deterministic hedging isn't limited to the fixed built-in
+    # abbreviation list.
+    try:
+        glossary_expansions = get_glossary_abbreviation_map(getattr(config, "source_id", "") or "")
+    except Exception as exc:
+        logger.debug("plan_node: abbrev glossary expansion map failed — %s", exc)
+        glossary_expansions = {}
+
     user = _USER_PROMPT.format(
         schema_context=schema_context,
         db_type=config.db_type,
@@ -5279,7 +5539,10 @@ def plan_node(state: DialogState) -> DialogState:
             sql = item["sql"].strip().rstrip(";").strip()
             sql = _qualify_sql(sql, db_schema, table_labels)
             sql = _fix_count_vs_sum(sql, natural_query)
-            sql = _fix_short_acronym_like_filters(sql)
+            sql = _fix_split_expansion_like_filters(sql, glossary_expansions)
+            sql = _fix_short_acronym_like_filters(sql, glossary_expansions)
+            sql = _fix_unhedged_expansion_like_filters(sql, glossary_expansions)
+            sql = _fix_unhedged_acronym_derived_like_filters(sql, natural_query, schema_context)
             sql = _dedupe_redundant_generic_like_clauses(sql)
             sql = _fix_percentage(sql, natural_query, config.db_type)
             sql = _enforce_sql_limits(sql, config.row_limit, config.db_type)

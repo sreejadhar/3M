@@ -57,6 +57,7 @@ from rdflib import Graph, Literal, Namespace, RDF, URIRef
 from rdflib.namespace import OWL, RDFS, SKOS
 
 import glossary_registry as _gr
+import abbrev_glossary_registry as _agr
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +321,41 @@ def _build_graph(source_id: str, source_ontology: str = "") -> Graph:
             else:
                 g.add((concept_uri, OWL.equivalentClass, struct_uri))
 
+    # ── Abbreviation glossary terms (abbrev_glossary_terms) ─────────────────
+    # A governed abbreviation either attaches as an alternate spelling on the
+    # business-glossary concept for the SAME column (abbreviation *is* that
+    # concept, just spelled differently), or — when that column has no
+    # business term — mints its own skos:Concept.
+    biz_col_to_term: Dict[tuple, str] = {}
+    for asset in _gr.list_assets_for_source(source_id):
+        if asset.get("term_id") in term_by_id:
+            biz_col_to_term[(asset.get("metadata_id", ""), asset.get("attr_id", ""))] = asset["term_id"]
+
+    abbrev_terms = [t for t in _agr.list_terms(source_id=source_id) if t.get("status") != "deprecated"]
+    for aterm in abbrev_terms:
+        aterm_id = aterm["term_id"]
+        assets = [a for a in _agr.list_assets_for_term(aterm_id) if a.get("source_id") == source_id]
+
+        attached_to_biz_term = False
+        for asset in assets:
+            biz_term_id = biz_col_to_term.get((asset.get("metadata_id", ""), asset.get("attr_id", "")))
+            if biz_term_id:
+                biz_concept_uri = BUSINESS_NS[f"term/{biz_term_id}"]
+                g.add((biz_concept_uri, SKOS.notation, Literal(aterm["abbreviation"])))
+                g.add((biz_concept_uri, SKOS.altLabel, Literal(aterm["abbreviation"])))
+                attached_to_biz_term = True
+
+        if not attached_to_biz_term:
+            abbrev_uri = BUSINESS_NS[f"abbrev/{aterm_id}"]
+            g.add((abbrev_uri, RDF.type, SKOS.Concept))
+            g.add((abbrev_uri, SKOS.inScheme, scheme_uri))
+            g.add((abbrev_uri, SKOS.prefLabel, Literal(aterm.get("full_form", ""))))
+            g.add((abbrev_uri, SKOS.notation, Literal(aterm["abbreviation"])))
+            if aterm.get("definition"):
+                g.add((abbrev_uri, SKOS.definition, Literal(aterm["definition"])))
+            if aterm.get("domain"):
+                g.add((abbrev_uri, RDFS.comment, Literal(f"Domain: {aterm['domain']}")))
+
     return g
 
 
@@ -353,6 +389,11 @@ def generate_business_ontology(source_id: str, created_by: str = "",
         _enricher.enrich_source_kg_from_business_glossary(source_id)
     except Exception:
         logger.exception("business_ontology: KG enrichment failed for source %s", source_id)
+    try:
+        import ontology_enricher as _enricher
+        _enricher.enrich_source_kg_from_abbrev_glossary(source_id)
+    except Exception:
+        logger.exception("business_ontology: abbreviation glossary KG enrichment failed for source %s", source_id)
 
     return {"source_id": source_id, "ttl_content": ttl_content, "triple_count": triple_count,
             "term_count": term_count, "updated_at": now}

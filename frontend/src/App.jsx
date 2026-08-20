@@ -13,6 +13,7 @@ import BusinessOntology from './views/BusinessOntology.jsx';
 import Redundancies from './views/Redundancies.jsx';
 import Glossary from './views/Glossary.jsx';
 import DataGlossary from './views/DataGlossary.jsx';
+import AbbrevGlossary from './views/AbbrevGlossary.jsx';
 import Kpi from './views/Kpi.jsx';
 import SqlConsole from './views/SqlConsole.jsx';
 import ChangeLog from './views/ChangeLog.jsx';
@@ -27,6 +28,7 @@ const VIEWS = {
   redundancy: Redundancies,
   glossary: Glossary,
   dataglossary: DataGlossary,
+  abbrevglossary: AbbrevGlossary,
   kpi: Kpi,
   sql: SqlConsole,
   cdc: ChangeLog,

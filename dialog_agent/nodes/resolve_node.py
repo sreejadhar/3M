@@ -361,15 +361,26 @@ MATCHING RULES — try in order, stop at the first rule that gives a match
    HR → Human Resources, R&D → Research and Development, PR → Public
    Relations, QA → Quality Assurance), time shorthand (YoY → Year over Year,
    MoM → Month over Month), or domain terms.
+   ⚠ THIS RULE IS DIRECTION-AGNOSTIC. The user may type EITHER the abbreviation
+     ("IT") OR the fully spelled-out form ("Information Technology") — both
+     phrasings refer to the exact same underlying concept, so both must resolve
+     to the exact same sql_fragment. Never treat "how many employees in
+     Information Technology" differently from "how many IT employees" — first
+     recognize the full phrase as the expansion of a well-known abbreviation,
+     THEN apply this rule exactly as if the user had typed the abbreviation
+     itself.
    Examples:
-     user "EMEA"         → stored "Europe", "Middle East", "Africa"
-     user "savoury"      → stored "Snacks & Foods"   (in FMCG: savoury = salty snack foods)
-     user "soft drinks"  → stored "Beverages" or "Carbonated Drinks"
-     user "HPC"          → stored "Home & Personal Care"
-     user "confectionery"→ stored "Candy & Chocolate" or "Sweets"
-     user "IT"           → stored "Information Technology"   (department/org column)
-     user "HR"           → stored "Human Resources"
-     user "R&D"          → stored "Research and Development"
+     user "EMEA"                 → stored "Europe", "Middle East", "Africa"
+     user "savoury"              → stored "Snacks & Foods"   (in FMCG: savoury = salty snack foods)
+     user "soft drinks"          → stored "Beverages" or "Carbonated Drinks"
+     user "HPC"                  → stored "Home & Personal Care"
+     user "confectionery"        → stored "Candy & Chocolate" or "Sweets"
+     user "IT"                   → stored "Information Technology"   (department/org column)
+     user "Information Technology" → same concept as "IT" above       (user typed the expansion instead of the abbreviation — resolve identically)
+     user "HR"                   → stored "Human Resources"
+     user "Human Resources"      → same concept as "HR" above
+     user "R&D"                  → stored "Research and Development"
+     user "Research and Development" → same concept as "R&D" above
    Include ALL semantically equivalent stored values in an IN() list.
    ⚠ APPLIES even when the sample values shown to you don't literally contain the
      expansion — a well-known abbreviation with an obvious domain expansion (IT,
@@ -381,7 +392,8 @@ MATCHING RULES — try in order, stop at the first rule that gives a match
    ⚠ THIS IS A GUESS, NOT A CONFIRMED MATCH (unlike rule 1/4 above, which matched
      something actually shown to you) — you do NOT know whether the real column
      stores the bare abbreviation ("IT"), the expanded phrase ("Information
-     Technology"), or both across different rows. Do NOT commit the sql_fragment
+     Technology"), or both across different rows. This is true REGARDLESS of
+     which spelling the user themselves typed. Do NOT commit the sql_fragment
      to only one spelling. OR together BOTH forms so either stored spelling is
      caught: an EXACT equality on the bare abbreviation OR'd with a LIKE on the
      expanded full form:
@@ -391,7 +403,14 @@ MATCHING RULES — try in order, stop at the first rule that gives a match
      Example combined sql_fragment:
        (LOWER(org_name) = 'it' OR LOWER(org_name) LIKE '%information technology%')
      This applies to every abbreviation resolved under this rule, regardless of
-     which table/column it is being resolved against.
+     which table/column it is being resolved against, and regardless of whether
+     the user's own wording was the abbreviation or its full expansion.
+   ⚠ NEVER split the expanded full form into separate single-word LIKE clauses
+     (e.g. LOWER(col) LIKE '%information%' OR LOWER(col) LIKE '%technology%').
+     Each bare word is a much broader match than the phrase (it also matches
+     "Information Security", "Medical Technology", etc.) and defeats the point
+     of resolving to the full form. Always keep the full form intact as ONE
+     LIKE '%whole phrase%' clause — never break it apart word by word.
 
 6. LAST RESORT — NO MATCH: ONLY use this when rules 1-5 all fail AND there are
    no KEYWORD MATCH HINTS for this term.
@@ -754,6 +773,32 @@ def _build_abbrev_hint_section(source_id: str) -> str:
         return ""
     lines.append("")
     return "\n".join(lines) + "\n"
+
+
+def get_glossary_abbreviation_map(source_id: str) -> Dict[str, str]:
+    """
+    {abbreviation.lower(): full_form.lower()} for every approved governed
+    abbreviation-glossary term on this source — the same ground-truth data
+    _build_abbrev_hint_section() formats for the LLM prompt, but as a plain
+    dict for plan_node.py's deterministic SQL post-processing (see
+    _fix_short_acronym_like_filters / _fix_unhedged_expansion_like_filters),
+    so that safety net covers whatever abbreviations THIS source's data
+    actually contains, not just a fixed hardcoded list.
+    """
+    if not source_id or _abr is None:
+        return {}
+    try:
+        terms = _abr.list_terms(source_id=source_id, status="approved")
+    except Exception as exc:
+        logger.debug("resolve_node: abbrev glossary lookup failed for source %s — %s", source_id, exc)
+        return {}
+    mapping: Dict[str, str] = {}
+    for term in terms:
+        abbrev = (term.get("abbreviation") or "").strip().lower()
+        full_form = (term.get("full_form") or "").strip().lower()
+        if abbrev and full_form:
+            mapping[abbrev] = full_form
+    return mapping
 
 
 def _call_resolve_llm(system: str, user: str, model: str) -> str:

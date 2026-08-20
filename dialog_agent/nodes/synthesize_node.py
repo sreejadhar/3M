@@ -814,6 +814,33 @@ def synthesize_node(state: DialogState) -> DialogState:
     except Exception:
         pass
 
+    # ── Abbreviation clarification ────────────────────────────────────────────
+    # If the question used an abbreviation (or its full form), surface both
+    # spellings together — e.g. "IT" and "Information Technology" — so the
+    # user sees the pairing regardless of which spelling the LLM's prose used.
+    try:
+        from .plan_node import _ABBREVIATION_EXPANSIONS as _fallback_abbrevs
+        from .resolve_node import get_glossary_abbreviation_map as _get_abbrev_map
+
+        source_id = getattr(config, "source_id", "") or ""
+        abbrev_map = dict(_fallback_abbrevs)
+        abbrev_map.update(_get_abbrev_map(source_id))
+
+        query_lower = natural_query.lower()
+        abbrev_lines = []
+        for abbrev, full_form in abbrev_map.items():
+            in_query = (
+                re.search(r'\b' + re.escape(abbrev) + r'\b', query_lower)
+                or re.search(r'\b' + re.escape(full_form) + r'\b', query_lower)
+            )
+            if not in_query:
+                continue
+            abbrev_lines.append(f"**{abbrev.upper()}** = {full_form.title()}")
+        if abbrev_lines:
+            insights = insights.rstrip() + "\n\n> **Terminology:** " + "  ·  ".join(abbrev_lines)
+    except Exception:
+        pass
+
     state["insights"] = insights
     state["sources"] = _build_sources(state, used_documents=used_documents)
     state["phase"] = "synthesize"

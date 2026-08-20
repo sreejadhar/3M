@@ -42,6 +42,7 @@ COPY llm_client.py .
 COPY snowflake_auth.py .
 COPY glossary_store.py .
 COPY glossary_registry.py .
+COPY abbrev_glossary_registry.py .
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

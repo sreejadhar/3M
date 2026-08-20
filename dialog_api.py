@@ -207,9 +207,9 @@ def _run_dialog(
         _jobs[job_id]["status"] = "running"
 
     try:
-        # Fetch current session history before running
-        with _sessions_lock:
-            history = list(_sessions.get(session_id, []))
+        # Each query is answered independently — no prior-turn context is fed
+        # into the planner/synthesizer, even when a session_id is reused.
+        history: List[ConversationTurn] = []
 
         # ── Multi-KG routing ───────────────────────────────────────────────────
         from dialog_agent.kg_router import route as _kg_route

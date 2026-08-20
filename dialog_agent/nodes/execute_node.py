@@ -128,11 +128,19 @@ _RETRYABLE_RE = re.compile(
     r"|ORA-06502"                               # Oracle: value / program error
     r"|ORA-01858"                               # Oracle: non-numeric char
     r"|ORA-01843"                               # Oracle: not a valid month
+    r"|ORA-01861"                               # Oracle: literal does not match date format
+    r"|ORA-01839"                               # Oracle: date not valid for month specified
     r"|datatype mismatch"                       # SQLite
     r"|type mismatch"
     r"|incompatible data type"
     r"|invalid cast"
     r"|cannot be cast"
+    r"|invalid argument types for function"     # Snowflake: e.g. DATEDIFF(number, date)
+    r"|invalid argument types"                  # Snowflake/generic: broader form of the above
+    r"|date/time field value out of range"      # PostgreSQL: bad date literal / arithmetic
+    r"|invalid datetime format"                 # SQL Server (ODBC) date/time cast fail
+    r"|incorrect datetime value"                # MySQL/MariaDB
+    r"|function .{0,60} does not exist"         # PostgreSQL: wrong overload, e.g. date - numeric
     r"|ambiguous column"                        # qualify with table name
     r"|no such column"                          # may be ambiguous — LLM can qualify
     r"|invalid identifier"                       # Snowflake: alias case / quoting — LLM can fix
@@ -219,6 +227,13 @@ def _llm_fix_sql(
         "2. Use correct syntax for the target database type.\n"
         "3. If an integer/numeric value is compared to a text column, add an explicit CAST.\n"
         "4. If the dialect is wrong (e.g. LIMIT used in SQL Server), rewrite to the correct form.\n"
+        "4b. If the error is about invalid argument types for a date-diff/date-arithmetic "
+        "function (e.g. a NUMBER being subtracted from/against a DATE, or passed where a "
+        "DATE/TIMESTAMP is expected), fix the date side: use the correct DATEDIFF/DATE_DIFF "
+        "argument order for this dialect, wrap any non-date operand that should be a date in "
+        "an explicit CAST(... AS DATE), and never subtract or diff a DATE against a plain "
+        "numeric expression (e.g. an AVG() of a prior day-count) — recompute using the "
+        "underlying date columns directly instead.\n"
         "5. If the error is an invalid/unknown column and the schema below shows the column "
         "genuinely does not exist under any name or casing in that table, REMOVE it from the "
         "query (or use the closest real column if one is clearly the intended one) — do not "

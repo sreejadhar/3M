@@ -66,6 +66,8 @@ import metadata_catalog as _mc   # standalone catalog module (no dialog_agent de
 import glossary_registry as _gr        # governed business-glossary term registry
 import glossary_generate as _gg        # on-demand cross-source glossary discovery
 import business_ontology as _bo        # SKOS+OWL business ontology generated from the glossary
+import abbrev_glossary_registry as _abr  # governed abbreviation-glossary term registry
+import abbrev_glossary_generate as _abg  # on-demand per-source abbreviation discovery
 import kpi_store as _kpi              # BI Manager KPI definitions
 import kg_store as _kg_store           # KG snapshot persistence
 import session_store as _sess_store     # chat session + history persistence
@@ -3123,6 +3125,10 @@ async def delete_source(source_id: str, request: Request):
     except Exception as exc:
         logger.warning("glossary_registry.delete_assets_and_jobs_for_source failed (non-fatal): %s", exc)
     try:
+        _abr.delete_assets_and_jobs_for_source(source_id)
+    except Exception as exc:
+        logger.warning("abbrev_glossary_registry.delete_assets_and_jobs_for_source failed (non-fatal): %s", exc)
+    try:
         from dialog_agent import metadata_store as _md
         _md.delete_entities_for_source(source_id)
     except Exception as exc:
@@ -4237,6 +4243,263 @@ async def reject_glossary_term_endpoint(term_id: str, request: Request, backgrou
             raise HTTPException(status_code=404, detail="Term not found")
         _reenrich_term_kg_sources(term_id, background_tasks)
         return _gr.get_term(term_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Abbreviation Glossary (governed, per-source, on-demand) ────────────────────
+# Same shape as the Business Glossary block above — NOT part of the indexing
+# pipeline, only invoked by a "Generate Abbreviation Glossary" button in
+# Schema Catalog, scoped to a single source at a time.
+
+@app.post("/metadata/sources/{source_id}/generate-abbreviation-glossary", status_code=202)
+async def generate_source_abbrev_glossary(source_id: str, request: Request, background_tasks: BackgroundTasks):
+    """
+    Discover and govern abbreviation <-> full-form mappings for every table
+    in a source: abbreviation-candidate detection -> canonical match against
+    already-governed abbreviations -> LLM fallback for anything unmatched.
+    Runs in the background with SSE progress, same convention as
+    generate_source_glossary above.
+    """
+    _require_source_access(request, source_id)
+
+    async def _run_abbrev_glossary(sid: str) -> None:
+        src_domain = ""
+        try:
+            import domain_classifier as _dc
+            cached_domain = _dc.get_cached_label(sid)
+            if cached_domain:
+                src_domain = cached_domain.get("sub_domain", "") or ""
+        except Exception as exc:
+            logger.debug("generate-abbreviation-glossary: domain label unavailable for %s — %s", sid[:8], exc)
+        if not src_domain:
+            src_domain = (_sources.get(sid) or {}).get("domain", "") or ""
+
+        src_business = ""
+        try:
+            import business_classifier as _bc
+            cached = _bc.get_cached_label(sid)
+            if cached:
+                src_business = cached.get("business", "") or ""
+        except Exception as exc:
+            logger.debug("generate-abbreviation-glossary: business label unavailable for %s — %s", sid[:8], exc)
+        _source_event_log[sid] = []
+
+        def _progress(stage: str, message: str) -> None:
+            _push_index_event(sid, f"abbrev-glossary:{stage}", "running", message)
+
+        try:
+            _build_connector = _live_connector_factory(sid)
+            stats = await asyncio.to_thread(
+                _abg.generate_abbreviations_for_source, sid,
+                domain=src_domain, business=src_business, progress_cb=_progress,
+                connector_factory=_build_connector,
+            )
+            _push_index_event(
+                sid, "abbrev-glossary", "done",
+                f"{stats['terms_created']} term(s) created, {stats['terms_linked']} column(s) linked, "
+                f"{stats['needs_review']} need review",
+            )
+            try:
+                _progress("kg-enrich", "Enriching knowledge graph from generated abbreviation glossary...")
+                kg_stats = await asyncio.to_thread(_enricher.enrich_source_kg_from_abbrev_glossary, sid)
+                if sid in _sources:
+                    nodes, edges = _kg_store.load_snapshot(sid)
+                    _sources[sid]["kg_nodes"] = nodes
+                    _sources[sid]["kg_edges"] = edges
+                _push_index_event(
+                    sid, "abbrev-glossary:kg-enrich", "done",
+                    f"{kg_stats['nodes_added']} abbreviation node(s), {kg_stats['edges_added']} edge(s) added to the KG",
+                )
+            except Exception as exc:
+                logger.warning("abbreviation glossary KG enrichment failed for %s: %s", sid[:8], exc)
+        except Exception as exc:
+            logger.warning("generate_abbreviations_for_source failed for %s: %s", sid[:8], exc)
+            _push_index_event(sid, "abbrev-glossary", "error", f"Abbreviation glossary generation failed: {exc}")
+        _push_index_event(sid, "abbrev-glossary-complete", "done", "Abbreviation glossary generation complete")
+
+    background_tasks.add_task(_run_abbrev_glossary, source_id)
+    return {"status": "accepted", "source_id": source_id,
+            "message": "Abbreviation glossary generation started in background"}
+
+
+@app.get("/metadata/abbreviation-glossary-sources")
+async def list_abbrev_glossary_sources_endpoint(request: Request):
+    """Sources that have at least one generated (non-deprecated) abbreviation
+    glossary term, with a term_count — lets the Abbreviation Glossary UI show
+    a per-source badge without fetching every term for every source. Scoped
+    to sources the caller owns (or all sources for admins), same as
+    /business-ontology/sources."""
+    try:
+        email = _current_user_email(request)
+        rows = _abr.list_glossary_sources()
+        out = []
+        for row in rows:
+            sid = row["source_id"]
+            src = _sources.get(sid)
+            if src is not None and not _owns_source(src, email):
+                continue
+            out.append({
+                "source_id": sid,
+                "source_name": (src or {}).get("name") or sid,
+                "term_count": row["term_count"],
+            })
+        out.sort(key=lambda r: r["source_name"].lower())
+        return out
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/metadata/abbreviation-glossary-terms")
+async def list_abbrev_glossary_terms_endpoint(source_id: Optional[str] = None, status: Optional[str] = None,
+                                               domain: Optional[str] = None):
+    """List governed abbreviation glossary terms, optionally filtered by source/status/domain."""
+    try:
+        return _abr.list_terms(source_id=source_id, status=status, domain=domain)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class CreateAbbrevGlossaryTermRequest(BaseModel):
+    source_id: str
+    abbreviation: str
+    full_form: str
+    definition: str = ""
+    domain: str = ""
+    steward: str = ""
+
+
+@app.post("/metadata/abbreviation-glossary-terms", status_code=201)
+async def create_abbrev_glossary_term_endpoint(req: CreateAbbrevGlossaryTermRequest, request: Request):
+    """Manually add an abbreviation term for a source, same 'declared beats
+    inferred' trust boundary as update_abbrev_glossary_term_endpoint: a
+    manually-created term is born approved, confidence=1.0, match_method='manual'.
+    Linked to source_id via a placeholder asset row (no specific column) so it
+    shows up in that source's glossary list alongside discovered terms."""
+    try:
+        if not req.abbreviation.strip() or not req.full_form.strip():
+            raise HTTPException(status_code=400, detail="abbreviation and full_form are required")
+        changed_by = _require_permission(request, "edit_business_ontology")
+        term = _abr.create_term(
+            abbreviation=req.abbreviation.strip(), full_form=req.full_form.strip(),
+            definition=req.definition.strip(), domain=req.domain.strip(),
+            status="approved", confidence=1.0, match_method="manual",
+            steward=req.steward.strip(), changed_by=changed_by,
+        )
+        _abr.link_asset(
+            term["term_id"], req.source_id, metadata_id="", attr_id="",
+            confidence=1.0, match_method="manual", domain=req.domain.strip(),
+        )
+        return term
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/metadata/abbreviation-glossary-terms/{term_id}")
+async def get_abbrev_glossary_term_endpoint(term_id: str):
+    try:
+        term = _abr.get_term(term_id)
+        if not term:
+            raise HTTPException(status_code=404, detail="Term not found")
+        term["assets"] = _abr.list_assets_for_term(term_id)
+        term["audit"] = _abr.list_audit(term_id)
+        return term
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class UpdateAbbrevGlossaryTermRequest(BaseModel):
+    abbreviation: Optional[str] = None
+    full_form: Optional[str] = None
+    definition: Optional[str] = None
+    domain: Optional[str] = None
+    steward: Optional[str] = None
+
+
+@app.patch("/metadata/abbreviation-glossary-terms/{term_id}")
+async def update_abbrev_glossary_term_endpoint(
+    term_id: str, req: UpdateAbbrevGlossaryTermRequest, request: Request, background_tasks: BackgroundTasks,
+):
+    """Manual edit — same 'declared beats inferred' trust boundary as
+    update_glossary_term_endpoint: the server forces match_method='manual',
+    status='approved', confidence=1.0. Future generation runs skip a
+    manually-edited term's linked columns rather than overwrite them."""
+    try:
+        kwargs: Dict[str, Any] = {}
+        if req.abbreviation is not None:
+            kwargs["abbreviation"] = req.abbreviation
+        if req.full_form is not None:
+            kwargs["full_form"] = req.full_form
+        if req.definition is not None:
+            kwargs["definition"] = req.definition
+        if req.domain is not None:
+            kwargs["domain"] = req.domain
+        if req.steward is not None:
+            kwargs["steward"] = req.steward
+        if not kwargs:
+            raise HTTPException(status_code=400, detail="No updatable fields provided")
+        kwargs["match_method"] = "manual"
+        kwargs["status"] = "approved"
+        kwargs["confidence"] = 1.0
+        changed_by = _require_permission(request, "edit_business_ontology")
+        if not _abr.update_term(term_id, changed_by=changed_by, **kwargs):
+            raise HTTPException(status_code=404, detail="Term not found")
+        _reenrich_abbrev_term_kg_sources(term_id, background_tasks)
+        return _abr.get_term(term_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _reenrich_abbrev_term_kg_sources(term_id: str, background_tasks: BackgroundTasks) -> None:
+    """Re-run abbreviation-glossary KG enrichment for every source this term
+    is linked to, mirrors _reenrich_term_kg_sources for the business glossary."""
+    source_ids = {a["source_id"] for a in _abr.list_assets_for_term(term_id) if a.get("source_id")}
+
+    def _run():
+        for source_id in source_ids:
+            try:
+                _enricher.enrich_source_kg_from_abbrev_glossary(source_id)
+                if source_id in _sources:
+                    nodes, edges = _kg_store.load_snapshot(source_id)
+                    _sources[source_id]["kg_nodes"] = nodes
+                    _sources[source_id]["kg_edges"] = edges
+            except Exception as exc:
+                logger.error("Abbreviation glossary KG re-enrichment failed for source %s: %s", source_id, exc)
+
+    if source_ids:
+        background_tasks.add_task(_run)
+
+
+@app.post("/metadata/abbreviation-glossary-terms/{term_id}/approve")
+async def approve_abbrev_glossary_term_endpoint(term_id: str, request: Request, background_tasks: BackgroundTasks):
+    try:
+        changed_by = _require_permission(request, "approve_business_ontology_term")
+        if not _abr.approve_term(term_id, changed_by=changed_by):
+            raise HTTPException(status_code=404, detail="Term not found")
+        _reenrich_abbrev_term_kg_sources(term_id, background_tasks)
+        return _abr.get_term(term_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/metadata/abbreviation-glossary-terms/{term_id}/reject")
+async def reject_abbrev_glossary_term_endpoint(term_id: str, request: Request, background_tasks: BackgroundTasks):
+    try:
+        changed_by = _require_permission(request, "approve_business_ontology_term")
+        if not _abr.reject_term(term_id, changed_by=changed_by):
+            raise HTTPException(status_code=404, detail="Term not found")
+        _reenrich_abbrev_term_kg_sources(term_id, background_tasks)
+        return _abr.get_term(term_id)
     except HTTPException:
         raise
     except Exception as exc:

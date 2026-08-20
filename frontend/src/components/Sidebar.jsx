@@ -23,6 +23,7 @@ const INSPECT = [
   ['redundancy', IconRedundancy, 'Redundancies'],
   ['glossary', IconGlossary, 'Business Glossary'],
   ['dataglossary', IconGlossary, 'Business Glossary (Discovery)'],
+  ['abbrevglossary', IconGlossary, 'Abbreviation Glossary'],
   ['kpi', IconKpi, 'KPI Registry'],
   ['documents', IconDocuments, 'Document Intelligence'],
 ];

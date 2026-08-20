@@ -106,6 +106,29 @@ export const updateBizGlossaryTerm = (termId, body) => apiPatch(`/metadata/gloss
 export const approveBizGlossaryTerm = (termId) => apiPost(`/metadata/glossary-terms/${termId}/approve`);
 export const rejectBizGlossaryTerm = (termId) => apiPost(`/metadata/glossary-terms/${termId}/reject`);
 
+// ── Abbreviation Glossary — governed abbreviation<->full-form registry, same
+// shape as the Business Glossary above (discovered from schema, per source,
+// on demand) ─────────────────────────────────────────────────────────────────
+export const generateSourceAbbrevGlossary = (sourceId) =>
+  apiPost(`/metadata/sources/${sourceId}/generate-abbreviation-glossary`);
+export const listAbbrevGlossarySources = () => apiGet('/metadata/abbreviation-glossary-sources');
+export const createAbbrevGlossaryTerm = (body) => apiPost('/metadata/abbreviation-glossary-terms', body);
+export const listAbbrevGlossaryTerms = (opts = {}) => {
+  const qs = new URLSearchParams();
+  if (opts.sourceId) qs.set('source_id', opts.sourceId);
+  if (opts.status) qs.set('status', opts.status);
+  if (opts.domain) qs.set('domain', opts.domain);
+  const q = qs.toString();
+  return apiGet(`/metadata/abbreviation-glossary-terms${q ? `?${q}` : ''}`);
+};
+export const getAbbrevGlossaryTerm = (termId) => apiGet(`/metadata/abbreviation-glossary-terms/${termId}`);
+export const updateAbbrevGlossaryTerm = (termId, body) =>
+  apiPatch(`/metadata/abbreviation-glossary-terms/${termId}`, body);
+export const approveAbbrevGlossaryTerm = (termId) =>
+  apiPost(`/metadata/abbreviation-glossary-terms/${termId}/approve`);
+export const rejectAbbrevGlossaryTerm = (termId) =>
+  apiPost(`/metadata/abbreviation-glossary-terms/${termId}/reject`);
+
 // ── Business Ontology — SKOS+OWL graph generated per-source from that
 // source's governed glossary above (distinct artifact from the per-source
 // structural ontology, and only offered for sources with a generated glossary) ─

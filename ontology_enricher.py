@@ -119,6 +119,19 @@ CREATE TABLE IF NOT EXISTS glossary_kg_links (
     created_at     TEXT NOT NULL,
     UNIQUE(term_id, target_node_id)
 );
+
+CREATE TABLE IF NOT EXISTS abbrev_glossary_kg_links (
+    link_id        TEXT PRIMARY KEY,
+    term_id        TEXT NOT NULL,
+    source_id      TEXT NOT NULL,
+    kg_node_id     TEXT NOT NULL,
+    target_node_id TEXT NOT NULL,
+    attr_id        TEXT NOT NULL DEFAULT '',
+    match_type     TEXT NOT NULL DEFAULT 'curated',
+    confidence     REAL NOT NULL DEFAULT 1.0,
+    created_at     TEXT NOT NULL,
+    UNIQUE(term_id, target_node_id)
+);
 """
 
 _schema_done = False
@@ -719,6 +732,187 @@ def get_business_glossary_kg_links(term_id: str, source_id: Optional[str] = None
         else:
             rows = conn.execute(
                 "SELECT * FROM glossary_kg_links WHERE term_id=? ORDER BY created_at",
+                (term_id,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Pass 4: Governed abbreviation glossary → per-source KG ──────────────────
+
+def enrich_source_kg_from_abbrev_glossary(source_id: str) -> Dict[str, int]:
+    """
+    Enrich a single source's KG snapshot with nodes/edges derived from the
+    GOVERNED abbreviation glossary (abbrev_glossary_terms/abbrev_glossary_registry.py,
+    generated per-source via abbrev_glossary_generate.py) — close mirror of
+    enrich_source_kg_from_business_glossary, kept as its own pass so the two
+    node kinds never collide (node id prefix `abbrevgloss:` vs `bizgloss:`).
+
+    Curated term<->asset links (abbrev_glossary_term_assets, already scoped
+    to this source) are treated as authoritative; a term with no curated
+    link falls back to name-matching against this source's KG node
+    properties by the abbreviation itself. Scoped to `source_id` only.
+
+    Returns {"terms_scanned": N, "nodes_added": M, "edges_added": K}.
+    """
+    _ensure_schema()
+
+    try:
+        import abbrev_glossary_registry as _agr
+    except ImportError:
+        logger.warning("ontology_enricher: abbrev_glossary_registry unavailable — skipping abbreviation glossary KG pass")
+        return {"terms_scanned": 0, "nodes_added": 0, "edges_added": 0}
+
+    try:
+        import metadata_catalog as _mc
+    except ImportError:
+        logger.warning("ontology_enricher: metadata_catalog unavailable — skipping abbreviation glossary KG pass")
+        return {"terms_scanned": 0, "nodes_added": 0, "edges_added": 0}
+
+    try:
+        import kg_store as _kg
+    except ImportError:
+        logger.warning("ontology_enricher: kg_store unavailable — skipping abbreviation glossary KG pass")
+        return {"terms_scanned": 0, "nodes_added": 0, "edges_added": 0}
+
+    terms = _agr.list_terms(source_id=source_id, status="approved")
+
+    nodes, edges = _kg.load_snapshot(source_id)
+    nodes = [n for n in nodes if not str(n.get("id", "")).startswith("abbrevgloss:")]
+    edges = [e for e in edges if e.get("label") != "ABBREV_GLOSSARY_MATCHES"]
+
+    prop_to_nodes: Dict[str, List[str]] = {}
+    label_to_nodes: Dict[str, List[str]] = {}
+    for node in nodes:
+        node_id = node.get("id", "")
+        if not node_id:
+            continue
+        ln = _norm(node.get("label", ""))
+        if ln:
+            label_to_nodes.setdefault(ln, []).append(node_id)
+        for prop in node.get("properties") or []:
+            pn = _norm(prop.get("name", "") or prop.get("column", ""))
+            if pn:
+                prop_to_nodes.setdefault(pn, []).append(node_id)
+
+    entity_cache: Dict[str, Optional[Dict]] = {}
+
+    def _get_entity(metadata_id: str) -> Optional[Dict]:
+        if metadata_id not in entity_cache:
+            entity_cache[metadata_id] = _mc.get_entity(metadata_id) if metadata_id else None
+        return entity_cache[metadata_id]
+
+    new_nodes: List[Dict] = []
+    new_edges: List[Dict] = []
+    link_rows: List[Tuple] = []
+    now = _now()
+
+    for term in terms:
+        term_id = term["term_id"]
+        node_id = f"abbrevgloss:{term_id}"
+
+        title_parts = [f"ABBREVIATION GLOSSARY: {term['abbreviation']} → {term['full_form']}"]
+        if term.get("domain"):
+            title_parts.append(f"Domain: {term['domain']}")
+        if term.get("definition"):
+            title_parts.append(term["definition"])
+        if term.get("steward"):
+            title_parts.append(f"Steward: {term['steward']}")
+
+        new_nodes.append({
+            "id":    node_id,
+            "label": f"{term['abbreviation']} → {term['full_form']}",
+            "title": "\n".join(title_parts),
+            "color": "#22d3ee",   # cyan — abbreviation glossary (distinct from business glossary pink)
+            "size":  16,
+            "node_kind": "annotation",
+            "properties": [
+                {"name": "abbreviation", "type": "text"},
+                {"name": "full_form",    "type": "text"},
+                {"name": "domain",       "type": "text"},
+            ],
+        })
+
+        matched_node_ids: Set[str] = set()
+
+        assets = [a for a in _agr.list_assets_for_term(term_id) if a.get("source_id") == source_id]
+        for asset in assets:
+            attr_id = asset.get("attr_id") or ""
+            entity = _get_entity(asset.get("metadata_id") or "")
+            if not entity:
+                continue
+            table_name = entity.get("table_name", "")
+            column_name = ""
+            if attr_id:
+                for attr in entity.get("attributes") or []:
+                    if attr.get("attr_id") == attr_id:
+                        column_name = attr.get("column_name", "")
+                        break
+
+            targets: Set[str] = set()
+            if column_name:
+                targets.update(prop_to_nodes.get(_norm(column_name), []))
+            if not targets and table_name:
+                targets.update(label_to_nodes.get(_norm(table_name), []))
+
+            for target_id in targets:
+                if target_id not in matched_node_ids:
+                    link_rows.append((
+                        str(uuid.uuid4()), term_id, source_id, node_id, target_id,
+                        attr_id, "curated", float(asset.get("confidence") or 1.0), now,
+                    ))
+                matched_node_ids.add(target_id)
+
+        if not matched_node_ids:
+            for target_id in prop_to_nodes.get(_norm(term["abbreviation"]), []):
+                if target_id not in matched_node_ids:
+                    link_rows.append((
+                        str(uuid.uuid4()), term_id, source_id, node_id, target_id,
+                        "", "name_match", 0.6, now,
+                    ))
+                matched_node_ids.add(target_id)
+
+        for target_id in matched_node_ids:
+            new_edges.append({
+                "from":  node_id,
+                "to":    target_id,
+                "label": "ABBREV_GLOSSARY_MATCHES",
+                "title": f"{term['abbreviation']} → {target_id.split('/')[-1]}",
+                "join_columns": [],
+            })
+
+    _kg.save_snapshot(source_id, nodes + new_nodes, edges + new_edges)
+
+    with _cur() as conn:
+        conn.execute("DELETE FROM abbrev_glossary_kg_links WHERE source_id=?", (source_id,))
+        if link_rows:
+            conn.executemany(
+                """INSERT OR IGNORE INTO abbrev_glossary_kg_links
+                   (link_id,term_id,source_id,kg_node_id,target_node_id,attr_id,
+                    match_type,confidence,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                link_rows,
+            )
+
+    logger.info(
+        "ontology_enricher: abbreviation glossary KG pass — source=%s, %d terms, %d nodes, %d edges",
+        source_id[:8], len(terms), len(new_nodes), len(new_edges),
+    )
+    return {"terms_scanned": len(terms), "nodes_added": len(new_nodes), "edges_added": len(new_edges)}
+
+
+def get_abbrev_glossary_kg_links(term_id: str, source_id: Optional[str] = None) -> List[Dict]:
+    """KG nodes/edges a governed abbreviation term currently enriches —
+    mirrors get_business_glossary_kg_links."""
+    _ensure_schema()
+    with _cur() as conn:
+        if source_id:
+            rows = conn.execute(
+                "SELECT * FROM abbrev_glossary_kg_links WHERE term_id=? AND source_id=? ORDER BY created_at",
+                (term_id, source_id),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM abbrev_glossary_kg_links WHERE term_id=? ORDER BY created_at",
                 (term_id,),
             ).fetchall()
     return [dict(r) for r in rows]

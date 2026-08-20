@@ -56,30 +56,32 @@ export default function Sidebar() {
         </div>
       </div>
 
-      <div className="sidebar-section">
-        <div className="sidebar-section-label">Observe</div>
-        <NavItem id="pipeline" Icon={IconPipeline} label="Pipeline Monitor" badge={sources.length} />
-        <NavItem id="graph" Icon={IconGraph} label="Graph Explorer" />
-      </div>
+      <div className="sidebar-nav">
+        <div className="sidebar-section">
+          <div className="sidebar-section-label">Observe</div>
+          <NavItem id="pipeline" Icon={IconPipeline} label="Pipeline Monitor" badge={sources.length} />
+          <NavItem id="graph" Icon={IconGraph} label="Graph Explorer" />
+        </div>
 
-      <div className="sidebar-section">
-        <div className="sidebar-section-label">Inspect</div>
-        {INSPECT.map(([id, Icon, label]) => (
-          <NavItem key={id} id={id} Icon={Icon} label={label} />
-        ))}
-      </div>
+        <div className="sidebar-section">
+          <div className="sidebar-section-label">Inspect</div>
+          {INSPECT.map(([id, Icon, label]) => (
+            <NavItem key={id} id={id} Icon={Icon} label={label} />
+          ))}
+        </div>
 
-      <div className="sidebar-section">
-        <div className="sidebar-section-label">Develop</div>
-        <NavItem id="sql" Icon={IconSql} label="SQL Console" />
-        <NavItem id="cdc" Icon={IconCdc} label="Change Log" />
-        {DEVELOP_COMING.map(([id, Icon, label]) => (
-          <div key={id} className="nav-item coming-soon" title="Coming Soon">
-            <Icon />
-            {label}
-            <span className="coming-soon-badge">Coming Soon</span>
-          </div>
-        ))}
+        <div className="sidebar-section">
+          <div className="sidebar-section-label">Develop</div>
+          <NavItem id="sql" Icon={IconSql} label="SQL Console" />
+          <NavItem id="cdc" Icon={IconCdc} label="Change Log" />
+          {DEVELOP_COMING.map(([id, Icon, label]) => (
+            <div key={id} className="nav-item coming-soon" title="Coming Soon">
+              <Icon />
+              {label}
+              <span className="coming-soon-badge">Coming Soon</span>
+            </div>
+          ))}
+        </div>
       </div>
 
       <div className="sidebar-source-selector">

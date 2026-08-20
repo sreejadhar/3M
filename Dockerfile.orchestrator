@@ -29,6 +29,8 @@ COPY domain_classifier.py .
 COPY glossary_store.py .
 COPY glossary_registry.py .
 COPY glossary_generate.py .
+COPY abbrev_glossary_registry.py .
+COPY abbrev_glossary_generate.py .
 COPY business_ontology.py .
 COPY glossary_nlp.py .
 COPY glossary_matcher.py .

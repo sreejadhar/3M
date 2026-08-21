@@ -4875,6 +4875,23 @@ async def train_business_classifier():
 
 # ── BI Manager — KPI endpoints ────────────────────────────────────────────────
 
+def _trigger_ontology_enrichment_bg(background_tasks: BackgroundTasks) -> None:
+    """Queue the ontology enrichment pipeline so a newly-active KPI gets its
+    KPI_METRIC node + MEASURES edges written into the knowledge graph without
+    requiring a manual POST /ontology/enrich call."""
+    def _run():
+        try:
+            _enricher.run_enrichment_coalesced()
+            for src in _kg_store.load_all():
+                if src["id"] in _sources:
+                    _sources[src["id"]]["kg_nodes"] = src.get("kg_nodes") or []
+                    _sources[src["id"]]["kg_edges"] = src.get("kg_edges") or []
+        except Exception as exc:
+            logger.error("Ontology enrichment background task failed: %s", exc)
+
+    background_tasks.add_task(_run)
+
+
 class CreateKpiRequest(BaseModel):
     name:           str
     description:    Optional[str]  = None
@@ -4915,10 +4932,12 @@ async def list_kpis(
 
 
 @app.post("/kpis", status_code=201)
-async def create_kpi(req: CreateKpiRequest):
+async def create_kpi(req: CreateKpiRequest, background_tasks: BackgroundTasks):
     """Create a new KPI definition. Returns {kpi, warnings}."""
     try:
         result = _kpi.create_kpi(**req.dict(exclude_none=True))
+        if result.get("kpi", {}).get("status") == "active":
+            _trigger_ontology_enrichment_bg(background_tasks)
         return result  # {"kpi": {...}, "warnings": [...]}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -4941,7 +4960,7 @@ async def get_kpi(kpi_id: str):
 
 
 @app.patch("/kpis/{kpi_id}")
-async def update_kpi(kpi_id: str, req: UpdateKpiRequest):
+async def update_kpi(kpi_id: str, req: UpdateKpiRequest, background_tasks: BackgroundTasks):
     """Update fields on a KPI definition. Returns {kpi, warnings}."""
     try:
         payload = req.dict(exclude_none=True)
@@ -4953,6 +4972,8 @@ async def update_kpi(kpi_id: str, req: UpdateKpiRequest):
                                   change_note=change_note, **payload)
         if not result.get("ok"):
             raise HTTPException(status_code=404, detail="KPI not found")
+        if payload.get("status") == "active":
+            _trigger_ontology_enrichment_bg(background_tasks)
         row = _kpi.get_kpi(kpi_id)
         return {"kpi": row, "warnings": result.get("warnings", [])}
     except HTTPException:
@@ -5027,13 +5048,15 @@ class ActivateKpiRequest(BaseModel):
 
 
 @app.post("/kpis/{kpi_id}/activate")
-async def activate_kpi(kpi_id: str, req: ActivateKpiRequest = ActivateKpiRequest()):
+async def activate_kpi(kpi_id: str, background_tasks: BackgroundTasks,
+                        req: ActivateKpiRequest = ActivateKpiRequest()):
     """
     Activation gate: validates guardrails then sets status → active.
     Returns {ok, kpi} on success; 422 with reasons on guardrail failure.
     """
     try:
         kpi = _kpi.activate_kpi(kpi_id, approved_by=req.approved_by or "")
+        _trigger_ontology_enrichment_bg(background_tasks)
         return {"ok": True, "kpi": kpi}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -5439,19 +5462,7 @@ async def trigger_ontology_enrichment(background_tasks: BackgroundTasks):
       3. Inject GLOSSARY_CONCEPT + KPI_METRIC nodes+edges into all KG snapshots
     Returns immediately with a run_id; poll GET /ontology/enrich/status for progress.
     """
-    def _run():
-        try:
-            _enricher.run_enrichment()
-            # Refresh in-memory KG snapshots so the graph UI sees the new nodes
-            # without requiring a container restart.
-            for src in _kg_store.load_all():
-                if src["id"] in _sources:
-                    _sources[src["id"]]["kg_nodes"] = src.get("kg_nodes") or []
-                    _sources[src["id"]]["kg_edges"] = src.get("kg_edges") or []
-        except Exception as exc:
-            logger.error("Ontology enrichment background task failed: %s", exc)
-
-    background_tasks.add_task(_run)
+    _trigger_ontology_enrichment_bg(background_tasks)
     status = _enricher.get_status()
     return {
         "status":   "accepted",

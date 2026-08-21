@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -960,6 +961,34 @@ def run_enrichment() -> Dict[str, Any]:
                 (_now(), "error", json.dumps({"error": str(exc)}), run_id),
             )
         raise
+
+
+# ── Coalescing wrapper ────────────────────────────────────────────────────────
+# KPI create/update/activate now each queue a background enrichment run (see
+# orchestrator_api.py's _trigger_ontology_enrichment_bg), so bursts of rapid
+# saves can otherwise fire overlapping run_enrichment() calls that race on the
+# same KG snapshot files. run_enrichment_coalesced() ensures only one pass runs
+# at a time; concurrent callers just mark that another pass is needed once the
+# in-flight one finishes, instead of starting a second one immediately.
+_enrich_pending = threading.Event()
+_enrich_worker_lock = threading.Lock()
+
+
+def run_enrichment_coalesced() -> Optional[Dict[str, Any]]:
+    """Like run_enrichment(), but coalesces concurrent calls into one run.
+    Returns the last run's result dict, or None if another in-flight call
+    already covered this request."""
+    _enrich_pending.set()
+    if not _enrich_worker_lock.acquire(blocking=False):
+        return None
+    try:
+        result = None
+        while _enrich_pending.is_set():
+            _enrich_pending.clear()
+            result = run_enrichment()
+        return result
+    finally:
+        _enrich_worker_lock.release()
 
 
 def get_status() -> Optional[Dict[str, Any]]:

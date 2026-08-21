@@ -137,6 +137,8 @@ _RETRYABLE_RE = re.compile(
     r"|cannot be cast"
     r"|invalid argument types for function"     # Snowflake: e.g. DATEDIFF(number, date)
     r"|invalid argument types"                  # Snowflake/generic: broader form of the above
+    r"|invalid type .{0,80} for parameter"      # Snowflake: e.g. TO_DATE(CAST(col AS DATE))
+    r"|can\s*not convert parameter"             # Snowflake: hallucinated fn misparsed as UDF, e.g. DATE_ADDYEARSTODATE(...)
     r"|date/time field value out of range"      # PostgreSQL: bad date literal / arithmetic
     r"|invalid datetime format"                 # SQL Server (ODBC) date/time cast fail
     r"|incorrect datetime value"                # MySQL/MariaDB
@@ -234,6 +236,18 @@ def _llm_fix_sql(
         "an explicit CAST(... AS DATE), and never subtract or diff a DATE against a plain "
         "numeric expression (e.g. an AVG() of a prior day-count) — recompute using the "
         "underlying date columns directly instead.\n"
+        "4c. If the error is 'invalid type ... for parameter' naming a date/timestamp function "
+        "(e.g. TO_DATE, TO_TIMESTAMP), the usual cause is passing an already-DATE/TIMESTAMP-typed "
+        "expression into a function that expects a string or numeric input — most commonly a "
+        "redundant CAST(... AS DATE) wrapped around a column that is already a date/timestamp "
+        "type being passed to TO_DATE(...). Drop the redundant CAST (and the outer TO_DATE call "
+        "if the column is already the right type) rather than adding more casts.\n"
+        "4d. If the error is \"Can not convert parameter '<expr>' of type [DATE] into expected "
+        "type [NUMBER(38,0)]\" (or similar), the SQL called a function name that does not exist "
+        "(e.g. DATE_ADDYEARSTODATE) and Snowflake mis-resolved it against an unrelated built-in "
+        "expecting a numeric argument. Replace the invented function with the correct dialect "
+        "equivalent for adding/subtracting an interval from a date — for Snowflake use "
+        "DATEADD(unit, signed_amount, date_expr), e.g. DATEADD(year, -5, CURRENT_DATE()).\n"
         "5. If the error is an invalid/unknown column and the schema below shows the column "
         "genuinely does not exist under any name or casing in that table, REMOVE it from the "
         "query (or use the closest real column if one is clearly the intended one) — do not "

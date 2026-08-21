@@ -455,6 +455,13 @@ CASE-INSENSITIVE  : col ILIKE '%term%'   — preferred; or LOWER(col) LIKE LOWER
 DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
                     DATE_TRUNC('month', date_col)
 DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
+DATE ARITHMETIC   : DATEADD(year, -5, CURRENT_DATE())   — add/subtract an interval from a date.
+                    Argument order is ALWAYS (unit, amount, date) — unit is a bare keyword
+                    (year/month/day/week/hour), NOT quoted, and amount is signed (negative to
+                    subtract). Also valid: DATE_ADD/DATE_SUB in some contexts, but DATEADD is
+                    the safe universal form. NEVER invent a function name like
+                    DATE_ADDYEARSTODATE or ADDYEARSTODATE — no such function exists in
+                    Snowflake; use DATEADD(year, -N, CURRENT_DATE()) instead.
 STRING CONCAT     : col1 || col2   or   CONCAT(col1, col2)
 PERCENTILES       : PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY col) AS median
 PERCENTAGE CALC   : ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS Pct

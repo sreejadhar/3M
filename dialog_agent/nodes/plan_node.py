@@ -448,13 +448,30 @@ COLUMN ALIASES    : Quote every alias / CTE column you introduce with AS in lowe
                     case at BOTH its definition AND every reference — e.g.
                     SUM("net_amount") AS "total_net" ... ORDER BY "total_net".
                     An UNQUOTED alias is folded to UPPER CASE, so a later quoted
-                    lower-case reference fails with "invalid identifier".
+                    lower-case reference fails with "invalid identifier". This
+                    applies just as much when the reference is qualified by a
+                    table/CTE alias later in the query, e.g.:
+                      SELECT DATEADD(year, -5, CURRENT_DATE()) AS "cutoff_date"  ← quoted, lower
+                      ... WHERE col >= (SELECT "cutoff_date" FROM date_range)    ← same quoting
+                    Do NOT write `AS cutoff_date` (unquoted) and then reference it
+                    as `d."cutoff_date"` (quoted) — the unquoted alias folds to
+                    CUTOFF_DATE and the quoted lower-case reference will not match it.
 ROW LIMITING      : LIMIT N at the end  (e.g. SELECT "col" FROM "t" LIMIT 100)
 TOP-N QUERIES     : ORDER BY "col" DESC LIMIT N
 CASE-INSENSITIVE  : col ILIKE '%term%'   — preferred; or LOWER(col) LIKE LOWER('%term%')
 DATE EXTRACTION   : EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)
                     DATE_TRUNC('month', date_col)
 DATE COMPARISON   : date_col BETWEEN '2024-01-01' AND '2024-12-31'
+EPOCH NUMERIC DATE: If the schema context shows a column typed NUMBER/decimal but tagged
+                    [date/period] (a "numeric measure" holding a huge integer, e.g.
+                    EVENT_DATE with values like 1534377600000000), it is a scaled epoch
+                    timestamp in MICROSECONDS, not a real DATE/TIMESTAMP column. Convert
+                    it with TO_DATE(col / 1000000) — dividing by 1,000,000 rescales
+                    microseconds to seconds, which TO_DATE(numeric) then interprets as an
+                    epoch. NEVER use CAST(col AS DATE) or TO_DATE(col) directly on such a
+                    column — both misinterpret the raw microsecond value and either error
+                    ("invalid type ... for parameter 'TO_DATE'") or silently produce a
+                    wrong date far in the future.
 DATE ARITHMETIC   : DATEADD(year, -5, CURRENT_DATE())   — add/subtract an interval from a date.
                     Argument order is ALWAYS (unit, amount, date) — unit is a bare keyword
                     (year/month/day/week/hour), NOT quoted, and amount is signed (negative to

@@ -70,6 +70,7 @@ jobs:
         S_SEED_PASSWORD_SREEJA: ${{ secrets.SEED_PASSWORD_SREEJA }}
         S_SEED_PASSWORD_SUSMITA: ${{ secrets.SEED_PASSWORD_SUSMITA }}
         S_SEED_PASSWORD_ADITYA: ${{ secrets.SEED_PASSWORD_ADITYA }}
+        S_SEED_PASSWORD_ARUNKUMAR: ${{ secrets.SEED_PASSWORD_ARUNKUMAR }}
       run: |
         kubectl create secret generic datananite-secrets \
           --namespace="$NAMESPACE" \
@@ -95,6 +96,7 @@ jobs:
           --from-literal=SEED_PASSWORD_SREEJA="$S_SEED_PASSWORD_SREEJA" \
           --from-literal=SEED_PASSWORD_SUSMITA="$S_SEED_PASSWORD_SUSMITA" \
           --from-literal=SEED_PASSWORD_ADITYA="$S_SEED_PASSWORD_ADITYA" \
+          --from-literal=SEED_PASSWORD_ARUNKUMAR="$S_SEED_PASSWORD_ARUNKUMAR" \
           --dry-run=client -o yaml | kubectl apply -f -
 
     - name: Apply Namespace, ConfigMap and PVCs

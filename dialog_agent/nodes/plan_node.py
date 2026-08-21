@@ -3343,6 +3343,83 @@ _EXACT_EQUALITY_FILTER = re.compile(
 )
 
 
+_TABLE_HEADER_RE = re.compile(r'^Table:\s*(.+)$', re.MULTILINE)
+_SAMPLE_VALUES_LINE_RE = re.compile(r'^\s{2,4}"?Sample values"?\s*:\s*(.*)$', re.MULTILINE | re.IGNORECASE)
+_ALL_STORED_VALUES_RE = re.compile(r'\[categorical\s*—\s*ALL stored values:\s*(.*?)\]', re.IGNORECASE)
+_QUOTED_VALUE_RE = re.compile(r"'((?:[^'\\]|\\.)*)'")
+
+
+def _parse_quoted_value_list(text: str) -> List[str]:
+    """Extract every single-quoted literal from a "'a', 'b', 'c'" fragment."""
+    return _QUOTED_VALUE_RE.findall(text or "")
+
+
+def _all_column_values_by_table(schema_context: str) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Parse schema_context into {BARE_TABLE_NAME (uppercase): {lowercased column
+    name: [known stored values]}}.
+
+    Mirrors the table/column-span parsing approach in _extract_column_numeric_ranges
+    (reusing _COLUMN_DECL_RE / _NON_COLUMN_LABELS), but pools literal values
+    instead of a numeric min/max — from both the inline
+    "[categorical — ALL stored values: 'a', 'b', ...]" annotation on a
+    column's own declaration line, and any separate "Sample values": '...'
+    landmark line that follows it (before the next column declaration).
+    """
+    result: Dict[str, Dict[str, List[str]]] = {}
+    text = schema_context or ""
+    if not text:
+        return result
+
+    table_matches = list(_TABLE_HEADER_RE.finditer(text))
+    col_matches = [
+        m for m in _COLUMN_DECL_RE.finditer(text)
+        if m.group(1).lower() not in _NON_COLUMN_LABELS
+    ]
+    sample_line_matches = list(_SAMPLE_VALUES_LINE_RE.finditer(text))
+    if not col_matches:
+        return result
+
+    def _table_for_pos(pos: int) -> str:
+        current = "UNKNOWN"
+        for tm in table_matches:
+            if tm.start() > pos:
+                break
+            current = tm.group(1).split(".")[-1].strip().strip('"').upper()
+        return current
+
+    for i, cm in enumerate(col_matches):
+        col = cm.group(1).lower()
+        span_end = col_matches[i + 1].start() if i + 1 < len(col_matches) else len(text)
+        table = _table_for_pos(cm.start())
+
+        decl_line_end = text.find("\n", cm.start())
+        if decl_line_end == -1:
+            decl_line_end = len(text)
+        decl_line = text[cm.start():decl_line_end]
+
+        values: List[str] = []
+        m_inline = _ALL_STORED_VALUES_RE.search(decl_line)
+        if m_inline:
+            values.extend(_parse_quoted_value_list(m_inline.group(1)))
+
+        for sm in sample_line_matches:
+            if cm.end() <= sm.start() < span_end:
+                values.extend(_parse_quoted_value_list(sm.group(1)))
+                break
+
+        if not values:
+            continue
+
+        table_cols = result.setdefault(table, {})
+        existing = table_cols.setdefault(col, [])
+        for v in values:
+            if v not in existing:
+                existing.append(v)
+
+    return result
+
+
 def _sample_values_for_column(schema_context: str, col: str) -> List[str]:
     """
     Case-insensitive, table-agnostic lookup of the sample/categorical values

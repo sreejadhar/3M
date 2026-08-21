@@ -569,9 +569,9 @@ def _fuzzy_match_candidates(
             for val in vals:
                 if val is None:
                     continue
-                val_lower = val.lower()
+                val_lower = str(val).lower()
                 matched_tokens = {t for t in query_tokens if _token_matches_text(t, val_lower)}
-                matched_tokens |= {t for t in acronym_tokens if _initials_match(t, val)}
+                matched_tokens |= {t for t in acronym_tokens if _initials_match(t, str(val))}
                 if not matched_tokens:
                     continue
 
@@ -600,7 +600,7 @@ def _fuzzy_match_candidates(
                         promoted_parents.add(pkey)
                         # Score the parent candidate by how well the query tokens
                         # match the parent value itself
-                        pval_lower = pval.lower()
+                        pval_lower = str(pval).lower()
                         p_matched = {t for t in query_tokens if _token_matches_text(t, pval_lower)}
                         # Only promote parents with at least some token affinity
                         # OR where the child match is strong (score >= 1)
@@ -620,7 +620,7 @@ def _fuzzy_match_candidates(
                             })
 
     # Sort: promoted parents first (higher score), then direct matches; tie-break shorter value
-    return sorted(candidates, key=lambda x: (-x["score"], len(x["stored_value"])))
+    return sorted(candidates, key=lambda x: (-x["score"], len(str(x["stored_value"]))))
 
 
 def _build_categorical_context(

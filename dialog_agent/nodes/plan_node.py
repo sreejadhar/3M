@@ -1730,14 +1730,14 @@ CRITICAL REMINDERS:
   KPI by name, use the pre-defined sql_expression verbatim — do not rewrite it.
 - ABBREVIATION GLOSSARY HINTS (see section above if present): these are governed
   abbreviation→full-form mappings discovered by profiling this source's own columns —
-  but only the bare abbreviation side is confirmed stored data; the full form is a
-  definition/expansion, not confirmed to be how the column stores it. When the question
-  uses an abbreviation (or its full form) listed there, filter using an exact equality
-  on the confirmed abbreviation OR'd with an (unbroken, unsplit) LIKE on the full form
-  — e.g. (LOWER(col) = 'it' OR LOWER(col) LIKE '%information technology%'). Do NOT
-  collapse this to a bare equality on the full form, and never split the full form into
-  separate per-word LIKE clauses. This is the same hedge pattern used for un-governed
-  abbreviations — just skip the guesswork since the abbreviation side is ground truth.
+  the abbreviation side is confirmed stored data. When the question uses an abbreviation
+  (or its full form) listed there, the user is naming a known, confirmed concept, not
+  asking for a fuzzy substring search — filter using an EXACT EQUALITY on BOTH spellings:
+  (LOWER(col) = 'it' OR LOWER(col) = 'information technology'). Do NOT use LIKE for the
+  full form here, and never split the full form into separate per-word clauses. This is
+  stricter than the LIKE-based hedge used for un-governed abbreviations (built-in
+  guesses not backed by this source's glossary), where the full-form expansion is only
+  a plausible guess and still needs a LIKE substring safety net.
 - VERIFIED EXAMPLES (see VERIFIED PAST CORRECTIONS section above if present): these are
   SQL queries a human has already confirmed correct for a similar question on THIS EXACT
   data source. They encode source-specific facts (which column is the real signal, which
@@ -3410,18 +3410,26 @@ def _fix_short_acronym_like_filters(sql: str, extra_expansions: Optional[Dict[st
 
     extra_expansions: source-specific {abbreviation: full_form} pairs from the
     governed abbreviation glossary (see get_glossary_abbreviation_map in
-    resolve_node.py) — merged over the fixed built-in list so this covers
-    whatever abbreviations THIS source's data actually contains, not just the
-    hardcoded defaults.
+    resolve_node.py). Unlike the fixed built-in list (a generic guess at what
+    the expansion might be), these are CONFIRMED for this source — profiling
+    discovered the abbreviation itself in real column values, and full_form is
+    the exact spelling a human approved for it — so when the term matches a
+    governed entry, hedge with an exact equality on BOTH spellings (not a
+    LIKE on the full form): the user is naming a known, confirmed value, not
+    guessing at a substring. Un-governed terms keep the LIKE-based hedge
+    since the full-form expansion there is only a plausible guess.
     """
-    expansions = _ABBREVIATION_EXPANSIONS
-    if extra_expansions:
-        expansions = {**_ABBREVIATION_EXPANSIONS, **extra_expansions}
+    guess_expansions = _ABBREVIATION_EXPANSIONS
+    confirmed_expansions = extra_expansions or {}
 
     def _replace(m: re.Match) -> str:
         col = m.group(1)
         term = m.group(2).lower()
-        expansion = expansions.get(term)
+        if term in confirmed_expansions:
+            full_form = confirmed_expansions[term]
+            lit = _sql_escape_literal(full_form)
+            return f"(LOWER({col}) = '{term}' OR LOWER({col}) = '{lit}')"
+        expansion = guess_expansions.get(term)
         if expansion:
             return f"(LOWER({col}) = '{term}' OR LOWER({col}) LIKE '%{expansion}%')"
         # No known expansion — fall back to word-boundary-safe matching so the
@@ -3486,18 +3494,19 @@ def _fix_unhedged_expansion_like_filters(sql: str, extra_expansions: Optional[Di
     _fix_short_acronym_like_filters, for when the user's own wording was the
     expanded phrase rather than the abbreviation.
 
-    extra_expansions: same source-specific glossary map as
-    _fix_short_acronym_like_filters — see that docstring.
+    extra_expansions: source-specific {abbreviation: full_form} pairs from the
+    governed abbreviation glossary — see _fix_short_acronym_like_filters'
+    docstring for why these get an exact-equality hedge (both sides) instead
+    of a LIKE on the full form, unlike the un-governed built-in guesses.
     """
-    expansions = _ABBREVIATION_EXPANSIONS
-    if extra_expansions:
-        expansions = {**_ABBREVIATION_EXPANSIONS, **extra_expansions}
-    expansion_to_abbrev = {v: k for k, v in expansions.items()}
+    guess_expansion_to_abbrev = {v: k for k, v in _ABBREVIATION_EXPANSIONS.items()}
+    confirmed_expansion_to_abbrev = {v: k for k, v in (extra_expansions or {}).items()}
 
     def _replace(m: re.Match) -> str:
         col, raw_phrase = m.group(1), m.group(2)
         phrase = _normalize_phrase_for_abbrev_lookup(raw_phrase)
-        abbrev = expansion_to_abbrev.get(phrase)
+        confirmed = phrase in confirmed_expansion_to_abbrev
+        abbrev = confirmed_expansion_to_abbrev.get(phrase) or guess_expansion_to_abbrev.get(phrase)
         if not abbrev:
             return m.group(0)  # not a known expansion — leave untouched
         # Already hedged with an equality on the abbreviation for this same
@@ -3509,6 +3518,8 @@ def _fix_unhedged_expansion_like_filters(sql: str, extra_expansions: Optional[Di
         if already_hedged:
             return m.group(0)
         lit = _sql_escape_literal(phrase)
+        if confirmed:
+            return f"(LOWER({col}) = '{abbrev}' OR LOWER({col}) = '{lit}')"
         return f"(LOWER({col}) = '{abbrev}' OR LOWER({col}) LIKE '%{lit}%')"
 
     fixed = _FULL_EXPANSION_LIKE_FILTER.sub(_replace, sql)
@@ -3544,18 +3555,19 @@ def _fix_unhedged_expansion_equality_filters(sql: str, extra_expansions: Optiona
     _fix_unhedged_expansion_like_filters, for when the LLM committed straight
     to an exact-match filter on the expanded phrase instead of hedging.
 
-    extra_expansions: same source-specific glossary map as
-    _fix_short_acronym_like_filters — see that docstring.
+    extra_expansions: source-specific {abbreviation: full_form} pairs from the
+    governed abbreviation glossary — see _fix_short_acronym_like_filters'
+    docstring for why these get an exact-equality hedge (both sides) instead
+    of a LIKE on the full form, unlike the un-governed built-in guesses.
     """
-    expansions = _ABBREVIATION_EXPANSIONS
-    if extra_expansions:
-        expansions = {**_ABBREVIATION_EXPANSIONS, **extra_expansions}
-    expansion_to_abbrev = {v: k for k, v in expansions.items()}
+    guess_expansion_to_abbrev = {v: k for k, v in _ABBREVIATION_EXPANSIONS.items()}
+    confirmed_expansion_to_abbrev = {v: k for k, v in (extra_expansions or {}).items()}
 
     def _replace(m: re.Match) -> str:
         col, raw_phrase = m.group(1), m.group(2)
         phrase = _normalize_phrase_for_abbrev_lookup(raw_phrase)
-        abbrev = expansion_to_abbrev.get(phrase)
+        confirmed = phrase in confirmed_expansion_to_abbrev
+        abbrev = confirmed_expansion_to_abbrev.get(phrase) or guess_expansion_to_abbrev.get(phrase)
         if not abbrev:
             return m.group(0)  # not a known expansion — leave untouched
         # Already hedged with an equality on the abbreviation for this same
@@ -3567,6 +3579,8 @@ def _fix_unhedged_expansion_equality_filters(sql: str, extra_expansions: Optiona
         if already_hedged:
             return m.group(0)
         lit = _sql_escape_literal(phrase)
+        if confirmed:
+            return f"(LOWER({col}) = '{abbrev}' OR LOWER({col}) = '{lit}')"
         return f"(LOWER({col}) = '{abbrev}' OR LOWER({col}) LIKE '%{lit}%')"
 
     fixed = _FULL_EXPANSION_EQUALITY_FILTER.sub(_replace, sql)

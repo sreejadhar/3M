@@ -699,10 +699,16 @@ def _build_abbrev_hint_section(source_id: str) -> str:
     Format governed abbreviation-glossary terms for this source as an
     ABBREVIATION GLOSSARY HINTS block. Unlike KEYWORD MATCH HINTS (proven
     token overlap) this is a GROUND-TRUTH mapping discovered by profiling
-    this source's own columns (abbrev_glossary_generate.py) — the LLM should
-    use the exact stored spelling it records rather than guessing/hedging
-    both spellings the way Rule 5 (SEMANTIC MATCH) has to for un-governed
-    abbreviations.
+    this source's own columns (abbrev_glossary_generate.py) — but only the
+    BARE ABBREVIATION side is confirmed stored data (it was discovered by
+    scanning actual column values for short all-caps tokens). The full_form
+    is an LLM-generated expansion/definition for readability, NOT something
+    confirmed present in the column — the real data may or may not also
+    spell it out in full. So the LLM should use an exact equality on the
+    confirmed abbreviation OR'd with an (unbroken, unsplit) LIKE on the full
+    form, same hedge pattern as Rule 5 (SEMANTIC MATCH) uses for un-governed
+    abbreviations — just skip Rule 5's guesswork since the abbreviation side
+    is already ground truth here.
     """
     if not source_id or _abr is None:
         return ""
@@ -731,8 +737,12 @@ def _build_abbrev_hint_section(source_id: str) -> str:
     lines = [
         "ABBREVIATION GLOSSARY HINTS (governed, discovered from this source's own columns — ground truth, not a guess):",
         "Each entry names the abbreviation, its full form, and the exact table/column where the abbreviation "
-        "is the value actually STORED. If the user's term matches either spelling, use the stored spelling "
-        "directly — do NOT hedge with an OR of both spellings for these entries.",
+        "is the value actually STORED. Only the abbreviation spelling is confirmed stored data — the full form "
+        "is a definition/expansion for your understanding, NOT confirmed to be how the column stores it. "
+        "If the user's term matches either spelling, use an exact equality on the confirmed abbreviation "
+        "OR'd with an (unbroken, unsplit) LIKE on the full form, e.g. "
+        "(LOWER(col) = 'it' OR LOWER(col) LIKE '%information technology%') — do NOT collapse this to a bare "
+        "equality on the full form, and never split the full form into separate per-word LIKE clauses.",
         "",
     ]
     added = 0
@@ -762,12 +772,17 @@ def _build_abbrev_hint_section(source_id: str) -> str:
                         break
             lines.append(
                 f'  "{abbrev}" = "{full_form}"  →  table={table_name!r}  column={column_name!r}  '
-                f'(stored spelling: {abbrev!r})'
+                f"(confirmed stored: {abbrev!r} — filter: LOWER(col) = '{abbrev.lower()}' "
+                f"OR LOWER(col) LIKE '%{full_form.lower()}%')"
             )
             located = True
             added += 1
         if not located:
-            lines.append(f'  "{abbrev}" = "{full_form}"')
+            lines.append(
+                f'  "{abbrev}" = "{full_form}"  '
+                f"(confirmed stored: {abbrev!r} — filter: LOWER(col) = '{abbrev.lower()}' "
+                f"OR LOWER(col) LIKE '%{full_form.lower()}%')"
+            )
             added += 1
     if not added:
         return ""

@@ -1730,10 +1730,14 @@ CRITICAL REMINDERS:
   KPI by name, use the pre-defined sql_expression verbatim — do not rewrite it.
 - ABBREVIATION GLOSSARY HINTS (see section above if present): these are governed
   abbreviation→full-form mappings discovered by profiling this source's own columns —
-  ground truth, not a guess. When the question uses an abbreviation (or its full form)
-  listed there, filter using the exact stored spelling the hint records; do NOT hedge
-  with an OR of both spellings for an abbreviation covered by this section. Only fall
-  back to guessing/hedging both spellings for abbreviations NOT listed there.
+  but only the bare abbreviation side is confirmed stored data; the full form is a
+  definition/expansion, not confirmed to be how the column stores it. When the question
+  uses an abbreviation (or its full form) listed there, filter using an exact equality
+  on the confirmed abbreviation OR'd with an (unbroken, unsplit) LIKE on the full form
+  — e.g. (LOWER(col) = 'it' OR LOWER(col) LIKE '%information technology%'). Do NOT
+  collapse this to a bare equality on the full form, and never split the full form into
+  separate per-word LIKE clauses. This is the same hedge pattern used for un-governed
+  abbreviations — just skip the guesswork since the abbreviation side is ground truth.
 - VERIFIED EXAMPLES (see VERIFIED PAST CORRECTIONS section above if present): these are
   SQL queries a human has already confirmed correct for a similar question on THIS EXACT
   data source. They encode source-specific facts (which column is the real signal, which
@@ -3125,6 +3129,167 @@ def _qualify_sql(sql: str, db_schema: str, known_tables: List[str]) -> str:
     return sql
 
 
+# Typographic (curly) apostrophe/quote characters that occasionally show up
+# in an LLM-generated string literal instead of a straight ASCII apostrophe.
+_TYPOGRAPHIC_APOSTROPHES = "’‘ʼ′´"
+
+_APOS_COL_CMP_RE = re.compile(
+    r'(?P<lower>LOWER\(\s*)?'
+    r'(?P<col>(?:"[^"]+"|[A-Za-z_]\w*)(?:\.(?:"[^"]+"|[A-Za-z_]\w*))?)'
+    r'(?P<close>\s*\))?'
+    r'(?P<sp1>\s*)(?P<op>=|LIKE)(?P<sp2>\s*)'
+    r"'(?P<lit>(?:[^'\\]|'')*)'",
+    re.IGNORECASE,
+)
+
+
+def _normalize_typographic_apostrophes(sql: str) -> str:
+    """
+    Normalize typographic (curly) apostrophes that landed *inside a SQL
+    string literal* into a properly-escaped straight apostrophe (`''`).
+
+    An LLM occasionally copies a curly apostrophe (’, U+2019) straight out of
+    the natural-language question into a string literal, e.g.:
+        WHERE "DEGREE" = 'doctor’s degree'
+    That parses as valid SQL (’ is not a SQL quote character) but the value
+    "doctor’s degree" (curly) will never equal a real value stored as
+    "doctor's degree" (straight) — the filter silently returns 0 rows.
+
+    This walks the SQL text tracking single-quoted string boundaries (so
+    double-quoted identifiers and code outside literals are left untouched)
+    and rewrites any typographic apostrophe found *inside* a literal into a
+    standard escaped straight apostrophe (`''`) — UNLESS the entire literal
+    is a single typographic-apostrophe character on its own. That exact
+    one-character literal is the marker this same fix inserts as the "from"
+    argument of a REPLACE(col, '’', '''') call it generates (see
+    _fix_text_literal_comparison_mismatches); leaving it alone keeps this
+    function idempotent when it runs again over already-fixed SQL (e.g. the
+    impossible-threshold corrective-retry path re-processes previously
+    generated SQL) instead of corrupting its own REPLACE() marker.
+    """
+    if not sql or not any(ch in sql for ch in _TYPOGRAPHIC_APOSTROPHES):
+        return sql
+
+    out = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch != "'":
+            out.append(ch)
+            i += 1
+            continue
+
+        # Found the start of a string literal — consume it whole so we can
+        # inspect its full content before deciding how to rewrite it.
+        j = i + 1
+        content = []
+        while j < n:
+            if sql[j] == "'":
+                if j + 1 < n and sql[j + 1] == "'":
+                    content.append("''")
+                    j += 2
+                    continue
+                break
+            content.append(sql[j])
+            j += 1
+        raw = "".join(content)
+
+        if raw in _TYPOGRAPHIC_APOSTROPHES:
+            # Our own REPLACE(...) marker literal — leave untouched.
+            out.append(f"'{raw}'")
+        else:
+            fixed = raw
+            for apos in _TYPOGRAPHIC_APOSTROPHES:
+                fixed = fixed.replace(apos, "''")
+            out.append(f"'{fixed}'")
+
+        i = j + 1  # skip the closing quote
+
+    return "".join(out)
+
+
+def _collapse_and_trim_sql_expr(expr: str) -> str:
+    """
+    Wrap *expr* (a SQL column/value expression) so that any run of extra
+    whitespace collapses to a single space and leading/trailing whitespace is
+    dropped, using only REPLACE()/TRIM() — both supported by every dialect
+    this pipeline targets (SQLite, Postgres, Snowflake, SQL Server, MySQL),
+    unlike REGEXP_REPLACE which several of them lack.
+
+    Doubling-replace collapses any run of 2^N spaces (here up to 16) down to
+    one; four passes is enough for the "extra spaces from copy/paste or messy
+    data entry" case this guards against.
+    """
+    e = expr
+    for _ in range(4):
+        e = f"REPLACE({e}, '  ', ' ')"
+    return f"TRIM({e})"
+
+
+def _fix_text_literal_comparison_mismatches(sql: str) -> str:
+    """
+    Guard simple text equality/LIKE filters against two common data-quality
+    mismatches between the literal the LLM writes and how the value is
+    actually stored:
+
+    1. Typographic apostrophe: the question "doctor's degree" produces the
+       (correct) SQL literal 'doctor''s degree', but the column value is
+       stored as "doctor’s degree" (curly apostrophe) — an exact filter then
+       silently returns 0 rows. Handled by _normalize_typographic_apostrophes
+       first (folds any curly apostrophe the LLM embedded directly in the
+       literal into the same escaped straight form) and then, when the
+       literal contains an escaped apostrophe, wrapping the column with
+       REPLACE(<col>, '<curly>', '''') to normalize a curly apostrophe in the
+       stored value to a straight one before comparison.
+
+    2. Extra/irregular whitespace: stored text often has leading/trailing or
+       doubled internal spaces ("Doctor's  Degree ") that a clean literal
+       ("doctor's degree") will never exactly match. Handled by wrapping the
+       column with TRIM()+collapse-doubled-spaces (see
+       _collapse_and_trim_sql_expr) and collapsing/trimming the literal text
+       itself the same way, so both sides compare on normalized whitespace.
+
+    Combined result, e.g.:
+        WHERE LOWER(TRIM(REPLACE(REPLACE(REPLACE(REPLACE(
+            REPLACE("DEGREE", '’', ''''), '  ', ' '), '  ', ' '),
+            '  ', ' '), '  ', ' '))) = 'doctor''s degree'
+
+    Deliberately narrow: only touches a simple `<col> = 'lit'` /
+    `<col> LIKE 'lit'` comparison (optionally `LOWER(<col>)`), and only wraps
+    a bare column / LOWER(col) expression — never one already wrapped by this
+    same fix — so it is idempotent and does not affect any other query
+    pattern (joins, IN-lists, numeric filters, etc. are untouched since the
+    regex only matches a single quoted string literal after = / LIKE).
+    """
+    sql = _normalize_typographic_apostrophes(sql)
+
+    curly = _TYPOGRAPHIC_APOSTROPHES[0]  # U+2019, the overwhelmingly common case
+
+    def _repl(m: "re.Match") -> str:
+        lit = m.group("lit")
+        # Only engage for literals that look like free text (letters), not
+        # numeric/date/code comparisons — leave those completely untouched.
+        if not re.search(r'[A-Za-z]', lit):
+            return m.group(0)
+
+        col = m.group("col")
+        op  = m.group("op")
+        sp1 = m.group("sp1")
+        sp2 = m.group("sp2")
+
+        inner = col
+        has_apostrophe = "''" in lit
+        if has_apostrophe:
+            inner = f"REPLACE({inner}, '{curly}', '''')"
+        inner = _collapse_and_trim_sql_expr(inner)
+        expr = f"LOWER({inner})" if m.group("lower") else inner
+
+        norm_lit = re.sub(r'\s+', ' ', lit).strip()
+        return f"{expr}{sp1}{op}{sp2}'{norm_lit}'"
+
+    return _APOS_COL_CMP_RE.sub(_repl, sql)
+
+
 _PERCENTAGE_KEYWORDS = re.compile(
     r'\b(percent(?:age)?|%|share|proportion|breakdown|distribution|'
     r'ratio|split|how\s+much\s+(?:is|are)|out\s+of\s+total)\b',
@@ -3275,6 +3440,26 @@ def _fix_short_acronym_like_filters(sql: str, extra_expansions: Optional[Dict[st
     return fixed
 
 
+# Normalization applied to a captured literal phrase BEFORE looking it up in
+# the expansions dict, so a messy LLM-emitted literal — a typographic (curly)
+# apostrophe, doubled/trailing internal whitespace, an escaped SQL ''
+# apostrophe — still resolves to the same dict key as the clean canonical
+# form. Without this, _fix_unhedged_expansion_like_filters /
+# _fix_unhedged_expansion_equality_filters silently no-op on exactly the
+# messy literals they exist to hedge, leaving an unhedged filter behind (the
+# whitespace/apostrophe normalizer that runs later in the pipeline cleans up
+# the literal's spelling but knows nothing about abbreviation hedging).
+def _normalize_phrase_for_abbrev_lookup(raw: str) -> str:
+    s = raw.replace("''", "'")
+    for apos in _TYPOGRAPHIC_APOSTROPHES:
+        s = s.replace(apos, "'")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _sql_escape_literal(text: str) -> str:
+    return text.replace("'", "''")
+
+
 # Mirror of _ABBREVIATION_EXPANSIONS — a user asking about "Information
 # Technology" and a user asking about "IT" mean the exact same filter, but
 # the LLM sometimes only hedges when the USER typed the abbreviation (see
@@ -3283,8 +3468,13 @@ def _fix_short_acronym_like_filters(sql: str, extra_expansions: Optional[Dict[st
 # emitting only LOWER(col) LIKE '%information technology%' with no OR'd
 # equality on the bare 'it'. Since the real column may store either
 # spelling, enforce the same bidirectional hedge deterministically here too.
+# The captured phrase is normalized (see _normalize_phrase_for_abbrev_lookup)
+# before the dict lookup below, so the character class here is deliberately
+# permissive (anything but the '%'/quote delimiters) rather than [a-z &] —
+# that stricter class used to silently reject literals containing a curly
+# apostrophe or a trailing space.
 _FULL_EXPANSION_LIKE_FILTER = re.compile(
-    r"LOWER\(\s*([\w.\"]+)\s*\)\s*LIKE\s*'%([a-z][a-z &]+[a-z])%'",
+    r"LOWER\(\s*([\w.\"]+)\s*\)\s*LIKE\s*'%([^%']+)%'",
     re.IGNORECASE,
 )
 
@@ -3305,7 +3495,8 @@ def _fix_unhedged_expansion_like_filters(sql: str, extra_expansions: Optional[Di
     expansion_to_abbrev = {v: k for k, v in expansions.items()}
 
     def _replace(m: re.Match) -> str:
-        col, phrase = m.group(1), m.group(2).lower()
+        col, raw_phrase = m.group(1), m.group(2)
+        phrase = _normalize_phrase_for_abbrev_lookup(raw_phrase)
         abbrev = expansion_to_abbrev.get(phrase)
         if not abbrev:
             return m.group(0)  # not a known expansion — leave untouched
@@ -3317,13 +3508,72 @@ def _fix_unhedged_expansion_like_filters(sql: str, extra_expansions: Optional[Di
         )
         if already_hedged:
             return m.group(0)
-        return f"(LOWER({col}) = '{abbrev}' OR LOWER({col}) LIKE '%{phrase}%')"
+        lit = _sql_escape_literal(phrase)
+        return f"(LOWER({col}) = '{abbrev}' OR LOWER({col}) LIKE '%{lit}%')"
 
     fixed = _FULL_EXPANSION_LIKE_FILTER.sub(_replace, sql)
     if fixed != sql:
         logger.info(
             "plan_node: rewrote unhedged full-expansion LIKE filter(s) into "
             "word-boundary-safe OR'd equality/LIKE on the matching abbreviation"
+        )
+    return fixed
+
+
+# Same mirror-image gap as _fix_unhedged_expansion_like_filters above, but for
+# a bare EQUALITY on the expanded phrase instead of a LIKE — e.g. the LLM (or
+# a governed ABBREVIATION GLOSSARY HINT, which only confirms the bare
+# abbreviation as actually stored — the full form is a definition, not
+# confirmed stored data) commits to LOWER(col) = 'information technology'
+# outright. That is unhedged: it silently misses rows where the real column
+# stores the bare abbreviation instead, and — unlike the LIKE case — it isn't
+# even a superset match, so a real IT-department row stored as "IT" would be
+# dropped entirely. Rewrite it into the same OR'd equality/LIKE hedge pair.
+# Same permissive character class + normalize-before-lookup reasoning as
+# _FULL_EXPANSION_LIKE_FILTER above.
+_FULL_EXPANSION_EQUALITY_FILTER = re.compile(
+    r"LOWER\(\s*([\w.\"]+)\s*\)\s*=\s*'([^']+)'",
+    re.IGNORECASE,
+)
+
+
+def _fix_unhedged_expansion_equality_filters(sql: str, extra_expansions: Optional[Dict[str, str]] = None) -> str:
+    """
+    Rewrite a bare LOWER(col) = '<known abbreviation expansion>' into an
+    OR'd equality/LIKE pair — the equality-comparison counterpart of
+    _fix_unhedged_expansion_like_filters, for when the LLM committed straight
+    to an exact-match filter on the expanded phrase instead of hedging.
+
+    extra_expansions: same source-specific glossary map as
+    _fix_short_acronym_like_filters — see that docstring.
+    """
+    expansions = _ABBREVIATION_EXPANSIONS
+    if extra_expansions:
+        expansions = {**_ABBREVIATION_EXPANSIONS, **extra_expansions}
+    expansion_to_abbrev = {v: k for k, v in expansions.items()}
+
+    def _replace(m: re.Match) -> str:
+        col, raw_phrase = m.group(1), m.group(2)
+        phrase = _normalize_phrase_for_abbrev_lookup(raw_phrase)
+        abbrev = expansion_to_abbrev.get(phrase)
+        if not abbrev:
+            return m.group(0)  # not a known expansion — leave untouched
+        # Already hedged with an equality on the abbreviation for this same
+        # column somewhere in the query — don't double up.
+        already_hedged = re.search(
+            rf"LOWER\(\s*{re.escape(col)}\s*\)\s*=\s*'{re.escape(abbrev)}'",
+            sql, re.IGNORECASE,
+        )
+        if already_hedged:
+            return m.group(0)
+        lit = _sql_escape_literal(phrase)
+        return f"(LOWER({col}) = '{abbrev}' OR LOWER({col}) LIKE '%{lit}%')"
+
+    fixed = _FULL_EXPANSION_EQUALITY_FILTER.sub(_replace, sql)
+    if fixed != sql:
+        logger.info(
+            "plan_node: rewrote unhedged full-expansion equality filter(s) into "
+            "OR'd equality/LIKE on the matching abbreviation"
         )
     return fixed
 
@@ -5643,6 +5893,7 @@ def plan_node(state: DialogState) -> DialogState:
             sql = _fix_split_expansion_like_filters(sql, glossary_expansions)
             sql = _fix_short_acronym_like_filters(sql, glossary_expansions)
             sql = _fix_unhedged_expansion_like_filters(sql, glossary_expansions)
+            sql = _fix_unhedged_expansion_equality_filters(sql, glossary_expansions)
             sql = _fix_unhedged_acronym_derived_like_filters(sql, natural_query, schema_context)
             sql = _dedupe_redundant_generic_like_clauses(sql)
             sql = _fix_percentage(sql, natural_query, config.db_type)
@@ -5975,6 +6226,14 @@ def plan_node(state: DialogState) -> DialogState:
                     "verify manually or prefer COUNT(DISTINCT <base_table_pk>)."
                 )
 
+            # Text-literal comparison normalization (typographic apostrophes,
+            # extra/irregular whitespace) runs LAST, after every hallucination/
+            # join/cross-table check above — those checks regex-match raw
+            # `alias.column` tokens directly followed by an operator, and
+            # wrapping a column in REPLACE(...)/TRIM(...) any earlier would
+            # stop them from recognizing it.
+            sql = _fix_text_literal_comparison_mismatches(sql)
+
             valid.append(
                 SQLQuery(
                     query_id    = item.get("query_id", f"q{offset + len(valid) + 1}"),
@@ -6136,6 +6395,11 @@ def plan_node(state: DialogState) -> DialogState:
                         current_sql = candidate  # let the next attempt build on this one
                         continue
 
+                    # Runs last, after the hallucination/cross-table checks above,
+                    # same reasoning as the first-pass validator: wrapping a column
+                    # in REPLACE(...)/TRIM(...) any earlier would stop those regex
+                    # checks from recognizing the raw alias.column token.
+                    candidate = _fix_text_literal_comparison_mismatches(candidate)
                     q["sql"] = candidate
                     logger.info(
                         "plan_node: query %s corrected (impossible-threshold fix "

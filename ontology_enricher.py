@@ -404,8 +404,7 @@ def _inject_kg_nodes() -> Dict[str, int]:
     for k in kpis:
         sql = k.get("sql_expression", "")
         cols = {_norm(c) for c in _extract_sql_columns(sql)} - {""}
-        if cols:
-            kpi_cols.append((k["kpi_id"], cols, k))
+        kpi_cols.append((k["kpi_id"], cols, k))
 
     sources = _kg.load_all()
     sources_updated = total_nodes = total_edges = 0
@@ -447,6 +446,15 @@ def _inject_kg_nodes() -> Dict[str, int]:
 
         new_nodes: List[Dict] = []
         new_edges: List[Dict] = []
+
+        # KPIs declare which datasource they belong to via source_id. Only
+        # inject a KPI's node into that source's KG snapshot — a KPI with no
+        # source_id set (legacy rows predating this field) still broadcasts
+        # to every source by column match, same as before.
+        src_kpi_cols = [
+            (kpi_id, col_norms, k) for kpi_id, col_norms, k in kpi_cols
+            if not k.get("source_id") or k.get("source_id") == src["id"]
+        ]
 
         # ── Glossary concept nodes ────────────────────────────────────────────
         for term_id, variants, t in term_norms:
@@ -493,7 +501,7 @@ def _inject_kg_nodes() -> Dict[str, int]:
                 })
 
         # ── KPI metric nodes ──────────────────────────────────────────────────
-        for kpi_id, col_norms, k in kpi_cols:
+        for kpi_id, col_norms, k in src_kpi_cols:
             node_id = f"kpi:{kpi_id}"
             direction_arrow = "↑" if k.get("direction") == "up" else "↓"
             title_parts = [

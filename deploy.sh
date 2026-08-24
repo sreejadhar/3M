@@ -84,11 +84,21 @@ check_env() {
         set +a
     fi
 
-    if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-        warn "ANTHROPIC_API_KEY is not set. LLM features will be unavailable."
-        warn "Set it in .env or export it: export ANTHROPIC_API_KEY=sk-ant-..."
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        success "ANTHROPIC_API_KEY detected — services will use the direct Anthropic API (local-dev override)."
     else
-        success "ANTHROPIC_API_KEY detected."
+        info "No ANTHROPIC_API_KEY set — services will use AWS Bedrock (default), assuming"
+        info "  ${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
+        info "  via STS. Verify the EC2 instance role can sts:AssumeRole that ARN."
+        if ! command -v aws &>/dev/null; then
+            warn "aws CLI not found — skipping a live STS check. LLM calls will still work"
+            warn "as long as the app's own boto3 client can assume the role at runtime."
+        elif aws sts get-caller-identity &>/dev/null; then
+            success "AWS credentials reachable on this host (instance role / IMDS OK)."
+        else
+            warn "Could not resolve AWS credentials via 'aws sts get-caller-identity'."
+            warn "Bedrock/Neptune calls will fail until the EC2 instance role is attached."
+        fi
     fi
 }
 
@@ -250,8 +260,16 @@ cmd_help() {
     echo "  --status         Show container status"
     echo "  --help           Show this help message"
     echo ""
+    echo -e "${BOLD}AWS setup check:${RESET} run ./verify_aws.sh before first deploy to confirm the"
+    echo "  execution role can be assumed, Neptune is reachable, and Bedrock responds."
+    echo ""
     echo -e "${BOLD}Environment variables (set in .env or export):${RESET}"
-    echo "  ANTHROPIC_API_KEY   Required for LLM Q&A features"
+    echo "  AWS_ASSUME_ROLE_ARN Cross-account role for Bedrock/Neptune"
+    echo "                      (default: arn:aws:iam::336756484937:role/datananite-dev-execution-role)"
+    echo "  AWS_REGION          AWS region for STS/Bedrock/Neptune (default: us-east-1)"
+    echo "  NEPTUNE_WRITER_ENDPOINT / NEPTUNE_READER_ENDPOINT / NEPTUNE_PORT"
+    echo "                      KG graph storage (defaults point at datananite-dev-neptune)"
+    echo "  ANTHROPIC_API_KEY   Optional — direct Anthropic API for local dev (overrides Bedrock)"
     echo "  AGENT_PORT          Agent API port      (default: 8000)"
     echo "  ONTOLOGY_PORT       Ontology API port   (default: 8001)"
     echo "  KG_PORT             KG API port         (default: 8002)"

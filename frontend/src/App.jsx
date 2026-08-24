@@ -17,7 +17,6 @@ import AbbrevGlossary from './views/AbbrevGlossary.jsx';
 import Kpi from './views/Kpi.jsx';
 import SqlConsole from './views/SqlConsole.jsx';
 import ChangeLog from './views/ChangeLog.jsx';
-import DocumentIntelligence from './views/DocumentIntelligence.jsx';
 
 const VIEWS = {
   pipeline: PipelineMonitor,
@@ -32,7 +31,6 @@ const VIEWS = {
   kpi: Kpi,
   sql: SqlConsole,
   cdc: ChangeLog,
-  documents: DocumentIntelligence,
 };
 
 function Workbench() {

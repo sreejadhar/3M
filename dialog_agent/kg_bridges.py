@@ -4,8 +4,8 @@ KG Bridge Registry — cross-KG join key definitions.
   declared  — explicitly registered by admin (confidence=1.0)
   inferred  — auto-detected by comparing column names across KGs (confidence<1.0)
 
-Persists to PostgreSQL when KG_POSTGRES_DSN is set; falls back to SQLite.
-See dialog_agent/pg_store.py for backend configuration.
+Persists to PostgreSQL when APP_ENV=production; falls back to SQLite.
+See dialog_agent/pg_store.py and pg_secrets.py for backend configuration.
 """
 from __future__ import annotations
 

@@ -49,11 +49,6 @@ export const IconCdc = (p) => (
     <polyline points="10 9 9 9 8 9" />
   </S>
 );
-export const IconDocuments = (p) => (
-  <S {...p}>
-    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-  </S>
-);
 export const IconGlossary = (p) => (
   <S {...p}>
     <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />

@@ -28,10 +28,10 @@ KG_API_URL         default http://localhost:8002
 DIALOG_API_URL     default http://localhost:8003
 DATA_DIR           default ./reports
 
-KG_POSTGRES_DSN    psycopg2 DSN — when set, kg_registry, kg_bridges and metadata use PG
 KG_FEDERATION_DB   SQLite path for KG federation tables (default data/kg_federation.db)
 METADATA_DB        SQLite path for metadata catalog     (default data/metadata.db)
-                   In production (APP_ENV=production) both tables use KG_POSTGRES_DSN.
+                   In production (APP_ENV=production) both use PostgreSQL — AWS
+                   RDS, credentials from Secrets Manager (see pg_secrets.py).
 """
 from __future__ import annotations
 
@@ -227,7 +227,6 @@ ONTOLOGY_API = os.environ.get("ONTOLOGY_API_URL", "http://localhost:8001")
 KG_API       = os.environ.get("KG_API_URL",       "http://localhost:8002")
 DIALOG_API   = os.environ.get("DIALOG_API_URL",   "http://localhost:8003")
 SHACL_API          = os.environ.get("SHACL_API_URL",          "http://localhost:8007")
-UNSTRUCTURED_API   = os.environ.get("UNSTRUCTURED_API_URL",   "http://localhost:8008")
 
 DATA_DIR  = Path(os.environ.get("DATA_DIR", "./reports"))
 UI_DIR    = Path(__file__).parent / "chat_ui"
@@ -5738,38 +5737,6 @@ async def proxy_glossary(request: Request, path: str):
         )
     except Exception as exc:
         raise HTTPException(502, f"Glossary service unavailable: {exc}")
-
-
-# ── Document Intelligence proxy route ─────────────────────────────────────────
-# Forwards /unstructured/* to the unstructured service. Additive route; all
-# other orchestrator routes and data are untouched.
-
-@app.api_route("/unstructured/{path:path}",
-               methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
-async def proxy_unstructured(request: Request, path: str):
-    body = await request.body()
-    qs   = f"?{request.url.query}" if request.url.query else ""
-    fwd_headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in _HOP_HEADERS and k.lower() != "host"}
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.request(
-                method=request.method,
-                url=f"{UNSTRUCTURED_API}/{path}{qs}",
-                headers=fwd_headers,
-                content=body,
-            )
-        resp_headers = {k: v for k, v in resp.headers.items()
-                        if k.lower() not in _HOP_HEADERS}
-        from fastapi.responses import Response as _Resp
-        return _Resp(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=resp_headers,
-            media_type=resp.headers.get("content-type"),
-        )
-    except Exception as exc:
-        raise HTTPException(502, f"Unstructured service unavailable: {exc}")
 
 
 # ── /api/* compatibility shim ─────────────────────────────────────────────────

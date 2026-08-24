@@ -8,9 +8,10 @@ orchestrator_api.py WITHOUT triggering dialog_agent/__init__.py
 
 Backend
 -------
-Production  (APP_ENV=production + KG_POSTGRES_DSN set) → PostgreSQL
-Dev / test  (default)                                   → SQLite  data/metadata.db
-                                                          (override: METADATA_DB)
+Production  (APP_ENV=production) → PostgreSQL (AWS RDS, credentials from
+                                    Secrets Manager — see pg_secrets.py)
+Dev / test  (default)             → SQLite  data/metadata.db
+                                    (override: METADATA_DB)
 
 Public API
 ----------
@@ -50,19 +51,7 @@ def _is_production() -> bool:
 
 
 def _is_postgres() -> bool:
-    if not _is_production():
-        return False
-    if os.environ.get("KG_POSTGRES_DSN", ""):
-        return True
-    logger.warning(
-        "APP_ENV=production but KG_POSTGRES_DSN is not set — "
-        "falling back to SQLite for metadata catalog."
-    )
-    return False
-
-
-def _pg_dsn() -> str:
-    return os.environ.get("KG_POSTGRES_DSN", "")
+    return _is_production()
 
 
 def _sqlite_path() -> str:
@@ -127,10 +116,9 @@ class _SQLiteCur:
 def _cursor_ctx() -> Iterator[Any]:
     """Yield a backend-agnostic cursor. Commits on success, rolls back on error."""
     if _is_postgres():
-        import psycopg2
         import psycopg2.extras
-        conn = psycopg2.connect(_pg_dsn(),
-                                cursor_factory=psycopg2.extras.RealDictCursor)
+        import pg_secrets
+        conn = pg_secrets.connect(cursor_factory=psycopg2.extras.RealDictCursor)
         cur = conn.cursor()
         try:
             yield _PGCur(conn, cur)

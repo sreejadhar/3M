@@ -68,13 +68,7 @@ def _is_production() -> bool:
 
 
 def _is_postgres() -> bool:
-    if not _is_production():
-        return False
-    return bool(os.environ.get("KG_POSTGRES_DSN", ""))
-
-
-def _pg_dsn() -> str:
-    return os.environ.get("KG_POSTGRES_DSN", "")
+    return _is_production()
 
 
 def _sqlite_path() -> str:
@@ -127,9 +121,9 @@ class _SQLiteCur:
 @contextmanager
 def _cursor_ctx() -> Iterator[Any]:
     if _is_postgres():
-        import psycopg2
         import psycopg2.extras
-        conn = psycopg2.connect(_pg_dsn(), cursor_factory=psycopg2.extras.RealDictCursor)
+        import pg_secrets
+        conn = pg_secrets.connect(cursor_factory=psycopg2.extras.RealDictCursor)
         cur = conn.cursor()
         try:
             yield _PGCur(conn, cur)

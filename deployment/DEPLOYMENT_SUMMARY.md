@@ -82,8 +82,7 @@ GKE Ingress (datananite-ingress)
   ├── /api/kg/*       → kg-api-service:8002
   ├── /api/dialog/*   → dialog-api-service:8003
   ├── /api/conformity/*→ conformity-api-service:8004
-  ├── /api/shacl/*    → shacl-api-service:8007
-  └── /api/unstructured/* → unstructured-api-service:8008
+  └── /api/shacl/*    → shacl-api-service:8007
 ```
 
 ---
@@ -100,7 +99,6 @@ GKE Ingress (datananite-ingress)
 | chat-ui | 8005 | `datananite-chat` | Dockerfile.chat | Main orchestrator UI |
 | tech-ui | 8006 | `datananite-tech` | Dockerfile.tech | Engineer workbench |
 | shacl-api | 8007 | `datananite-shacl` | Dockerfile.shacl | SHACL validation |
-| unstructured-api | 8008 | `datananite-unstructured` | Dockerfile.unstructured | Document indexing |
 | streamlit-ui | 8501 | `datananite-ui` | Dockerfile.ui | Streamlit metadata UI |
 
 All images stored at: `gcr.io/cog01k24f1ea555zdv7ynzthxanz5/datananite-{name}:latest`
@@ -131,7 +129,6 @@ metadataextractor/
 │       ├── chat-ui.yaml                  ← Deployment + Service
 │       ├── tech-ui.yaml                  ← Deployment + Service
 │       ├── shacl-api.yaml                ← Deployment + Service
-│       ├── unstructured-api.yaml         ← Deployment + Service
 │       └── streamlit-ui.yaml             ← Deployment + Service
 ```
 
@@ -179,7 +176,6 @@ Each service has its **own dedicated PVC** (ReadWriteOnce). This is critical —
 | chat-ui-pvc | 5Gi | chat-ui (also uses metadata-catalog-pvc) |
 | tech-ui-pvc | 5Gi | tech-ui |
 | metadata-catalog-pvc | 5Gi | chat-ui (for /data — metadata.db, kg_store.db) |
-| unstructured-pvc | 10Gi | unstructured-api |
 
 ---
 
@@ -194,15 +190,12 @@ DATA_DIR=/data/reports
 GLOSSARY_DB=/data/reports/glossary.db
 METADATA_DB=/data/metadata.db
 KG_STORE_DB=/data/kg_store.db
-UNSTRUCTURED_DB=/data/unstructured.db
 METADATA_API_URL=http://agent-api-service:8000
 ONTOLOGY_API_URL=http://ontology-api-service:8001
 KG_API_URL=http://kg-api-service:8002
 DIALOG_API_URL=http://dialog-api-service:8003
 CONFORMITY_API_URL=http://conformity-api-service:8004
 SHACL_API_URL=http://shacl-api-service:8007
-UNSTRUCTURED_API_URL=http://unstructured-api-service:8008
-UNSTRUCTURED_PUBLIC_URL=http://datananite.endpoints.cog01k24f1ea555zdv7ynzthxanz5.cloud.goog/api/unstructured
 ```
 
 ### Secret (datananite-secrets) — Sensitive

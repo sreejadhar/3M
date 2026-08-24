@@ -1,5 +1,4 @@
 # Ontology Agent API service dependencies
-# Lightweight — no DB connectors needed
 
 # FastAPI service layer
 fastapi>=0.110.0
@@ -12,3 +11,12 @@ rdflib>=7.0.0
 # LangGraph pipeline
 langgraph>=0.2.0
 langchain-core>=0.3.0
+
+# Anthropic LLM (build_node) + AWS (Bedrock via assumed cross-account role —
+# see aws_auth.py/llm_client.py)
+anthropic[vertex,bedrock]>=0.34.0
+boto3>=1.34.0
+
+# PostgreSQL — business_ontology.py (RDS, credentials from Secrets Manager —
+# see pg_secrets.py)
+psycopg2-binary>=2.9.9

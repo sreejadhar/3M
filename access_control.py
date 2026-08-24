@@ -40,7 +40,8 @@ Enforcement
 Persistence
 -----------
   SQLite (AC_DB, default data/access_control.db) in dev/test.
-  PostgreSQL (KG_POSTGRES_DSN) in production.
+  PostgreSQL in production (AWS RDS, credentials from Secrets Manager —
+  see pg_secrets.py).
 
 Public API
 ----------
@@ -113,27 +114,19 @@ def is_enforced() -> bool:
 
 
 def _use_postgres() -> bool:
-    if not is_enforced():
-        return False
-    dsn = os.environ.get("KG_POSTGRES_DSN", "")
-    if dsn:
-        return True
-    logger.warning("APP_ENV=production but KG_POSTGRES_DSN is not set — access control uses SQLite.")
-    return False
+    return is_enforced()
 
 
 def _sqlite_path() -> str:
     return os.environ.get("AC_DB", "data/access_control.db")
 
-def _pg_dsn() -> str:
-    return os.environ.get("KG_POSTGRES_DSN", "")
-
 
 @contextmanager
 def _cursor_ctx() -> Iterator[Any]:
     if _use_postgres():
-        import psycopg2, psycopg2.extras
-        conn = psycopg2.connect(_pg_dsn(), cursor_factory=psycopg2.extras.RealDictCursor)
+        import psycopg2.extras
+        import pg_secrets
+        conn = pg_secrets.connect(cursor_factory=psycopg2.extras.RealDictCursor)
         cur  = conn.cursor()
         try:
             yield _PGCur(conn, cur)

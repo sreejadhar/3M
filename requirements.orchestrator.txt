@@ -1,9 +1,11 @@
 # DataChat Orchestrator — dependencies
 fastapi>=0.111.0
-anthropic[vertex]>=0.25.0      # KPI formula compiler (kpi_store.compile_formula)
+anthropic[vertex,bedrock]>=0.34.0      # KPI formula compiler (kpi_store.compile_formula)
 uvicorn[standard]>=0.29.0
 pydantic>=2.0.0
 httpx>=0.27.0          # async HTTP calls to the other microservices
+boto3>=1.34.0          # Bedrock (assumed cross-account role — aws_auth.py/llm_client.py)
+requests>=2.31.0       # Neptune openCypher HTTPS Data API (neptune_store.py, via kg_store)
 python-multipart>=0.0.9  # file upload support
 numpy>=1.26.0          # GraphRAG cosine similarity
 scikit-learn>=1.4.0    # TF-IDF embedding backend (optional but recommended)

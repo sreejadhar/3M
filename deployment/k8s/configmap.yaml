@@ -5,6 +5,7 @@ metadata:
   namespace: datananite2
 data:
   LOG_LEVEL: "info"
+  APP_ENV: "production"
   DIALOG_ENV: "production"
   DATA_DIR: "/data/reports"
   GLOSSARY_DB: "/data/reports/glossary.db"
@@ -18,7 +19,21 @@ data:
   SHACL_API_URL: "http://shacl-api-service:8007"
   ORCHESTRATOR_URL: "http://chat-ui-service:8005"
   KG_FEDERATION_DB: "/data/kg_federation.db"
-  UNSTRUCTURED_API_URL: "http://unstructured-api-service:8008"
-  UNSTRUCTURED_DB: "/data/unstructured.db"
-  UNSTRUCTURED_WORKERS: "4"
   PLAN_NODE_AST_HALLUCINATION_ENABLED: "1"
+  # AWS Bedrock (llm_client.py) + Neptune (kg_store.py/neptune_store.py) —
+  # both authenticate via the same assumed cross-account IAM role, no
+  # API key/password needed at runtime (see aws_auth.py).
+  AWS_REGION: "us-east-1"
+  AWS_ASSUME_ROLE_ARN: "arn:aws:iam::336756484937:role/datananite-dev-execution-role"
+  NEPTUNE_WRITER_ENDPOINT: "datananite-dev-neptune.cluster-c676y6esoazm.us-east-1.neptune.amazonaws.com"
+  NEPTUNE_READER_ENDPOINT: "datananite-dev-neptune.cluster-ro-c676y6esoazm.us-east-1.neptune.amazonaws.com"
+  NEPTUNE_PORT: "8182"
+  # AWS RDS PostgreSQL (kg_store.py, metadata_catalog.py, kpi_store.py,
+  # glossary_registry.py, abbrev_glossary_registry.py, business_ontology.py,
+  # access_control.py, session_store.py, dialog_agent/pg_store.py) —
+  # credentials come from Secrets Manager at runtime, not from this
+  # ConfigMap (see pg_secrets.py); PG_SECRET_ID names which secret to read.
+  PG_SECRET_ID: "datananite/rds/app-user"
+  PG_HOST: "pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com"
+  PG_PORT: "5432"
+  PG_DATABASE: "datananite"

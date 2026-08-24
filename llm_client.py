@@ -5,17 +5,24 @@ requires changes only in this file.
 
 Provider selection:
   • If ANTHROPIC_API_KEY is set (local dev), use the direct Anthropic API.
-    Vertex-style model ids (claude-sonnet-4-6, claude-haiku-4-5, claude-opus-4-x)
-    are normalised by tier to valid public-API ids so the ~20 call sites that
-    pass Vertex ids keep working unchanged.
-  • Otherwise use GCP Vertex AI (AnthropicVertex) via Application Default
-    Credentials — the production/GKE path (node service account has
-    roles/aiplatform.user; no key needed at runtime).
+    Model-tier ids (claude-sonnet-4-6, claude-haiku-4-5, claude-opus-4-x) are
+    normalised by tier to valid public-API ids so the ~20 call sites that pass
+    those ids keep working unchanged.
+  • If LLM_PROVIDER=vertex, use GCP Vertex AI (AnthropicVertex) via
+    Application Default Credentials.
+  • Otherwise (default/production, EC2 datananited01.mmm.com), use AWS
+    Bedrock: the app assumes the cross-account role in aws_auth.py via STS,
+    then calls Bedrock with those temporary credentials — no API key. The
+    same tier-detection used for the direct-API path maps model-tier ids to
+    the account's Bedrock application inference profile ARNs (required
+    instead of raw model ids for cost tracking).
 
 Config:
   ANTHROPIC_API_KEY  — direct Anthropic API key (enables local dev path)
+  LLM_PROVIDER       — "vertex" to force the GCP path; default is Bedrock
   GCP_PROJECT_ID     — GCP project ID (Vertex path)
   VERTEX_REGION      — Vertex AI region (default: us-east5)
+  AWS_ASSUME_ROLE_ARN, AWS_REGION — see aws_auth.py (Bedrock path)
 """
 import logging
 import os
@@ -23,6 +30,8 @@ import socket
 import time
 
 import anthropic
+
+import aws_auth
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +114,25 @@ def _normalize_model(model: str) -> str:
         return _DIRECT_OPUS
     if "sonnet" in s:
         return _DIRECT_SONNET
+    return model
+
+
+# Map a model-tier id to this account's Bedrock application inference profile
+# ARN — required instead of the raw model id so Bedrock usage is attributed
+# per-application for cost tracking.
+_BEDROCK_HAIKU = "arn:aws:bedrock:us-east-1:336756484937:application-inference-profile/wfd1mwndgpsn"
+_BEDROCK_SONNET = "arn:aws:bedrock:us-east-1:336756484937:application-inference-profile/qp3hg66g81b3"
+_BEDROCK_OPUS = "arn:aws:bedrock:us-east-1:336756484937:application-inference-profile/5lrrvuwa9oy0"
+
+
+def _normalize_bedrock_model(model: str) -> str:
+    s = (model or "").lower()
+    if "haiku" in s:
+        return _BEDROCK_HAIKU
+    if "opus" in s:
+        return _BEDROCK_OPUS
+    if "sonnet" in s:
+        return _BEDROCK_SONNET
     return model
 
 
@@ -192,17 +220,50 @@ class _VertexClient:
         return getattr(self._inner, name)
 
 
+class _BedrockRemapMessages(_TimedMessages):
+    """Proxy for client.messages that rewrites the `model` kwarg to the
+    matching Bedrock application inference profile ARN before delegating."""
+
+    def _prepare(self, kwargs):
+        if "model" in kwargs:
+            kwargs["model"] = _normalize_bedrock_model(kwargs["model"])
+        return kwargs
+
+
+class _BedrockClient:
+    """Wraps AnthropicBedrock so .messages calls remap model ids to inference
+    profile ARNs and are timed; everything else passes through unchanged."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.messages = _BedrockRemapMessages(inner.messages)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def get_client():
     """Return an Anthropic-compatible client.
 
-    Local dev: set ANTHROPIC_API_KEY in .env → direct Anthropic API.
-    GKE/prod:  leave it unset → Vertex AI with ADC
-               (run `gcloud auth application-default login` to use Vertex locally).
+    Local dev:      set ANTHROPIC_API_KEY in .env → direct Anthropic API.
+    Vertex (opt-in): set LLM_PROVIDER=vertex → Vertex AI with ADC
+                     (run `gcloud auth application-default login` locally).
+    Default/prod:   AWS Bedrock, authenticated via the cross-account role
+                     assumed in aws_auth.py (STS) — no key needed at runtime.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if api_key:
         return _DirectClient(anthropic.Anthropic(api_key=api_key))
 
-    project_id = os.environ.get("GCP_PROJECT_ID", "cog01k24f1ea555zdv7ynzthxanz5")
-    vertex_region = os.environ.get("VERTEX_REGION", "us-east5")
-    return _VertexClient(anthropic.AnthropicVertex(region=vertex_region, project_id=project_id))
+    if os.environ.get("LLM_PROVIDER", "").strip().lower() == "vertex":
+        project_id = os.environ.get("GCP_PROJECT_ID", "cog01k24f1ea555zdv7ynzthxanz5")
+        vertex_region = os.environ.get("VERTEX_REGION", "us-east5")
+        return _VertexClient(anthropic.AnthropicVertex(region=vertex_region, project_id=project_id))
+
+    creds = aws_auth.get_frozen_credentials()
+    return _BedrockClient(anthropic.AnthropicBedrock(
+        aws_access_key=creds.access_key,
+        aws_secret_key=creds.secret_key,
+        aws_session_token=creds.token,
+        aws_region=aws_auth.AWS_REGION,
+    ))

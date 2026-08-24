@@ -6,9 +6,9 @@ experience — and how every supporting capability is built.
 
 > **How to read this doc.** Section 1 gives the big picture and the end-to-end
 > indexing sequence. Sections 2–4 detail the three core artifacts the user asked
-> about (metadata → ontology → knowledge graph). Sections 5–10 cover the rest of
-> the functionality (DataChat, conformity/bridges, SHACL validation, unstructured
-> documents, glossary, KPIs). Every claim is traceable to `file:line` in the repo.
+> about (metadata → ontology → knowledge graph). Sections 5–9 cover the rest of
+> the functionality (DataChat, conformity/bridges, SHACL validation, glossary,
+> KPIs). Every claim is traceable to `file:line` in the repo.
 
 ---
 
@@ -40,7 +40,6 @@ importing each other.
 | 8005 | orchestrator (`orchestrator_api.py`) | *(coordinator, no agent)* | End-to-end indexing + serves chat UI |
 | 8006 | tech-ui (`tech_ui_server.py`) | *(serves the Engineer Workbench UI)* | — |
 | 8007 | shacl-api (`shacl_api.py`) | SHACL validation (`shacl_agent/`) | Ontology quality report |
-| 8008 | unstructured-api (`unstructured_api.py`) | Documents (`unstructured_agent/`) | Doc fingerprints + links |
 | 8501 | streamlit-ui (`app.py`) | *(Metadata Agent Streamlit UI)* | — |
 
 ### 1.3 The end-to-end indexing flow (what happens when you register a source)
@@ -477,9 +476,8 @@ Linear, no branches (`agent.py:37-55`).
    token budget), calls **Sonnet** (prod) / Haiku (dev) with rules that forbid
    citing any number not in the results and tell it to treat `q_summary` as THE
    answer. Then **deterministically** appends a `## Data` section (always-present
-   markdown tables, right-aligned numerics), glossary/KPI definition callouts for
-   any terms named, and a cross-modal "Supporting Context from Documents" section
-   fetched from the unstructured service (port 8008).
+   markdown tables, right-aligned numerics) and glossary/KPI definition callouts
+   for any terms named.
 
 ### 5.4 Defense-in-depth against bad SQL
 
@@ -549,42 +547,7 @@ semantic checks, returning PASS / WARN / FAIL.
 
 ---
 
-## 8. Unstructured Documents Agent (port 8008)
-
-**Goal:** ingest enterprise documents, extract an LLM "semantic fingerprint," link
-them to the structured model (KPIs, tables, other docs), and serve cross-modal
-context to DataChat. **Raw document text is never persisted — only metadata.**
-
-**Files:** `unstructured_agent/{pipeline,parsers,fingerprinter,linker,store,query}.py`,
-`unstructured_api.py`.
-
-- **Trigger:** register a source (`POST /sources`, supports local/S3/GCS/Azure/
-  GDrive/SharePoint/OneDrive), then `POST /sources/{id}/index`.
-- **Pipeline** (`pipeline.py:32`, thread pool of 4):
-  1. **Enumerate** files via a connector.
-  2. **Checksum/version**: unchanged files skipped; changed files snapshot the old
-     version and bump `version_num`.
-  3. **Parse** by type (PDF via pdfplumber + OCR fallback; DOCX/PPTX/HTML/MD/TXT;
-     XLSX = sheet/range names only, no cell values). Returns structural metadata +
-     an **ephemeral text window** (lead 8000 + trail 1200 chars).
-  4. **Quality gate**: reject tiny/junk/low-text files before the LLM.
-  5. **LLM fingerprint** (Haiku, or Sonnet for big/low-confidence OCR): strict JSON
-     — `title, summary, domain, doc_type, topics, named_entities, time_references,
-     sensitivity, pii_risk`. Persisted (full text discarded).
-  6. **Change summary** vs the prior version (structural diff).
-  7. **Linking** (`linker.py`): **DESCRIBES_KPI** (fuzzy-match doc KPI names against
-     the KPI store + catalog measures, ≥0.60), **REFERENCES_TABLE** (doc entities vs
-     catalog table names), **SIMILAR_TOPIC/WEAKLY_SIMILAR** (Jaccard of topic sets,
-     ≥0.85 / ≥0.70).
-- **Storage:** independent SQLite `data/unstructured.db` (`store.py`) with an FTS5
-  search index; identity key `(source_id, path)`.
-- **Query:** `POST /query` (`query.py`) — **no LLM**, pure retrieval: FTS5 search +
-  KPI-graph lookup, merged by score, top-4 formatted as a "Supporting Context"
-  markdown block. This is what `synthesize_node` appends to chat answers.
-
----
-
-## 9. Business Glossary (`glossary_store.py`)
+## 8. Business Glossary (`glossary_store.py`)
 
 **Goal:** the controlled vocabulary the query planner uses to disambiguate terms.
 
@@ -599,7 +562,7 @@ context to DataChat. **Raw document text is never persisted — only metadata.**
 
 ---
 
-## 10. KPI Formula Registry (`kpi_store.py`)
+## 9. KPI Formula Registry (`kpi_store.py`)
 
 **Goal:** define, version, and govern BI KPIs, compiling NL formulas to SQL.
 
@@ -615,12 +578,11 @@ context to DataChat. **Raw document text is never persisted — only metadata.**
   (warns, never blocks).
 - **LLM compiler** (`compile_formula`): Haiku turns the NL formula + available
   columns into SQL, saved to `sql_expression`. Active KPIs flow into chat
-  (`understand`/`plan`/`synthesize`) and the unstructured linker uses them as KPI
-  candidates.
+  (`understand`/`plan`/`synthesize`).
 
 ---
 
-## 11. Putting It Together — Data Flow Summary
+## 10. Putting It Together — Data Flow Summary
 
 ```
    Database ──► [Metadata Extraction 8000] ──► metadata report (JSON)
@@ -640,25 +602,25 @@ context to DataChat. **Raw document text is never persisted — only metadata.**
    ▼                                                              ▼
 [SHACL 8007] validates the ontology            [DataChat 8003] answers questions:
                                                 retrieve → understand → resolve →
-[Unstructured 8008] fingerprints docs ───────► plan → execute → synthesize
-   and links them to KPIs/tables                (LLM SQL + narrative, guarded)
-                                                + glossary/KPI/doc context
+                                                plan → execute → synthesize
+                                                (LLM SQL + narrative, guarded)
+                                                + glossary/KPI context
 ```
 
 **One-line mental model:** *Extraction discovers the facts, the Ontology formalizes
 them, the Knowledge Graph makes them navigable and semantically searchable, and
-DataChat uses all of it — plus glossary, KPIs, bridges, and documents — to answer
+DataChat uses all of it — plus glossary, KPIs, and bridges — to answer
 questions in plain language with verified SQL.*
 
 ---
 
-## 12. Sequence Diagrams (Mermaid)
+## 11. Sequence Diagrams (Mermaid)
 
 > These render on GitHub, VS Code (with a Mermaid extension), and most Markdown
 > viewers. They show *who calls whom, in what order* for the two most important
 > flows.
 
-### 12.1 Source indexing — `_index_source` (Orchestrator coordinating the services)
+### 11.1 Source indexing — `_index_source` (Orchestrator coordinating the services)
 
 ```mermaid
 sequenceDiagram
@@ -712,7 +674,7 @@ sequenceDiagram
     ORCH-->>User: SSE "complete" — source ready
 ```
 
-### 12.2 A DataChat turn — `retrieve → understand → resolve → plan → execute → synthesize`
+### 11.2 A DataChat turn — `retrieve → understand → resolve → plan → execute → synthesize`
 
 > The phase events (`thinking`/`plan`/`execute`/`ready`) are emitted by the
 > **orchestrator** consuming the dialog agent's `stream_run` generator
@@ -727,7 +689,6 @@ sequenceDiagram
     participant AG as Dialog Agent (LangGraph)
     participant LLM as Claude (Haiku/Sonnet)
     participant DB as Source DB (Snowflake/…)
-    participant DOC as Unstructured API (8008)
 
     User->>ORCH: Ask a question
     ORCH->>DLG: POST /query (NL + KG subgraph)
@@ -745,15 +706,13 @@ sequenceDiagram
     AG->>DB: execute SQL (self-heal up to 3 retries)
     DB-->>AG: rows
     ORCH-->>User: SSE "execute"
-    AG->>DOC: POST /query (cross-modal doc context)
-    DOC-->>AG: supporting context (no LLM)
     AG->>LLM: synthesize narrative [Sonnet in prod]
     LLM-->>AG: insight markdown
     AG-->>DLG: results (insights + SQL + data)
     ORCH-->>User: SSE "ready" → render charts / tables
 ```
 
-### 12.3 The agent graphs at a glance (Mermaid flowcharts)
+### 11.3 The agent graphs at a glance (Mermaid flowcharts)
 
 ```mermaid
 flowchart LR
@@ -783,7 +742,6 @@ flowchart LR
 | DataChat | `dialog_api.py` | `dialog_agent/agent.py` | `nodes/{retrieve,plan,execute,synthesize}_node.py` |
 | Conformity | `conformity_api.py` | `conformity_agent/agent.py` | `nodes/{analyse,stitch}_node.py` |
 | SHACL | `shacl_api.py` | `shacl_agent/agent.py` | `shapes/ontology_quality.ttl` |
-| Unstructured | `unstructured_api.py` | *(pipeline, not LangGraph)* | `unstructured_agent/{pipeline,fingerprinter,linker}.py` |
 | Glossary | — | — | `glossary_store.py` |
 | KPIs | — | — | `kpi_store.py` |
 | Orchestration | `orchestrator_api.py` | *(coordinator)* | `_index_source` at `orchestrator_api.py:1608` |

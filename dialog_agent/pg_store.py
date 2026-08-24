@@ -8,8 +8,8 @@ Backend is selected by APP_ENV:
       No external database required — works out of the box.
 
   production  (APP_ENV=production)
-      Uses PostgreSQL (KG_POSTGRES_DSN must be set).
-      Falls back to SQLite with a warning if KG_POSTGRES_DSN is missing.
+      Uses PostgreSQL (AWS RDS, credentials from Secrets Manager — see
+      pg_secrets.py at the repo root).
 
 Usage
 -----
@@ -27,8 +27,7 @@ Environment variables
 ---------------------
 APP_ENV          "production" activates the PostgreSQL backend.
                  Any other value (or unset) uses SQLite + inline KG.
-KG_POSTGRES_DSN  Required in production. psycopg2 DSN:
-                 "host=localhost dbname=datachat user=app password=secret"
+KG_POSTGRES_DSN  Explicit DSN override (local dev only) — see pg_secrets.py.
 KG_FEDERATION_DB SQLite path used in dev/test (default: data/kg_federation.db)
 """
 from __future__ import annotations
@@ -50,23 +49,13 @@ def is_postgres() -> bool:
     True when the PostgreSQL backend is active.
 
     Rules:
-      - production env  → PG when KG_POSTGRES_DSN is set; SQLite fallback with warning.
-      - dev / test env  → always SQLite, even if KG_POSTGRES_DSN happens to be set.
+      - production env  → PostgreSQL (credentials from Secrets Manager).
+      - dev / test env  → always SQLite.
     """
-    if not is_production():
-        return False
-    dsn = os.environ.get("KG_POSTGRES_DSN", "")
-    if dsn:
-        return True
-    logger.warning(
-        "APP_ENV=production but KG_POSTGRES_DSN is not set — "
-        "falling back to SQLite for KG federation tables."
-    )
-    return False
+    return is_production()
 
 
-# Convenience accessors (read at call time so env overrides work after import)
-def _pg_dsn()     -> str: return os.environ.get("KG_POSTGRES_DSN", "")
+# Convenience accessor (read at call time so env overrides work after import)
 def _sqlite_path() -> str: return os.environ.get("KG_FEDERATION_DB", "data/kg_federation.db")
 
 
@@ -77,12 +66,9 @@ def cursor_ctx() -> Iterator[Any]:
     Commits on clean exit; rolls back and re-raises on error.
     """
     if is_postgres():
-        import psycopg2
         import psycopg2.extras
-        conn = psycopg2.connect(
-            _pg_dsn(),
-            cursor_factory=psycopg2.extras.RealDictCursor,
-        )
+        import pg_secrets
+        conn = pg_secrets.connect(cursor_factory=psycopg2.extras.RealDictCursor)
         cur = conn.cursor()
         try:
             yield _PGCursor(conn, cur)

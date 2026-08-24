@@ -1,8 +1,16 @@
 """
 KG Snapshot Store — persists source registry + KG node/edge snapshots.
 
-In production (APP_ENV=production + KG_POSTGRES_DSN) stores in PostgreSQL.
-In dev/test stores in SQLite (KG_STORE_DB, default data/kg_store.db).
+Source registry (kg_sources: connection config, status, table list, etc.) is
+always relational: PostgreSQL (AWS RDS, credentials from Secrets Manager —
+see pg_secrets.py) in production (APP_ENV=production), SQLite otherwise
+(KG_STORE_DB, default data/kg_store.db).
+
+The KG graph itself (nodes/edges) is stored in AWS Neptune when
+NEPTUNE_WRITER_ENDPOINT is set — see neptune_store.py (IAM/SigV4 auth via the
+assumed cross-account role in aws_auth.py, openCypher over the HTTPS Data
+API). Falls back to the same SQLite/Postgres store (as a nodes_json/edges_json
+blob) when Neptune isn't configured, e.g. local dev.
 
 On server startup call ``load_all()`` to restore _sources from the last
 persisted snapshot so previously-indexed KGs are immediately available.
@@ -30,26 +38,21 @@ def _is_production() -> bool:
     return os.environ.get("APP_ENV", "").strip().lower() == "production"
 
 def _use_postgres() -> bool:
-    if not _is_production():
-        return False
-    dsn = os.environ.get("KG_POSTGRES_DSN", "")
-    if dsn:
-        return True
-    logger.warning("APP_ENV=production but KG_POSTGRES_DSN is not set — KG store uses SQLite.")
-    return False
+    return _is_production()
 
 def _sqlite_path() -> str:
     return os.environ.get("KG_STORE_DB", "data/kg_store.db")
 
-def _pg_dsn() -> str:
-    return os.environ.get("KG_POSTGRES_DSN", "")
+def _use_neptune() -> bool:
+    return bool(os.environ.get("NEPTUNE_WRITER_ENDPOINT", "").strip())
 
 
 @contextmanager
 def _cursor_ctx() -> Iterator[Any]:
     if _use_postgres():
-        import psycopg2, psycopg2.extras
-        conn = psycopg2.connect(_pg_dsn(), cursor_factory=psycopg2.extras.RealDictCursor)
+        import psycopg2.extras
+        import pg_secrets
+        conn = pg_secrets.connect(cursor_factory=psycopg2.extras.RealDictCursor)
         cur  = conn.cursor()
         try:
             yield _PGCur(conn, cur)
@@ -156,8 +159,6 @@ def save(source: Dict) -> None:
     tables    = json.dumps(source.get("table_names") or [])
     report    = json.dumps(source.get("report")) if source.get("report") else None
     ontology  = source.get("ontology_content")
-    nodes     = json.dumps(source.get("kg_nodes") or [])
-    edges     = json.dumps(source.get("kg_edges") or [])
 
     with _cursor_ctx() as cur:
         _ensure(cur)
@@ -211,20 +212,7 @@ def save(source: Dict) -> None:
                     now,
                 ),
             )
-        # Upsert KG snapshot
-        cur.execute("SELECT source_id FROM kg_snapshots WHERE source_id=?", (sid,))
-        snap_exists = cur.fetchone()
-        if snap_exists:
-            cur.execute(
-                "UPDATE kg_snapshots SET nodes_json=?, edges_json=?, updated_at=? WHERE source_id=?",
-                (nodes, edges, now, sid),
-            )
-        else:
-            cur.execute(
-                "INSERT INTO kg_snapshots (source_id, nodes_json, edges_json, updated_at) VALUES (?,?,?,?)",
-                (sid, nodes, edges, now),
-            )
-
+    save_snapshot(sid, source.get("kg_nodes") or [], source.get("kg_edges") or [])
     logger.debug("kg_store.save: %s (%s nodes, %s edges)", sid[:8], len(source.get("kg_nodes") or []), len(source.get("kg_edges") or []))
 
 
@@ -232,7 +220,17 @@ def save_snapshot(source_id: str, nodes: List[Dict], edges: List[Dict]) -> None:
     """Upsert just the KG snapshot (nodes/edges) for source_id, leaving any
     kg_sources row untouched. Used by knowledge_graph_agent's execute/embed
     nodes, which only know kg_id — not the full source record that
-    orchestrator_api's save() manages."""
+    orchestrator_api's save() manages.
+
+    Writes to Neptune (real vertices/edges) when NEPTUNE_WRITER_ENDPOINT is
+    set; otherwise falls back to a nodes_json/edges_json blob in the SQLite/
+    Postgres store."""
+    if _use_neptune():
+        import neptune_store
+        neptune_store.save_snapshot(source_id, nodes or [], edges or [])
+        logger.debug("kg_store.save_snapshot (neptune): %s (%d nodes, %d edges)", source_id[:8], len(nodes or []), len(edges or []))
+        return
+
     now = time.time()
     nodes_json = json.dumps(nodes or [])
     edges_json = json.dumps(edges or [])
@@ -255,6 +253,10 @@ def save_snapshot(source_id: str, nodes: List[Dict], edges: List[Dict]) -> None:
 def load_snapshot(source_id: str) -> "tuple[List[Dict], List[Dict]]":
     """Read back just the KG snapshot (nodes/edges) for source_id.
     Returns ([], []) if no snapshot exists."""
+    if _use_neptune():
+        import neptune_store
+        return neptune_store.load_snapshot(source_id)
+
     with _cursor_ctx() as cur:
         _ensure(cur)
         row = cur.execute(
@@ -275,10 +277,15 @@ def load_snapshot(source_id: str) -> "tuple[List[Dict], List[Dict]]":
 
 def delete(source_id: str) -> None:
     """Remove a source and its KG snapshot from the store."""
+    if _use_neptune():
+        import neptune_store
+        neptune_store.delete(source_id)
+
     with _cursor_ctx() as cur:
         _ensure(cur)
         cur.execute("DELETE FROM kg_sources    WHERE source_id=?", (source_id,))
-        cur.execute("DELETE FROM kg_snapshots  WHERE source_id=?", (source_id,))
+        if not _use_neptune():
+            cur.execute("DELETE FROM kg_snapshots  WHERE source_id=?", (source_id,))
     logger.info("kg_store.delete: %s", source_id[:8])
 
 
@@ -289,13 +296,10 @@ def load_all() -> List[Dict]:
     """
     with _cursor_ctx() as cur:
         _ensure(cur)
-        src_rows  = cur.execute("SELECT * FROM kg_sources").fetchall()
-        snap_rows = cur.execute("SELECT * FROM kg_snapshots").fetchall()
+        src_rows = cur.execute("SELECT * FROM kg_sources").fetchall()
 
-    snap_by_id = {r["source_id"]: r for r in snap_rows}
     result = []
     for r in src_rows:
-        snap = snap_by_id.get(r["source_id"], {})
         try:
             conn = json.loads(r.get("connection_json") or "{}")
         except Exception:
@@ -312,14 +316,7 @@ def load_all() -> List[Dict]:
             report = json.loads(r["report_json"]) if r.get("report_json") else None
         except Exception:
             report = None
-        try:
-            nodes = json.loads(snap.get("nodes_json") or "[]")
-        except Exception:
-            nodes = []
-        try:
-            edges = json.loads(snap.get("edges_json") or "[]")
-        except Exception:
-            edges = []
+        nodes, edges = load_snapshot(r["source_id"])
 
         result.append({
             "id":               r["source_id"],

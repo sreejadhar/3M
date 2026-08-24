@@ -14,8 +14,18 @@ services:
     volumes:
       - reports_data:/data/reports
     environment:
-      # Anthropic key — set in .env or shell before running
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      # Bedrock (llm_client.py assumes this role via STS — no API key needed).
+      # ANTHROPIC_API_KEY is optional, for local-dev override only.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_ASSUME_ROLE_ARN: "${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
+      # RDS PostgreSQL (metadata_catalog.py etc.) — credentials from Secrets
+      # Manager at runtime, not from here. See pg_secrets.py.
+      APP_ENV: "${APP_ENV:-production}"
+      PG_SECRET_ID: "${PG_SECRET_ID:-datananite/rds/app-user}"
+      PG_HOST: "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
+      PG_PORT: "${PG_PORT:-5432}"
+      PG_DATABASE: "${PG_DATABASE:-datananite}"
       DATA_DIR: /data/reports
       GLOSSARY_DB:  "/data/reports/glossary.db"
       # Tune log verbosity: debug | info | warning
@@ -51,6 +61,17 @@ services:
     environment:
       DATA_DIR: /data/reports
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # Bedrock (build_node) — see aws_auth.py. ANTHROPIC_API_KEY is optional,
+      # for local-dev override only.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_ASSUME_ROLE_ARN: "${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
+      # RDS PostgreSQL (business_ontology.py) — see pg_secrets.py.
+      APP_ENV: "${APP_ENV:-production}"
+      PG_SECRET_ID: "${PG_SECRET_ID:-datananite/rds/app-user}"
+      PG_HOST: "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
+      PG_PORT: "${PG_PORT:-5432}"
+      PG_DATABASE: "${PG_DATABASE:-datananite}"
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=4)"]
@@ -73,6 +94,20 @@ services:
       - "${KG_PORT:-8002}:8002"
     environment:
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # Bedrock (profile_node) + Neptune (kg_store.py graph snapshots) —
+      # both authenticate via the assumed cross-account role, see aws_auth.py.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_ASSUME_ROLE_ARN: "${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
+      NEPTUNE_WRITER_ENDPOINT: "${NEPTUNE_WRITER_ENDPOINT:-datananite-dev-neptune.cluster-c676y6esoazm.us-east-1.neptune.amazonaws.com}"
+      NEPTUNE_READER_ENDPOINT: "${NEPTUNE_READER_ENDPOINT:-datananite-dev-neptune.cluster-ro-c676y6esoazm.us-east-1.neptune.amazonaws.com}"
+      NEPTUNE_PORT: "${NEPTUNE_PORT:-8182}"
+      # RDS PostgreSQL (kg_store.py source registry) — see pg_secrets.py.
+      APP_ENV: "${APP_ENV:-production}"
+      PG_SECRET_ID: "${PG_SECRET_ID:-datananite/rds/app-user}"
+      PG_HOST: "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
+      PG_PORT: "${PG_PORT:-5432}"
+      PG_DATABASE: "${PG_DATABASE:-datananite}"
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=4)"]
@@ -96,7 +131,18 @@ services:
     volumes:
       - reports_data:/data/reports
     environment:
-      ANTHROPIC_API_KEY:      "${ANTHROPIC_API_KEY}"
+      # Bedrock (llm_client.py assumes this role via STS — no API key needed).
+      # ANTHROPIC_API_KEY is optional, for local-dev override only.
+      ANTHROPIC_API_KEY:      "${ANTHROPIC_API_KEY:-}"
+      AWS_REGION:             "${AWS_REGION:-us-east-1}"
+      AWS_ASSUME_ROLE_ARN:    "${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
+      # RDS PostgreSQL (kg_registry/kg_bridges/semantic_lexicon/verified_queries
+      # /metadata_store via dialog_agent/pg_store.py) — see pg_secrets.py.
+      APP_ENV:                "${APP_ENV:-production}"
+      PG_SECRET_ID:           "${PG_SECRET_ID:-datananite/rds/app-user}"
+      PG_HOST:                "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
+      PG_PORT:                "${PG_PORT:-5432}"
+      PG_DATABASE:            "${PG_DATABASE:-datananite}"
       LOG_LEVEL:              "${LOG_LEVEL:-info}"
       GLOSSARY_DB:            "/data/reports/glossary.db"
       # Controls which LLM synthesize_node uses for insight generation:
@@ -125,7 +171,11 @@ services:
     ports:
       - "${CONFORMITY_PORT:-8004}:8004"
     environment:
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      # Bedrock (llm_client.py assumes this role via STS — no API key needed).
+      # ANTHROPIC_API_KEY is optional, for local-dev override only.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_ASSUME_ROLE_ARN: "${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -150,7 +200,24 @@ services:
     volumes:
       - metadata_catalog_data:/data
     environment:
-      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      # Bedrock (llm_client.py assumes this role via STS — no API key needed).
+      # ANTHROPIC_API_KEY is optional, for local-dev override only.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      AWS_ASSUME_ROLE_ARN: "${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
+      # Neptune (kg_store.py graph snapshots) — same assumed role, IAM/SigV4 auth.
+      NEPTUNE_WRITER_ENDPOINT: "${NEPTUNE_WRITER_ENDPOINT:-datananite-dev-neptune.cluster-c676y6esoazm.us-east-1.neptune.amazonaws.com}"
+      NEPTUNE_READER_ENDPOINT: "${NEPTUNE_READER_ENDPOINT:-datananite-dev-neptune.cluster-ro-c676y6esoazm.us-east-1.neptune.amazonaws.com}"
+      NEPTUNE_PORT: "${NEPTUNE_PORT:-8182}"
+      # RDS PostgreSQL — kg_store/metadata_catalog/kpi_store/glossary_registry/
+      # abbrev_glossary_registry/business_ontology/access_control/session_store
+      # all switch to this when APP_ENV=production (see pg_secrets.py).
+      # NOTE: this also activates real access-control (RBAC) enforcement.
+      APP_ENV: "${APP_ENV:-production}"
+      PG_SECRET_ID: "${PG_SECRET_ID:-datananite/rds/app-user}"
+      PG_HOST: "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
+      PG_PORT: "${PG_PORT:-5432}"
+      PG_DATABASE: "${PG_DATABASE:-datananite}"
       # Internal Docker DNS — matches service names above
       METADATA_API_URL: "http://agent-api:8000"
       ONTOLOGY_API_URL: "http://ontology-api:8001"

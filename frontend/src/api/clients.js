@@ -204,21 +204,3 @@ export const listKpiVersions = (id) => apiGet(`/kpis/${id}/versions`);
 export const rollbackKpiVersion = (id, versionNum) =>
   apiPost(`/kpis/${id}/versions/${versionNum}/rollback`, {});
 export const activateKpi = (id) => apiPost(`/kpis/${id}/activate`, {});
-
-// ── Document Intelligence (unstructured agent, port 8008) ─────────────────────
-// All routes proxy through the orchestrator: /unstructured/* → unstructured-api/*
-const _U = '/unstructured';
-export const listConnectorTypes = () => apiGet(`${_U}/connectors`);
-export const docListSources     = ()          => apiGet(`${_U}/sources`);
-export const docCreateSource    = (body)      => apiPost(`${_U}/sources`, body);
-export const docDeleteSource    = (id)        => apiDelete(`${_U}/sources/${id}`);
-export const docStartIndex      = (id)        => apiPost(`${_U}/sources/${id}/index`);
-export const docListJobs        = (id)        => apiGet(`${_U}/sources/${id}/jobs`);
-export const docListAssets      = (id)        => apiGet(`${_U}/sources/${id}/assets`);
-export const docGetAsset        = (assetId)   => apiGet(`${_U}/assets/${assetId}`);
-export const fsBrowse           = (path = '') => apiGet(`${_U}/fs/browse?path=${encodeURIComponent(path)}`);
-export const docUploadDocument  = (sourceId, file) => {
-  const fd = new FormData();
-  fd.append('file', file, file.name);
-  return apiUpload(`${_U}/sources/${sourceId}/upload`, fd);
-};

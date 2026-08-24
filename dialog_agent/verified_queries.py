@@ -17,9 +17,9 @@ similarity against the new question) and injected into the planning prompt
 as verified few-shot examples — so a mistake fixed once does not have to be
 rediscovered on every future phrasing of a similar question.
 
-Persists to PostgreSQL when APP_ENV=production + KG_POSTGRES_DSN is set,
-else SQLite — same backend selection as kg_bridges.py / kg_registry.py
-(see dialog_agent/pg_store.py).
+Persists to PostgreSQL when APP_ENV=production, else SQLite — same backend
+selection as kg_bridges.py / kg_registry.py (see dialog_agent/pg_store.py
+and pg_secrets.py).
 """
 from __future__ import annotations
 

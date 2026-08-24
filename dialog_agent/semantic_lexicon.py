@@ -15,9 +15,9 @@ one-time `bootstrap()` seed from data that already exists (KPIs, glossary
 terms, profiled semantic roles, and mining `verified_queries` for real
 {table, column} references from SQL that already ran successfully).
 
-Persists to PostgreSQL when APP_ENV=production + KG_POSTGRES_DSN is set,
-else SQLite — same backend selection as verified_queries.py (see
-dialog_agent/pg_store.py).
+Persists to PostgreSQL when APP_ENV=production, else SQLite — same backend
+selection as verified_queries.py (see dialog_agent/pg_store.py and
+pg_secrets.py).
 
 Design: docs/Semantic_Lexicon_And_Evaluation_Loop_Design.md
 """

@@ -33,8 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 # ── Backend selection ──────────────────────────────────────────────────────────
-# Production  (APP_ENV=production + KG_POSTGRES_DSN set) → PostgreSQL
-# Dev / test  (default)                                  → SQLite  data/metadata.db
+# Production  (APP_ENV=production) → PostgreSQL (AWS RDS, credentials from
+#                                     Secrets Manager — see pg_secrets.py)
+# Dev / test  (default)             → SQLite  data/metadata.db
 #
 # Override the SQLite path with the METADATA_DB env var.
 

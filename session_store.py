@@ -5,8 +5,8 @@ Without this, sessions live only in the in-memory ``_sessions`` dict in
 orchestrator_api and are lost on every restart. This module mirrors the
 ``kg_store`` pattern: SQLite in dev/test, PostgreSQL in production.
 
-In production (APP_ENV=production + SESSION_POSTGRES_DSN, or the shared
-KG_POSTGRES_DSN) stores in PostgreSQL. Otherwise stores in SQLite
+In production (APP_ENV=production) stores in PostgreSQL — AWS RDS, credentials
+from Secrets Manager (see pg_secrets.py). Otherwise stores in SQLite
 (SESSION_STORE_DB, default ``$DATA_DIR/session_store.db``).
 
 On server startup call ``load_all()`` to restore every persisted session so
@@ -34,17 +34,8 @@ logger = logging.getLogger(__name__)
 def _is_production() -> bool:
     return os.environ.get("APP_ENV", "").strip().lower() == "production"
 
-def _pg_dsn() -> str:
-    # Prefer a session-specific DSN, fall back to the shared KG one.
-    return os.environ.get("SESSION_POSTGRES_DSN", "") or os.environ.get("KG_POSTGRES_DSN", "")
-
 def _use_postgres() -> bool:
-    if not _is_production():
-        return False
-    if _pg_dsn():
-        return True
-    logger.warning("APP_ENV=production but no SESSION/KG_POSTGRES_DSN — session store uses SQLite.")
-    return False
+    return _is_production()
 
 def _sqlite_path() -> str:
     explicit = os.environ.get("SESSION_STORE_DB")
@@ -57,8 +48,9 @@ def _sqlite_path() -> str:
 @contextmanager
 def _cursor_ctx() -> Iterator[Any]:
     if _use_postgres():
-        import psycopg2, psycopg2.extras
-        conn = psycopg2.connect(_pg_dsn(), cursor_factory=psycopg2.extras.RealDictCursor)
+        import psycopg2.extras
+        import pg_secrets
+        conn = pg_secrets.connect(cursor_factory=psycopg2.extras.RealDictCursor)
         cur  = conn.cursor()
         try:
             yield _PGCur(conn, cur)

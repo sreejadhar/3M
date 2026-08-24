@@ -127,7 +127,7 @@ install_pkg() {
     esac
 }
 
-for tool in curl git ca-certificates; do
+for tool in curl git ca-certificates unzip; do
     if command -v "$tool" &>/dev/null; then
         success "${tool} already installed."
     else
@@ -136,6 +136,33 @@ for tool in curl git ca-certificates; do
         success "${tool} installed."
     fi
 done
+
+# netcat — used by verify_aws.sh to test Neptune reachability. Package name
+# differs by distro family.
+if command -v nc &>/dev/null; then
+    success "nc (netcat) already installed."
+else
+    step "Installing netcat…"
+    case "$OS_FLAVOUR" in
+        al2|al2023|rhel7|rhel8) install_pkg nmap-ncat ;;
+        ubuntu|debian)          install_pkg netcat-openbsd ;;
+    esac
+    success "netcat installed."
+fi
+
+# AWS CLI v2 — used by verify_aws.sh and deploy.sh's Bedrock/Neptune checks.
+if command -v aws &>/dev/null; then
+    success "AWS CLI already installed: $(aws --version 2>&1)."
+else
+    step "Installing AWS CLI v2…"
+    AWSCLI_ARCH="$(uname -m)"
+    AWSCLI_TMP="$(mktemp -d)"
+    curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" -o "${AWSCLI_TMP}/awscliv2.zip"
+    unzip -q "${AWSCLI_TMP}/awscliv2.zip" -d "$AWSCLI_TMP"
+    "${AWSCLI_TMP}/aws/install"
+    rm -rf "$AWSCLI_TMP"
+    success "AWS CLI installed: $(aws --version 2>&1)."
+fi
 
 # ── 3. Install Docker Engine ──────────────────────────────────────────────────
 header "Installing Docker Engine"
@@ -338,12 +365,36 @@ ENV_FILE="${SCRIPT_DIR}/.env"
 
 if [[ -f "$ENV_FILE" ]]; then
     success ".env already exists at ${ENV_FILE} — not overwriting."
-    info "Edit it to verify ANTHROPIC_API_KEY is set."
+    info "Edit it to verify AWS_ASSUME_ROLE_ARN / NEPTUNE_* endpoints are correct."
 else
     cat > "$ENV_FILE" <<'EOF'
-# ── Anthropic API key (REQUIRED) ─────────────────────────────────────────────
-# Get yours at https://console.anthropic.com/
-ANTHROPIC_API_KEY=sk-ant-REPLACE_ME
+# ── LLM (AWS Bedrock, default) + KG storage (AWS Neptune) ────────────────────
+# No API key or DB password needed: the app assumes this cross-account IAM
+# role via STS from the EC2 instance role, then uses the temporary
+# credentials for both Bedrock and Neptune (SigV4). Verify the EC2 instance
+# role has sts:AssumeRole permission on AWS_ASSUME_ROLE_ARN before deploying.
+AWS_REGION=us-east-1
+AWS_ASSUME_ROLE_ARN=arn:aws:iam::336756484937:role/datananite-dev-execution-role
+NEPTUNE_WRITER_ENDPOINT=datananite-dev-neptune.cluster-c676y6esoazm.us-east-1.neptune.amazonaws.com
+NEPTUNE_READER_ENDPOINT=datananite-dev-neptune.cluster-ro-c676y6esoazm.us-east-1.neptune.amazonaws.com
+NEPTUNE_PORT=8182
+
+# ── App state storage (AWS RDS PostgreSQL) ────────────────────────────────────
+# Also via the assumed role above: DB credentials are fetched from Secrets
+# Manager at runtime (see pg_secrets.py) — never stored here. APP_ENV=production
+# is what switches every store from local SQLite to this RDS instance, and also
+# activates real access-control (RBAC) enforcement — make sure ac_users/roles
+# are seeded before deploying with this set.
+APP_ENV=production
+PG_SECRET_ID=datananite/rds/app-user
+PG_HOST=pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com
+PG_PORT=5432
+PG_DATABASE=datananite
+
+# ── Anthropic API key (OPTIONAL) ─────────────────────────────────────────────
+# Only needed to override Bedrock with the direct Anthropic API for local dev.
+# Leave blank in production.
+ANTHROPIC_API_KEY=
 
 # ── Service ports (change only if the defaults conflict with other services) ──
 AGENT_PORT=8000
@@ -359,7 +410,7 @@ LOG_LEVEL=info
 EOF
     chmod 600 "$ENV_FILE"
     success ".env template created at ${ENV_FILE}"
-    warn "IMPORTANT: Edit .env and replace ANTHROPIC_API_KEY before running deploy.sh."
+    warn "IMPORTANT: verify AWS_ASSUME_ROLE_ARN and NEPTUNE_* endpoints in .env before running deploy.sh."
 fi
 
 # ── 11. Make deploy.sh executable ────────────────────────────────────────────
@@ -370,6 +421,11 @@ if [[ -f "${SCRIPT_DIR}/deploy.sh" ]]; then
     success "deploy.sh is now executable."
 else
     warn "deploy.sh not found in ${SCRIPT_DIR} — it will be set executable once present."
+fi
+
+if [[ -f "${SCRIPT_DIR}/verify_aws.sh" ]]; then
+    chmod +x "${SCRIPT_DIR}/verify_aws.sh"
+    success "verify_aws.sh is now executable."
 fi
 
 # ── 12. Verify all prerequisites ─────────────────────────────────────────────
@@ -395,6 +451,8 @@ check "curl binary present"            command -v curl
 check "git binary present"             command -v git
 check ".env file exists"               test -f "${SCRIPT_DIR}/.env"
 check "deploy.sh is executable"        test -x "${SCRIPT_DIR}/deploy.sh"
+check "aws CLI present"                command -v aws
+check "nc (netcat) present"            command -v nc
 
 echo ""
 if [[ $FAIL -eq 0 ]]; then
@@ -417,6 +475,35 @@ printf "  %-12s %-10s %-40s\n" "8000-8004" "TCP"      "API services (internal / 
 echo ""
 warn "Never open all ports (0-65535) to 0.0.0.0/0 — restrict to your office IP range."
 
+# ── 13b. IAM role + instance metadata (required for Bedrock/Neptune) ─────────
+header "AWS IAM Role & Instance Metadata (Bedrock / Neptune)"
+
+echo -e "  The app authenticates to Bedrock and Neptune by assuming"
+echo -e "  ${CYAN}arn:aws:iam::336756484937:role/datananite-dev-execution-role${RESET}"
+echo -e "  via STS, using credentials from this EC2 instance's attached IAM role."
+echo ""
+echo -e "  ${BOLD}Before deploying, confirm:${RESET}"
+echo -e "  1. This EC2 instance has an IAM instance profile attached whose role"
+echo -e "     is allowed to ${CYAN}sts:AssumeRole${RESET} the ARN above."
+echo -e "  2. Docker containers can reach the instance metadata service (IMDS) so"
+echo -e "     boto3 can resolve that instance role. Containers add a network hop,"
+echo -e "     so the default IMDSv2 PUT-response hop limit of 1 will block them —"
+echo -e "     raise it to 2:"
+echo -e "     ${CYAN}aws ec2 modify-instance-metadata-options --instance-id <id> \\"
+echo -e "         --http-put-response-hop-limit 2 --http-tokens required${RESET}"
+
+IMDS_TOKEN=$(curl -sf --max-time 2 -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)
+if [[ -n "$IMDS_TOKEN" ]] && curl -sf --max-time 2 \
+        -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
+        http://169.254.169.254/latest/meta-data/iam/security-credentials/ &>/dev/null; then
+    success "Instance metadata service is reachable and an IAM role is attached."
+else
+    warn "Could not confirm an IAM instance profile via the metadata service —"
+    warn "attach one before deploying, or Bedrock/Neptune calls will fail."
+fi
+echo ""
+
 # ── 14. Instance size recommendation ─────────────────────────────────────────
 header "EC2 Instance Size Recommendation"
 
@@ -435,21 +522,24 @@ header "Next Steps"
 
 EC2_IP=$(curl -sf --max-time 3 http://169.254.169.254/latest/meta-data/public-ipv4 || echo "<your-ec2-ip>")
 
-echo -e "  ${BOLD}1.${RESET} Edit your API key:"
+echo -e "  ${BOLD}1.${RESET} Verify AWS config (usually the defaults are already correct):"
 echo -e "     ${CYAN}nano ${ENV_FILE}${RESET}"
-echo -e "     Replace  ANTHROPIC_API_KEY=sk-ant-REPLACE_ME  with your real key.\n"
+echo -e "     Confirm AWS_ASSUME_ROLE_ARN / NEPTUNE_* match your environment.\n"
 
 echo -e "  ${BOLD}2.${RESET} Log out and back in so docker group takes effect:"
 echo -e "     ${CYAN}exit${RESET}  then reconnect with SSH\n"
 
+echo -e "  ${BOLD}3.${RESET} Verify Bedrock + Neptune are reachable via the assumed role:"
+echo -e "     ${CYAN}./verify_aws.sh${RESET}\n"
+
 if [[ -n "$LOGIN_USER" ]]; then
-    echo -e "  ${BOLD}3.${RESET} Run the deployment (as ${LOGIN_USER}, not root):"
+    echo -e "  ${BOLD}4.${RESET} Run the deployment (as ${LOGIN_USER}, not root):"
 else
-    echo -e "  ${BOLD}3.${RESET} Run the deployment:"
+    echo -e "  ${BOLD}4.${RESET} Run the deployment:"
 fi
 echo -e "     ${CYAN}cd ${SCRIPT_DIR} && ./deploy.sh${RESET}\n"
 
-echo -e "  ${BOLD}4.${RESET} Open DataChat in your browser:"
+echo -e "  ${BOLD}5.${RESET} Open DataChat in your browser:"
 echo -e "     ${CYAN}http://${EC2_IP}:8005${RESET}  ← upload your Excel/CSV and start chatting\n"
 
 echo -e "  ${BOLD}Other commands:${RESET}"

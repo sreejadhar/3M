@@ -642,7 +642,8 @@ General Rules:
       Limiting aggregation queries silently drops groups and produces wrong totals.
    b. Explicit top-N questions ONLY ("top 10 products", "bottom 5 regions"):
       use ORDER BY <metric> DESC then the appropriate limit syntax for this database.
-   c. Do NOT add LIMIT {row_limit} to any query — the system applies row limits automatically.
+   c. For all other questions (no explicit "top N" / "first N" / "bottom N" wording),
+      do NOT add a row limit at all — return every matching row unbounded.
 6. JOIN only when strictly required — CRITICAL:
    a. Only JOIN a table if at least one column from that table is needed in
       SELECT, WHERE, GROUP BY, or ORDER BY to answer the question.
@@ -4038,10 +4039,11 @@ def _enforce_sql_limits(sql: str, row_limit: int, db_type: str = "") -> str:
         drops groups and produces wrong totals.
 
     - Raw-row queries (no aggregation):
-        If no limit is present, add one using db-appropriate syntax:
-          PostgreSQL / SQLite / Redshift / BigQuery / CSV / Excel : LIMIT N
-          SQL Server                                               : SELECT TOP N …
-          Oracle                                                   : … FETCH FIRST N ROWS ONLY
+        No limit is injected automatically. If the LLM already added a
+        limit clause because the user's question explicitly asked for a
+        specific number of rows (e.g. "top 20", "first 10"), that clause
+        is left as-is. Otherwise the query runs unbounded and returns all
+        matching rows.
     """
     db        = db_type.lower()
     is_agg    = bool(_AGG_PATTERN.search(sql))
@@ -4089,32 +4091,11 @@ def _enforce_sql_limits(sql: str, row_limit: int, db_type: str = "") -> str:
         return cleaned
 
     else:
-        # Raw-row query — add db-appropriate limit if none present
-        if has_any_limit:
-            return sql  # LLM already added a top-N; leave it
-
-        sql_clean = sql.rstrip().rstrip(';').strip()
-
-        if db == "sqlserver":
-            # Insert TOP N immediately after SELECT (before DISTINCT / column list)
-            patched = re.sub(
-                r'(\bSELECT\b)(\s+)',
-                lambda m: m.group(1) + m.group(2) + f"TOP {row_limit} ",
-                sql_clean, count=1, flags=re.IGNORECASE,
-            )
-            logger.info("plan_node: added TOP %d to raw-row SQL Server query", row_limit)
-            return patched
-
-        elif db == "oracle":
-            patched = sql_clean + f" FETCH FIRST {row_limit} ROWS ONLY"
-            logger.info("plan_node: added FETCH FIRST %d to raw-row Oracle query", row_limit)
-            return patched
-
-        else:
-            # PostgreSQL, Redshift, BigQuery, SQLite, CSV, Excel
-            patched = sql_clean + f" LIMIT {row_limit}"
-            logger.info("plan_node: added LIMIT %d to raw-row query", row_limit)
-            return patched
+        # Raw-row query — no automatic limit is injected. If the LLM
+        # already added a top-N clause (because the user's question
+        # explicitly asked for a specific row count), leave it as-is;
+        # otherwise run unbounded and return every matching row.
+        return sql
 
 
 def _fix_sqlserver_subquery_limits(sql: str, db_type: str) -> str:

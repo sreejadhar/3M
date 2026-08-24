@@ -1742,10 +1742,6 @@ def _execute_one_query(
         )
         q["sql"] = executed_sql
 
-    # For aggregation queries, return all rows — truncating would silently
-    # drop groups and produce wrong totals.  For raw-row queries the SQL
-    # already has a LIMIT clause added by plan_node, so Python truncation
-    # is redundant; we keep it only as a safety cap for very large raw dumps.
     _is_agg = bool(re.search(
         r'\b(GROUP\s+BY|COUNT\s*\(|SUM\s*\(|AVG\s*\(|MIN\s*\(|MAX\s*\()\b',
         executed_sql, re.IGNORECASE,
@@ -1758,7 +1754,9 @@ def _execute_one_query(
     # HAVING-filtered aggregate semantics.
     if not _is_agg and not error_msg:
         rows = _dedupe_placeholder_rows(columns, rows)
-    returned_rows = rows if _is_agg else rows[: config.row_limit]
+    # No automatic truncation — the SQL itself carries a LIMIT only when
+    # the user's question explicitly asked for a specific row count.
+    returned_rows = rows
 
     result = QueryResult(
         query_id    = q["query_id"],

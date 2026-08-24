@@ -4876,9 +4876,9 @@ async def train_business_classifier():
 # ── BI Manager — KPI endpoints ────────────────────────────────────────────────
 
 def _trigger_ontology_enrichment_bg(background_tasks: BackgroundTasks) -> None:
-    """Queue the ontology enrichment pipeline so a newly-active KPI gets its
-    KPI_METRIC node + MEASURES edges written into the knowledge graph without
-    requiring a manual POST /ontology/enrich call."""
+    """Queue the ontology enrichment pipeline so any created/edited/activated
+    KPI gets its KPI_METRIC node + MEASURES edges written into the knowledge
+    graph without requiring a manual POST /ontology/enrich call."""
     def _run():
         try:
             _enricher.run_enrichment_coalesced()
@@ -4936,8 +4936,7 @@ async def create_kpi(req: CreateKpiRequest, background_tasks: BackgroundTasks):
     """Create a new KPI definition. Returns {kpi, warnings}."""
     try:
         result = _kpi.create_kpi(**req.dict(exclude_none=True))
-        if result.get("kpi", {}).get("status") == "active":
-            _trigger_ontology_enrichment_bg(background_tasks)
+        _trigger_ontology_enrichment_bg(background_tasks)
         return result  # {"kpi": {...}, "warnings": [...]}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
@@ -4972,8 +4971,7 @@ async def update_kpi(kpi_id: str, req: UpdateKpiRequest, background_tasks: Backg
                                   change_note=change_note, **payload)
         if not result.get("ok"):
             raise HTTPException(status_code=404, detail="KPI not found")
-        if payload.get("status") == "active":
-            _trigger_ontology_enrichment_bg(background_tasks)
+        _trigger_ontology_enrichment_bg(background_tasks)
         row = _kpi.get_kpi(kpi_id)
         return {"kpi": row, "warnings": result.get("warnings", [])}
     except HTTPException:

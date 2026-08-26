@@ -380,16 +380,20 @@ NEPTUNE_READER_ENDPOINT=datananite-dev-neptune.cluster-ro-c676y6esoazm.us-east-1
 NEPTUNE_PORT=8182
 
 # ── App state storage (AWS RDS PostgreSQL) ────────────────────────────────────
-# Also via the assumed role above: DB credentials are fetched from Secrets
-# Manager at runtime (see pg_secrets.py) — never stored here. APP_ENV=production
-# is what switches every store from local SQLite to this RDS instance, and also
-# activates real access-control (RBAC) enforcement — make sure ac_users/roles
-# are seeded before deploying with this set.
+# The dev RDS instance is private and PinAD-secured, reachable only from this
+# EC2 host, so it isn't fetched through the assumed cross-account role above.
+# Fill in PG_USER/PG_PASSWORD below and pg_secrets.py will use them directly,
+# skipping Secrets Manager entirely (production instead sets PG_SECRET_ID and
+# leaves PG_USER/PG_PASSWORD blank). APP_ENV=production is what switches
+# every store from local SQLite to this RDS instance, and also activates real
+# access-control (RBAC) enforcement — make sure ac_users/roles are seeded
+# before deploying with this set.
 APP_ENV=production
-PG_SECRET_ID=datananite/rds/app-user
 PG_HOST=pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com
 PG_PORT=5432
 PG_DATABASE=datananite
+PG_USER=
+PG_PASSWORD=
 
 # ── Anthropic API key (OPTIONAL) ─────────────────────────────────────────────
 # Only needed to override Bedrock with the direct Anthropic API for local dev.
@@ -411,6 +415,7 @@ EOF
     chmod 600 "$ENV_FILE"
     success ".env template created at ${ENV_FILE}"
     warn "IMPORTANT: verify AWS_ASSUME_ROLE_ARN and NEPTUNE_* endpoints in .env before running deploy.sh."
+    warn "IMPORTANT: also fill in PG_USER/PG_PASSWORD for the dev RDS instance before running deploy.sh."
 fi
 
 # ── 11. Make deploy.sh executable ────────────────────────────────────────────

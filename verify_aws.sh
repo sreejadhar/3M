@@ -33,6 +33,8 @@ NEPTUNE_PORT="${NEPTUNE_PORT:-8182}"
 PG_SECRET_ID="${PG_SECRET_ID:-datananite/rds/app-user}"
 PG_HOST="${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
 PG_PORT="${PG_PORT:-5432}"
+PG_USER="${PG_USER:-}"
+PG_PASSWORD="${PG_PASSWORD:-}"
 
 # One profile ARN per tier — verified in step 3 below.
 BEDROCK_HAIKU_PROFILE="arn:aws:bedrock:us-east-1:336756484937:application-inference-profile/wfd1mwndgpsn"
@@ -105,27 +107,35 @@ else
 fi
 rm -f "$OUT_FILE" "${OUT_FILE}.err"
 
-# ── 4. RDS PostgreSQL: Secrets Manager fetch + reachability ──────────────────
-header "4. Fetching DB credentials from Secrets Manager and testing RDS reachability"
-info "Secret: ${PG_SECRET_ID}"
-
-SECRET_JSON=$(aws secretsmanager get-secret-value \
-    --secret-id "$PG_SECRET_ID" \
-    --region "$AWS_REGION" \
-    --query 'SecretString' \
-    --output text 2>&1) || {
-    error "secretsmanager get-secret-value failed:"
-    echo "$SECRET_JSON" >&2
-    FAIL=1
-}
-
-if [[ -z "${SECRET_JSON:-}" ]]; then
-    :  # already recorded as a failure above
-elif ! echo "$SECRET_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'username' in d and 'password' in d" 2>/dev/null; then
-    error "Secret ${PG_SECRET_ID} does not contain both 'username' and 'password' keys."
-    FAIL=1
+# ── 4. RDS PostgreSQL: credentials + reachability ────────────────────────────
+# Dev's RDS instance is private and PinAD-secured, reachable only from this
+# EC2 host, so its credentials live in the host's own .env (PG_USER/
+# PG_PASSWORD) rather than Secrets Manager — this mirrors pg_secrets.py.
+if [[ -n "$PG_USER" && -n "$PG_PASSWORD" ]]; then
+    header "4. Using PG_USER/PG_PASSWORD from .env and testing RDS reachability"
+    success "PG_USER/PG_PASSWORD are set — skipping Secrets Manager (dev credential path)."
 else
-    success "Secret fetched and has the expected username/password shape."
+    header "4. Fetching DB credentials from Secrets Manager and testing RDS reachability"
+    info "Secret: ${PG_SECRET_ID}"
+
+    SECRET_JSON=$(aws secretsmanager get-secret-value \
+        --secret-id "$PG_SECRET_ID" \
+        --region "$AWS_REGION" \
+        --query 'SecretString' \
+        --output text 2>&1) || {
+        error "secretsmanager get-secret-value failed:"
+        echo "$SECRET_JSON" >&2
+        FAIL=1
+    }
+
+    if [[ -z "${SECRET_JSON:-}" ]]; then
+        :  # already recorded as a failure above
+    elif ! echo "$SECRET_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'username' in d and 'password' in d" 2>/dev/null; then
+        error "Secret ${PG_SECRET_ID} does not contain both 'username' and 'password' keys."
+        FAIL=1
+    else
+        success "Secret fetched and has the expected username/password shape."
+    fi
 fi
 
 if nc -zv -w 5 "$PG_HOST" "$PG_PORT" 2>&1 | tee /dev/stderr | grep -qi "succeeded\|open"; then

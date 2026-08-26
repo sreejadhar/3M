@@ -4,20 +4,31 @@ Shared AWS RDS PostgreSQL connection info for every DataNanite store
 abbrev_glossary_registry.py, business_ontology.py, access_control.py,
 session_store.py, dialog_agent/pg_store.py).
 
-Credentials are never stored in env vars or config — they're fetched from AWS
-Secrets Manager at runtime, using the same assumed cross-account role as
-Bedrock/Neptune (see aws_auth.py). Secrets Manager handles automatic password
-rotation; connect() below retries once with a forced refresh on an auth
-failure, so a mid-session rotation doesn't require restarting the app.
+Production fetches credentials from AWS Secrets Manager at runtime, using the
+same assumed cross-account role as Bedrock/Neptune (see aws_auth.py). Secrets
+Manager handles automatic password rotation; connect() below retries once
+with a forced refresh on an auth failure, so a mid-session rotation doesn't
+require restarting the app.
+
+Dev is different: the dev RDS instance is a private, PinAD-secured instance
+reachable only from the app's own EC2 host, so there's no cross-account role
+to assume it through. Dev credentials instead live in the .env file on that
+EC2 instance (PG_USER/PG_PASSWORD) and are read directly — no Secrets
+Manager call is made when they're set.
 
 Config:
+  PG_USER, PG_PASSWORD — dev-only credentials read straight from the EC2
+                    .env file; when both are set, Secrets Manager is
+                    bypassed entirely and a DSN is built from these plus
+                    PG_HOST/PG_PORT/PG_DATABASE below.
   PG_SECRET_ID    — Secrets Manager secret id/ARN holding {"username",
-                    "password"} for the app login (default: see below)
+                    "password"} for the app login (production; default: see
+                    below). Ignored when PG_USER/PG_PASSWORD are set.
   PG_HOST         — RDS endpoint (default: pg-rds-datananite-dev-001a...)
   PG_PORT         — default 5432
   PG_DATABASE     — default "datananite"
   KG_POSTGRES_DSN — explicit DSN override (local dev only) — when set, this
-                    bypasses Secrets Manager entirely.
+                    takes priority over everything else below.
 """
 from __future__ import annotations
 
@@ -54,6 +65,13 @@ def get_pg_dsn(force_refresh: bool = False) -> str:
     override = os.environ.get("KG_POSTGRES_DSN", "").strip()
     if override:
         return override
+
+    # Dev: private, PinAD-secured RDS instance reachable only from this EC2
+    # host — credentials come from the box's own .env, not Secrets Manager.
+    dev_user = os.environ.get("PG_USER", "").strip()
+    dev_password = os.environ.get("PG_PASSWORD", "").strip()
+    if dev_user and dev_password:
+        return f"postgresql://{dev_user}:{dev_password}@{_HOST}:{_PORT}/{_DATABASE}"
 
     global _cached_dsn, _cached_at
     with _lock:

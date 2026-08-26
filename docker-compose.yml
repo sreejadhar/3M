@@ -19,13 +19,16 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       AWS_REGION: "${AWS_REGION:-us-east-1}"
       AWS_ASSUME_ROLE_ARN: "${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
-      # RDS PostgreSQL (metadata_catalog.py etc.) — credentials from Secrets
-      # Manager at runtime, not from here. See pg_secrets.py.
+      # RDS PostgreSQL (metadata_catalog.py etc.) — dev's RDS is private/
+      # PinAD-secured, so PG_USER/PG_PASSWORD (from the EC2 .env) are used
+      # directly instead of Secrets Manager. See pg_secrets.py.
       APP_ENV: "${APP_ENV:-production}"
       PG_SECRET_ID: "${PG_SECRET_ID:-datananite/rds/app-user}"
       PG_HOST: "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
       PG_PORT: "${PG_PORT:-5432}"
       PG_DATABASE: "${PG_DATABASE:-datananite}"
+      PG_USER: "${PG_USER:-}"
+      PG_PASSWORD: "${PG_PASSWORD:-}"
       DATA_DIR: /data/reports
       GLOSSARY_DB:  "/data/reports/glossary.db"
       # Tune log verbosity: debug | info | warning
@@ -66,12 +69,15 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       AWS_REGION: "${AWS_REGION:-us-east-1}"
       AWS_ASSUME_ROLE_ARN: "${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
-      # RDS PostgreSQL (business_ontology.py) — see pg_secrets.py.
+      # RDS PostgreSQL (business_ontology.py) — dev credentials come from
+      # PG_USER/PG_PASSWORD (EC2 .env), not Secrets Manager. See pg_secrets.py.
       APP_ENV: "${APP_ENV:-production}"
       PG_SECRET_ID: "${PG_SECRET_ID:-datananite/rds/app-user}"
       PG_HOST: "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
       PG_PORT: "${PG_PORT:-5432}"
       PG_DATABASE: "${PG_DATABASE:-datananite}"
+      PG_USER: "${PG_USER:-}"
+      PG_PASSWORD: "${PG_PASSWORD:-}"
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=4)"]
@@ -102,12 +108,15 @@ services:
       NEPTUNE_WRITER_ENDPOINT: "${NEPTUNE_WRITER_ENDPOINT:-datananite-dev-neptune.cluster-c676y6esoazm.us-east-1.neptune.amazonaws.com}"
       NEPTUNE_READER_ENDPOINT: "${NEPTUNE_READER_ENDPOINT:-datananite-dev-neptune.cluster-ro-c676y6esoazm.us-east-1.neptune.amazonaws.com}"
       NEPTUNE_PORT: "${NEPTUNE_PORT:-8182}"
-      # RDS PostgreSQL (kg_store.py source registry) — see pg_secrets.py.
+      # RDS PostgreSQL (kg_store.py source registry) — dev credentials come
+      # from PG_USER/PG_PASSWORD (EC2 .env), not Secrets Manager. See pg_secrets.py.
       APP_ENV: "${APP_ENV:-production}"
       PG_SECRET_ID: "${PG_SECRET_ID:-datananite/rds/app-user}"
       PG_HOST: "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
       PG_PORT: "${PG_PORT:-5432}"
       PG_DATABASE: "${PG_DATABASE:-datananite}"
+      PG_USER: "${PG_USER:-}"
+      PG_PASSWORD: "${PG_PASSWORD:-}"
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=4)"]
@@ -137,12 +146,15 @@ services:
       AWS_REGION:             "${AWS_REGION:-us-east-1}"
       AWS_ASSUME_ROLE_ARN:    "${AWS_ASSUME_ROLE_ARN:-arn:aws:iam::336756484937:role/datananite-dev-execution-role}"
       # RDS PostgreSQL (kg_registry/kg_bridges/semantic_lexicon/verified_queries
-      # /metadata_store via dialog_agent/pg_store.py) — see pg_secrets.py.
+      # /metadata_store via dialog_agent/pg_store.py) — dev credentials come
+      # from PG_USER/PG_PASSWORD (EC2 .env), not Secrets Manager. See pg_secrets.py.
       APP_ENV:                "${APP_ENV:-production}"
       PG_SECRET_ID:           "${PG_SECRET_ID:-datananite/rds/app-user}"
       PG_HOST:                "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
       PG_PORT:                "${PG_PORT:-5432}"
       PG_DATABASE:            "${PG_DATABASE:-datananite}"
+      PG_USER:                "${PG_USER:-}"
+      PG_PASSWORD:            "${PG_PASSWORD:-}"
       LOG_LEVEL:              "${LOG_LEVEL:-info}"
       GLOSSARY_DB:            "/data/reports/glossary.db"
       # Controls which LLM synthesize_node uses for insight generation:
@@ -213,11 +225,15 @@ services:
       # abbrev_glossary_registry/business_ontology/access_control/session_store
       # all switch to this when APP_ENV=production (see pg_secrets.py).
       # NOTE: this also activates real access-control (RBAC) enforcement.
+      # Dev's RDS is private/PinAD-secured, so PG_USER/PG_PASSWORD (EC2 .env)
+      # are used directly instead of Secrets Manager.
       APP_ENV: "${APP_ENV:-production}"
       PG_SECRET_ID: "${PG_SECRET_ID:-datananite/rds/app-user}"
       PG_HOST: "${PG_HOST:-pg-rds-datananite-dev-001a.cuepp5apko9u.us-east-1.rds.amazonaws.com}"
       PG_PORT: "${PG_PORT:-5432}"
       PG_DATABASE: "${PG_DATABASE:-datananite}"
+      PG_USER: "${PG_USER:-}"
+      PG_PASSWORD: "${PG_PASSWORD:-}"
       # Internal Docker DNS — matches service names above
       METADATA_API_URL: "http://agent-api:8000"
       ONTOLOGY_API_URL: "http://ontology-api:8001"

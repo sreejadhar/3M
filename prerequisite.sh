@@ -395,6 +395,12 @@ PG_DATABASE=datananite
 PG_USER=
 PG_PASSWORD=
 
+# ── App auth (orchestrator_api.py) ────────────────────────────────────────────
+# JWT_SECRET signs login session tokens — generate with: openssl rand -hex 32
+# SEED_PASSWORD_ADMIN seeds the single admin login (AJ3YRZZ@mmm.com).
+JWT_SECRET=
+SEED_PASSWORD_ADMIN=
+
 # ── Anthropic API key (OPTIONAL) ─────────────────────────────────────────────
 # Only needed to override Bedrock with the direct Anthropic API for local dev.
 # Leave blank in production.
@@ -416,6 +422,7 @@ EOF
     success ".env template created at ${ENV_FILE}"
     warn "IMPORTANT: verify AWS_ASSUME_ROLE_ARN and NEPTUNE_* endpoints in .env before running deploy.sh."
     warn "IMPORTANT: also fill in PG_USER/PG_PASSWORD for the dev RDS instance before running deploy.sh."
+    warn "IMPORTANT: also fill in JWT_SECRET and SEED_PASSWORD_ADMIN in .env before running deploy.sh."
 fi
 
 # ── 11. Make deploy.sh executable ────────────────────────────────────────────

@@ -243,7 +243,7 @@ services:
       LOG_LEVEL:        "${LOG_LEVEL:-info}"
       METADATA_DB:      "/data/metadata.db"
       KG_STORE_DB:      "/data/kg_store.db"
-      SEED_PASSWORD_ADITYA: "${SEED_PASSWORD_ADITYA}"
+      SEED_PASSWORD_ADMIN: "${SEED_PASSWORD_ADMIN}"
     depends_on:
       agent-api:
         condition: service_healthy

@@ -1,4 +1,4 @@
-name: Deploy DataNanite to GKE
+name: Deploy DataNanite to EC2
 
 on:
   push:
@@ -6,264 +6,34 @@ on:
       - main
   workflow_dispatch:
 
-env:
-  PROJECT_ID: cog01k24f1ea555zdv7ynzthxanz5
-  GKE_CLUSTER: lvp-fastapi-cluster
-  GKE_ZONE: asia-south1-a
-  NAMESPACE: datananite2
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
-  # ── Job 0: Update K8s secrets + ConfigMap FIRST so pods get correct env ───────
-  pre-deploy:
-    name: Update Secrets & ConfigMap
+  deploy:
+    name: Deploy to EC2
     runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Authenticate to Google Cloud
-      uses: google-github-actions/auth@v2
-      with:
-        credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-    - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v2
-      with:
-        install_components: 'gke-gcloud-auth-plugin'
-
-    - name: Get GKE credentials
-      run: |
-        gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
-
-    - name: Guard — reject placeholder JWT_SECRET
-      env:
-        S_JWT_SECRET: ${{ secrets.JWT_SECRET }}
-      run: |
-        # Fail if the GitHub Actions secret itself looks like a placeholder
-        if echo "$S_JWT_SECRET" | grep -qiE "^$|CHANGE_ME|openssl"; then
-          echo "FATAL: JWT_SECRET GitHub secret is empty or placeholder. Generate one with: openssl rand -hex 32"
-          exit 1
-        fi
-
-    - name: Update K8s secrets from GitHub Actions secrets
-      env:
-        S_JWT_SECRET: ${{ secrets.JWT_SECRET }}
-        S_SEED_PASSWORD_RIMNA: ${{ secrets.SEED_PASSWORD_RIMNA }}
-        S_SEED_PASSWORD_IYER: ${{ secrets.SEED_PASSWORD_IYER }}
-        S_SEED_PASSWORD_SENTHEESH: ${{ secrets.SEED_PASSWORD_SENTHEESH }}
-        S_SEED_PASSWORD_HARPREET: ${{ secrets.SEED_PASSWORD_HARPREET }}
-        S_SEED_PASSWORD_SUNIL: ${{ secrets.SEED_PASSWORD_SUNIL }}
-        S_SEED_PASSWORD_SATHISH: ${{ secrets.SEED_PASSWORD_SATHISH }}
-        S_SEED_PASSWORD_PALASH: ${{ secrets.SEED_PASSWORD_PALASH }}
-        S_SEED_PASSWORD_SASWATA: ${{ secrets.SEED_PASSWORD_SASWATA }}
-        S_SEED_PASSWORD_MURUGESH: ${{ secrets.SEED_PASSWORD_MURUGESH }}
-        S_SEED_PASSWORD_JISHNU: ${{ secrets.SEED_PASSWORD_JISHNU }}
-        S_SEED_PASSWORD_HEMANT: ${{ secrets.SEED_PASSWORD_HEMANT }}
-        S_SEED_PASSWORD_SAMIR: ${{ secrets.SEED_PASSWORD_SAMIR }}
-        S_SEED_PASSWORD_SOUMEN: ${{ secrets.SEED_PASSWORD_SOUMEN }}
-        S_SEED_PASSWORD_ANNAL: ${{ secrets.SEED_PASSWORD_ANNAL }}
-        S_SEED_PASSWORD_SIVAKUMAR: ${{ secrets.SEED_PASSWORD_SIVAKUMAR }}
-        S_SEED_PASSWORD_SREEJA: ${{ secrets.SEED_PASSWORD_SREEJA }}
-        S_SEED_PASSWORD_SUSMITA: ${{ secrets.SEED_PASSWORD_SUSMITA }}
-        S_SEED_PASSWORD_ADITYA: ${{ secrets.SEED_PASSWORD_ADITYA }}
-        S_SEED_PASSWORD_ARUNKUMAR: ${{ secrets.SEED_PASSWORD_ARUNKUMAR }}
-      run: |
-        kubectl create secret generic datananite-secrets \
-          --namespace="$NAMESPACE" \
-          --from-literal=JWT_SECRET="$S_JWT_SECRET" \
-          --from-literal=SEED_PASSWORD_RIMNA="$S_SEED_PASSWORD_RIMNA" \
-          --from-literal=SEED_PASSWORD_IYER="$S_SEED_PASSWORD_IYER" \
-          --from-literal=SEED_PASSWORD_SENTHEESH="$S_SEED_PASSWORD_SENTHEESH" \
-          --from-literal=SEED_PASSWORD_HARPREET="$S_SEED_PASSWORD_HARPREET" \
-          --from-literal=SEED_PASSWORD_SUNIL="$S_SEED_PASSWORD_SUNIL" \
-          --from-literal=SEED_PASSWORD_SATHISH="$S_SEED_PASSWORD_SATHISH" \
-          --from-literal=SEED_PASSWORD_PALASH="$S_SEED_PASSWORD_PALASH" \
-          --from-literal=SEED_PASSWORD_SASWATA="$S_SEED_PASSWORD_SASWATA" \
-          --from-literal=SEED_PASSWORD_MURUGESH="$S_SEED_PASSWORD_MURUGESH" \
-          --from-literal=SEED_PASSWORD_JISHNU="$S_SEED_PASSWORD_JISHNU" \
-          --from-literal=SEED_PASSWORD_HEMANT="$S_SEED_PASSWORD_HEMANT" \
-          --from-literal=SEED_PASSWORD_SAMIR="$S_SEED_PASSWORD_SAMIR" \
-          --from-literal=SEED_PASSWORD_SOUMEN="$S_SEED_PASSWORD_SOUMEN" \
-          --from-literal=SEED_PASSWORD_ANNAL="$S_SEED_PASSWORD_ANNAL" \
-          --from-literal=SEED_PASSWORD_SIVAKUMAR="$S_SEED_PASSWORD_SIVAKUMAR" \
-          --from-literal=SEED_PASSWORD_SREEJA="$S_SEED_PASSWORD_SREEJA" \
-          --from-literal=SEED_PASSWORD_SUSMITA="$S_SEED_PASSWORD_SUSMITA" \
-          --from-literal=SEED_PASSWORD_ADITYA="$S_SEED_PASSWORD_ADITYA" \
-          --from-literal=SEED_PASSWORD_ARUNKUMAR="$S_SEED_PASSWORD_ARUNKUMAR" \
-          --dry-run=client -o yaml | kubectl apply -f -
-
-    - name: Apply Namespace, ConfigMap and PVCs
-      run: |
-        kubectl apply -f deployment/k8s/namespace2.yaml
-        kubectl apply -f deployment/k8s/pvc2.yaml
-        kubectl apply -f deployment/k8s/configmap.yaml
-        kubectl apply -f deployment/k8s/orchestrator-api.yaml
-
-  # ── Job 1: Build → Push → Deploy each service fully in parallel ───────────────
-  build-push-deploy:
-    name: Build→Push→Deploy ${{ matrix.service.name }}
-    runs-on: ubuntu-latest
-    needs: pre-deploy
-    strategy:
-      fail-fast: false
-      matrix:
-        service:
-          - { name: agent-api,        image: datananite-agent,        dockerfile: Dockerfile.agent,        deployment: agent-api,        container: agent-api }
-          - { name: ontology-api,     image: datananite-ontology,     dockerfile: Dockerfile.ontology,     deployment: ontology-api,     container: ontology-api }
-          - { name: kg-api,           image: datananite-kg,           dockerfile: Dockerfile.kg,           deployment: kg-api,           container: kg-api }
-          - { name: dialog-api,       image: datananite-dialog,       dockerfile: Dockerfile.dialog,       deployment: dialog-api,       container: dialog-api }
-          - { name: conformity-api,   image: datananite-conformity,   dockerfile: Dockerfile.conformity,   deployment: conformity-api,   container: conformity-api }
-          - { name: chat-ui,          image: datananite-chat,         dockerfile: Dockerfile.chat,         deployment: chat-ui,          container: chat-ui }
-          - { name: tech-ui,          image: datananite-tech,         dockerfile: Dockerfile.tech,         deployment: tech-ui,          container: tech-ui }
-          - { name: shacl-api,        image: datananite-shacl,        dockerfile: Dockerfile.shacl,        deployment: shacl-api,        container: shacl-api }
-          - { name: streamlit-ui,     image: datananite-ui,           dockerfile: Dockerfile.ui,           deployment: streamlit-ui,     container: streamlit-ui }
-          - { name: orchestrator-api, image: datananite-orchestrator, dockerfile: Dockerfile.orchestrator, deployment: orchestrator-api, container: orchestrator-api }
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Authenticate to Google Cloud
-      uses: google-github-actions/auth@v2
+    - name: SSH in, pull latest main, and redeploy via deploy.sh
+      # Credentials (JWT_SECRET, SEED_PASSWORD_ADMIN, PG_USER/PG_PASSWORD,
+      # etc.) live in the .env file already on the EC2 host (see
+      # prerequisite.sh) — deploy.sh loads it, so nothing is injected here.
+      uses: appleboy/ssh-action@v1
       with:
-        credentials_json: ${{ secrets.GCP_SA_KEY }}
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_SSH_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script_stop: true
+        script: |
+          cd ~/datananite
+          git fetch origin main
+          git reset --hard origin/main
+          ./deploy.sh
 
-    - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v2
+    - name: Verify deployment status
+      uses: appleboy/ssh-action@v1
       with:
-        install_components: 'gke-gcloud-auth-plugin'
-
-    - name: Configure Docker
-      run: gcloud auth configure-docker gcr.io
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Cache Docker layers
-      uses: actions/cache@v4
-      with:
-        path: /tmp/.buildx-cache-${{ matrix.service.name }}
-        key: ${{ runner.os }}-buildx-${{ matrix.service.name }}-${{ hashFiles(matrix.service.dockerfile) }}-${{ hashFiles('requirements*.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-buildx-${{ matrix.service.name }}-
-
-    # GCR pushes intermittently time out during the final auth/manifest-commit
-    # handshake (layers finish uploading, then "failed to authorize: DeadlineExceeded")
-    # — a transient flake on Google's side (GCR is being wound down in favor of
-    # Artifact Registry), unrelated to this service's own code. Retry up to 3
-    # times before actually failing the job.
-    - name: Build & Push ${{ matrix.service.name }} (attempt 1)
-      id: build_1
-      uses: docker/build-push-action@v5
-      continue-on-error: true
-      with:
-        context: .
-        file: ${{ matrix.service.dockerfile }}
-        push: true
-        tags: |
-          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:${{ github.sha }}
-          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:latest
-        cache-from: type=local,src=/tmp/.buildx-cache-${{ matrix.service.name }}
-        cache-to: type=local,dest=/tmp/.buildx-cache-${{ matrix.service.name }}-new,mode=max
-
-    - name: Wait before retry ${{ matrix.service.name }} (1)
-      if: steps.build_1.outcome == 'failure'
-      run: sleep 20
-
-    - name: Build & Push ${{ matrix.service.name }} (attempt 2)
-      id: build_2
-      if: steps.build_1.outcome == 'failure'
-      uses: docker/build-push-action@v5
-      continue-on-error: true
-      with:
-        context: .
-        file: ${{ matrix.service.dockerfile }}
-        push: true
-        tags: |
-          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:${{ github.sha }}
-          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:latest
-        cache-from: type=local,src=/tmp/.buildx-cache-${{ matrix.service.name }}
-        cache-to: type=local,dest=/tmp/.buildx-cache-${{ matrix.service.name }}-new,mode=max
-
-    - name: Wait before retry ${{ matrix.service.name }} (2)
-      if: steps.build_1.outcome == 'failure' && steps.build_2.outcome == 'failure'
-      run: sleep 20
-
-    - name: Build & Push ${{ matrix.service.name }} (attempt 3)
-      id: build_3
-      if: steps.build_1.outcome == 'failure' && steps.build_2.outcome == 'failure'
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ${{ matrix.service.dockerfile }}
-        push: true
-        tags: |
-          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:${{ github.sha }}
-          gcr.io/${{ env.PROJECT_ID }}/${{ matrix.service.image }}:latest
-        cache-from: type=local,src=/tmp/.buildx-cache-${{ matrix.service.name }}
-        cache-to: type=local,dest=/tmp/.buildx-cache-${{ matrix.service.name }}-new,mode=max
-
-    - name: Rotate cache
-      run: |
-        rm -rf /tmp/.buildx-cache-${{ matrix.service.name }}
-        mv /tmp/.buildx-cache-${{ matrix.service.name }}-new /tmp/.buildx-cache-${{ matrix.service.name }}
-
-    - name: Get GKE credentials
-      run: |
-        gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
-
-    - name: Deploy ${{ matrix.service.name }} to GKE
-      run: |
-        kubectl set image deployment/${{ matrix.service.deployment }} \
-          ${{ matrix.service.container }}=gcr.io/$PROJECT_ID/${{ matrix.service.image }}:${{ github.sha }} \
-          -n $NAMESPACE
-        kubectl rollout restart deployment/${{ matrix.service.deployment }} -n $NAMESPACE
-        kubectl rollout status deployment/${{ matrix.service.deployment }} -n $NAMESPACE --timeout=10m
-
-    - name: Diagnose ${{ matrix.service.name }} rollout failure
-      if: failure()
-      run: |
-        echo "=== Node capacity ==="
-        kubectl describe nodes -l cloud.google.com/gke-nodepool=datananite-pool | grep -A5 "Allocated resources"
-        echo ""
-        echo "=== Pods ==="
-        kubectl get pods -n $NAMESPACE -l app=${{ matrix.service.deployment }} -o wide
-        echo ""
-        echo "=== Pod describe (events) ==="
-        kubectl describe pods -n $NAMESPACE -l app=${{ matrix.service.deployment }}
-        echo ""
-        echo "=== Pod logs ==="
-        kubectl logs -n $NAMESPACE -l app=${{ matrix.service.deployment }} --tail=200 --all-containers || true
-        echo ""
-        echo "=== Pod logs (previous container, if crashed) ==="
-        kubectl logs -n $NAMESPACE -l app=${{ matrix.service.deployment }} --tail=200 --all-containers --previous || true
-
-  # ── Job 2: Final status check after all services deployed ─────────────────────
-  status:
-    name: Deployment Status
-    runs-on: ubuntu-latest
-    needs: build-push-deploy
-
-    steps:
-    - name: Authenticate to Google Cloud
-      uses: google-github-actions/auth@v2
-      with:
-        credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-    - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v2
-      with:
-        install_components: 'gke-gcloud-auth-plugin'
-
-    - name: Get GKE credentials
-      run: |
-        gcloud container clusters get-credentials $GKE_CLUSTER --zone $GKE_ZONE --project $PROJECT_ID
-
-    - name: Get Deployment Status
-      run: |
-        echo "=== Pods ==="
-        kubectl get pods -n $NAMESPACE
-        echo ""
-        echo "=== Ingress ==="
-        kubectl get ingress -n $NAMESPACE
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_SSH_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          cd ~/datananite
+          ./deploy.sh --status

@@ -245,32 +245,13 @@ _AUTH_DB_PATH = Path(os.environ.get("DATA_DIR", "./data")) / "auth.db"
 
 # Seed users: env var name → email
 _SEED_USERS = [
-    ("SEED_PASSWORD_SIVAKUMAR",      "Sivakumar.Shanmugam2@cognizant.com"),
-    ("SEED_PASSWORD_RIMNA",      "Rimna.Radhakrishnan@cognizant.com"),
-    ("SEED_PASSWORD_IYER",       "Iyer.Kasinath@cognizant.com"),
-    ("SEED_PASSWORD_SENTHEESH",  "Sentheesh.Lingam@cognizant.com"),
-    ("SEED_PASSWORD_HARPREET",   "Harpreet.Sethi@cognizant.com"),
-    ("SEED_PASSWORD_SUNIL",      "Sunil.Pinnamaneni@cognizant.com"),
-    ("SEED_PASSWORD_SATHISH",    "Sathish.Hegde@cognizant.com"),
-    ("SEED_PASSWORD_PALASH",     "Palash.Ghosh@cognizant.com"),
-    ("SEED_PASSWORD_SASWATA",    "Saswata.Kundu@cognizant.com"),
-    ("SEED_PASSWORD_MURUGESH",   "Murugesh.Mayandi@cognizant.com"),
-    ("SEED_PASSWORD_JISHNU",     "Jishnu.Chatterji@cognizant.com"),
-    ("SEED_PASSWORD_HEMANT",     "Hemant.Singhal@cognizant.com"),
-    ("SEED_PASSWORD_SAMIR",      "Samir.Sawant@cognizant.com"),
-    ("SEED_PASSWORD_SOUMEN",     "Soumen.Das5@cognizant.com"),
-    ("SEED_PASSWORD_ANNAL",      "Annal.Tamizhnambi@cognizant.com"),
-    ("SEED_PASSWORD_SREEJA",     "sreeja.dhar@cognizant.com"),
-    ("SEED_PASSWORD_SUSMITA",     "Sushmita.Sahu@cognizant.com"),
-    ("SEED_PASSWORD_ADITYA",      "AdityaSankar.Sarkar@cognizant.com"),
+    ("SEED_PASSWORD_ADMIN",      "AJ3YRZZ@mmm.com"),
 ]
 
 # Users who can see every source regardless of who indexed it. Everyone else
 # only sees sources they personally indexed (kg_sources.created_by).
 ADMIN_EMAILS = {
-    "sreeja.dhar@cognizant.com",
-    "iyer.kasinath@cognizant.com",
-    "palash.ghosh@cognizant.com",
+    "aj3yrzz@mmm.com",
 }
 
 
